@@ -1,0 +1,9 @@
+[package]
+name = "fieldcad-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+thiserror = { workspace = true }

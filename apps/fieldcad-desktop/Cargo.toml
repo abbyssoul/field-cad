@@ -1,0 +1,30 @@
+[package]
+name = "fieldcad-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fieldcad"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+fieldcad-core = { workspace = true }
+fieldcad-electrostatics = { workspace = true }
+fieldcad-simulation = { workspace = true }
+glam = { workspace = true }
+pollster = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+
+[dev-dependencies]
+# Parses `scene.wgsl` in a unit test so a broken shader fails the build rather
+# than the first frame on a developer's machine.
+fieldcad-test-field = { workspace = true }
+naga = { workspace = true }

@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/fieldcad-desktop",
+    "crates/fieldcad-core",
+    "crates/fieldcad-plugin-api",
+    "crates/fieldcad-simulation",
+    "plugins/electrostatics",
+    "plugins/test-field",
+]
+
+# Shared versions live here so a bump happens once. Notably `glam`, `serde`, and
+# `thiserror` appear in most crates; `wgpu`, `winit`, and the `egui` family must
+# stay mutually compatible and are pinned together.
+[workspace.dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+egui = "0.35"
+egui-wgpu = "0.35"
+egui-winit = "0.35"
+glam = "0.30"
+naga = { version = "29", features = ["wgsl-in"] }
+pollster = "0.4"
+serde = { version = "1", features = ["derive", "rc"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "29"
+winit = "0.30.13"
+
+fieldcad-core = { path = "crates/fieldcad-core" }
+fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
+fieldcad-simulation = { path = "crates/fieldcad-simulation" }
+fieldcad-electrostatics = { path = "plugins/electrostatics" }
+fieldcad-test-field = { path = "plugins/test-field" }
