@@ -78,7 +78,33 @@ jobs:
             libwayland-dev libxkbcommon-dev \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             mesa-vulkan-drivers libgl1-mesa-dri \
+            libegl1 libegl-mesa0 libgles2 \
             xvfb
+
+      # The OpenGL smoke test runs with no display, so wgpu reaches GL through
+      # EGL's surfaceless platform rather than GLX. That needs three separate
+      # pieces, and a missing one reports only as "gl drivers/libraries could
+      # not be loaded", so check them here where the diagnosis is cheap:
+      # libEGL.so.1 is the loader wgpu dlopens (libegl1), libEGL_mesa.so.0 is
+      # the driver behind it that provides EGL_MESA_platform_surfaceless
+      # (libegl-mesa0), and swrast_dri.so is the llvmpipe renderer it drives
+      # (libgl1-mesa-dri).
+      - name: Verify the headless OpenGL stack is present
+        run: |
+          missing=0
+          for lib in \
+            /usr/lib/x86_64-linux-gnu/libEGL.so.1 \
+            /usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0 \
+            /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so
+          do
+            if [ -e "$lib" ]; then
+              echo "found $lib"
+            else
+              echo "::error::missing $lib — the OpenGL backend cannot start without it"
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Build
         run: cargo build --release -p fieldcad-desktop
