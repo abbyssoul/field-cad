@@ -12,18 +12,29 @@ members = [
     "plugins/electromagnetism",
     "plugins/test-field",
 ]
+default-members = ["apps/fieldcad-desktop"]
 
 # Shared versions live here so a bump happens once. Notably `glam`, `serde`, and
 # `thiserror` appear in most crates; `wgpu`, `winit`, and the `egui` family must
 # stay mutually compatible and are pinned together.
+#
+# `wgpu` is the version `egui-wgpu` depends on, and cannot lead it. The app hands
+# egui the same device, queue, and render pass it uses itself, so two `wgpu`
+# versions in the tree are not merely wasteful — they are different types, and
+# every one of those calls stops compiling. Bump `wgpu` only together with the
+# `egui` family, and check what `egui-wgpu` requires first.
+#
+# `naga` follows `wgpu` for the same reason: it is a dev-dependency that
+# validates the WGSL in tests, and it is only evidence about what `wgpu` will
+# accept at runtime if it is the version `wgpu` itself parses with.
 [workspace.dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
 egui = "0.35"
 egui-wgpu = "0.35"
 egui-winit = "0.35"
-glam = "0.30"
+glam = "0.33"
 naga = { version = "29", features = ["wgsl-in"] }
-pollster = "0.4"
+pollster = "1.0"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"

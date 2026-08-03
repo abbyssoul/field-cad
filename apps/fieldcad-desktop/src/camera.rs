@@ -194,13 +194,17 @@ impl OrbitCamera {
     }
 
     pub fn view_projection(&self, aspect_ratio: f32) -> Mat4 {
-        let projection = Mat4::perspective_rh(
+        // `directx` is glam's name for the WebGPU clip convention — Z in [0, 1],
+        // Y-up — which is the one wgpu expects. The `opengl` variant's [-1, 1]
+        // depth range would halve the usable precision of the depth buffer and
+        // clip everything in front of the camera's midpoint.
+        let projection = glam::camera::rh::proj::directx::perspective(
             self.vertical_fov,
             aspect_ratio.max(0.01),
             self.near,
             self.far,
         );
-        projection * Mat4::look_at_rh(self.eye(), self.target, Vec3::Z)
+        projection * glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Z)
     }
 
     pub fn orbit(&mut self, pointer_delta: Vec2) {
