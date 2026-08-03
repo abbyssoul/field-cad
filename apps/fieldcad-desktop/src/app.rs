@@ -4,18 +4,19 @@ use std::{
 };
 
 use fieldcad_core::{
-    BoundaryConditions, Domain, DomainBounds, ObjectShape, ObjectSpec, Precision, ProbeSpec,
-    Resolution, SessionId, SlicePlaneSpec, TimeStep, Transform, WorldCommand, WorldSnapshot,
+    BoundaryConditions, Domain, DomainBounds, ObjectShape, ObjectSpec, Precision, ProbePosition,
+    ProbeSpec, Resolution, SessionId, SlicePlaneSpec, TimeStep, Transform, WorldCommand,
+    WorldSnapshot,
 };
 use fieldcad_electrostatics::{
     ElectrostaticBatchEvaluator, ElectrostaticsPlugin, charge_component_id, charge_properties,
     electric_field_channel_id, electric_potential_channel_id,
 };
 use fieldcad_simulation::{
-    CommandSequencer, FieldDataSource, LocalDataSource, ProbeHistory, RuntimeConfig,
-    SimulationRuntime, Subscription,
+    AsyncLocalDataSource, CommandEvent, CommandSequencer, FieldDataSource, LocalDataSource,
+    ProbeHistory, RuntimeConfig, SimulationRuntime, Subscription,
 };
-use glam::{DVec2, DVec3, UVec2, Vec2};
+use glam::{DQuat, DVec2, DVec3, UVec2, Vec2};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -325,6 +326,22 @@ impl WindowState {
         self.data_source
             .poll(elapsed)
             .map_err(|error| format!("simulation update failed: {error}"))?;
+        for event in self.data_source.drain_command_events() {
+            match event {
+                CommandEvent::Completed(receipt) => {
+                    self.ui_model.command_error = None;
+                    tracing::debug!(
+                        command = receipt.command.get(),
+                        disposition = ?receipt.disposition,
+                        "compute command completed"
+                    );
+                }
+                CommandEvent::Failed { command, error } => {
+                    self.ui_model.command_error = Some(error.to_string());
+                    tracing::warn!(command = command.get(), %error, "compute command rejected");
+                }
+            }
+        }
         self.refresh_world();
 
         if self.occluded {
@@ -336,6 +353,26 @@ impl WindowState {
 
         let compute = ComputeView::build(self.data_source.as_ref(), &self.world);
         let raw_input = self.egui_state.take_egui_input(&self.window);
+        let pixels_per_point_before_frame = self.egui_context.pixels_per_point().max(0.01);
+        let transform_preview = self.active_transform.map(ActiveTransformDrag::preview);
+        let plane_normal_label = self
+            .ui_model
+            .scene_selection()
+            .and_then(|selection| {
+                scene::plane_normal_label_position(
+                    &self.world,
+                    selection,
+                    &self.camera,
+                    self.viewport,
+                    transform_preview,
+                )
+            })
+            .map(|position| {
+                egui::pos2(
+                    position.x / pixels_per_point_before_frame,
+                    position.y / pixels_per_point_before_frame,
+                )
+            });
         let mut ui_frame = ui::UiFrameOutput::default();
         let adapter_name = self.renderer.adapter_name().to_owned();
         let frame_time_ms = self.frame_stats.smoothed_frame_ms;
@@ -352,6 +389,10 @@ impl WindowState {
                     adapter_name: &adapter_name,
                     frame_time_ms,
                     active_translation: self.active_transform.map(|drag| drag.constraint.label()),
+                    plane_normal_label,
+                    plane_normal_active: self
+                        .active_transform
+                        .is_some_and(|drag| drag.constraint == ManipulationConstraint::PlaneNormal),
                 },
             );
         });
@@ -369,11 +410,15 @@ impl WindowState {
         self.apply_camera_action(ui_frame.camera_action);
         self.apply_viewport_gesture(ui_frame.viewport_gesture, pixels_per_point)?;
 
-        if let Some(payload) = ui_frame.command {
-            let command = self.commands.issue(payload);
-            self.data_source
-                .execute(command)
-                .map_err(|error| format!("simulation command failed: {error}"))?;
+        // In submission order, which is also the order queued edits are applied
+        // in at a tick boundary (ADR 0011).
+        if !ui_frame.commands.is_empty() {
+            for payload in std::mem::take(&mut ui_frame.commands) {
+                let command = self.commands.issue(payload);
+                self.data_source
+                    .execute(command)
+                    .map_err(|error| format!("simulation command failed: {error}"))?;
+            }
             self.refresh_world();
         }
 
@@ -385,7 +430,9 @@ impl WindowState {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map_or(MAX_IDLE_INTERVAL, |viewport| viewport.repaint_delay);
-        let next_frame_delay = if compute.mode == fieldcad_core::SimulationMode::Running {
+        let next_frame_delay = if compute.mode == fieldcad_core::SimulationMode::Running
+            || self.data_source.pending_command_count() > 0
+        {
             RUNNING_FRAME_INTERVAL.min(ui_repaint_delay)
         } else {
             ui_repaint_delay
@@ -405,23 +452,30 @@ impl WindowState {
         );
         let primitives = self.egui_context.tessellate(shapes, pixels_per_point);
         let instances = scene::instances(&self.world, self.ui_model.selection);
-        let mut field = self.data_source.latest_snapshot().map_or_else(
-            scene::FieldGeometry::default,
-            |snapshot| {
-                scene::field_geometry(
-                    &snapshot,
-                    self.ui_model.field_layers,
-                    &self.ui_model.plane_layers,
-                )
-            },
-        );
+        // Every visible layer names a channel declared by the snapshot. Several
+        // channels (for example Maxwell E and B) can be drawn independently.
+        let mut field = scene::FieldGeometry::default();
+        if let Some(snapshot) = self.data_source.latest_snapshot() {
+            for (channel, layer) in &self.ui_model.field_layers {
+                if !layer.visible || !compute.vector_channels.contains(channel) {
+                    continue;
+                }
+                let layer_geometry =
+                    scene::field_geometry(&snapshot, channel, layer.whole_domain, &layer.planes);
+                field
+                    .surface_triangles
+                    .extend(layer_geometry.surface_triangles);
+                field.vector_lines.extend(layer_geometry.vector_lines);
+            }
+        }
         scene::append_authoring_geometry(&mut field, &self.world, self.ui_model.scene_selection());
-        scene::append_translation_gizmo(
+        scene::append_transform_gizmo(
             &mut field,
             &self.world,
-            self.ui_model.selection,
+            self.ui_model.scene_selection(),
             self.active_transform
                 .and_then(|drag| drag.constraint.handle()),
+            transform_preview,
         );
 
         let status = self.renderer.render(
@@ -490,14 +544,19 @@ impl WindowState {
         {
             self.ui_model.probe_selection = None;
         }
-        self.ui_model
-            .plane_layers
-            .retain(|id, _| self.world.planes().contains_key(id));
-        if self.active_transform.is_some_and(|drag| {
-            self.world
-                .object(drag.object)
-                .is_none_or(|object| !object.visible)
-        }) {
+        for layer in self.ui_model.field_layers.values_mut() {
+            layer
+                .planes
+                .retain(|id, _| self.world.planes().contains_key(id));
+        }
+        // Each series is bounded, but the set of them is not: probe IDs are
+        // never reused, so deleted probes would accumulate for the session.
+        self.probe_history
+            .retain_probes(|probe| self.world.probe(probe).is_some());
+        if self
+            .active_transform
+            .is_some_and(|drag| scene::selection_origin(&self.world, drag.target).is_none())
+        {
             self.active_transform = None;
         }
     }
@@ -533,69 +592,83 @@ impl WindowState {
         let was_active = self.active_transform.is_some();
 
         if gesture.primary_pressed
-            && let (Some(object_id), Some(pointer)) = (self.ui_model.selection, pointer)
-            && let Some(object) = self.world.object(object_id)
+            && let (Some(selection), Some(pointer)) = (self.ui_model.scene_selection(), pointer)
+            && let Some(origin) = scene::selection_origin(&self.world, selection)
         {
-            let constraint =
-                scene::pick_transform_handle(&self.camera, self.viewport, pointer, object)
-                    .map(TranslationConstraint::Handle)
-                    .or_else(|| {
-                        (scene::pick_object(&self.world, &self.camera, self.viewport, pointer)
-                            == Some(object_id))
-                        .then_some(TranslationConstraint::ViewPlane)
-                    });
+            let picked_handle = scene::pick_transform_handle(
+                &self.world,
+                selection,
+                &self.camera,
+                self.viewport,
+                pointer,
+            );
+            let constraint = match picked_handle {
+                Some(TransformHandle::PlaneNormal) => Some(ManipulationConstraint::PlaneNormal),
+                Some(handle) => Some(ManipulationConstraint::Handle(handle)),
+                None if scene::pick_scene(&self.world, &self.camera, self.viewport, pointer)
+                    == Some(selection) =>
+                {
+                    Some(ManipulationConstraint::ViewPlane)
+                }
+                None => None,
+            };
             if let Some(constraint) = constraint {
+                let plane_frame = match selection {
+                    scene::SceneSelection::Plane(id) => {
+                        self.world.planes().get(&id).map(|plane| PlaneFrame {
+                            normal: plane.normal,
+                            u_axis: plane.u_axis,
+                        })
+                    }
+                    _ => None,
+                };
                 self.active_transform = Some(ActiveTransformDrag {
-                    object: object_id,
+                    target: selection,
                     constraint,
-                    translation: object.transform.translation,
+                    origin: origin.as_dvec3(),
+                    plane_frame,
                 });
             }
         }
 
         if gesture.primary_dragged
             && let (Some(active), Some(pointer)) = (self.active_transform, pointer)
-            && let Some(object) = self.world.object(active.object)
-            && let Some(translation) = match active.constraint {
-                TranslationConstraint::Handle(handle) => scene::constrained_translation(
-                    handle,
-                    &self.camera,
-                    self.viewport,
-                    pointer,
-                    pointer_delta,
-                    active.translation.as_vec3(),
-                    object,
-                ),
-                TranslationConstraint::ViewPlane => scene::view_plane_translation(
-                    &self.camera,
-                    self.viewport,
-                    pointer,
-                    pointer_delta,
-                    active.translation.as_vec3(),
-                ),
-            }
-            && translation.length_squared() > 0.0
         {
-            let transform = Transform::new(
-                active.translation + translation.as_dvec3(),
-                object.transform.rotation,
-            )
-            .map_err(|error| error.to_string())?;
-            if let Some(active) = self.active_transform.as_mut() {
-                active.translation = transform.translation;
+            match active.constraint {
+                ManipulationConstraint::PlaneNormal => {
+                    self.drag_plane_normal(active, pointer)?;
+                }
+                ManipulationConstraint::Handle(handle) => {
+                    let length = scene::selection_gizmo_length(&self.world, active.target)
+                        .ok_or_else(|| {
+                            "selected entity no longer has a transform gizmo".to_owned()
+                        })?;
+                    if let Some(translation) = scene::constrained_translation(
+                        handle,
+                        &self.camera,
+                        self.viewport,
+                        pointer,
+                        pointer_delta,
+                        active.origin.as_vec3(),
+                        length,
+                    ) && translation.length_squared() > 0.0
+                    {
+                        self.translate_selection(active, translation.as_dvec3())?;
+                    }
+                }
+                ManipulationConstraint::ViewPlane => {
+                    if let Some(translation) = scene::view_plane_translation(
+                        &self.camera,
+                        self.viewport,
+                        pointer,
+                        pointer_delta,
+                        active.origin.as_vec3(),
+                    ) && translation.length_squared() > 0.0
+                    {
+                        self.translate_selection(active, translation.as_dvec3())?;
+                    }
+                }
             }
-            let command = self
-                .commands
-                .issue(fieldcad_simulation::CommandPayload::CommitWorld(vec![
-                    WorldCommand::SetTransform {
-                        object: active.object,
-                        transform,
-                    },
-                ]));
-            self.data_source
-                .execute(command)
-                .map_err(|error| format!("object move failed: {error}"))?;
-            self.refresh_world();
         }
 
         let drag_consumed = was_active || self.active_transform.is_some();
@@ -616,40 +689,202 @@ impl WindowState {
         Ok(())
     }
 
+    fn translate_selection(
+        &mut self,
+        active: ActiveTransformDrag,
+        translation: DVec3,
+    ) -> Result<(), String> {
+        let next_origin = active.origin + translation;
+        let world_command = match active.target {
+            scene::SceneSelection::Object(object_id) => {
+                let object = self
+                    .world
+                    .object(object_id)
+                    .ok_or_else(|| format!("object {object_id} no longer exists"))?;
+                WorldCommand::SetTransform {
+                    object: object_id,
+                    transform: Transform::new(next_origin, object.transform.rotation)
+                        .map_err(|error| error.to_string())?,
+                }
+            }
+            scene::SceneSelection::Plane(plane_id) => {
+                let plane = self
+                    .world
+                    .planes()
+                    .get(&plane_id)
+                    .ok_or_else(|| format!("plane {plane_id} no longer exists"))?;
+                WorldCommand::SetPlane {
+                    plane: plane_id,
+                    spec: SlicePlaneSpec::from_plane(plane)
+                        .with_origin(next_origin)
+                        .map_err(|error| error.to_string())?,
+                }
+            }
+            scene::SceneSelection::Probe(probe_id) => {
+                let probe = self
+                    .world
+                    .probe(probe_id)
+                    .ok_or_else(|| format!("probe {probe_id} no longer exists"))?;
+                let position = match probe.position {
+                    ProbePosition::World(_) => ProbePosition::World(next_origin),
+                    ProbePosition::Attached { object, .. } => {
+                        let parent = self
+                            .world
+                            .object(object)
+                            .ok_or_else(|| format!("attached object {object} no longer exists"))?;
+                        ProbePosition::Attached {
+                            object,
+                            offset: parent.transform.rotation.inverse()
+                                * (next_origin - parent.transform.translation),
+                        }
+                    }
+                };
+                WorldCommand::SetProbePosition {
+                    probe: probe_id,
+                    position,
+                }
+            }
+        };
+        if let Some(current) = self.active_transform.as_mut() {
+            current.origin = next_origin;
+        }
+        self.submit_world_manipulation(world_command, "scene move")
+    }
+
+    fn drag_plane_normal(
+        &mut self,
+        active: ActiveTransformDrag,
+        pointer: Vec2,
+    ) -> Result<(), String> {
+        let scene::SceneSelection::Plane(plane_id) = active.target else {
+            return Ok(());
+        };
+        let Some(frame) = active.plane_frame else {
+            return Ok(());
+        };
+        let plane = self
+            .world
+            .planes()
+            .get(&plane_id)
+            .ok_or_else(|| format!("plane {plane_id} no longer exists"))?;
+        let (_, tip) = scene::plane_normal_tip(&self.world, active.target, Some(active.preview()))
+            .ok_or_else(|| "selected plane no longer has a normal handle".to_owned())?;
+        let radius = tip.distance(active.origin.as_vec3());
+        let Some(normal) = scene::dragged_plane_normal(
+            &self.camera,
+            self.viewport,
+            pointer,
+            active.origin.as_vec3(),
+            radius,
+            frame.normal.as_vec3(),
+        ) else {
+            return Ok(());
+        };
+        let normal = normal.as_dvec3().normalize();
+        if normal.dot(frame.normal) > 1.0 - 1.0e-12 {
+            return Ok(());
+        }
+        let rotation = DQuat::from_rotation_arc(frame.normal, normal);
+        let u_axis = (rotation * frame.u_axis).normalize();
+        let spec = SlicePlaneSpec::new(&plane.name, active.origin, normal)
+            .and_then(|spec| spec.with_u_axis(u_axis))
+            .and_then(|spec| spec.with_half_extent(plane.half_extent))
+            .map(|spec| spec.with_visibility(plane.visible))
+            .map_err(|error| error.to_string())?;
+        if let Some(current) = self.active_transform.as_mut() {
+            current.plane_frame = Some(PlaneFrame { normal, u_axis });
+        }
+        self.submit_world_manipulation(
+            WorldCommand::SetPlane {
+                plane: plane_id,
+                spec,
+            },
+            "plane rotation",
+        )
+    }
+
+    fn submit_world_manipulation(
+        &mut self,
+        world_command: WorldCommand,
+        operation: &str,
+    ) -> Result<(), String> {
+        let command = self
+            .commands
+            .issue(fieldcad_simulation::CommandPayload::CommitWorld(vec![
+                world_command,
+            ]));
+        self.data_source
+            .execute(command)
+            .map_err(|error| format!("{operation} failed: {error}"))?;
+        self.refresh_world();
+        Ok(())
+    }
+
     fn focus_selection(&mut self) {
-        let Some(id) = self.ui_model.selection else {
+        let Some(selection) = self.ui_model.scene_selection() else {
             return;
         };
-        let Some(object) = self.world.object(id) else {
-            return;
+        match selection {
+            scene::SceneSelection::Object(id) => {
+                let Some(object) = self.world.object(id) else {
+                    return;
+                };
+                let (centre, radius) = object.bounding_sphere();
+                self.camera.focus(centre.as_vec3(), radius as f32);
+            }
+            scene::SceneSelection::Plane(id) => {
+                let Some(plane) = self.world.planes().get(&id) else {
+                    return;
+                };
+                self.camera
+                    .focus(plane.origin.as_vec3(), plane.half_extent.length() as f32);
+            }
+            scene::SceneSelection::Probe(id) => {
+                let Some(probe) = self.world.probe(id) else {
+                    return;
+                };
+                if let Ok(position) = self.world.resolve_probe_position(probe) {
+                    self.camera.focus(position.as_vec3(), 0.2);
+                }
+            }
         };
-        let (centre, radius) = object.bounding_sphere();
-        self.camera.focus(centre.as_vec3(), radius as f32);
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ActiveTransformDrag {
-    object: fieldcad_core::ObjectId,
-    constraint: TranslationConstraint,
-    /// Latest absolute translation submitted during this drag. The
+    target: scene::SceneSelection,
+    constraint: ManipulationConstraint,
+    /// Latest absolute origin submitted during this drag. The
     /// authoritative world intentionally remains unchanged while Running edits
     /// wait for a tick boundary, so accumulating against the replica would lose
     /// pointer deltas between ticks.
-    translation: DVec3,
+    origin: DVec3,
+    plane_frame: Option<PlaneFrame>,
+}
+
+impl ActiveTransformDrag {
+    fn preview(self) -> scene::TransformPreview {
+        scene::TransformPreview {
+            origin: self.origin.as_vec3(),
+            plane_normal: self.plane_frame.map(|frame| frame.normal.as_vec3()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TranslationConstraint {
+enum ManipulationConstraint {
     Handle(TransformHandle),
     ViewPlane,
+    PlaneNormal,
 }
 
-impl TranslationConstraint {
+impl ManipulationConstraint {
     const fn handle(self) -> Option<TransformHandle> {
         match self {
             Self::Handle(handle) => Some(handle),
             Self::ViewPlane => None,
+            Self::PlaneNormal => Some(TransformHandle::PlaneNormal),
         }
     }
 
@@ -662,15 +897,23 @@ impl TranslationConstraint {
                 TransformHandle::PlaneXY => "Constrained move · XY plane",
                 TransformHandle::PlaneYZ => "Constrained move · YZ plane",
                 TransformHandle::PlaneZX => "Constrained move · ZX plane",
+                TransformHandle::PlaneNormal => "Rotate plane · normal N",
             },
             Self::ViewPlane => "Free move · camera plane",
+            Self::PlaneNormal => "Rotate plane · normal N",
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlaneFrame {
+    normal: DVec3,
+    u_axis: DVec3,
+}
+
 fn create_local_data_source(
     evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
-) -> Result<LocalDataSource, String> {
+) -> Result<AsyncLocalDataSource, String> {
     let domain = Domain::new(
         DomainBounds::centred_cube(5.0).map_err(|error| error.to_string())?,
         Resolution::uniform(32).map_err(|error| error.to_string())?,
@@ -717,7 +960,7 @@ fn create_local_data_source(
         ])
         .map_err(|error| error.to_string())?;
 
-    Ok(LocalDataSource::new(runtime))
+    Ok(AsyncLocalDataSource::new(LocalDataSource::new(runtime)))
 }
 
 struct FrameStats {

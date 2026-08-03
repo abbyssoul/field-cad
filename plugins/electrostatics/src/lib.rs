@@ -82,13 +82,17 @@ pub struct ElectrostaticSample {
     pub validity: SampleValidity,
 }
 
-/// Host-provided parallel evaluator for one complete sample geometry.
+/// Evaluator for one complete sample geometry.
 ///
 /// The plugin defines this narrow, renderer-free seam while the application
 /// host owns concrete GPU device/queue access and resource budgets. Results
 /// return through ordinary snapshot columns, so a local GPU is an implementation
 /// detail of compute and the visualizer remains interchangeable with a remote
 /// data source.
+///
+/// The reference `f64` evaluator implements this trait too, so there is one
+/// plugin and one solver rather than a CPU pair and an accelerated pair that
+/// must be kept in step by hand.
 pub trait ElectrostaticBatchEvaluator: Send + Sync {
     /// Numerical representation written into the returned snapshot columns.
     fn precision(&self) -> Precision;
@@ -100,6 +104,29 @@ pub trait ElectrostaticBatchEvaluator: Send + Sync {
         domain: &Domain,
         geometry: &SampleGeometry,
     ) -> Result<Vec<ElectrostaticSample>, String>;
+}
+
+/// The reference `f64` evaluator, and the oracle every faster backend is
+/// checked against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuBatchEvaluator;
+
+impl ElectrostaticBatchEvaluator for CpuBatchEvaluator {
+    fn precision(&self) -> Precision {
+        Precision::F64
+    }
+
+    fn evaluate(
+        &self,
+        sources: &[ChargeSource],
+        _domain: &Domain,
+        geometry: &SampleGeometry,
+    ) -> Result<Vec<ElectrostaticSample>, String> {
+        Ok(geometry
+            .positions()
+            .map(|position| evaluate_sources(sources, position))
+            .collect())
+    }
 }
 
 impl ElectrostaticSample {
@@ -173,20 +200,29 @@ pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> Electrosta
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ElectrostaticsPlugin;
+/// Analytic electrostatics over a pluggable batched evaluator.
+pub struct ElectrostaticsPlugin {
+    evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
+}
 
-impl ElectrostaticsPlugin {
-    pub fn with_evaluator(
-        evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
-    ) -> AcceleratedElectrostaticsPlugin {
-        AcceleratedElectrostaticsPlugin { evaluator }
+impl Default for ElectrostaticsPlugin {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// Electrostatics plugin configured with a host-owned batched evaluator.
-pub struct AcceleratedElectrostaticsPlugin {
-    evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
+impl ElectrostaticsPlugin {
+    /// Backed by the reference `f64` evaluator.
+    pub fn new() -> Self {
+        Self {
+            evaluator: Arc::new(CpuBatchEvaluator),
+        }
+    }
+
+    /// Backed by a host-owned evaluator, typically a `wgpu` compute backend.
+    pub fn with_evaluator(evaluator: Arc<dyn ElectrostaticBatchEvaluator>) -> Self {
+        Self { evaluator }
+    }
 }
 
 impl EquationSystemPlugin for ElectrostaticsPlugin {
@@ -231,30 +267,9 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
         &self,
         context: SolverContext<'_>,
     ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
-        Ok(Box::new(ElectrostaticsSolver {
-            sources: collect_sources(context.world)?,
-            world_revision: context.world.revision(),
-        }))
-    }
-}
-
-impl EquationSystemPlugin for AcceleratedElectrostaticsPlugin {
-    fn metadata(&self) -> PluginMetadata {
-        ElectrostaticsPlugin.metadata()
-    }
-
-    fn channels(&self) -> Vec<ChannelSchema> {
-        ElectrostaticsPlugin.channels()
-    }
-
-    fn component_schemas(&self) -> Vec<ComponentSchema> {
-        ElectrostaticsPlugin.component_schemas()
-    }
-
-    fn create_solver(
-        &self,
-        context: SolverContext<'_>,
-    ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
+        // A snapshot's precision metadata must describe the numbers it actually
+        // carries, or an `f32` interactive result is indistinguishable from the
+        // `f64` oracle it is checked against.
         if context.domain.precision() != self.evaluator.precision() {
             return Err(PluginError::InvalidConfiguration(format!(
                 "electrostatics evaluator produces {}, but the domain declares {}",
@@ -262,7 +277,7 @@ impl EquationSystemPlugin for AcceleratedElectrostaticsPlugin {
                 context.domain.precision().label()
             )));
         }
-        Ok(Box::new(AcceleratedElectrostaticsSolver {
+        Ok(Box::new(ElectrostaticsSolver {
             domain: *context.domain,
             sources: collect_sources(context.world)?,
             world_revision: context.world.revision(),
@@ -273,17 +288,12 @@ impl EquationSystemPlugin for AcceleratedElectrostaticsPlugin {
 }
 
 struct ElectrostaticsSolver {
-    sources: Vec<ChargeSource>,
-    world_revision: fieldcad_core::WorldRevision,
-}
-
-struct AcceleratedElectrostaticsSolver {
     domain: Domain,
     sources: Vec<ChargeSource>,
     world_revision: fieldcad_core::WorldRevision,
     evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
     /// Runtime publication asks for E and V separately. Retain the small set of
-    /// geometries from this publication so both channels share one GPU dispatch.
+    /// geometries from this publication so both channels share one evaluation.
     cache: Mutex<Vec<(SampleGeometry, Arc<[ElectrostaticSample]>)>>,
 }
 
@@ -299,74 +309,9 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
         self.sources = collect_sources(world)?;
         self.world_revision = world.revision();
-        Ok(())
-    }
-
-    fn sample(
-        &self,
-        channel: ChannelHandle,
-        geometry: &SampleGeometry,
-    ) -> Result<SampledColumn, PluginError> {
-        let mut validity = Vec::with_capacity(geometry.len());
-
-        match channel {
-            ELECTRIC_FIELD_HANDLE => {
-                let mut values = Vec::with_capacity(geometry.len());
-                for position in geometry.positions() {
-                    let sample = self.evaluate(position);
-                    values.push(sample.electric_field);
-                    validity.push(sample.validity);
-                }
-                Ok(SampledColumn::new(FieldColumn::vectors(values), validity))
-            }
-            ELECTRIC_POTENTIAL_HANDLE => {
-                let mut values = Vec::with_capacity(geometry.len());
-                for position in geometry.positions() {
-                    let sample = self.evaluate(position);
-                    values.push(sample.potential);
-                    validity.push(sample.validity);
-                }
-                Ok(SampledColumn::new(FieldColumn::scalars(values), validity))
-            }
-            other => Err(PluginError::UnknownChannel(other.index())),
-        }
-    }
-
-    fn diagnostics(&self) -> Vec<SolverDiagnostic> {
-        vec![SolverDiagnostic {
-            plugin: plugin_id(),
-            severity: DiagnosticSeverity::Info,
-            code: "electrostatic-source-count".to_owned(),
-            message: format!(
-                "{} charge source(s), world revision {}",
-                self.sources.len(),
-                self.world_revision
-            ),
-        }]
-    }
-}
-
-impl ElectrostaticsSolver {
-    fn evaluate(&self, position: DVec3) -> ElectrostaticSample {
-        evaluate_sources(&self.sources, position)
-    }
-}
-
-impl EquationSystemSolver for AcceleratedElectrostaticsSolver {
-    fn kind(&self) -> SolverKind {
-        SolverKind::Analytic
-    }
-
-    fn validate_world(&self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        collect_sources(world).map(|_| ())
-    }
-
-    fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        self.sources = collect_sources(world)?;
-        self.world_revision = world.revision();
         self.cache
             .get_mut()
-            .map_err(|_| PluginError::Solver("electrostatics GPU cache is poisoned".to_owned()))?
+            .map_err(|_| PluginError::Solver(POISONED_CACHE.to_owned()))?
             .clear();
         Ok(())
     }
@@ -395,7 +340,7 @@ impl EquationSystemSolver for AcceleratedElectrostaticsSolver {
         vec![SolverDiagnostic {
             plugin: plugin_id(),
             severity: DiagnosticSeverity::Info,
-            code: "electrostatic-gpu-source-count".to_owned(),
+            code: "electrostatic-source-count".to_owned(),
             message: format!(
                 "{} charge source(s), {} batched evaluator, world revision {}",
                 self.sources.len(),
@@ -406,7 +351,9 @@ impl EquationSystemSolver for AcceleratedElectrostaticsSolver {
     }
 }
 
-impl AcceleratedElectrostaticsSolver {
+const POISONED_CACHE: &str = "electrostatics evaluation cache is poisoned";
+
+impl ElectrostaticsSolver {
     fn samples_for(
         &self,
         geometry: &SampleGeometry,
@@ -414,7 +361,7 @@ impl AcceleratedElectrostaticsSolver {
         let mut cache = self
             .cache
             .lock()
-            .map_err(|_| PluginError::Solver("electrostatics GPU cache is poisoned".to_owned()))?;
+            .map_err(|_| PluginError::Solver(POISONED_CACHE.to_owned()))?;
         if let Some((_, samples)) = cache.iter().find(|(cached, _)| cached == geometry) {
             return Ok(Arc::clone(samples));
         }
@@ -610,7 +557,7 @@ mod tests {
         world
             .commit([
                 WorldCommand::RegisterComponentSchema(
-                    ElectrostaticsPlugin.component_schemas().remove(0),
+                    ElectrostaticsPlugin::new().component_schemas().remove(0),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("invalid")
@@ -622,7 +569,7 @@ mod tests {
         let domain = Domain::centred_cube(2.0, 8).unwrap();
 
         assert!(matches!(
-            ElectrostaticsPlugin.create_solver(SolverContext {
+            ElectrostaticsPlugin::new().create_solver(SolverContext {
                 configuration: &PropertyBag::default(),
                 domain: &domain,
                 world: &world.snapshot(),
@@ -655,6 +602,59 @@ mod tests {
                 };
                 geometry.len()
             ])
+        }
+    }
+
+    #[test]
+    fn every_evaluator_backing_declares_the_same_contract() {
+        // One plugin type means the schemas a host validates against cannot
+        // depend on which evaluator was injected. Two plugin types previously
+        // could, and silently did.
+        let reference = ElectrostaticsPlugin::new();
+        let accelerated = ElectrostaticsPlugin::with_evaluator(Arc::new(CountingEvaluator {
+            calls: AtomicUsize::new(0),
+        }));
+
+        assert_eq!(reference.metadata(), accelerated.metadata());
+        assert_eq!(reference.channels(), accelerated.channels());
+        assert_eq!(
+            reference.component_schemas(),
+            accelerated.component_schemas()
+        );
+        assert_eq!(
+            reference.configuration_schema(),
+            accelerated.configuration_schema()
+        );
+        assert_eq!(
+            reference.default_configuration(),
+            accelerated.default_configuration()
+        );
+    }
+
+    #[test]
+    fn the_reference_evaluator_agrees_with_the_analytic_oracle() {
+        let sources = [
+            point(DVec3::ZERO, 1.5e-9, 0.05),
+            point(DVec3::X, -0.8e-9, 0.05),
+        ];
+        let geometry = SampleGeometry::Plane {
+            plane: fieldcad_core::PlaneId::new(0),
+            lattice: PlaneLattice::new(
+                DVec3::new(-1.0, -1.0, 0.0),
+                DVec3::new(0.5, 0.0, 0.0),
+                DVec3::new(0.0, 0.5, 0.0),
+                UVec2::splat(4),
+            ),
+        };
+        let domain = Domain::centred_cube(4.0, 8).unwrap();
+
+        let batched = CpuBatchEvaluator
+            .evaluate(&sources, &domain, &geometry)
+            .unwrap();
+
+        assert_eq!(batched.len(), geometry.len());
+        for (batched, position) in batched.iter().zip(geometry.positions()) {
+            assert_eq!(*batched, evaluate_sources(&sources, position));
         }
     }
 

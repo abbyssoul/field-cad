@@ -50,6 +50,21 @@ impl Transform {
         self.translation + self.rotation * point
     }
 
+    /// The same transform with a unit rotation.
+    ///
+    /// The fields are public and `Transform` is `Deserialize`, so a value can
+    /// reach the world without passing through [`Transform::new`]. A quaternion
+    /// of length `k` scales every rotated vector by `k²`, which would move an
+    /// attached probe's sample point while the reading still claimed `Exact`
+    /// validity — so the command boundary normalizes rather than trusting its
+    /// input.
+    pub(crate) fn normalized(self) -> Self {
+        Self {
+            translation: self.translation,
+            rotation: self.rotation.normalize(),
+        }
+    }
+
     pub(crate) fn validate(self) -> Result<(), WorldError> {
         if !self.translation.is_finite()
             || !self.rotation.is_finite()
@@ -606,6 +621,10 @@ pub enum WorldCommand {
         probe: ProbeId,
         position: ProbePosition,
     },
+    SetProbeChannels {
+        probe: ProbeId,
+        channels: Vec<ChannelId>,
+    },
     SetProbeVisible {
         probe: ProbeId,
         visible: bool,
@@ -688,7 +707,7 @@ fn apply_command(
                 WorldObject {
                     id,
                     name: spec.name,
-                    transform: spec.transform,
+                    transform: spec.transform.normalized(),
                     velocity: spec.velocity,
                     shape: spec.shape,
                     visible: spec.visible,
@@ -710,7 +729,7 @@ fn apply_command(
         }
         WorldCommand::SetTransform { object, transform } => {
             transform.validate()?;
-            object_mut(state, object)?.transform = transform;
+            object_mut(state, object)?.transform = transform.normalized();
         }
         WorldCommand::SetVelocity { object, velocity } => {
             velocity.validate()?;
@@ -821,6 +840,13 @@ fn apply_command(
                 .get_mut(&probe)
                 .ok_or(WorldError::ProbeNotFound { id: probe })?
                 .position = position;
+        }
+        WorldCommand::SetProbeChannels { probe, channels } => {
+            let probe = state
+                .probes
+                .get_mut(&probe)
+                .ok_or(WorldError::ProbeNotFound { id: probe })?;
+            probe.channels = channels;
         }
         WorldCommand::SetProbeVisible { probe, visible } => {
             state
@@ -1130,6 +1156,33 @@ mod tests {
     }
 
     #[test]
+    fn probe_recording_channels_change_at_one_world_revision() {
+        let mut world = World::new();
+        let created = world
+            .commit([WorldCommand::CreateProbe(ProbeSpec::at(
+                "probe",
+                DVec3::ZERO,
+                Vec::new(),
+            ))])
+            .unwrap();
+        let probe = created.created_probes[0];
+        let channel = ChannelId::new(crate::PluginId::new("test").unwrap(), "field").unwrap();
+
+        let report = world
+            .commit([WorldCommand::SetProbeChannels {
+                probe,
+                channels: vec![channel.clone()],
+            }])
+            .unwrap();
+
+        assert_eq!(world.revision(), report.revision);
+        assert_eq!(
+            world.snapshot().probe(probe).unwrap().channels,
+            vec![channel]
+        );
+    }
+
+    #[test]
     fn viewport_visibility_is_revisioned_without_removing_entities() {
         let mut world = World::new();
         let created = world
@@ -1161,6 +1214,47 @@ mod tests {
         assert!(!snapshot.probe(probe).unwrap().visible);
         assert_eq!(snapshot.objects().len(), 1);
         assert_eq!(snapshot.probes().len(), 1);
+    }
+
+    #[test]
+    fn a_denormalised_rotation_cannot_scale_an_attached_probe_offset() {
+        let mut world = World::new();
+        // Built literally rather than through `Transform::new`, which is the
+        // only reason a non-unit quaternion can reach a command at all.
+        let stretched = Transform {
+            translation: DVec3::ZERO,
+            rotation: DQuat::from_xyzw(0.0, 0.0, 0.0, 3.0),
+        };
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("source").with_transform(stretched),
+            )])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateProbe(ProbeSpec::attached(
+                "offset",
+                ObjectId::new(0),
+                DVec3::X,
+                Vec::new(),
+            ))])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let probe = snapshot.probes().values().next().unwrap();
+        let position = snapshot.resolve_probe_position(probe).unwrap();
+
+        // A length-3 quaternion would have placed the probe nine metres out.
+        assert!((position - DVec3::X).length() < 1.0e-12);
+
+        world
+            .commit([WorldCommand::SetTransform {
+                object: ObjectId::new(0),
+                transform: stretched,
+            }])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let probe = snapshot.probes().values().next().unwrap();
+        assert!((snapshot.resolve_probe_position(probe).unwrap() - DVec3::X).length() < 1.0e-12);
     }
 
     #[test]

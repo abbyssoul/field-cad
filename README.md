@@ -14,13 +14,20 @@ validity, and compute diagnostics.
 The simulation workbench now includes an independent playback-rate control,
 explicit paused/running/solving/stale/invalid states, deterministic queued edits
 while running, attachable probes, and bounded scalar or vector-component history
-plots. Command/pacing recordings provide repeatable headless regression
-fixtures.
+plots. A probe can select the channels it records and pin a persistent floating
+plot that keeps updating while another scene entity is selected or moved.
+Command/pacing recordings provide repeatable headless regression fixtures.
 
 Electrostatics has an independent CPU `f64` oracle and a batched WGSL `f32`
 backend for interactive probe, plane, and grid samples. Local GPU output still
 becomes an ordinary immutable snapshot before visualization, preserving the
 same consumer contract planned for a remote compute machine.
+
+The first Milestone 5 reference solver also exists as a headless plugin. It
+advances coupled electric and magnetic fields on a periodic 3D Yee lattice,
+publishes energy and divergence residuals, rejects unstable Courant time steps,
+and has a grid-convergence test against a prescribed vacuum plane wave. Its
+`wgpu` port and desktop Maxwell scenario are the next implementation increment.
 
 ## Product direction
 
@@ -31,6 +38,7 @@ The first useful version will let a user:
 - show or hide a reference grid and field visualization layers;
 - orbit, pan, zoom, select, and move objects with CAD-style controls;
 - place probes and plot sampled field values over simulation time;
+- keep one or more probe recorder plots open while manipulating the scene;
 - play, pause, and advance the simulation by one fixed time step; and
 - edit an object's supported properties while the simulation is running.
 
@@ -125,14 +133,16 @@ Controls:
 - Shift + middle-button drag pans;
 - mouse wheel dollies;
 - `1`, `3`, and `7` select the +X, +Y, and +Z views;
-- clicking a charge, probe, or slice plane selects it; `F` frames a selected
-  charge and `Esc` clears the selection;
-- selecting a charge displays a transform gizmo: drag a red, green, or blue
-  arrow to move only along X, Y, or Z, or drag one of the coloured unit squares
-  to move only in XY, YZ, or ZX. The active constraint turns yellow and is named
-  at the top of the viewport;
-- dragging directly on the selected charge moves it freely in the
+- clicking a charge, probe, or slice plane highlights it; `F` frames the selected
+  entity and `Esc` clears the selection;
+- every selected entity shows its origin as three RGB wire circles and shares the
+  same transform gizmo: drag a red, green, or blue arrow to move only along X,
+  Y, or Z, or drag a coloured unit square to move only in XY, YZ, or ZX. The
+  active constraint turns yellow and is named at the top of the viewport;
+- dragging directly on the selected entity's body moves it freely in the
   camera-oriented view plane; dragging empty space never moves it;
+- a selected slice plane additionally shows a proportional dashed purple normal
+  arrow labelled `N`. Drag its outer tip to rotate and reorient the plane;
 - the Scene panel creates positive/negative point charges, uniformly charged
   spheres, probes, and slice planes. Each row has viewport visibility and delete
   controls; and
@@ -141,7 +151,10 @@ Controls:
   density with non-negative numeric inputs, and whether vectors are projected
   into the plane (the default) or shown in full 3D. A selected probe can attach
   to an object, detach without jumping, edit its local offset, and show bounded
-  scalar or x/y/z/magnitude history.
+  scalar or x/y/z/magnitude history; and
+- under a selected probe, Recorded channels controls which published fields enter
+  its bounded history; Open floating plot pins a non-blocking recorder window
+  that can display several unit-safe channel plots at once.
 
 Use `RUST_LOG=fieldcad_desktop=debug` for more application diagnostics.
 
@@ -162,7 +175,8 @@ The domain core is headless by construction. Working on the model, the plugin
 contract, or the runtime needs no GPU and no window system:
 
 ```shell
-cargo test -p fieldcad-core -p fieldcad-plugin-api -p fieldcad-simulation
+cargo test -p fieldcad-core -p fieldcad-plugin-api -p fieldcad-simulation \
+  -p fieldcad-electromagnetism
 ```
 
 ## Repository
@@ -178,16 +192,19 @@ cargo test -p fieldcad-core -p fieldcad-plugin-api -p fieldcad-simulation
 │   └── reviews/    # Review findings and remediation reports
 ├── apps/
 │   └── fieldcad-desktop/     # Native visualizer and composition root
-│       ├── app.rs            # winit lifecycle, input routing, composition
-│       ├── camera.rs         # Orbit camera, physical viewport, picking rays
-│       ├── scene.rs          # World snapshot to draw instances and picking
-│       ├── renderer.rs       # wgpu surface, instanced scene, egui composition
-│       ├── scene.wgsl        # Grid/axes and instanced object shader
-│       └── ui.rs             # egui panels over a per-frame compute view
+│       └── src/
+│           ├── app.rs        # winit lifecycle, input routing, composition
+│           ├── camera.rs     # Orbit camera, physical viewport, picking rays
+│           ├── scene/        # Field layers, gizmos, picking, authoring proxies
+│           ├── renderer.rs   # wgpu surface, instanced scene, egui composition
+│           ├── scene.wgsl    # Grid/axes and instanced object shader
+│           └── ui/           # Panels, compute view, inline/floating plots
 ├── crates/
 │   ├── fieldcad-core/        # Units, world, domain, sampling, clock, snapshots
 │   ├── fieldcad-plugin-api/  # Headless equation-system plugin contract
 │   └── fieldcad-simulation/  # Runtime, data-source boundary, probe history
 └── plugins/
+    ├── electrostatics/       # Coulomb CPU oracle and host-injected evaluator
+    ├── electromagnetism/     # Periodic CPU f64 Yee/Maxwell reference
     └── test-field/           # Known analytic scalar/vector contract fixture
 ```

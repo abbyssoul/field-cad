@@ -12,7 +12,7 @@ use fieldcad_core::{
     FieldSnapshot, SimulationMode, TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
 };
 
-use crate::runtime::{RuntimeError, SimulationRuntime, SimulationStatus, TickPacer};
+use crate::runtime::{RuntimeError, SimulationRuntime, SimulationStatus, Subscription, TickPacer};
 
 /// Client-issued identity for one command, echoed in its acknowledgement.
 ///
@@ -52,6 +52,14 @@ pub enum CommandPayload {
     Step,
     SetTimeStep(TimeStep),
     SetPlaybackSpeed(PlaybackSpeed),
+    /// Change what the source samples when it publishes.
+    ///
+    /// Purely a visualization concern: it changes how densely a result is
+    /// observed, never the result itself, so it does not advance the world
+    /// revision and is never queued behind a tick boundary. It is a command
+    /// rather than a local setting because a remote session must renew its
+    /// subscriptions after a reconnect.
+    SetSubscription(Subscription),
     CommitWorld(Vec<WorldCommand>),
 }
 
@@ -99,6 +107,8 @@ pub struct PlaybackSpeedError {
 pub enum CommandDisposition {
     Applied,
     Queued,
+    /// Accepted by a non-blocking client and awaiting authoritative completion.
+    Submitted,
 }
 
 /// The authoritative side's answer to one command.
@@ -113,7 +123,7 @@ pub struct CommandReceipt {
     pub tick: u64,
     /// The sequence of the snapshot that reflects this command, if one was
     /// produced.
-    pub snapshot_sequence: u64,
+    pub snapshot_sequence: Option<u64>,
     pub disposition: CommandDisposition,
 }
 
@@ -156,6 +166,9 @@ pub trait FieldDataSource: Send {
     fn simulation_status(&self) -> SimulationStatus;
     fn playback_speed(&self) -> PlaybackSpeed;
     fn pending_command_count(&self) -> usize;
+    /// What the source is currently asked to publish. Acknowledged, not hoped
+    /// for: it reflects the last accepted [`CommandPayload::SetSubscription`].
+    fn subscription(&self) -> Subscription;
 
     /// The world the client currently believes in.
     ///
@@ -171,6 +184,13 @@ pub trait FieldDataSource: Send {
     /// Take in wall-clock time and pick up whatever the source has produced.
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError>;
     fn latest_snapshot(&self) -> Option<Arc<FieldSnapshot>>;
+
+    /// Completion/rejection events produced after a non-blocking submission.
+    /// Synchronous and remote-loopback sources return their receipt directly and
+    /// therefore have no deferred events to drain.
+    fn drain_command_events(&mut self) -> Vec<crate::CommandEvent> {
+        Vec::new()
+    }
 }
 
 /// The client-side presentation buffer.
@@ -248,23 +268,159 @@ impl From<RuntimeError> for SourceError {
     }
 }
 
-/// Wraps an in-process runtime.
-pub struct LocalDataSource {
+/// The authoritative side of a session: a runtime, its wall-clock pacing, and
+/// the queue of edits waiting for a fixed-tick boundary.
+///
+/// Both data sources own one of these. The rules in ADR 0011 — what may be
+/// applied immediately, what is queued, when a queue is flushed, and how
+/// wall-clock time becomes whole fixed ticks — are therefore implemented once.
+/// What genuinely differs between a local runtime and a compute service is
+/// *delivery*, and that is all the two source types below still contain.
+struct SessionCore {
     runtime: SimulationRuntime,
-    mailbox: SnapshotMailbox,
     pacer: TickPacer,
     playback_speed: PlaybackSpeed,
     pending_world_edits: VecDeque<Vec<WorldCommand>>,
 }
 
-impl LocalDataSource {
-    pub fn new(runtime: SimulationRuntime) -> Self {
-        let mut source = Self {
+/// What one wall-clock advance actually did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TickProgress {
+    ticks_advanced: u32,
+    commands_applied: u32,
+    fell_behind: bool,
+    /// Authoritative state as it stood after queued edits were flushed but
+    /// before any tick was taken.
+    ///
+    /// A remote client adopts *this*, not the state after the ticks: an edit was
+    /// acknowledged at the boundary, but the ticks that followed are only known
+    /// to the client once their snapshots arrive over the link.
+    status_after_flush: SimulationStatus,
+}
+
+impl SessionCore {
+    fn new(runtime: SimulationRuntime) -> Self {
+        Self {
             runtime,
-            mailbox: SnapshotMailbox::default(),
             pacer: TickPacer::default(),
             playback_speed: PlaybackSpeed::default(),
             pending_world_edits: VecDeque::new(),
+        }
+    }
+
+    fn status(&self) -> SimulationStatus {
+        self.runtime.status()
+    }
+
+    fn latest_snapshot(&self) -> Arc<FieldSnapshot> {
+        self.runtime.latest_snapshot()
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_world_edits.len()
+    }
+
+    /// Apply one command to the authoritative side and report how it landed.
+    fn execute(&mut self, payload: CommandPayload) -> Result<CommandDisposition, SourceError> {
+        match payload {
+            CommandPayload::Play => {
+                self.runtime.play();
+                self.pacer.reset();
+            }
+            CommandPayload::Pause => {
+                self.flush_pending_world_edits()?;
+                self.runtime.pause();
+            }
+            CommandPayload::Step => {
+                self.flush_pending_world_edits()?;
+                self.runtime.step_once()?;
+            }
+            CommandPayload::SetTimeStep(step) => {
+                self.runtime.set_time_step(step)?;
+                self.pacer.reset();
+            }
+            CommandPayload::SetPlaybackSpeed(speed) => {
+                self.playback_speed = speed;
+                self.pacer.reset();
+            }
+            CommandPayload::SetSubscription(subscription) => {
+                // Never queued: it cannot change a computed value, so there is
+                // no boundary for it to be atomic with.
+                self.runtime.set_subscription(subscription)?;
+            }
+            CommandPayload::CommitWorld(commands) => {
+                if self.runtime.status().mode() == SimulationMode::Running {
+                    self.pending_world_edits.push_back(commands);
+                    return Ok(CommandDisposition::Queued);
+                }
+                self.runtime.commit_world_commands(commands)?;
+            }
+        }
+        Ok(CommandDisposition::Applied)
+    }
+
+    /// Take in wall-clock time and advance whole fixed ticks, applying queued
+    /// edits immediately before the first of them.
+    fn advance(&mut self, elapsed: Duration) -> Result<TickProgress, SourceError> {
+        let status = self.runtime.status();
+        let elapsed = scale_elapsed(elapsed, self.playback_speed);
+        let demand = self.pacer.ticks_due(elapsed, status.time_step());
+
+        let commands_applied = if demand.ticks > 0 && status.mode() == SimulationMode::Running {
+            self.flush_pending_world_edits()?
+        } else {
+            0
+        };
+        let status_after_flush = self.runtime.status();
+
+        let mut ticks_advanced = 0;
+        for _ in 0..demand.ticks {
+            if !self.runtime.advance_running()? {
+                break;
+            }
+            ticks_advanced += 1;
+        }
+
+        Ok(TickProgress {
+            ticks_advanced,
+            commands_applied,
+            fell_behind: demand.fell_behind && ticks_advanced > 0,
+            status_after_flush,
+        })
+    }
+
+    fn receipt(&self, command: CommandId, disposition: CommandDisposition) -> CommandReceipt {
+        let status = self.status();
+        CommandReceipt {
+            command,
+            world_revision: status.world_revision,
+            tick: status.tick(),
+            snapshot_sequence: Some(self.latest_snapshot().identity.sequence),
+            disposition,
+        }
+    }
+
+    fn flush_pending_world_edits(&mut self) -> Result<u32, SourceError> {
+        let mut applied = 0;
+        while let Some(commands) = self.pending_world_edits.pop_front() {
+            self.runtime.commit_world_commands(commands)?;
+            applied += 1;
+        }
+        Ok(applied)
+    }
+}
+
+/// Wraps an in-process runtime.
+pub struct LocalDataSource {
+    core: SessionCore,
+    mailbox: SnapshotMailbox,
+}
+
+impl LocalDataSource {
+    pub fn new(runtime: SimulationRuntime) -> Self {
+        let mut source = Self {
+            core: SessionCore::new(runtime),
+            mailbox: SnapshotMailbox::default(),
         };
         // Publishing through the mailbox even in local mode is what makes the
         // two sources equivalent for consumers.
@@ -273,35 +429,15 @@ impl LocalDataSource {
     }
 
     pub const fn runtime(&self) -> &SimulationRuntime {
-        &self.runtime
+        &self.core.runtime
     }
 
     pub const fn runtime_mut(&mut self) -> &mut SimulationRuntime {
-        &mut self.runtime
+        &mut self.core.runtime
     }
 
     fn publish(&mut self) -> Result<bool, SourceError> {
-        Ok(self.mailbox.offer(self.runtime.latest_snapshot())?)
-    }
-
-    fn receipt(&self, command: CommandId, disposition: CommandDisposition) -> CommandReceipt {
-        let status = self.runtime.status();
-        CommandReceipt {
-            command,
-            world_revision: status.world_revision,
-            tick: status.tick(),
-            snapshot_sequence: self.runtime.latest_snapshot().identity.sequence,
-            disposition,
-        }
-    }
-
-    fn apply_pending_world_edits(&mut self) -> Result<u32, SourceError> {
-        let mut applied = 0;
-        while let Some(commands) = self.pending_world_edits.pop_front() {
-            self.runtime.commit_world_commands(commands)?;
-            applied += 1;
-        }
-        Ok(applied)
+        Ok(self.mailbox.offer(self.core.latest_snapshot())?)
     }
 }
 
@@ -315,81 +451,38 @@ impl FieldDataSource for LocalDataSource {
     }
 
     fn simulation_status(&self) -> SimulationStatus {
-        self.runtime.status()
+        self.core.status()
     }
 
     fn playback_speed(&self) -> PlaybackSpeed {
-        self.playback_speed
+        self.core.playback_speed
     }
 
     fn pending_command_count(&self) -> usize {
-        self.pending_world_edits.len()
+        self.core.pending_count()
+    }
+
+    fn subscription(&self) -> Subscription {
+        self.core.runtime.subscription()
     }
 
     fn world(&self) -> WorldSnapshot {
-        self.runtime.world_snapshot()
+        self.core.runtime.world_snapshot()
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
-        let mut disposition = CommandDisposition::Applied;
-        match command.payload {
-            CommandPayload::Play => {
-                self.runtime.play();
-                self.pacer.reset();
-            }
-            CommandPayload::Pause => {
-                self.apply_pending_world_edits()?;
-                self.runtime.pause();
-            }
-            CommandPayload::Step => {
-                self.apply_pending_world_edits()?;
-                self.runtime.step_once()?;
-            }
-            CommandPayload::SetTimeStep(step) => {
-                self.runtime.set_time_step(step);
-                self.pacer.reset();
-            }
-            CommandPayload::SetPlaybackSpeed(speed) => {
-                self.playback_speed = speed;
-                self.pacer.reset();
-            }
-            CommandPayload::CommitWorld(commands) => {
-                if self.runtime.status().mode() == SimulationMode::Running {
-                    self.pending_world_edits.push_back(commands);
-                    disposition = CommandDisposition::Queued;
-                } else {
-                    self.runtime.commit_world_commands(commands)?;
-                }
-            }
-        }
+        let disposition = self.core.execute(command.payload)?;
         self.publish()?;
-        Ok(self.receipt(command.id, disposition))
+        Ok(self.core.receipt(command.id, disposition))
     }
 
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
-        let status = self.runtime.status();
-        let elapsed = scale_elapsed(elapsed, self.playback_speed);
-        let demand = self.pacer.ticks_due(elapsed, status.time_step());
-
-        let commands_applied = if demand.ticks > 0 && status.mode() == SimulationMode::Running {
-            self.apply_pending_world_edits()?
-        } else {
-            0
-        };
-
-        let mut advanced = 0;
-        for _ in 0..demand.ticks {
-            if !self.runtime.advance_running()? {
-                break;
-            }
-            advanced += 1;
-        }
-
+        let progress = self.core.advance(elapsed)?;
         Ok(PollOutcome {
             snapshot_updated: self.publish()?,
-            ticks_advanced: advanced,
-            fell_behind: demand.fell_behind && advanced > 0,
-            commands_applied,
+            ticks_advanced: progress.ticks_advanced,
+            fell_behind: progress.fell_behind,
+            commands_applied: progress.commands_applied,
         })
     }
 
@@ -406,7 +499,7 @@ impl FieldDataSource for LocalDataSource {
 /// consumer that assumes an acknowledgement means the pixels changed fails here,
 /// which is the point.
 pub struct LoopbackDataSource {
-    server: SimulationRuntime,
+    core: SessionCore,
     link: VecDeque<Arc<FieldSnapshot>>,
     mailbox: SnapshotMailbox,
     /// What the client currently believes, updated only by acknowledgements and
@@ -415,9 +508,6 @@ pub struct LoopbackDataSource {
     /// The client's replica of the authoritative world.
     believed_world: WorldSnapshot,
     connected: bool,
-    pacer: TickPacer,
-    playback_speed: PlaybackSpeed,
-    pending_world_edits: VecDeque<Vec<WorldCommand>>,
 }
 
 impl LoopbackDataSource {
@@ -425,15 +515,12 @@ impl LoopbackDataSource {
         let believed = server.status();
         let believed_world = server.world_snapshot();
         let mut source = Self {
-            server,
+            core: SessionCore::new(server),
             link: VecDeque::new(),
             mailbox: SnapshotMailbox::default(),
             believed,
             believed_world,
             connected: true,
-            pacer: TickPacer::default(),
-            playback_speed: PlaybackSpeed::default(),
-            pending_world_edits: VecDeque::new(),
         };
         source.transmit();
         source
@@ -441,7 +528,7 @@ impl LoopbackDataSource {
 
     /// Move whatever the server has produced onto the wire.
     fn transmit(&mut self) {
-        let snapshot = self.server.latest_snapshot();
+        let snapshot = self.core.latest_snapshot();
         let already_queued = self
             .link
             .back()
@@ -449,6 +536,13 @@ impl LoopbackDataSource {
         if !already_queued {
             self.link.push_back(snapshot);
         }
+    }
+
+    /// Adopt authoritative state the server has acknowledged, rather than
+    /// assuming the client's own edit took effect.
+    fn adopt(&mut self, status: SimulationStatus) {
+        self.believed = status;
+        self.believed_world = self.core.runtime.world_snapshot();
     }
 
     /// Simulate losing the connection. The last complete snapshot is retained.
@@ -459,30 +553,16 @@ impl LoopbackDataSource {
 
     pub fn reconnect(&mut self) {
         self.connected = true;
-        self.pacer.reset();
+        self.core.pacer.reset();
         // Reconciliation: the server's authoritative state is re-sent before any
         // new data is labelled current.
-        self.believed = self.server.status();
-        self.believed_world = self.server.world_snapshot();
+        self.adopt(self.core.status());
         self.transmit();
     }
 
     /// How many snapshots are in flight but not yet presented.
     pub fn queued_snapshots(&self) -> usize {
         self.link.len()
-    }
-
-    fn apply_pending_world_edits(&mut self) -> Result<u32, SourceError> {
-        let mut applied = 0;
-        while let Some(commands) = self.pending_world_edits.pop_front() {
-            self.server.commit_world_commands(commands)?;
-            applied += 1;
-        }
-        if applied > 0 {
-            self.believed = self.server.status();
-            self.believed_world = self.server.world_snapshot();
-        }
-        Ok(applied)
     }
 }
 
@@ -504,11 +584,15 @@ impl FieldDataSource for LoopbackDataSource {
     }
 
     fn playback_speed(&self) -> PlaybackSpeed {
-        self.playback_speed
+        self.core.playback_speed
     }
 
     fn pending_command_count(&self) -> usize {
-        self.pending_world_edits.len()
+        self.core.pending_count()
+    }
+
+    fn subscription(&self) -> Subscription {
+        self.core.runtime.subscription()
     }
 
     fn world(&self) -> WorldSnapshot {
@@ -520,63 +604,14 @@ impl FieldDataSource for LoopbackDataSource {
             return Err(SourceError::Disconnected);
         }
 
-        let mut disposition = CommandDisposition::Applied;
-        match command.payload {
-            CommandPayload::Play => {
-                self.server.play();
-                self.pacer.reset();
-            }
-            CommandPayload::Pause => {
-                self.apply_pending_world_edits()?;
-                self.server.pause();
-            }
-            CommandPayload::Step => {
-                self.apply_pending_world_edits()?;
-                self.server.step_once()?;
-            }
-            CommandPayload::SetTimeStep(step) => {
-                self.server.set_time_step(step);
-                self.pacer.reset();
-            }
-            CommandPayload::SetPlaybackSpeed(speed) => {
-                self.playback_speed = speed;
-                self.pacer.reset();
-            }
-            CommandPayload::CommitWorld(commands) => {
-                if self.server.status().mode() == SimulationMode::Running {
-                    self.pending_world_edits.push_back(commands);
-                    disposition = CommandDisposition::Queued;
-                } else {
-                    self.server.commit_world_commands(commands)?;
-                }
-            }
+        let disposition = self.core.execute(command.payload)?;
+        // A queued edit has changed nothing the server can publish or the client
+        // can believe yet, so nothing goes on the wire until its boundary.
+        if disposition == CommandDisposition::Applied {
+            self.transmit();
+            self.adopt(self.core.status());
         }
-
-        if disposition == CommandDisposition::Queued {
-            let status = self.server.status();
-            return Ok(CommandReceipt {
-                command: command.id,
-                world_revision: status.world_revision,
-                tick: status.tick(),
-                snapshot_sequence: self.server.latest_snapshot().identity.sequence,
-                disposition,
-            });
-        }
-
-        self.transmit();
-
-        // The acknowledgement carries the authoritative state; the client adopts
-        // it rather than assuming its own edit took effect.
-        let status = self.server.status();
-        self.believed = status;
-        self.believed_world = self.server.world_snapshot();
-        Ok(CommandReceipt {
-            command: command.id,
-            world_revision: status.world_revision,
-            tick: status.tick(),
-            snapshot_sequence: self.server.latest_snapshot().identity.sequence,
-            disposition,
-        })
+        Ok(self.core.receipt(command.id, disposition))
     }
 
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
@@ -584,29 +619,18 @@ impl FieldDataSource for LoopbackDataSource {
             return Ok(PollOutcome::default());
         }
 
-        let status = self.server.status();
-        let elapsed = scale_elapsed(elapsed, self.playback_speed);
-        let demand = self.pacer.ticks_due(elapsed, status.time_step());
-        let commands_applied = if demand.ticks > 0 && status.mode() == SimulationMode::Running {
-            self.apply_pending_world_edits()?
-        } else {
-            0
-        };
-        let mut advanced = 0;
-        for _ in 0..demand.ticks {
-            if !self.server.advance_running()? {
-                break;
-            }
-            advanced += 1;
+        let progress = self.core.advance(elapsed)?;
+        if progress.commands_applied > 0 {
+            self.adopt(progress.status_after_flush);
         }
-        if advanced > 0 || commands_applied > 0 {
+        if progress.ticks_advanced > 0 || progress.commands_applied > 0 {
             self.transmit();
         }
 
-        let mut updated = false;
+        let mut snapshot_updated = false;
         if let Some(snapshot) = self.link.pop_front() {
-            updated = self.mailbox.offer(Arc::clone(&snapshot))?;
-            if updated {
+            snapshot_updated = self.mailbox.offer(Arc::clone(&snapshot))?;
+            if snapshot_updated {
                 self.believed.clock.step.tick = snapshot.identity.tick;
                 self.believed.clock.step.time_seconds = snapshot.identity.time_seconds;
                 self.believed.world_revision = snapshot.identity.world_revision;
@@ -614,10 +638,10 @@ impl FieldDataSource for LoopbackDataSource {
         }
 
         Ok(PollOutcome {
-            snapshot_updated: updated,
-            ticks_advanced: advanced,
-            fell_behind: demand.fell_behind && advanced > 0,
-            commands_applied,
+            snapshot_updated,
+            ticks_advanced: progress.ticks_advanced,
+            fell_behind: progress.fell_behind,
+            commands_applied: progress.commands_applied,
         })
     }
 

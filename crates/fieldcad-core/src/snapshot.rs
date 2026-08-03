@@ -145,6 +145,18 @@ impl FieldSnapshot {
         matches!(self.completeness, SnapshotCompleteness::Complete)
     }
 
+    /// The published channels whose values are vectors, in channel-ID order.
+    ///
+    /// A generic glyph or streamline layer needs to know what it *can* draw
+    /// without naming an equation system. Declared channel schemas already say
+    /// so; asking the snapshot is what keeps the renderer independent of which
+    /// plugins are loaded.
+    pub fn vector_channels(&self) -> impl Iterator<Item = &ChannelSnapshot> {
+        self.channels
+            .values()
+            .filter(|channel| matches!(channel.schema.value_kind, crate::FieldValueKind::Vector(_)))
+    }
+
     pub fn total_samples(&self) -> usize {
         self.channels
             .values()

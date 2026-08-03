@@ -23,3 +23,5 @@ Status values: `accepted`, `superseded by NNNN`, `revisited NNNN`.
 | [0009](0009-demand-driven-redraw.md) | Redraws are demand-driven, not continuous | accepted |
 | [0010](0010-gpu-evaluation-publishes-snapshots.md) | GPU evaluation publishes ordinary field snapshots | accepted |
 | [0011](0011-queue-running-edits-at-fixed-tick-boundaries.md) | Running edits enter the world immediately before a fixed tick | accepted |
+| [0012](0012-background-local-compute.md) | Local compute does not run on the window thread | accepted |
+| [0013](0013-validate-time-step-before-adoption.md) | Equation systems validate a time step before adoption | accepted |

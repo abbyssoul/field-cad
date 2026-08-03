@@ -27,10 +27,12 @@ absolute tolerance of `2e-3` plus a relative tolerance of `5e-4` across point
 sources, positive/negative superposition, a uniform sphere, a plane, a 3D grid,
 and undefined source-radius samples.
 
-Readback is synchronous in this first static solver, but it occurs only when a
+Readback inside the first evaluator is synchronous, but it occurs only when a
 world or subscription edit invalidates the analytic result—not once per rendered
-frame. A time-stepped GPU solver must use asynchronous publication rather than
-copy this scheduling choice.
+frame. ADR 0012 subsequently moved that complete compute path to a background
+worker, so the desktop command and render loop no longer waits for it. A
+time-stepped GPU solver should use native asynchronous completion rather than
+copy the evaluator's internal wait.
 
 ## Consequences
 
@@ -39,8 +41,7 @@ copy this scheduling choice.
 - Local mode pays one GPU-to-CPU copy per invalidated geometry. That copy is
   accepted for the static milestone and keeps probe, network, and renderer
   consumers identical.
-- Large edits currently block the command path until readback completes. Before
-  Maxwell/FDTD or full-resolution grids, compute publication must become
-  asynchronous and expose solving/stale state while work is in flight.
+- Large edits occupy the ordered compute worker until readback completes, while
+  the UI retains the last complete snapshot and exposes solving/pending state.
 - A dedicated compute service can reuse the kernel and publish the same columns;
   no server GPU handle crosses the protocol boundary.

@@ -11,7 +11,7 @@
 use fieldcad_core::{
     ChannelSchema, ComponentSchema, Domain, FieldColumn, PluginId, PluginVersion, PropertyBag,
     PropertySchema, SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic, StepContext,
-    WorldSnapshot, validate_properties,
+    TimeStep, WorldSnapshot, validate_properties,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +162,16 @@ pub trait EquationSystemSolver: Send {
     /// an edit that the solver then refuses.
     fn validate_world(&self, world: &WorldSnapshot) -> Result<(), PluginError> {
         let _ = world;
+        Ok(())
+    }
+
+    /// Report whether the numerical method can advance with `time_step`.
+    ///
+    /// The runtime calls this before adopting an initial or edited `dt`, which
+    /// gives explicit schemes a place to enforce stability limits atomically.
+    /// Analytic solvers normally accept every positive core-validated value.
+    fn validate_time_step(&self, time_step: TimeStep) -> Result<(), PluginError> {
+        let _ = time_step;
         Ok(())
     }
 

@@ -10,5 +10,6 @@ glam = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+fieldcad-electromagnetism = { workspace = true }
 fieldcad-electrostatics = { workspace = true }
 fieldcad-test-field = { workspace = true }

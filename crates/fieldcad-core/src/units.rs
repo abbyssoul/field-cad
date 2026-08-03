@@ -29,6 +29,12 @@ impl Dimension {
     pub const ELECTRIC_POTENTIAL: Self = Self::new(1, 2, -3, -1, 0, 0, 0);
     /// Tesla.
     pub const MAGNETIC_FLUX_DENSITY: Self = Self::new(1, 0, -2, -1, 0, 0, 0);
+    /// Joules per cubic metre.
+    pub const ENERGY_DENSITY: Self = Self::new(1, -1, -2, 0, 0, 0, 0);
+    /// Electric field divergence, volts per square metre.
+    pub const ELECTRIC_FIELD_DIVERGENCE: Self = Self::new(1, 0, -3, -1, 0, 0, 0);
+    /// Magnetic flux-density divergence, tesla per metre.
+    pub const MAGNETIC_FIELD_DIVERGENCE: Self = Self::new(1, -1, -2, -1, 0, 0, 0);
 
     #[allow(clippy::too_many_arguments)]
     pub const fn new(

@@ -36,6 +36,25 @@ pub struct Subscription {
     pub domain_stride: Option<u32>,
 }
 
+/// Host-owned limit on presentation sampling work requested in one snapshot.
+///
+/// The same validated limit applies to local UI commands and future remote
+/// clients; a widget range is not a security or memory boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplingBudget {
+    pub max_plane_samples_per_axis: u32,
+    pub max_samples_per_snapshot: u64,
+}
+
+impl Default for SamplingBudget {
+    fn default() -> Self {
+        Self {
+            max_plane_samples_per_axis: 1_024,
+            max_samples_per_snapshot: 16 * 1_024 * 1_024,
+        }
+    }
+}
+
 impl Default for Subscription {
     fn default() -> Self {
         Self {
@@ -177,6 +196,7 @@ pub struct SimulationRuntime {
     clock: SimulationClock,
     domain: Domain,
     subscription: Subscription,
+    sampling_budget: SamplingBudget,
     session: SessionId,
     next_sequence: u64,
     plugins: Vec<PluginSlot>,
@@ -190,6 +210,7 @@ pub struct RuntimeConfig {
     pub time_step: TimeStep,
     pub session: SessionId,
     pub subscription: Subscription,
+    pub sampling_budget: SamplingBudget,
     pub plugins: Vec<PluginRegistration>,
 }
 
@@ -201,6 +222,7 @@ impl RuntimeConfig {
             time_step,
             session,
             subscription: Subscription::default(),
+            sampling_budget: SamplingBudget::default(),
             plugins: Vec::new(),
         }
     }
@@ -212,6 +234,11 @@ impl RuntimeConfig {
 
     pub fn with_subscription(mut self, subscription: Subscription) -> Self {
         self.subscription = subscription;
+        self
+    }
+
+    pub fn with_sampling_budget(mut self, sampling_budget: SamplingBudget) -> Self {
+        self.sampling_budget = sampling_budget;
         self
     }
 
@@ -230,6 +257,7 @@ impl SimulationRuntime {
             time_step,
             session,
             subscription,
+            sampling_budget,
             plugins,
         } = config;
 
@@ -290,6 +318,7 @@ impl SimulationRuntime {
                 world: &world_snapshot,
             })?;
             solver.validate_world(&world_snapshot)?;
+            solver.validate_time_step(time_step)?;
             prepared.push(PluginSlot {
                 metadata,
                 channels,
@@ -302,6 +331,7 @@ impl SimulationRuntime {
             clock: SimulationClock::new(time_step),
             domain,
             subscription,
+            sampling_budget,
             session,
             next_sequence: 0,
             plugins: prepared,
@@ -311,6 +341,7 @@ impl SimulationRuntime {
         for slot in &mut runtime.plugins {
             slot.solver.on_world_changed(&world_snapshot)?;
         }
+        runtime.validate_subscription(runtime.subscription)?;
         runtime.publish_snapshot(SamplingPolicy::All)?;
         Ok(runtime)
     }
@@ -337,8 +368,81 @@ impl SimulationRuntime {
         if subscription == self.subscription {
             return Ok(());
         }
-        self.subscription = subscription;
-        self.publish_snapshot(SamplingPolicy::All)
+        self.validate_subscription(subscription)?;
+        let previous = std::mem::replace(&mut self.subscription, subscription);
+        if let Err(error) = self.publish_snapshot(SamplingPolicy::All) {
+            // Publication builds its candidate off to the side and changes
+            // `latest` only at the end, so restoring this field makes the
+            // rejected command completely unobservable.
+            self.subscription = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn validate_subscription(&self, subscription: Subscription) -> Result<(), RuntimeError> {
+        if self.sampling_budget.max_plane_samples_per_axis == 0
+            || self.sampling_budget.max_samples_per_snapshot == 0
+        {
+            return Err(RuntimeError::InvalidSamplingBudget);
+        }
+        if let Some(counts) = subscription.planes {
+            if counts.min_element() == 0 {
+                return Err(RuntimeError::InvalidSubscription(
+                    "plane counts must be non-zero when plane sampling is enabled".to_owned(),
+                ));
+            }
+            if counts.max_element() > self.sampling_budget.max_plane_samples_per_axis {
+                return Err(RuntimeError::InvalidSubscription(format!(
+                    "plane counts exceed the per-axis limit of {}",
+                    self.sampling_budget.max_plane_samples_per_axis
+                )));
+            }
+        }
+        if subscription.domain_stride == Some(0) {
+            return Err(RuntimeError::InvalidSubscription(
+                "domain stride must be non-zero when grid sampling is enabled".to_owned(),
+            ));
+        }
+
+        let world = self.world.snapshot();
+        let mut requested = 0_u64;
+        for slot in &self.plugins {
+            for schema in &slot.channels {
+                if subscription.probes {
+                    requested = requested.saturating_add(
+                        world
+                            .probes()
+                            .values()
+                            .filter(|probe| probe.channels.contains(&schema.id))
+                            .count() as u64,
+                    );
+                }
+                if let Some(counts) = subscription.planes {
+                    let planes = world
+                        .planes()
+                        .values()
+                        .filter(|plane| plane.visible)
+                        .count() as u64;
+                    requested = requested.saturating_add(
+                        planes
+                            .saturating_mul(u64::from(counts.x))
+                            .saturating_mul(u64::from(counts.y)),
+                    );
+                }
+                if let Some(stride) = subscription.domain_stride {
+                    requested = requested
+                        .saturating_add(self.domain.decimated_lattice(stride).len() as u64);
+                }
+                if requested > self.sampling_budget.max_samples_per_snapshot {
+                    return Err(RuntimeError::SamplingBudgetExceeded {
+                        requested,
+                        limit: self.sampling_budget.max_samples_per_snapshot,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn latest_snapshot(&self) -> Arc<fieldcad_core::FieldSnapshot> {
@@ -361,8 +465,12 @@ impl SimulationRuntime {
         self.clock.pause();
     }
 
-    pub fn set_time_step(&mut self, time_step: TimeStep) {
+    pub fn set_time_step(&mut self, time_step: TimeStep) -> Result<(), RuntimeError> {
+        for slot in &self.plugins {
+            slot.solver.validate_time_step(time_step)?;
+        }
         self.clock.set_time_step(time_step);
+        Ok(())
     }
 
     pub fn step_once(&mut self) -> Result<(), RuntimeError> {
@@ -616,6 +724,12 @@ pub enum RuntimeError {
     TooManyChannels(PluginId),
     #[error("single-step is only valid while the simulation is paused")]
     CannotStepWhileRunning,
+    #[error("invalid sampling budget")]
+    InvalidSamplingBudget,
+    #[error("invalid subscription: {0}")]
+    InvalidSubscription(String),
+    #[error("subscription requests {requested} samples, exceeding the limit of {limit}")]
+    SamplingBudgetExceeded { requested: u64, limit: u64 },
 }
 
 impl RuntimeError {
@@ -632,6 +746,9 @@ impl RuntimeError {
             Self::ForeignComponent { .. } => "foreign-component",
             Self::TooManyChannels(_) => "too-many-channels",
             Self::CannotStepWhileRunning => "cannot-step-while-running",
+            Self::InvalidSamplingBudget => "invalid-sampling-budget",
+            Self::InvalidSubscription(_) => "invalid-subscription",
+            Self::SamplingBudgetExceeded { .. } => "sampling-budget-exceeded",
         }
     }
 }

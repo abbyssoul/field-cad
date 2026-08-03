@@ -6,16 +6,18 @@
 //! required to be interchangeable, and the tests in this crate check that by
 //! driving both through the same script.
 
+pub mod async_source;
 pub mod history;
 pub mod recording;
 pub mod runtime;
 pub mod source;
 
+pub use async_source::{AsyncLocalDataSource, CommandEvent};
 pub use history::{ProbeHistory, ProbeReading};
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
 pub use runtime::{
-    PluginRegistration, RuntimeConfig, RuntimeError, SimulationRuntime, SimulationStatus,
-    Subscription, TickDemand, TickPacer,
+    PluginRegistration, RuntimeConfig, RuntimeError, SamplingBudget, SimulationRuntime,
+    SimulationStatus, Subscription, TickDemand, TickPacer,
 };
 pub use source::{
     Command, CommandDisposition, CommandId, CommandPayload, CommandReceipt, CommandSequencer,
@@ -28,9 +30,14 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use fieldcad_core::{
-        Domain, ObjectId, ObjectShape, ObjectSpec, ProbeSpec, SampleGeometry, SampleValidity,
-        SessionId, SimulationMode, SlicePlaneSpec, SnapshotCompleteness, TimeStep, Transform,
-        UndefinedReason, World, WorldCommand,
+        BoundaryCondition, BoundaryConditions, Domain, DomainBounds, ObjectId, ObjectShape,
+        ObjectSpec, Precision, ProbeSpec, Resolution, SampleGeometry, SampleValidity, SessionId,
+        SimulationMode, SlicePlaneSpec, SnapshotCompleteness, TimeStep, Transform, UndefinedReason,
+        World, WorldCommand,
+    };
+    use fieldcad_electromagnetism::{
+        ElectromagnetismPlugin, courant_limit, electric_field_channel_id as maxwell_e_channel_id,
+        energy_density_channel_id, magnetic_field_channel_id,
     };
     use fieldcad_electrostatics::{
         COULOMB_CONSTANT, ElectrostaticsPlugin, charge_component_id, charge_properties,
@@ -88,6 +95,79 @@ mod tests {
         assert!(!runtime.advance_running().unwrap());
         assert_eq!(runtime.clock_snapshot().tick(), 2);
         assert_eq!(runtime.latest_snapshot().identity.sequence, 2);
+    }
+
+    #[test]
+    fn maxwell_fields_publish_through_the_generic_runtime_contract() {
+        let domain = Domain::new(
+            DomainBounds::new(DVec3::ZERO, DVec3::ONE).unwrap(),
+            Resolution::new(16, 2, 2).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let stable_step = TimeStep::from_seconds(courant_limit(&domain) * 0.8).unwrap();
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateProbe(ProbeSpec::at(
+                "Maxwell recorder",
+                DVec3::new(0.125, 0.5, 0.5),
+                vec![
+                    maxwell_e_channel_id(),
+                    magnetic_field_channel_id(),
+                    energy_density_channel_id(),
+                ],
+            ))])
+            .unwrap();
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain, stable_step, SessionId::from_u128(0x5a))
+                .with_world(world)
+                .with_plugin(Box::new(ElectromagnetismPlugin)),
+        )
+        .unwrap();
+
+        let initial = runtime.latest_snapshot();
+        assert!(initial.channel(&maxwell_e_channel_id()).is_some());
+        assert!(initial.channel(&magnetic_field_channel_id()).is_some());
+        assert!(initial.channel(&energy_density_channel_id()).is_some());
+
+        runtime.step_once().unwrap();
+        assert_eq!(runtime.latest_snapshot().identity.tick, 1);
+
+        let before = runtime.clock_snapshot().time_step();
+        let rejected = TimeStep::from_seconds(courant_limit(&domain) * 1.01).unwrap();
+        assert!(matches!(
+            runtime.set_time_step(rejected),
+            Err(RuntimeError::Plugin(_))
+        ));
+        assert_eq!(runtime.clock_snapshot().time_step(), before);
+
+        // The desktop-facing adapter returns immediately, then reports the same
+        // rejection as a final event without poisoning the source or its clock.
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime));
+        let submitted = source
+            .execute(command(CommandPayload::SetTimeStep(rejected)))
+            .unwrap();
+        assert_eq!(submitted.disposition, CommandDisposition::Submitted);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let event = loop {
+            source.poll(Duration::ZERO).unwrap();
+            if let Some(event) = source.drain_command_events().into_iter().next() {
+                break event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not reject the unstable time step"
+            );
+            std::thread::yield_now();
+        };
+        assert!(matches!(
+            event,
+            CommandEvent::Failed {
+                error: SourceError::Solver { ref code, .. },
+                ..
+            } if code == "plugin"
+        ));
+        assert_eq!(source.simulation_status().time_step(), before);
     }
 
     #[test]
@@ -406,6 +486,37 @@ mod tests {
     }
 
     #[test]
+    fn asynchronous_local_commands_complete_without_blocking_submission() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        let receipt = source.execute(command(CommandPayload::Step)).unwrap();
+
+        assert_eq!(receipt.disposition, CommandDisposition::Submitted);
+        assert_eq!(receipt.snapshot_sequence, None);
+        assert_eq!(source.simulation_status().tick(), 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let completed = loop {
+            source.poll(Duration::ZERO).unwrap();
+            if let Some(event) = source.drain_command_events().into_iter().next() {
+                break event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not respond"
+            );
+            std::thread::yield_now();
+        };
+
+        let CommandEvent::Completed(receipt) = completed else {
+            panic!("the valid step command must complete");
+        };
+        assert_eq!(receipt.disposition, CommandDisposition::Applied);
+        assert_eq!(receipt.snapshot_sequence, Some(1));
+        assert_eq!(source.simulation_status().tick(), 1);
+        assert_eq!(source.latest_snapshot().unwrap().identity.tick, 1);
+    }
+
+    #[test]
     fn disconnect_retains_the_last_complete_snapshot_and_marks_it_stale() {
         let mut remote = LoopbackDataSource::new(runtime());
         remote.poll(Duration::ZERO).unwrap();
@@ -464,6 +575,91 @@ mod tests {
             source.simulation_status().time_seconds(),
             3.0 * time_step().seconds()
         );
+    }
+
+    /// A subscription change is a visualization command: it is applied at once
+    /// even while running, because it cannot make a solver observe half an edit.
+    fn subscriptions_change_density_but_not_physics(source: &mut dyn FieldDataSource) {
+        source.poll(Duration::ZERO).unwrap();
+        source.execute(command(CommandPayload::Play)).unwrap();
+        let before = source.latest_snapshot().unwrap();
+
+        let receipt = source
+            .execute(command(CommandPayload::SetSubscription(
+                Subscription::PROBES_ONLY.with_domain_stride(2),
+            )))
+            .unwrap();
+        // A loopback source delivers over a link, so drain it before comparing.
+        for _ in 0..4 {
+            source.poll(Duration::ZERO).unwrap();
+        }
+        let after = source.latest_snapshot().unwrap();
+
+        assert_eq!(receipt.disposition, CommandDisposition::Applied);
+        assert_eq!(source.pending_command_count(), 0);
+        assert_eq!(
+            source.subscription(),
+            Subscription::PROBES_ONLY.with_domain_stride(2)
+        );
+        assert!(after.total_samples() > before.total_samples());
+        // Denser observation, same world and same numerical configuration.
+        assert_eq!(
+            after.identity.world_revision,
+            before.identity.world_revision
+        );
+        assert_eq!(after.domain, before.domain);
+    }
+
+    #[test]
+    fn local_subscriptions_change_density_but_not_physics() {
+        subscriptions_change_density_but_not_physics(&mut LocalDataSource::new(runtime()));
+    }
+
+    #[test]
+    fn loopback_subscriptions_change_density_but_not_physics() {
+        subscriptions_change_density_but_not_physics(&mut LoopbackDataSource::new(runtime()));
+    }
+
+    #[test]
+    fn a_rejected_subscription_does_not_replace_the_acknowledged_one() {
+        let mut source = LocalDataSource::new(runtime());
+        let before = source.subscription();
+        let sequence = source.latest_snapshot().unwrap().identity.sequence;
+
+        let result = source.execute(command(CommandPayload::SetSubscription(
+            Subscription::PROBES_ONLY.with_planes(UVec2::splat(1_025)),
+        )));
+
+        assert!(matches!(
+            result,
+            Err(SourceError::Solver { ref code, .. }) if code == "invalid-subscription"
+        ));
+        assert_eq!(source.subscription(), before);
+        assert_eq!(
+            source.latest_snapshot().unwrap().identity.sequence,
+            sequence
+        );
+    }
+
+    #[test]
+    fn the_authoritative_source_enforces_a_total_sampling_budget() {
+        let source_runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(31))
+                .with_world(seeded_world())
+                .with_sampling_budget(SamplingBudget {
+                    max_plane_samples_per_axis: 32,
+                    max_samples_per_snapshot: 1,
+                })
+                .with_plugin(Box::new(TestFieldPlugin)),
+        );
+
+        assert!(matches!(
+            source_runtime,
+            Err(RuntimeError::SamplingBudgetExceeded {
+                requested: 2,
+                limit: 1
+            })
+        ));
     }
 
     #[test]
@@ -711,7 +907,7 @@ mod tests {
                     .with_planes(UVec2::splat(5))
                     .with_domain_stride(8),
             )
-            .with_plugin(Box::new(ElectrostaticsPlugin)),
+            .with_plugin(Box::new(ElectrostaticsPlugin::new())),
         )
         .unwrap();
         runtime

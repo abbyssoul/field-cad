@@ -682,6 +682,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldcad-electromagnetism"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "fieldcad-plugin-api",
+ "glam",
+]
+
+[[package]]
 name = "fieldcad-electrostatics"
 version = "0.1.0"
 dependencies = [
@@ -704,6 +713,7 @@ name = "fieldcad-simulation"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
+ "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-plugin-api",
  "fieldcad-test-field",

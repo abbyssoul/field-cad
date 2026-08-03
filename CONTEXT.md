@@ -13,6 +13,23 @@ The workbench now adds source-owned playback pacing, deterministic running-edit
 boundaries, bounded probe histories with attachment, and record/replay fixtures
 without moving simulation authority into the desktop (ADR 0011).
 
+Milestone 5 has begun with a CPU `f64` vacuum Maxwell reference. It evolves
+staggered `E` and `B` components on a periodic 3D Yee lattice, publishes energy
+density and both divergence residuals, and rejects a `dt` above its Courant
+limit before the clock adopts it (ADR 0013). A prescribed travelling plane wave
+provides the convergence oracle. The GPU port and default desktop Maxwell
+scenario remain to be built.
+
+A review of Milestones 3 and 4 has been held and its findings applied. The
+visualization model now owns independent layers for every published vector
+channel rather than naming an equation system, so electric `E`, magnetic `B`, or
+gravitational acceleration can be shown together with separate plane and 3D
+settings. Subscriptions became validated commands on the data-source boundary;
+the authoritative source enforces per-axis and total sample budgets before
+adopting them. Local compute now runs behind a non-blocking submission/final
+completion boundary on a dedicated worker (ADR 0012), matching the latency shape
+of the later remote client while retaining the last complete snapshot.
+
 The decisions that shaped the code — and the reasoning behind them — are recorded
 as ADRs in `docs/adr/`. Where this document describes intent, an ADR describes a
 commitment and what it cost.
@@ -53,7 +70,7 @@ say which model, parameters, domain, resolution, time, and solver produced it.
 | **Sample validity** | Whether a returned value was evaluated exactly, interpolated from stored samples, or is undefined — inside a source radius, outside the domain, or unconverged. |
 | **Visualization layer** | A view of one field channel using glyphs, colour, contours, streamlines, or another generic rendering technique. |
 | **Slice plane** | A transformable plane on which a field is sampled and drawn. The XY plane is only a default. |
-| **Probe** | A point, optionally attached to an object, that samples selected channels and records time-series values. |
+| **Probe** | A recorder, currently point-shaped and optionally attached to an object, that samples selected channels and stores bounded time-series values. |
 | **Simulation tick** | One deterministic, fixed-duration advance of authoritative simulation state. |
 | **Frame** | One screen presentation. Frames and simulation ticks are intentionally independent. |
 
@@ -192,6 +209,11 @@ object integration remains inside the equation system where numerical coupling
 requires it. The core runtime coordinates phases without assuming every theory
 uses the same integrator.
 
+A candidate numerical time step is validated by every active solver before the
+runtime adopts it. This makes a Courant or other method-specific stability error
+part of the rejected command, rather than a failure discovered after the next
+tick has begun.
+
 ### Local and remote compute boundary
 
 The desktop application talks to a field data source rather than directly to a
@@ -206,6 +228,12 @@ simulation clock. The desktop may stage edits for responsiveness, but it does no
 claim that they took effect until the service acknowledges the resulting
 revision. Play, pause, and step are commands with correlated acknowledgements;
 they are not inferred from incoming frame timing.
+
+Local compute has the same asynchronous shape at the application boundary. A
+submission is provisional and carries no promised snapshot sequence; a later
+completion event reports whether the ordered worker applied, queued, or rejected
+it. While work is pending the visualizer remains interactive and shows the last
+complete snapshot as solving/stale rather than borrowing mutable solver memory.
 
 A remote snapshot envelope includes at least:
 
@@ -243,6 +271,7 @@ A plugin will conceptually provide:
   and suggested visual mappings;
 - object-component and solver-configuration schemas;
 - configuration and world validation;
+- candidate time-step validation for numerical stability;
 - initialization from a domain and a read-only world view;
 - static evaluation and/or fixed-step advancement;
 - immutable field resources or samplers for snapshots;
@@ -280,6 +309,11 @@ normal component when that is useful. These density and projection choices are
 visualizer-owned presentation state; they do not change the simulation or the
 field values published by local or remote compute.
 
+Each vector channel owns an independent presentation layer, including plane
+visibility/density/projection and sparse whole-domain glyph visibility. Several
+layers may be active at once; this is how coupled `E` and `B` are compared
+without a renderer that understands Maxwell's equations.
+
 Plane display density is a non-negative glyph/mesh count per axis. The
 visualizer distributes those presentation samples uniformly across the complete
 plane and bilinearly interpolates immutable snapshot columns when the requested
@@ -297,20 +331,37 @@ and view-axis shortcuts. Input bindings will be remappable. Scene grid, world
 XYZ axes, and field sampling grids are distinct, independently visible layers.
 
 The viewport also has an authoring layer independent of field rendering. Charges
-use spherical source proxies, slice planes use selectable translucent rectangles
-with solid corner tabs, and selected charges expose axis and plane translation
-handles. A drag is constrained by the chosen handle for its entire duration;
-dragging the selected object's body instead moves parallel to the camera view
-plane while retaining depth. Body dragging starts only after the picking ray
-intersects that object's rendered proxy, so empty-space drags cannot move it.
+use spherical source proxies and slice planes use selectable translucent
+rectangles with solid corner tabs. Objects, probes, and planes share one selected
+entity language: selection highlighting, three wire circles marking the origin,
+world-axis arrows, and world-plane translation squares. A drag is constrained by
+the chosen handle for its entire duration; dragging the selected entity's body
+instead moves parallel to the camera view plane while retaining depth. Body
+dragging starts only after the picking ray intersects that entity's rendered
+proxy, so empty-space drags cannot move it.
+
+A selected slice plane also draws its normal from the plane centre as a dashed
+purple arrow, proportional to the plane extent and labelled `N` in screen space.
+Dragging the outer normal handle uses a virtual 3D arcball to rotate the normal
+while carrying the plane's in-plane `u` orientation with it. The dashed colour,
+label, and outer-only hit region distinguish rotation from solid RGB translation
+axes and from sampled field-vector arrows.
 
 ### Probes
 
-A probe contains a world-space position or object attachment, a list of channel
-IDs, and a bounded time-series buffer. Each sample records simulation time,
-snapshot revision, value, units, and validity. GPU-only fields may require
-asynchronous readback; the UI must show that latency rather than label a stale
-sample as current.
+A probe contains a world-space position or object attachment, a list of recorded
+channel IDs, and a bounded time-series buffer. Each sample records simulation
+time, snapshot revision, value, units, and validity. The selected-probe inspector
+keeps its inline history, while any probe can pin a persistent, non-blocking
+floating recorder window. A window remains visible while the user selects and
+moves other scene entities and can show several recorded channels as separate,
+unit-safe plots. GPU-only fields may require asynchronous readback; the UI shows
+that latency rather than labelling a stale sample as current.
+
+Point probes are the implemented geometry. A later spatial probe will add an
+explicit region and reduction/statistic to the sample schema; its plotted
+series will still use this recorder/history contract rather than expose solver
+storage to the UI.
 
 ## Technology direction
 
@@ -358,8 +409,12 @@ compromise the host.
   accepts scientific notation and explicit SI time-unit suffixes without
   changing the authoritative clock representation.
 - UI and rendering never mutate solver state directly; they submit commands.
+- Candidate worlds, subscriptions, and numerical time steps are validated before
+  their authoritative values are replaced.
 - A field channel has explicit dimensional units and scalar/vector shape.
 - Visualization sampling density does not alter simulation resolution.
+- Presentation subscriptions are bounded by authoritative source budgets, not
+  only by widget ranges.
 - Plugins do not depend on the UI or own the presentation surface.
 - A plugin failure is reported with context and must not corrupt the saved world.
 - Static analytic cases remain available as regression oracles for numerical

@@ -30,8 +30,29 @@ Progress as of 2026-08-03:
   and plot bounded scalar/vector history; workbench state is explicit; and
   semantic command recordings replay deterministically. Manual UX acceptance
   of the new plot and transport controls remains.
+- A code review of Milestones 3 and 4 was held and its findings applied. It
+  found no failing guarantee, but three structural problems: the local and
+  loopback data sources duplicated the session semantics they were meant to
+  share, the electrostatics plugin existed twice and the copy had already lost
+  two trait methods, and the visualization engine drew one hardcoded channel
+  from one named plugin. It also found a non-unit rotation that could reach the
+  world through a command, a glyph scale recomputed per glyph, and a UI that
+  discarded all but the last command in a frame. See the
+  [review findings](docs/reviews/2026-08-03-milestone-3-4-review.md) and the
+  [remediation report](docs/reviews/2026-08-03-remediation-report.md).
+- The review follow-up is implemented. Subscriptions validate and enforce a
+  total source-owned sampling budget before adoption; local compute commands
+  complete on an ordered background worker; and the visualizer owns independent
+  layers for every published vector channel. A probe can choose its recorded
+  channels and pin a persistent floating, multi-channel recorder plot while the
+  user manipulates the scene.
+- Milestone 5's CPU reference slice is implemented. The new electromagnetism
+  plugin advances `E` and `B` on a periodic `f64` Yee lattice, validates the
+  Courant limit before accepting `dt`, and publishes energy density plus `div E`
+  and `div B` residuals. Wave-speed convergence is covered headlessly. The GPU
+  solver and desktop Maxwell scenario remain.
 
-The plan deliberately builds a thin end-to-end product before the time-domain
+The plan deliberately built a thin end-to-end product before the time-domain
 Maxwell solver. Each milestone ends in something observable and testable, and
 each scientific solver has an independent reference case.
 
@@ -53,12 +74,15 @@ crates/
 plugins/
   test-field/            analytic contract fixture                   [present]
   electrostatics/        first real equation system                  [present]
-  electromagnetism/      later Maxwell/FDTD equation system          [planned]
+  electromagnetism/      Maxwell/FDTD CPU reference                  [present]
 ```
 
 `fieldcad-render` and `fieldcad-ui` remain modules inside `fieldcad-desktop`
 until there is a second consumer. Splitting them now would produce crate
-ceremony without isolation.
+ceremony without isolation. Inside the app they are directories rather than
+single files — `scene/` divides field geometry, gizmos, picking, and authoring
+proxies; `ui/` divides the view model, panels, and the probe plot — which is the
+right amount of structure while there is still one consumer.
 
 Crate boundaries are dependency rules, not a promise of separate threads or
 dynamic libraries. We should merge any boundary that produces ceremony without
@@ -190,6 +214,12 @@ The top-panel time step is also an editable, magnitude-sensitive drag value. It
 parses unitless seconds, scientific notation, and explicit SI time suffixes,
 then submits the existing validated `SetTimeStep` command.
 
+The unified-selection refinement applies the same origin marker, X/Y/Z axis
+handles, XY/YZ/ZX plane handles, free camera-plane drag, and focus action to
+objects, probes, and slice planes. Selected planes additionally expose a dashed,
+labelled, size-proportional normal handle whose arcball drag preserves in-plane
+orientation while rotating the plane.
+
 Exit criteria:
 
 - a single-charge result matches the analytic formula at selected points;
@@ -216,6 +246,8 @@ Turn the vertical slice into a coherent simulation workbench:
   simulation time;
 - exact one-tick stepping while paused;
 - a bounded probe history plot with vector components and magnitude;
+- a persistent floating recorder plot that survives selection changes and can
+  show several recorded channels without blocking viewport interaction;
 - attach/detach probes from moving objects;
 - command queuing for edits made while running;
 - clear solving, stale, invalid, and paused states in the UI; and
@@ -235,15 +267,25 @@ Exit criteria:
 
 ## Milestone 5 — coupled Maxwell solver and magnetic visualization
 
+Implementation status: **CPU reference slice complete; GPU port and desktop
+scenario pending.**
+
 Add an electromagnetism plugin rather than extending electrostatics in place:
 
-1. implement a small CPU reference finite-difference time-domain solver;
-2. place `E` and `B` components on a Yee lattice;
-3. enforce the Courant stability limit when choosing `dt`;
-4. start with simple documented boundary conditions and prescribed sources;
-5. port field updates to `wgpu` compute with ping-pong or equivalent buffers;
-6. publish electric, magnetic, energy, and divergence/residual channels; and
-7. reuse planes, glyphs, colours, and probes for both vector fields.
+1. **Done:** implement a small CPU `f64` reference finite-difference time-domain
+   solver;
+2. **Done:** place `E` and `B` components on a three-dimensional Yee lattice;
+3. **Done:** enforce the Courant stability limit when choosing `dt`, using the
+   plugin's validate-before-adopt time-step hook;
+4. **Done for the reference slice:** periodic boundaries and a prescribed
+   travelling plane-wave initial condition;
+5. **Next:** port field updates to `wgpu` compute with ping-pong or equivalent
+   buffers and asynchronous completion/cancellation;
+6. **Done:** publish electric, magnetic, energy-density, and both divergence
+   residual channels; and
+7. **Infrastructure complete:** planes, glyphs, colours, and probe recorders can
+   show both vector fields as independent layers once the desktop composes the
+   Maxwell scenario.
 
 Absorbing boundaries should follow the basic solver; perfectly matched layers
 are valuable but should not obscure validation of the interior update scheme.
@@ -413,17 +455,23 @@ the default if no contrary requirement emerges during review.
 
 ## Next implementation increment
 
-Hold the **Milestone 3 visual-legibility review gate** on a native run. In
-particular, inspect logarithmic magnitude colour around positive/negative point
-sources and uniform spheres, plane glyph density at several orientations,
-sparse 3D glyph legibility, undefined-radius holes, and object manipulation from
-axis and perspective views. Record any layer defaults that should change.
+Port the tested Maxwell update to host-owned `wgpu` buffers. Use ping-pong or an
+equivalent hazard-free layout, publish through the existing background source,
+and add cancellation/supersession so rapid edits do not force every obsolete
+grid through readback. Compare a small deterministic grid against the CPU `f64`
+reference with an explicit `f32` tolerance.
 
-After that review, proceed to **Milestone 4**: editable `dt` and speed controls,
-probe-history plots, probe attachment, running-edit boundary semantics, visible
-solving/stale/invalid states, and deterministic record/replay fixtures. Before a
-time-stepped GPU solver, replace Milestone 3's edit-time synchronous readback
-with asynchronous snapshot publication as required by ADR 0010.
+Then add a desktop Maxwell scenario with user-visible periodic domain,
+resolution, prescribed-wave settings, and a stable default `dt`. Compose its
+published `E` and `B` into the already generic independent layer controls and
+record both on the default probe/floating plot. This should be a scenario or
+equation-system choice rather than silently mixing the current open-boundary
+electrostatic `f32` setup with the periodic `f64` reference domain.
+
+The manual acceptance pass should now include the floating recorder while moving
+a charge/probe, simultaneous layer legibility, sampling-budget rejection, and
+continued camera responsiveness while the compute worker is solving. The older
+Milestone 1 cross-platform interactive checks remain pending.
 
 Cross-platform Milestone 1 verification runs in parallel — CI builds and tests
 Windows and macOS on every push, leaving only interactive checks (window

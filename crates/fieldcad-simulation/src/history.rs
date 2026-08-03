@@ -105,6 +105,15 @@ impl ProbeHistory {
         self.series.clear();
     }
 
+    /// Drop the series of probes that no longer exist.
+    ///
+    /// Each series is bounded, but the set of series is not: probe identifiers
+    /// are minted monotonically and never reused, so a session that repeatedly
+    /// adds and removes probes would otherwise retain every one of them.
+    pub fn retain_probes(&mut self, live: impl Fn(ProbeId) -> bool) {
+        self.series.retain(|(probe, _), _| live(*probe));
+    }
+
     /// Probe/channel pairs that have at least one reading.
     pub fn tracked(&self) -> impl Iterator<Item = (ProbeId, &ChannelId)> {
         self.series
@@ -117,5 +126,73 @@ impl ProbeHistory {
 impl Default for ProbeHistory {
     fn default() -> Self {
         Self::new(fieldcad_core::DEFAULT_PROBE_HISTORY)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fieldcad_core::{
+        ChannelSchema, ChannelSnapshot, Dimension, Domain, FieldBatch, FieldColumn, FieldValueKind,
+        PluginId, SampleGeometry, SampleValidity, SessionId, SnapshotCompleteness,
+        SnapshotIdentity,
+    };
+    use glam::DVec3;
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use super::*;
+
+    fn channel_id() -> ChannelId {
+        ChannelId::new(PluginId::new("test").unwrap(), "scalar").unwrap()
+    }
+
+    fn snapshot_with(probes: &[ProbeId]) -> FieldSnapshot {
+        let schema = Arc::new(ChannelSchema {
+            id: channel_id(),
+            display_name: "Scalar".to_owned(),
+            value_kind: FieldValueKind::Scalar(Dimension::LENGTH),
+        });
+        let geometry =
+            SampleGeometry::probes(probes.to_vec(), vec![DVec3::X; probes.len()]).unwrap();
+        let batch = FieldBatch::new(
+            geometry,
+            FieldColumn::scalars(vec![1.0; probes.len()]),
+            vec![SampleValidity::Exact; probes.len()],
+        )
+        .unwrap();
+        FieldSnapshot {
+            identity: SnapshotIdentity {
+                session: SessionId::from_u128(1),
+                sequence: 0,
+                world_revision: WorldRevision::INITIAL,
+                tick: 0,
+                time_seconds: 0.0,
+            },
+            completeness: SnapshotCompleteness::Complete,
+            domain: Domain::centred_cube(1.0, 2).unwrap(),
+            plugins: Arc::from([]),
+            channels: BTreeMap::from([(
+                channel_id(),
+                ChannelSnapshot {
+                    schema,
+                    batches: Arc::from([batch]),
+                },
+            )]),
+            diagnostics: Arc::from([]),
+        }
+    }
+
+    #[test]
+    fn deleted_probes_do_not_retain_their_history_forever() {
+        let kept = ProbeId::new(0);
+        let removed = ProbeId::new(1);
+        let mut history = ProbeHistory::new(8);
+        history.record(&snapshot_with(&[kept, removed]));
+        assert_eq!(history.tracked().count(), 2);
+
+        history.retain_probes(|probe| probe == kept);
+
+        assert_eq!(history.len(kept, &channel_id()), 1);
+        assert_eq!(history.len(removed, &channel_id()), 0);
+        assert_eq!(history.tracked().count(), 1);
     }
 }

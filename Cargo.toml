@@ -6,6 +6,7 @@ members = [
     "crates/fieldcad-plugin-api",
     "crates/fieldcad-simulation",
     "plugins/electrostatics",
+    "plugins/electromagnetism",
     "plugins/test-field",
 ]
 
@@ -31,4 +32,5 @@ fieldcad-core = { path = "crates/fieldcad-core" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
 fieldcad-simulation = { path = "crates/fieldcad-simulation" }
 fieldcad-electrostatics = { path = "plugins/electrostatics" }
+fieldcad-electromagnetism = { path = "plugins/electromagnetism" }
 fieldcad-test-field = { path = "plugins/test-field" }
