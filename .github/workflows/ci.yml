@@ -77,30 +77,42 @@ jobs:
           sudo apt-get install -y \
             libwayland-dev libxkbcommon-dev \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-x11-0 libx11-xcb1 libxcb1 \
             mesa-vulkan-drivers libgl1-mesa-dri \
             libegl1 libegl-mesa0 libgles2 \
             xvfb
 
+      # Both halves of this job reach their graphics stack through `dlopen`, so
+      # a missing package is not a link error at build time — it is a panic or
+      # an unhelpful "no adapter" message part-way through a run. Checking the
+      # sonames up front turns that into one line naming the file.
+      #
       # The OpenGL smoke test runs with no display, so wgpu reaches GL through
-      # EGL's surfaceless platform rather than GLX. That needs three separate
-      # pieces, and a missing one reports only as "gl drivers/libraries could
-      # not be loaded", so check them here where the diagnosis is cheap:
-      # libEGL.so.1 is the loader wgpu dlopens (libegl1), libEGL_mesa.so.0 is
-      # the driver behind it that provides EGL_MESA_platform_surfaceless
-      # (libegl-mesa0), and swrast_dri.so is the llvmpipe renderer it drives
-      # (libgl1-mesa-dri).
-      - name: Verify the headless OpenGL stack is present
+      # EGL's surfaceless platform rather than GLX: libEGL.so.1 is the loader
+      # wgpu opens (libegl1), libEGL_mesa.so.0 is the driver behind it that
+      # provides EGL_MESA_platform_surfaceless (libegl-mesa0), and swrast_dri.so
+      # is the llvmpipe renderer it drives (libgl1-mesa-dri).
+      #
+      # The windowed run adds winit's X11 keyboard path, which opens
+      # libxkbcommon-x11.so.0 (libxkbcommon-x11-0 — note that libxkbcommon-dev
+      # does *not* pull this in), reaches the xcb connection behind the Xlib
+      # display through libX11-xcb.so.1 (libx11-xcb1), and talks xcb through
+      # libxcb.so.1 (libxcb1).
+      - name: Verify the graphics and window-system libraries are present
         run: |
           missing=0
           for lib in \
             /usr/lib/x86_64-linux-gnu/libEGL.so.1 \
             /usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0 \
-            /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so
+            /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so \
+            /usr/lib/x86_64-linux-gnu/libxkbcommon-x11.so.0 \
+            /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1 \
+            /usr/lib/x86_64-linux-gnu/libxcb.so.1
           do
             if [ -e "$lib" ]; then
               echo "found $lib"
             else
-              echo "::error::missing $lib — the OpenGL backend cannot start without it"
+              echo "::error::missing $lib — a run will fail at dlopen without it"
               missing=1
             fi
           done
