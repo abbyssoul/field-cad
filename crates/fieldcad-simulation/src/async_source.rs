@@ -17,11 +17,12 @@ use std::{
 };
 
 use fieldcad_core::{FieldSnapshot, WorldSnapshot};
+use fieldcad_plugin_api::SolverCancellation;
 
 use crate::{
     Command, CommandDisposition, CommandId, CommandReceipt, DataSourceStatus, FieldDataSource,
-    LocalDataSource, PlaybackSpeed, PollOutcome, SimulationStatus, SnapshotMailbox, SourceError,
-    Subscription,
+    FieldSystemStatus, LocalDataSource, PlaybackSpeed, PollOutcome, SimulationStatus,
+    SnapshotMailbox, SourceError, Subscription,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +62,7 @@ struct SourceState {
     playback_speed: PlaybackSpeed,
     pending_commands: usize,
     subscription: Subscription,
+    field_systems: Vec<FieldSystemStatus>,
     world: WorldSnapshot,
     snapshot: Option<Arc<FieldSnapshot>>,
 }
@@ -72,6 +74,7 @@ impl SourceState {
             playback_speed: source.playback_speed(),
             pending_commands: source.pending_command_count(),
             subscription: source.subscription(),
+            field_systems: source.field_systems(),
             world: source.world(),
             snapshot: source.latest_snapshot(),
         }
@@ -83,12 +86,14 @@ pub struct AsyncLocalDataSource {
     requests: Sender<WorkerRequest>,
     events: Receiver<WorkerEvent>,
     stop: Arc<AtomicBool>,
+    cancellation: SolverCancellation,
     worker: Option<JoinHandle<()>>,
     simulation: SimulationStatus,
     playback_speed: PlaybackSpeed,
     worker_pending_commands: usize,
     submitted_commands: BTreeSet<CommandId>,
     subscription: Subscription,
+    field_systems: Vec<FieldSystemStatus>,
     world: WorldSnapshot,
     mailbox: SnapshotMailbox,
     poll_in_flight: bool,
@@ -100,6 +105,7 @@ pub struct AsyncLocalDataSource {
 impl AsyncLocalDataSource {
     pub fn new(source: LocalDataSource) -> Self {
         let initial = SourceState::capture(&source);
+        let cancellation = source.cancellation();
         let mut mailbox = SnapshotMailbox::default();
         if let Some(snapshot) = &initial.snapshot {
             let _ = mailbox.offer(Arc::clone(snapshot));
@@ -117,12 +123,14 @@ impl AsyncLocalDataSource {
             requests: request_sender,
             events: event_receiver,
             stop,
+            cancellation,
             worker: Some(worker),
             simulation: initial.simulation,
             playback_speed: initial.playback_speed,
             worker_pending_commands: initial.pending_commands,
             submitted_commands: BTreeSet::new(),
             subscription: initial.subscription,
+            field_systems: initial.field_systems,
             world: initial.world,
             mailbox,
             poll_in_flight: false,
@@ -137,6 +145,7 @@ impl AsyncLocalDataSource {
         self.playback_speed = state.playback_speed;
         self.worker_pending_commands = state.pending_commands;
         self.subscription = state.subscription;
+        self.field_systems = state.field_systems;
         self.world = state.world;
         match state.snapshot {
             Some(snapshot) => Ok(self.mailbox.offer(snapshot)?),
@@ -236,6 +245,10 @@ impl FieldDataSource for AsyncLocalDataSource {
         self.subscription
     }
 
+    fn field_systems(&self) -> Vec<FieldSystemStatus> {
+        self.field_systems.clone()
+    }
+
     fn world(&self) -> WorldSnapshot {
         self.world.clone()
     }
@@ -277,6 +290,7 @@ impl FieldDataSource for AsyncLocalDataSource {
 impl Drop for AsyncLocalDataSource {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.cancellation.cancel();
         let _ = self.requests.send(WorkerRequest::Stop);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

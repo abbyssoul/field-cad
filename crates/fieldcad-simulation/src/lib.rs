@@ -16,8 +16,8 @@ pub use async_source::{AsyncLocalDataSource, CommandEvent};
 pub use history::{ProbeHistory, ProbeReading};
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
 pub use runtime::{
-    PluginRegistration, RuntimeConfig, RuntimeError, SamplingBudget, SimulationRuntime,
-    SimulationStatus, Subscription, TickDemand, TickPacer,
+    FieldSystemStatus, PluginRegistration, RuntimeConfig, RuntimeError, SamplingBudget,
+    SimulationRuntime, SimulationStatus, Subscription, TickDemand, TickPacer,
 };
 pub use source::{
     Command, CommandDisposition, CommandId, CommandPayload, CommandReceipt, CommandSequencer,
@@ -35,14 +35,18 @@ mod tests {
         SimulationMode, SlicePlaneSpec, SnapshotCompleteness, TimeStep, Transform, UndefinedReason,
         World, WorldCommand,
     };
+    use fieldcad_electromagnetic_sources::{
+        charge_component_id, charge_properties, charge_property_id,
+    };
     use fieldcad_electromagnetism::{
         ElectromagnetismPlugin, courant_limit, electric_field_channel_id as maxwell_e_channel_id,
         energy_density_channel_id, magnetic_field_channel_id,
     };
     use fieldcad_electrostatics::{
-        COULOMB_CONSTANT, ElectrostaticsPlugin, charge_component_id, charge_properties,
-        electric_field_channel_id, electric_potential_channel_id,
+        COULOMB_CONSTANT, ElectrostaticsPlugin, electric_field_channel_id,
+        electric_potential_channel_id, plugin_id as electrostatics_plugin_id,
     };
+    use fieldcad_particles::particle_component_id;
     use fieldcad_test_field::{TestFieldPlugin, scalar_channel_id, vector_channel_id};
     use glam::{DVec2, DVec3, UVec2};
 
@@ -121,7 +125,7 @@ mod tests {
         let mut runtime = SimulationRuntime::new(
             RuntimeConfig::new(domain, stable_step, SessionId::from_u128(0x5a))
                 .with_world(world)
-                .with_plugin(Box::new(ElectromagnetismPlugin)),
+                .with_plugin(Box::new(ElectromagnetismPlugin::new())),
         )
         .unwrap();
 
@@ -132,6 +136,18 @@ mod tests {
 
         runtime.step_once().unwrap();
         assert_eq!(runtime.latest_snapshot().identity.tick, 1);
+
+        // Inactive time-stepped systems own no solver memory and do not advance.
+        // Re-enabling recreates Maxwell at the current scene tick, so its next
+        // step remains aligned with the snapshot time instead of resuming stale
+        // tick-one state under a later timestamp.
+        let maxwell = fieldcad_electromagnetism::plugin_id();
+        runtime.set_field_system_enabled(&maxwell, false).unwrap();
+        runtime.step_once().unwrap();
+        assert!(runtime.latest_snapshot().channels.is_empty());
+        runtime.set_field_system_enabled(&maxwell, true).unwrap();
+        runtime.step_once().unwrap();
+        assert_eq!(runtime.latest_snapshot().identity.tick, 3);
 
         let before = runtime.clock_snapshot().time_step();
         let rejected = TimeStep::from_seconds(courant_limit(&domain) * 1.01).unwrap();
@@ -217,6 +233,164 @@ mod tests {
                 .freshness_against(runtime.world_snapshot().revision()),
             fieldcad_core::SnapshotFreshness::Current
         );
+    }
+
+    #[test]
+    fn inactive_field_system_stops_simulating_but_retains_its_object_schema() {
+        let plugin = electrostatics_plugin_id();
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x51))
+                .with_plugin_registration(
+                    PluginRegistration::with_default_configuration(Box::new(
+                        ElectrostaticsPlugin::new(),
+                    ))
+                    .with_enabled(false),
+                ),
+        )
+        .unwrap();
+
+        assert!(
+            runtime
+                .world_snapshot()
+                .component_schemas()
+                .contains_key(&charge_component_id())
+        );
+        assert!(!runtime.field_systems()[0].enabled);
+        assert!(runtime.latest_snapshot().plugins.is_empty());
+        assert!(runtime.latest_snapshot().channels.is_empty());
+
+        // A charged object can still carry the plugin-contributed property while
+        // the solver is inactive. This object deliberately has no shape, which
+        // the electrostatics solver itself cannot represent.
+        let report = runtime
+            .commit_world_commands(vec![WorldCommand::CreateObject(
+                ObjectSpec::new("unfinished charged object")
+                    .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+            )])
+            .unwrap();
+        let object = report.created_objects[0];
+        assert!(
+            runtime.world_snapshot().object(object).unwrap().components[&charge_component_id()]
+                .scalar(&charge_property_id())
+                .is_some()
+        );
+
+        // Reactivation validates the scene before changing authoritative state.
+        assert!(matches!(
+            runtime.set_field_system_enabled(&plugin, true),
+            Err(RuntimeError::Plugin(_))
+        ));
+        assert!(!runtime.field_systems()[0].enabled);
+
+        runtime
+            .commit_world_commands(vec![WorldCommand::SetShape {
+                object,
+                shape: Some(ObjectShape::point(0.1).unwrap()),
+            }])
+            .unwrap();
+        runtime.set_field_system_enabled(&plugin, true).unwrap();
+
+        assert!(runtime.field_systems()[0].enabled);
+        assert_eq!(
+            runtime.latest_snapshot().plugins[0].id,
+            electrostatics_plugin_id()
+        );
+    }
+
+    #[test]
+    fn electrostatic_and_maxwell_plugins_compose_one_shared_charge_schema() {
+        let domain = Domain::new(
+            DomainBounds::centred_cube(2.0).unwrap(),
+            Resolution::uniform(8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.8).unwrap();
+
+        let runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain, step, SessionId::from_u128(0x52))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new()))
+                .with_plugin(Box::new(ElectromagnetismPlugin::new())),
+        )
+        .unwrap();
+
+        assert_eq!(runtime.field_systems().len(), 2);
+        assert_eq!(runtime.world_snapshot().component_schemas().len(), 2);
+        assert!(
+            runtime
+                .world_snapshot()
+                .component_schemas()
+                .contains_key(&charge_component_id())
+        );
+        assert!(
+            runtime
+                .world_snapshot()
+                .component_schemas()
+                .contains_key(&particle_component_id())
+        );
+    }
+
+    #[test]
+    fn maxwell_alone_registers_and_consumes_the_shared_charge_schema() {
+        let domain = Domain::new(
+            DomainBounds::centred_cube(2.0).unwrap(),
+            Resolution::uniform(8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.8).unwrap();
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain, step, SessionId::from_u128(0x53))
+                .with_plugin(Box::new(ElectromagnetismPlugin::new())),
+        )
+        .unwrap();
+
+        runtime
+            .commit_world_commands(vec![
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("charge")
+                        .with_shape(ObjectShape::point(0.1).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                ),
+                WorldCommand::CreateProbe(ProbeSpec::at(
+                    "Maxwell E",
+                    DVec3::X,
+                    vec![maxwell_e_channel_id()],
+                )),
+            ])
+            .unwrap();
+
+        let probe = *runtime.world_snapshot().probes().keys().next().unwrap();
+        let electric = runtime
+            .latest_snapshot()
+            .probe_sample(&maxwell_e_channel_id(), probe)
+            .unwrap();
+        assert!(electric.value.magnitude() > 0.0);
+    }
+
+    #[test]
+    fn field_system_activation_is_a_transport_command() {
+        let plugin = fieldcad_test_field::plugin_id();
+        let mut source = LocalDataSource::new(runtime());
+
+        source
+            .execute(command(CommandPayload::SetFieldSystemEnabled {
+                plugin: plugin.clone(),
+                enabled: false,
+            }))
+            .unwrap();
+
+        assert_eq!(source.field_systems()[0].plugin.id, plugin);
+        assert!(!source.field_systems()[0].enabled);
+        assert_eq!(
+            source.field_systems()[0]
+                .configuration_schema
+                .properties
+                .len(),
+            1
+        );
+        assert_eq!(source.field_systems()[0].configuration.len(), 1);
+        assert!(source.latest_snapshot().unwrap().channels.is_empty());
     }
 
     #[test]

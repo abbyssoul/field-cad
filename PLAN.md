@@ -2,6 +2,13 @@
 
 Status: **accepted; implementation underway**
 
+Project objective: build a high-performance physics research and modelling
+environment capable of reproducible field, atomic-arrangement,
+subatomic-particle, and particle-physics experiments. Named particles are
+catalog templates that instantiate generic mass/charge objects; the active
+field equations determine their behaviour. The current electrostatic and
+Maxwell milestones establish that intended modelling foundation.
+
 Progress as of 2026-08-03:
 
 - Milestone 0 is accepted. Its decisions are now recorded as ADRs in
@@ -46,11 +53,47 @@ Progress as of 2026-08-03:
   layers for every published vector channel. A probe can choose its recorded
   channels and pin a persistent floating, multi-channel recorder plot while the
   user manipulates the scene.
-- Milestone 5's CPU reference slice is implemented. The new electromagnetism
-  plugin advances `E` and `B` on a periodic `f64` Yee lattice, validates the
-  Courant limit before accepting `dt`, and publishes energy density plus `div E`
-  and `div B` residuals. Wave-speed convergence is covered headlessly. The GPU
-  solver and desktop Maxwell scenario remain.
+- Scene-level field-system composition is implemented through the same local or
+  remote-ready command boundary. The Inspector lists each plugin's available
+  channels and can activate the coupled system as a unit; inactive solvers stop
+  all compute while their object schemas and authored properties remain.
+- Milestone 5 is implemented. The CPU `f64` oracle and host-injected `wgpu f32`
+  backend advance `E` and `B` on periodic Yee lattices, validate the Courant
+  limit before accepting `dt`, and publish energy density plus `div E` and
+  `div B` residuals. CPU/GPU parity and wave-speed convergence are covered
+  headlessly. The desktop composes electrostatics and Maxwell; its XY default
+  plane shows a charge-constrained Maxwell E field matching electrostatics,
+  while the prescribed wave remains an explicit validation configuration.
+- A code review of Milestone 5 was held and its findings applied. The dynamic
+  solver, wave convergence, Courant enforcement, and CPU/GPU parity all held up.
+  The static-charge initial condition did not: it differenced a non-periodic
+  Coulomb potential across the lattice wrap and published the resulting
+  fabricated outer layer as an ordinary field value — 281% error in the shipped
+  default scene, and up to 30% of the reported energy. The existing test could
+  not see it because it centred the charge, where symmetry makes the wrap
+  accidentally correct. The seam is now reported as undefined, excluded from
+  conservation diagnostics, and covered by an off-centre regression test. The
+  review also removed the duplicated CPU/GPU solver scaffolding and stopped
+  rebuilding the constrained field for edits that cannot change it. See the
+  [review findings](docs/reviews/2026-08-03-milestone-5-review.md) and the
+  [remediation report](docs/reviews/2026-08-03-milestone-5-remediation-report.md).
+- Milestone 6 architecture preparation is complete. Charge is now defined by a
+  shared electromagnetic-source Module rather than by the electrostatics
+  Implementation; electrostatics and Maxwell compose the same schema without
+  depending on one another. Solver ticks now have a narrow kinematic-outcome
+  Interface: motion ownership is checked before stepping and the runtime alone
+  validates, revisions, and publishes returned object transforms/velocities.
+  See ADRs 0017 and 0018 and the
+  [readiness assessment](docs/reviews/2026-08-03-milestone-6-readiness-assessment.md).
+- Milestone 6 is implemented. One generic particle schema and a NIST CODATA
+  catalog feed fixed, prescribed, or dynamically integrated objects to Maxwell.
+  Periodic CIC charge, six-path continuity-preserving current deposition,
+  Gauss-consistent Poisson initialization, Yee interpolation, and a relativistic
+  Boris pusher are shared by CPU and host-owned GPU field backends. Runtime
+  interventions and solver motion are distinguished in conservation
+  diagnostics. ADRs 0019 and 0020 record the model and numerical choices; the
+  [implementation report](docs/reviews/2026-08-03-milestone-6-implementation-report.md)
+  records the evidence and remaining review items.
 
 The plan deliberately built a thin end-to-end product before the time-domain
 Maxwell solver. Each milestone ends in something observable and testable, and
@@ -65,7 +108,10 @@ apps/
   fieldcad-desktop/      native visualizer and composition root      [present]
   fieldcad-compute/      later headless dedicated compute service    [planned]
 crates/
+  fieldcad-bench/        headless compute performance harness        [present]
   fieldcad-core/         world, domain, sampling, units, time        [present]
+  fieldcad-electromagnetic-sources/ shared charge schema/sources     [present]
+  fieldcad-particles/     generic particle schema/catalog           [present]
   fieldcad-plugin-api/   equation-system contract and schemas        [present]
   fieldcad-simulation/   runtime and data-source boundary            [present]
   fieldcad-render/       wgpu renderer and visualization layers      [planned]
@@ -147,6 +193,9 @@ Create the non-rendering foundation:
 - immutable, revisioned field snapshots of columnar batches with per-sample
   validity;
 - a field data source interface with two implementations, local and loopback;
+- scene-level field-system composition exposed through that data-source
+  boundary: available channels remain discoverable while inactive systems stop
+  simulation without unregistering their object properties;
 - Rust plugin traits with configuration validation, world validation, and
   diagnostics; and
 - a tiny test plugin that exposes a known scalar/vector function.
@@ -267,8 +316,7 @@ Exit criteria:
 
 ## Milestone 5 — coupled Maxwell solver and magnetic visualization
 
-Implementation status: **CPU reference slice complete; GPU port and desktop
-scenario pending.**
+Implementation status: **complete; performance review gate pending.**
 
 Add an electromagnetism plugin rather than extending electrostatics in place:
 
@@ -279,13 +327,15 @@ Add an electromagnetism plugin rather than extending electrostatics in place:
    plugin's validate-before-adopt time-step hook;
 4. **Done for the reference slice:** periodic boundaries and a prescribed
    travelling plane-wave initial condition;
-5. **Next:** port field updates to `wgpu` compute with ping-pong or equivalent
-   buffers and asynchronous completion/cancellation;
+   the desktop default instead builds a curl-free E constraint from stationary
+   authored charges with B=0, whose outermost lattice layer is undefined
+   because a Coulomb potential is not periodic;
+5. **Done:** port field updates to host-owned `wgpu` compute buffers with
+   asynchronous submission/readback and cooperative shutdown cancellation;
 6. **Done:** publish electric, magnetic, energy-density, and both divergence
    residual channels; and
-7. **Infrastructure complete:** planes, glyphs, colours, and probe recorders can
-   show both vector fields as independent layers once the desktop composes the
-   Maxwell scenario.
+7. **Done:** the desktop composes the Maxwell scenario; planes, glyphs, colours,
+   and probe recorders show E and B as independent layers.
 
 Absorbing boundaries should follow the basic solver; perfectly matched layers
 are valuable but should not obscure validation of the interior update scheme.
@@ -298,15 +348,27 @@ Exit criteria:
 - divergence and energy diagnostics are visible and covered by regression tests;
 - CPU and GPU solvers agree on a small deterministic grid within tolerance; and
 - electric and magnetic channels can be inspected together on independent
-  visualization layers.
+  visualization layers; and
+- a stationary authored charge produces the electrostatic field direction and
+  magnitude within grid tolerance and remains stationary across Maxwell steps.
 
 Review gate: profile representative grids and choose performance budgets from
 measurements on named hardware rather than from speculative cell counts.
 
 ## Milestone 6 — moving charged objects and field coupling
 
+Implementation status: **complete.** The shared charge-source Module retains
+object identity, position, velocity, charge, and distribution. The solver-step
+Interface publishes canonical object kinematics through the authoritative
+runtime with pre-step motion-ownership conflict checks. ADRs 0017–0020 record
+the ownership, particle-model, and numerical coupling decisions.
+
 Support physical feedback between objects and fields:
 
+- define one generic particle object with mass, charge, transform, velocity, and
+  motion mode;
+- provide initial electron, proton, positron, and neutron templates that fill
+  mass/charge values without introducing template-specific solver behaviour;
 - distinguish fixed, prescribed-motion, and dynamically integrated objects;
 - deposit charge and current onto the grid using a charge-conserving scheme;
 - interpolate fields back to particles;
@@ -318,10 +380,25 @@ This is a particle-in-cell feature, not merely `position += velocity * dt`.
 Manual object edits during a run create a discontinuity; they must be logged as
 external interventions and may require solver reinitialization.
 
+The reference implementation uses periodic CIC charge deposition and averages
+six exact-continuity axis paths for current. It subtracts and diagnoses the
+uniform background required by net charge in a periodic Poisson solve,
+interpolates reconstructed Yee fields, and advances dynamic velocity with a
+relativistic Boris pusher. Domain exits wrap periodically and particles pass
+through one another; collisions are not part of this increment. The host-owned
+GPU backend advances E/B and current on GPU while using one full-state readback
+per tick for the shared CPU `f64` particle oracle. Diagnostics name that
+reference-path cost; eliminating it is a performance follow-up, not a hidden
+claim of fully resident GPU particle coupling.
+
 Exit criteria:
 
 - charge conservation and deposition have focused numerical tests;
+- every initial catalog template creates the same inspectable generic particle
+  representation with versioned source values;
 - known single-particle trajectories behave within documented error bounds;
+- a two-particle proton/electron baseline runs reproducibly and reports its
+  stability or decay without asserting that Maxwell must produce a stable atom;
 - pause/edit/resume has explicit and tested reinitialization semantics; and
 - diagnostics distinguish numerical drift from user-injected changes.
 
@@ -403,6 +480,64 @@ Review gate: choose and commit to the production transport only after the payloa
 and latency measurements above. The snapshot and command semantics must not
 depend on that choice.
 
+## Milestone 10 — reproducible research experiments
+
+Turn an interactive scene into a durable, inspectable research experiment:
+
+- define a versioned experiment specification containing the world, active
+  models and versions, parameters, initial/boundary conditions, run controls,
+  random seeds, interventions, and requested observations;
+- support checkpoint/restart and headless batch execution;
+- add parameter sweeps and statistical ensembles without coupling them to the
+  viewport lifecycle;
+- export quantitative observations, diagnostics, and provenance in documented
+  machine-readable forms;
+- generalize the current field-only result stream to typed trajectories,
+  probe and energy histories, integrated quantities, and statistical
+  distributions with the same identity and backpressure semantics; and
+- record convergence studies, uncertainty estimates, and comparisons with
+  accepted reference data as first-class run outputs.
+
+Exit criteria:
+
+- another machine can reproduce a deterministic experiment from its saved
+  specification or report exactly why it cannot;
+- batch and interactive execution use the same model configuration and result
+  identity;
+- a published result retains solver, hardware/execution, precision, parameter,
+  and intervention provenance; and
+- parameter sweeps and ensembles can run on dedicated compute without streaming
+  every intermediate field to the desktop.
+
+## Milestone 11 — atomic-arrangement and particle experiment suite
+
+Build research comparisons on the generic particle/catalog foundation while
+keeping behaviour entirely attributable to active field models:
+
+- expand the versioned template catalog and retain template identity only as
+  provenance and UI metadata;
+- publish reproducible experiment presets, beginning with a proton/electron
+  Hydrogen-under-Maxwell arrangement across selected initial velocities;
+- record particle trajectories together with E/B fields, probe histories,
+  radiation/energy measures, and conservation diagnostics; and
+- compare explicit changes to equations, coupling, regularization, boundaries,
+  resolution, and integration to determine why an arrangement is stable or
+  unstable under each model.
+
+Exit criteria:
+
+- a proton/electron experiment runs reproducibly through Maxwell particle
+  coupling and reports its observed orbit, radiation, energy transfer, and any
+  collapse or decay without hidden stabilization;
+- any modification that changes stability is named in experiment provenance and
+  can be enabled, disabled, and compared against the baseline; and
+- workloads execute through the same local/dedicated data-source architecture
+  with visualization subscriptions independent of solver scale.
+
+Review gate: specify the first proton/electron experiment's initial conditions,
+measured observables, acceptable numerical error, and comparison protocol before
+choosing or tuning any stabilizing model change.
+
 ## Cross-cutting engineering work
 
 ### Verification
@@ -413,12 +548,21 @@ depend on that choice.
 - Add convergence tests; a visually plausible image is not a correctness test.
 - Separate tolerances for `f32` GPU results and `f64` reference calculations.
 - Capture deterministic world/solver fixtures for regression testing.
+- Treat reproducible experiment definitions, convergence evidence, uncertainty,
+  and comparisons with external reference results as research deliverables, not
+  optional documentation.
 
 ### Observability and performance
 
 - Instrument simulation ticks, GPU dispatches, snapshot publication, render
   passes, probe readback, command latency, snapshot assembly, and data-source
   latency from the first vertical slice.
+- Define representative research benchmarks on named hardware and record
+  throughput, memory use, numerical precision, CPU/GPU transfer cost, and
+  strong/weak scaling where a backend supports parallel execution.
+- Keep authoritative solver state on the compute resource and avoid mandatory
+  full-state readback; interactive subscriptions and research observations
+  should transfer only what their consumers request.
 - Display domain resolution, memory estimate, solver `dt`, tick rate, and stale
   snapshot age in a diagnostics panel.
 - Degrade visualization density before changing solver resolution.
@@ -440,11 +584,11 @@ the default if no contrary requirement emerges during review.
 
 | Question | Recommended starting answer |
 | --- | --- |
-| Primary audience and accuracy | Educational/engineering exploration with transparent numerical error; not a certified research solver. |
+| Primary audience and accuracy | Physics research and advanced modelling, with explicit validity regimes, reproducible provenance, convergence evidence, and transparent numerical error. Early solvers remain exploratory until individually validated. |
 | Initial platforms | Linux, Windows, and macOS desktop, with Linux as the first development target. |
 | Runtime third-party plugins | Defer; use first-party Cargo crates until electrostatics and electromagnetism stabilize the contract. |
 | First electric model | Analytic electrostatics with point/sphere charges. |
-| First Maxwell sources | Prescribed current/field sources; defer freely moving charged particles to the PIC milestone. |
+| First Maxwell sources | Constrained stationary charges plus a prescribed-wave validation mode; defer moving-charge current deposition to the coupling milestone. |
 | Internal units | SI, with display-unit conversion in the UI. |
 | Whole-field 3D view | Sparse vector glyphs and seeded streamlines; do not attempt one glyph per solver cell. |
 | Initial numerical domain | User-visible finite box with uniform resolution and explicit boundary conditions. |
@@ -455,18 +599,41 @@ the default if no contrary requirement emerges during review.
 
 ## Next implementation increment
 
-Port the tested Maxwell update to host-owned `wgpu` buffers. Use ping-pong or an
-equivalent hazard-free layout, publish through the existing background source,
-and add cancellation/supersession so rapid edits do not force every obsolete
-grid through readback. Compare a small deterministic grid against the CPU `f64`
-reference with an explicit `f32` tolerance.
+Close Milestone 5's performance review gate on named hardware. Profile GPU step
+submission, full-grid readback, snapshot publication, scene extraction, and
+render time separately over representative grid and visualization densities.
+Use those measurements to establish desktop budgets and decide when the current
+single 32³ readback should give way to GPU-side sparse sampling or chunked
+publication. Preserve the CPU/GPU parity fixture while optimizing.
 
-Then add a desktop Maxwell scenario with user-visible periodic domain,
-resolution, prescribed-wave settings, and a stable default `dt`. Compose its
-published `E` and `B` into the already generic independent layer controls and
-record both on the default probe/floating plot. This should be a scenario or
-equation-system choice rather than silently mixing the current open-boundary
-electrostatic `f32` setup with the periodic `f64` reference domain.
+The headless half of that measurement now exists: `crates/fieldcad-bench` sweeps
+named scenes, reports cost per cell/source/sample, and fits the observed growth
+against each operation's declared complexity. First observations on named
+hardware are recorded in
+[docs/perf](docs/perf/2026-08-03-first-compute-observations.md); the largest
+finding is that a default-scene tick spends 26% of its time advancing fields and
+76% publishing and diagnosing them. Two gaps remain for the gate itself: GPU
+backends are not reachable from the harness because `GpuMaxwellBackend` is
+crate-private to the desktop, and scene extraction and render time are
+deliberately unmeasured because visualization is not the current target.
+
+After that gate, begin Milestone 6 on the prepared Interfaces in this order:
+
+1. add generic particle mass/charge properties, initial catalog templates, and
+   explicit fixed, prescribed, and dynamically integrated motion modes; assign
+   kinematic authority only for dynamic objects;
+2. specify and test a charge-conserving charge/current deposition scheme,
+   including discrete continuity and stationary-source compatibility;
+3. interpolate Yee fields back to charged objects and validate a Lorentz-force
+   pusher against known single-particle trajectories;
+4. connect accepted transform/velocity outcomes to the runtime and define
+   domain-exit, authored-edit, and pause/resume reinitialization semantics; and
+5. publish total charge, particle/field energy, and intervention-aware drift
+   diagnostics before exposing the new mode as a desktop default.
+
+This extends the current instantaneous stationary-charge constraint into causal
+moving-source electromagnetism rather than replacing the prescribed-wave
+validation case.
 
 The manual acceptance pass should now include the floating recorder while moving
 a charge/probe, simultaneous layer legibility, sampling-budget rejection, and

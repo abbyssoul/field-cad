@@ -1,5 +1,6 @@
 mod app;
 pub mod camera;
+mod electromagnetism_gpu;
 mod electrostatics_gpu;
 pub mod gpu;
 mod renderer;

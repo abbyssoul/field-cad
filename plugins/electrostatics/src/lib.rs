@@ -7,10 +7,14 @@
 use std::sync::{Arc, Mutex};
 
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, ComponentTypeId, DiagnosticSeverity, Dimension,
-    Domain, FieldColumn, FieldValueKind, ObjectShape, PluginId, PluginVersion, Precision,
-    PropertyBag, PropertyId, PropertyKind, PropertySchema, PropertyValue, Quantity, QuantityError,
-    SampleGeometry, SampleValidity, SolverDiagnostic, UndefinedReason, WorldObject, WorldSnapshot,
+    ChannelId, ChannelSchema, ComponentSchema, DiagnosticSeverity, Dimension, Domain, FieldColumn,
+    FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry, SampleValidity,
+    SolverDiagnostic, UndefinedReason, WorldSnapshot,
+};
+use fieldcad_electromagnetic_sources::charge_component_schema;
+pub use fieldcad_electromagnetic_sources::{
+    ChargeDistribution, ChargeSource, charge_component_id, charge_properties, charge_property_id,
+    collect_charge_sources as collect_sources,
 };
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginError, PluginMetadata,
@@ -18,9 +22,10 @@ use fieldcad_plugin_api::{
 };
 use glam::DVec3;
 
+#[cfg(test)]
+use fieldcad_core::PropertyBag;
+
 pub const PLUGIN_ID: &str = "fieldcad.electrostatics";
-pub const CHARGE_COMPONENT: &str = "charge-source";
-pub const CHARGE_PROPERTY: &str = "charge";
 pub const ELECTRIC_FIELD_CHANNEL: &str = "electric-field";
 pub const ELECTRIC_POTENTIAL_CHANNEL: &str = "electric-potential";
 
@@ -34,45 +39,12 @@ pub fn plugin_id() -> PluginId {
     PluginId::new(PLUGIN_ID).expect("static plugin ID is valid")
 }
 
-pub fn charge_component_id() -> ComponentTypeId {
-    ComponentTypeId::new(plugin_id(), CHARGE_COMPONENT).expect("static component ID is valid")
-}
-
-pub fn charge_property_id() -> PropertyId {
-    PropertyId::new(CHARGE_PROPERTY).expect("static property ID is valid")
-}
-
 pub fn electric_field_channel_id() -> ChannelId {
     ChannelId::new(plugin_id(), ELECTRIC_FIELD_CHANNEL).expect("static channel ID is valid")
 }
 
 pub fn electric_potential_channel_id() -> ChannelId {
     ChannelId::new(plugin_id(), ELECTRIC_POTENTIAL_CHANNEL).expect("static channel ID is valid")
-}
-
-pub fn charge_properties(coulombs: f64) -> Result<PropertyBag, QuantityError> {
-    Ok([(
-        charge_property_id(),
-        PropertyValue::Scalar(Quantity::new(coulombs, Dimension::CHARGE)?),
-    )]
-    .into_iter()
-    .collect())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ChargeDistribution {
-    /// An ideal point source. Values at or inside `exclusion_radius` are
-    /// deliberately undefined rather than clamped.
-    Point { exclusion_radius: f64 },
-    /// A solid sphere with uniform volume charge density.
-    UniformSphere { radius: f64 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ChargeSource {
-    pub position: DVec3,
-    pub charge_coulombs: f64,
-    pub distribution: ChargeDistribution,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -251,16 +223,7 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
     }
 
     fn component_schemas(&self) -> Vec<ComponentSchema> {
-        vec![ComponentSchema {
-            id: charge_component_id(),
-            display_name: "Charge source".to_owned(),
-            properties: vec![PropertySchema {
-                id: charge_property_id(),
-                display_name: "Charge".to_owned(),
-                kind: PropertyKind::Scalar(Dimension::CHARGE),
-                required: true,
-            }],
-        }]
+        vec![charge_component_schema()]
     }
 
     fn create_solver(
@@ -279,7 +242,8 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
         }
         Ok(Box::new(ElectrostaticsSolver {
             domain: *context.domain,
-            sources: collect_sources(context.world)?,
+            sources: collect_sources(context.world)
+                .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
             world_revision: context.world.revision(),
             evaluator: Arc::clone(&self.evaluator),
             cache: Mutex::new(Vec::new()),
@@ -303,11 +267,14 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     }
 
     fn validate_world(&self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        collect_sources(world).map(|_| ())
+        collect_sources(world)
+            .map(|_| ())
+            .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
     }
 
     fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        self.sources = collect_sources(world)?;
+        self.sources = collect_sources(world)
+            .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?;
         self.world_revision = world.revision();
         self.cache
             .get_mut()
@@ -389,57 +356,13 @@ impl ElectrostaticsSolver {
     }
 }
 
-pub fn collect_sources(world: &WorldSnapshot) -> Result<Vec<ChargeSource>, PluginError> {
-    world
-        .objects_with(&charge_component_id())
-        .map(|(object, properties)| source_from_object(object, properties))
-        .collect()
-}
-
-fn source_from_object(
-    object: &WorldObject,
-    properties: &PropertyBag,
-) -> Result<ChargeSource, PluginError> {
-    let charge_coulombs = properties.scalar(&charge_property_id()).ok_or_else(|| {
-        PluginError::UnsupportedWorld(format!(
-            "object '{}' has a charge component without a scalar charge",
-            object.name
-        ))
-    })?;
-    let distribution = match object.shape {
-        Some(ObjectShape::Point { radius }) => ChargeDistribution::Point {
-            exclusion_radius: radius,
-        },
-        Some(ObjectShape::Sphere { radius }) if radius > 0.0 => {
-            ChargeDistribution::UniformSphere { radius }
-        }
-        Some(ObjectShape::Sphere { .. }) => {
-            return Err(PluginError::UnsupportedWorld(format!(
-                "charged sphere '{}' must have a positive radius",
-                object.name
-            )));
-        }
-        _ => {
-            return Err(PluginError::UnsupportedWorld(format!(
-                "charged object '{}' must use a point or sphere shape",
-                object.name
-            )));
-        }
-    };
-    Ok(ChargeSource {
-        position: object.transform.translation,
-        charge_coulombs,
-        distribution,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use fieldcad_core::{
-        BoundaryConditions, DomainBounds, ObjectSpec, PlaneLattice, Resolution, Transform, World,
-        WorldCommand,
+        BoundaryConditions, DomainBounds, ObjectId, ObjectSpec, PlaneLattice, Resolution,
+        Transform, Velocity, World, WorldCommand,
     };
     use glam::UVec2;
 
@@ -455,7 +378,9 @@ mod tests {
 
     fn point(position: DVec3, charge_coulombs: f64, radius: f64) -> ChargeSource {
         ChargeSource {
+            object: ObjectId::new(0),
             position,
+            velocity: Velocity::default(),
             charge_coulombs,
             distribution: ChargeDistribution::Point {
                 exclusion_radius: radius,
@@ -526,7 +451,9 @@ mod tests {
         let charge = 2.0e-9;
         let radius = 0.5;
         let source = ChargeSource {
+            object: ObjectId::new(0),
             position: DVec3::ZERO,
+            velocity: Velocity::default(),
             charge_coulombs: charge,
             distribution: ChargeDistribution::UniformSphere { radius },
         };
@@ -573,6 +500,12 @@ mod tests {
                 configuration: &PropertyBag::default(),
                 domain: &domain,
                 world: &world.snapshot(),
+                initial_step: fieldcad_core::StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+                },
+                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
             }),
             Err(PluginError::UnsupportedWorld(_))
         ));
@@ -677,6 +610,12 @@ mod tests {
                 configuration: &configuration,
                 domain: &domain,
                 world: &world,
+                initial_step: fieldcad_core::StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+                },
+                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
             })
             .unwrap();
         solver.on_world_changed(&world).unwrap();
@@ -706,6 +645,12 @@ mod tests {
                 configuration: &configuration,
                 domain: &domain,
                 world: &world,
+                initial_step: fieldcad_core::StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+                },
+                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
             }),
             Err(PluginError::InvalidConfiguration(_))
         ));

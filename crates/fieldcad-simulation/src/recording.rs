@@ -10,8 +10,8 @@ use std::time::Duration;
 use fieldcad_core::{SnapshotIdentity, WorldSnapshot};
 
 use crate::{
-    CommandPayload, CommandReceipt, CommandSequencer, FieldDataSource, PlaybackSpeed, PollOutcome,
-    SimulationStatus, SourceError,
+    CommandPayload, CommandReceipt, CommandSequencer, FieldDataSource, FieldSystemStatus,
+    PlaybackSpeed, PollOutcome, SimulationStatus, SourceError,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +91,7 @@ pub struct ReplayObservation {
     pub simulation: SimulationStatus,
     pub playback_speed: PlaybackSpeed,
     pub pending_commands: usize,
+    pub field_systems: Vec<FieldSystemStatus>,
     pub world: WorldSnapshot,
     pub snapshot: Option<SnapshotIdentity>,
 }
@@ -109,6 +110,7 @@ impl ReplayObservation {
             simulation: source.simulation_status(),
             playback_speed: source.playback_speed(),
             pending_commands: source.pending_command_count(),
+            field_systems: source.field_systems(),
             world: source.world(),
             snapshot: source.latest_snapshot().map(|snapshot| snapshot.identity),
         }

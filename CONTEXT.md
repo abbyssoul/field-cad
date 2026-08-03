@@ -13,12 +13,33 @@ The workbench now adds source-owned playback pacing, deterministic running-edit
 boundaries, bounded probe histories with attachment, and record/replay fixtures
 without moving simulation authority into the desktop (ADR 0011).
 
-Milestone 5 has begun with a CPU `f64` vacuum Maxwell reference. It evolves
-staggered `E` and `B` components on a periodic 3D Yee lattice, publishes energy
-density and both divergence residuals, and rejects a `dt` above its Courant
-limit before the clock adopts it (ADR 0013). A prescribed travelling plane wave
-provides the convergence oracle. The GPU port and default desktop Maxwell
-scenario remain to be built.
+Milestone 5 is implemented. A CPU `f64` Maxwell reference and a
+host-injected `wgpu f32` backend evolve staggered `E` and `B` components on a
+periodic 3D Yee lattice, publish energy density and both divergence observables,
+and reject a `dt` above the Courant limit before the clock adopts it (ADRs 0013
+and 0015). A prescribed travelling plane wave remains the convergence oracle.
+The desktop instead initializes a curl-free Yee E field from its stationary
+authored charge and B=0, rebuilding that constraint after source edits (ADR
+0016). A Milestone 5 review then found that this construction differences a
+non-periodic Coulomb potential across the lattice wrap, fabricating the
+outermost layer; that layer is now reported as undefined rather than drawn, and
+excluded from conservation diagnostics. The periodic domain, resolution,
+precision, and initial-condition settings are visible through the source-owned
+scene catalog; independent E/B layers and the default probe consume ordinary
+immutable snapshots just like a later remote visualizer will.
+
+Milestone 6 is implemented. Its preparation removed an accidental dependency
+between equation systems: charge schema and authored-source extraction live in a shared
+electromagnetic-source Module consumed independently by electrostatics and
+Maxwell (ADR 0017). Solver ticks can also declare exclusive kinematic authority
+and return narrow transform/velocity outcomes. The runtime validates and adopts
+those outcomes as the only world writer (ADR 0018). A shared generic-particle
+component and versioned catalog feed mass/charge data to the solver without
+species dispatch (ADR 0019). Maxwell uses periodic CIC charge, six-path
+continuity-preserving current deposition, Gauss-consistent periodic Poisson
+initialization, Yee-field interpolation, and a relativistic Boris pusher (ADR
+0020). The GPU field update shares the CPU `f64` particle oracle for now and
+reports its per-tick E/B readback explicitly as a performance limitation.
 
 A review of Milestones 3 and 4 has been held and its findings applied. The
 visualization model now owns independent layers for every published vector
@@ -40,9 +61,19 @@ Rust API.
 
 ## Purpose
 
-Field CAD is an interactive laboratory for spatial fields. A user constructs a
-world, chooses an equation system, observes its fields in 3D or on arbitrary
-planes, and inspects how values evolve over time.
+Field CAD is a high-performance physics research and modelling environment. A
+user constructs a world and a reproducible experiment, chooses equation
+systems, runs them locally or on dedicated compute, observes fields and
+particles in 3D or on arbitrary planes, and analyses how quantitative values
+evolve over time.
+
+The long-term scientific scope includes atoms, subatomic particles, and
+particle-physics experiments viewed through fields. Electron, proton, positron,
+and neutron names belong to an authoring catalog: each template creates the same
+generic particle object with preset mass and charge. It does not select hidden
+species-specific behaviour. The active equation systems, coupling, boundaries,
+and numerical methods determine the result and must declare the physical regime
+they represent.
 
 The application should serve two modes without creating two architectures:
 
@@ -50,28 +81,36 @@ The application should serve two modes without creating two architectures:
 2. **Simulation:** advance numerical state using a fixed time step and display
    successive field snapshots.
 
-The emphasis is scientific legibility. A result must retain enough provenance to
-say which model, parameters, domain, resolution, time, and solver produced it.
+The emphasis is scientific legibility, reproducibility, and performance. A
+result must retain enough provenance to say which model, parameters, domain,
+resolution, precision, time, solver, and execution configuration produced it,
+and enough diagnostics to judge whether it is valid for the experiment.
 
 ## Ubiquitous language
 
 | Term | Meaning |
 | --- | --- |
 | **World** | The user-authored objects, common transforms and velocities, attached plugin properties, probes, and visualization planes. |
+| **Experiment** | A reproducible specification of a world, active physical models, parameters, initial and boundary conditions, interventions, run controls, and requested observations. |
 | **Object** | An identifiable entity with a transform and optional shape, velocity, and plugin-defined components such as charge or mass. |
+| **Particle template** | A catalog entry, such as electron, proton, positron, or neutron, that creates a generic particle with preset physical properties such as mass and charge. It is an authoring convenience and provenance record, not a separate runtime behaviour. |
 | **Equation system** | A physical model and its coupled equations, such as electrostatics or electromagnetism. |
 | **Equation-system plugin** | A module that declares fields and object properties, validates configuration, and evaluates or advances its equation system. |
+| **Physical-source schema** | A stable object-property schema, such as charge, that may be consumed by several independent equation systems and is not owned by one solver Implementation. |
+| **Field system** | One equation-system plugin composed into a scene, with an authoritative active/inactive state. Its field channels are coupled at this activation boundary. |
 | **Field channel** | One observable scalar or vector output of a plugin, such as electric field `E`, magnetic field `B`, potential, or an error residual. |
+| **Observation** | A versioned experiment output with model and run provenance. Field samples are one kind; particle trajectories, probe/energy histories, integrated quantities, and statistical distributions are others. |
 | **Domain** | The finite 3D region over which a numerical field is represented, including resolution and boundary conditions. |
 | **Field snapshot** | Immutable, versioned solver output for a particular simulation time and world revision. |
 | **Field data source** | A local runtime or remote compute session that accepts commands and publishes field snapshots through the same application-facing contract. |
 | **Subscription** | The channels, spatial region, representation, and level of detail that a visualizer currently asks a data source to publish. Purely a visualization concern: it never changes a computed value. |
 | **Sample geometry** | Where a batch of field values was taken — probe points, a lattice on a slice plane, or a lattice over the domain. Described once per batch rather than stored per sample. |
-| **Sample validity** | Whether a returned value was evaluated exactly, interpolated from stored samples, or is undefined — inside a source radius, outside the domain, or unconverged. |
+| **Sample validity** | Whether a returned value was evaluated exactly, interpolated from stored samples, or is undefined — inside a source radius, outside the domain, unconverged, overflowed, or read across a periodic seam the solver's state does not satisfy. |
 | **Visualization layer** | A view of one field channel using glyphs, colour, contours, streamlines, or another generic rendering technique. |
 | **Slice plane** | A transformable plane on which a field is sampled and drawn. The XY plane is only a default. |
 | **Probe** | A recorder, currently point-shaped and optionally attached to an object, that samples selected channels and stores bounded time-series values. |
 | **Simulation tick** | One deterministic, fixed-duration advance of authoritative simulation state. |
+| **Kinematic authority** | The one active solver permitted to publish the canonical transform and velocity of a particular dynamically integrated object during a tick. |
 | **Frame** | One screen presentation. Frames and simulation ticks are intentionally independent. |
 
 “Plugin” below always means an equation-system plugin. It does not imply that
@@ -114,7 +153,43 @@ Yee grid.
 
 Moving point charges add another level of coupling: object charge and velocity
 must become charge/current density on the grid while respecting charge
-conservation. Prescribed sources come before a particle-in-cell implementation.
+conservation. Before that dynamic coupling, stationary authored charges provide
+a constrained electrostatic initialization: E is a discrete curl-free gradient
+and B is zero, so Maxwell agrees with the electrostatic picture instead of
+inventing a source-free wave. A periodic lattice can only carry a field whose
+potential is periodic, and an isolated charge's is not, so the outermost layer
+is undefined rather than fabricated. The legacy stationary-charge initialization
+remains available for non-particle sources; a moving generic particle switches
+Maxwell to the periodic coupled state.
+
+### Particle templates and field-model experiments
+
+Milestone 6 introduces charged-particle/field feedback. The simulated entity is
+a generic particle carrying ordinary world properties such as mass, charge,
+position, and velocity. Electron, proton, positron, and neutron templates fill
+those values from a versioned catalog; after creation they do not dispatch to
+species-specific solver code. A neutral template simply has zero charge and is
+unaffected by an electromagnetic field unless another enabled field system
+couples to one of its properties.
+
+A proton and electron with selected initial positions and velocities form a
+Hydrogen experiment under the active Maxwell/Lorentz model. The application does
+not promise a stable atom. If the arrangement radiates, loses energy,
+collapses, or otherwise decays, that is an observable result of the stated
+equations, regularization, discretization, boundaries, and time integration.
+
+The research workflow is to reproduce that result, inspect fields, trajectories,
+energy and conservation diagnostics, then compare explicit model or solver
+changes. A stabilizing change must be named and attributable—for example a
+different coupling term, approximation, regularization, boundary treatment, or
+integrator. The solver must never introduce hidden forces merely because the
+catalog template or scene preset is called “electron”, “proton”, or
+“Hydrogen under Maxwell”.
+
+Particle-in-cell macro-particles remain distinct from individually authored
+particles because their mass and charge may represent a distribution rather
+than one physical particle. The active representation must be visible in
+experiment provenance.
 
 ### Units and singularities
 
@@ -178,9 +253,19 @@ Owns stable object identifiers and common authoring state:
 - probes, slice planes, and visualization-layer configuration; and
 - a monotonically increasing revision.
 
-Plugin-specific values are attachments to world objects. The electric plugin can
-add `charge`; a future gravity plugin can add `mass` to the same object. A plugin
-does not privately own the canonical object transform.
+Physical values are attachments to world objects. A shared source Module owns
+the stable `charge` schema consumed by electrostatics and electromagnetism; a
+future gravity Module can add `mass` to the same object. Multiple plugins may
+contribute one identical schema, which the runtime registers once, while
+incompatible definitions with the same identity are rejected before solver
+creation. A plugin does not privately own the canonical object transform.
+
+Field-system activation is scene/session state, distinct from schema
+registration. Inactive systems remain discoverable and their component schemas
+stay registered, so authored charge, mass, and other properties survive. They do
+not validate, step, sample, diagnose, or publish. Re-enabling constructs solver
+state at the current scene time and validates the current world, `dt`, and
+sampling budget before the new composition is adopted.
 
 An edit becomes a command and is committed at a tick boundary. While paused it
 can commit immediately at the current boundary. While running it is queued in
@@ -209,10 +294,22 @@ object integration remains inside the equation system where numerical coupling
 requires it. The core runtime coordinates phases without assuming every theory
 uses the same integrator.
 
+A time-stepped solver may declare exclusive kinematic authority over selected
+objects and return complete transform/velocity outcomes from a tick. The runtime
+checks missing objects and competing claims before any solver advances, then
+validates and adopts all results through the authoritative world-command
+Interface. Plugins never receive mutable world access. A tick that moves an
+object republishes analytic systems as well, because their fields may depend on
+the new pose.
+
 A candidate numerical time step is validated by every active solver before the
 runtime adopts it. This makes a Courant or other method-specific stability error
 part of the rejected command, rather than a failure discovered after the next
 tick has begun.
+
+The runtime exposes the full field-system catalog independently of snapshot
+provenance. Only active systems appear in provenance; otherwise a system that
+correctly publishes nothing could not be re-enabled from a local or remote UI.
 
 ### Local and remote compute boundary
 
@@ -222,6 +319,13 @@ remote mode a client sends commands and subscriptions to a dedicated compute
 service and assembles streamed snapshot chunks. Both modes expose the same world
 revision, simulation time, channels, validity, diagnostics, and connection state
 to the rest of the application.
+
+`FieldDataSource` is the current Interface name because field snapshots are the
+implemented result type. It is not a claim that every research observation is a
+field. Particle experiments must extend or generalize the typed result stream
+for trajectories, probe and energy histories, integrated quantities, and
+statistical distributions while preserving the same authoritative session,
+provenance, subscription, completeness, and backpressure semantics.
 
 When compute is remote, the service is authoritative for the world revision and
 simulation clock. The desktop may stage edits for responsiveness, but it does not
@@ -278,10 +382,25 @@ A plugin will conceptually provide:
 - probe sampling with validity/error information; and
 - diagnostics such as stability limits, residuals, divergence error, and energy.
 
+Future particle-coupled field plugins may additionally declare non-field
+observation schemas. These must be typed and versioned; encoding a trajectory or
+energy history as an invented spatial field merely to reuse the current
+Interface is not acceptable.
+
 The host owns GPU device/queue access and resource budgets. Plugins request
 capabilities and publish opaque, typed field resources; they do not own the
 window or present frames. Generic renderers operate on declared channel layouts,
 while a plugin may later contribute an optional specialized visualization.
+
+The Maxwell plugin exercises this rule with a backend factory: its CPU `f64`
+oracle is the default, while the desktop injects a `wgpu f32` implementation
+using the host's existing device and queue. Yee state stays in storage buffers
+between ticks, but complete results are asynchronously read back and published
+as ordinary snapshot columns. A session cancellation token interrupts pending
+GPU completion during compute-worker shutdown. Renderer code never sees solver
+buffers, and CPU/GPU backends expose identical plugin metadata and channels.
+Both backends accept the same charge-constrained or prescribed-wave initial
+state through that factory.
 
 The first-party contract is expressed as Rust traits and serializable data types.
 It should avoid leaking `egui`, `winit`, or application state into plugin crates.
@@ -400,10 +519,15 @@ compromise the host.
 
 - A rendered value is attributable to a world revision, plugin version,
   simulation time, domain, and numerical configuration.
+- A research result is attributable to a reproducible experiment definition,
+  solver Implementation and version, precision, execution configuration, and
+  recorded interventions.
 - Local and remote data sources publish the same snapshot semantics; no renderer
   depends on direct solver memory.
 - Snapshot chunks from different identities are never combined, and incomplete
   remote data is visibly identified.
+- Non-field observations retain the same authoritative experiment/run identity,
+  completeness, provenance, and unit discipline as field snapshots.
 - Simulation time advances only through accepted fixed ticks.
 - Time-step input is normalized to seconds at the command boundary; the desktop
   accepts scientific notation and explicit SI time-unit suffixes without
@@ -411,6 +535,9 @@ compromise the host.
 - UI and rendering never mutate solver state directly; they submit commands.
 - Candidate worlds, subscriptions, and numerical time steps are validated before
   their authoritative values are replaced.
+- Solver-produced object motion has one declared owner per object and reaches
+  the canonical world only through the runtime's validated kinematic outcome
+  Interface.
 - A field channel has explicit dimensional units and scalar/vector shape.
 - Visualization sampling density does not alter simulation resolution.
 - Presentation subscriptions are bounded by authoritative source budgets, not
@@ -422,7 +549,10 @@ compromise the host.
 
 ## Initial non-goals
 
-- research-grade error guarantees for arbitrary geometries;
+- claiming research-grade validity outside the explicitly tested regime of a
+  solver;
+- claiming that a proton/electron arrangement includes unmodelled effects, or
+  silently adding species-specific forces to make it stable;
 - solid modelling, parametric constraints, or a general-purpose CAD kernel;
 - conductors, dielectrics, and arbitrary material meshes in the first solver;
 - relativistically correct moving particles in the electrostatic milestone;

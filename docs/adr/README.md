@@ -25,3 +25,10 @@ Status values: `accepted`, `superseded by NNNN`, `revisited NNNN`.
 | [0011](0011-queue-running-edits-at-fixed-tick-boundaries.md) | Running edits enter the world immediately before a fixed tick | accepted |
 | [0012](0012-background-local-compute.md) | Local compute does not run on the window thread | accepted |
 | [0013](0013-validate-time-step-before-adoption.md) | Equation systems validate a time step before adoption | accepted |
+| [0014](0014-scene-level-field-system-activation.md) | Field-system activation is scene state, separate from object schemas | accepted |
+| [0015](0015-host-owned-gpu-maxwell-backend.md) | Maxwell uses a host-owned GPU backend and publishes ordinary snapshots | accepted |
+| [0016](0016-static-charges-constrain-the-default-maxwell-field.md) | Stationary charges constrain the default Maxwell field | accepted |
+| [0017](0017-share-physical-source-schemas-across-equation-systems.md) | Physical-source schemas are shared across equation systems | accepted |
+| [0018](0018-solvers-return-narrow-kinematic-outcomes.md) | Solvers return narrow kinematic outcomes through the runtime | accepted |
+| [0019](0019-generic-particle-catalog-is-data.md) | The particle catalog creates one generic representation | accepted |
+| [0020](0020-charge-conserving-periodic-particle-coupling.md) | Moving particles use charge-conserving periodic coupling | accepted |

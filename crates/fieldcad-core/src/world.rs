@@ -189,6 +189,11 @@ impl ObjectSpec {
         self
     }
 
+    pub fn with_velocity(mut self, velocity: Velocity) -> Self {
+        self.velocity = velocity;
+        self
+    }
+
     pub fn with_shape(mut self, shape: ObjectShape) -> Self {
         self.shape = Some(shape);
         self

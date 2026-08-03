@@ -1,8 +1,25 @@
 # Field CAD
 
-Field CAD is a desktop application for constructing, simulating, and exploring
-scientific fields in three dimensions. It combines CAD-style scene interaction
-with equation-driven simulation and field-specific visualization.
+Field CAD is a high-performance physics research and modelling environment for
+constructing, simulating, and exploring fields, particles, and experiments in
+three dimensions. It combines CAD-style scene interaction with equation-driven
+simulation, field-specific visualization, quantitative observation, and local
+or dedicated compute.
+
+The long-term objective includes modelling atoms, subatomic particles, and
+particle-physics experiments from the perspective of fields. Electron, proton,
+positron, and neutron entries are catalog templates: selecting one creates the
+same generic particle object with preset mass and charge values. The template
+does not bring hidden species-specific interactions; the active field equations
+and solver determine how the particle behaves.
+
+For example, a user can place one proton and one electron with chosen initial
+velocities and run a Hydrogen experiment under the Maxwell model. It may
+radiate, lose energy, or collapse instead of remaining stable. That is a
+meaningful research result for the selected model. Field CAD should
+make it practical to ask which explicit changes to equations, coupling,
+regularization, boundaries, or numerical methods alter that behaviour—without
+silently stabilizing the scene.
 
 The first useful electrostatic vertical slice is implemented. The desktop
 application draws the real world model through the field-data-source boundary:
@@ -23,13 +40,34 @@ backend for interactive probe, plane, and grid samples. Local GPU output still
 becomes an ordinary immutable snapshot before visualization, preserving the
 same consumer contract planned for a remote compute machine.
 
-The first Milestone 5 reference solver also exists as a headless plugin. It
-advances coupled electric and magnetic fields on a periodic 3D Yee lattice,
-publishes energy and divergence residuals, rejects unstable Courant time steps,
-and has a grid-convergence test against a prescribed vacuum plane wave. Its
-`wgpu` port and desktop Maxwell scenario are the next implementation increment.
+The Milestone 5 Maxwell solver is available in both CPU `f64` reference and
+host-owned `wgpu f32` forms. It advances coupled electric and magnetic fields on
+a periodic 3D Yee lattice, publishes energy and divergence observables, rejects
+unstable Courant time steps, and is checked by grid-convergence and CPU/GPU
+parity tests. The desktop defaults to a stationary-charge constraint: Maxwell E
+is initialized from the same authored charge as electrostatics, B starts at
+zero, and the original XY plane at the origin shows the resulting radial field.
+The prescribed plane wave remains an explicit validation configuration. The
+scene inspector shows the active periodic domain, precision, resolution, and
+initial-condition settings alongside the system's published channels.
+
+Milestone 6 adds generic particles and physical field feedback. The Scene panel
+can create electron, proton, positron, and neutron catalog templates; the object
+inspector exposes mass, fixed/prescribed/dynamic motion mode, and editable
+velocity. Moving particles deposit charge and current with a discrete
+continuity-preserving CIC scheme, sample reconstructed Yee fields, and use a
+relativistic Boris pusher before returning canonical motion through the runtime.
+Periodic Poisson initialization makes the coupled E field satisfy the lattice
+Gauss operator; diagnostics expose charge, the explicit neutralizing background,
+particle and field energy, continuity residual, and intervention-aware drift.
 
 ## Product direction
+
+The product target is a research workbench in which a user can define a
+reproducible experiment, select validated physical models, run it efficiently
+on a workstation or dedicated compute machine, and inspect both spatial fields
+and quantitative observables. Interactive visualization and high-throughput
+compute are two views of the same authoritative experiment.
 
 The first useful version will let a user:
 
@@ -42,9 +80,18 @@ The first useful version will let a user:
 - play, pause, and advance the simulation by one fixed time step; and
 - edit an object's supported properties while the simulation is running.
 
-The first field model will be electrostatic. The next model will evolve the
-electric and magnetic fields together using Maxwell's equations. A gravitational
-model is a likely later addition.
+The first field model is electrostatic. The second evolves electric and magnetic
+fields together using Maxwell's equations and now couples generic moving
+particles through deposited charge/current and Lorentz-force feedback. A
+gravitational model remains a likely later addition.
+
+Charge authoring is shared infrastructure rather than an electrostatics-owned
+detail: electrostatics and Maxwell consume the same schema/source Module without
+depending on one another. The runtime remains the sole validated world writer:
+the Maxwell solver claims kinematic authority only for prescribed or dynamic
+particles and returns complete transform/velocity outcomes. Solver-produced
+revisions continue the integration; authored physical changes are reported as
+external interventions and reset the coupled conservation reference.
 
 ## Central design idea
 
@@ -52,15 +99,25 @@ The extension unit is an **equation-system plugin**, not an individual rendered
 field. A plugin may expose one or more related field channels, object properties,
 and solvers. For example:
 
-- an electrostatics plugin exposes electric field `E`, electric potential, and
-  charge;
-- an electromagnetism plugin exposes the coupled `E` and `B` fields, charge,
-  current, and its time integrator; and
+- a shared electromagnetic-source Module defines authored charge;
+- an electrostatics plugin exposes electric field `E` and electric potential;
+- an electromagnetism plugin consumes charge and exposes the coupled `E` and
+  `B` fields, current, and its time integrator;
+- a particle catalog creates generic objects from electron, proton, positron,
+  neutron, and other mass/charge templates;
+- future field systems may test alternative couplings, correction terms, or
+  approximations against the same particle arrangement; and
 - a gravity plugin could expose gravitational acceleration, potential, and mass.
 
 The application owns the scene, time controls, input, generic visualization,
 and probes. Plugins own the physical equations and the state needed to solve
 them. This keeps a new physical theory from requiring a new application.
+
+Equation systems are composed per scene. The Inspector lists every available
+system and the scalar/vector field channels it provides. Disabling a system
+stops its solver and removes its channels from new snapshots, while objects keep
+the plugin-contributed properties—such as charge or mass—that were authored on
+them. Coupled channels such as Maxwell `E` and `B` are activated together.
 
 The visualizer also consumes solver results through a **field data source**
 boundary. Initially that source is an in-process simulation runtime. A later
@@ -68,6 +125,11 @@ version will connect the same desktop application to a dedicated compute service
 send authoring and time-control commands to it, and stream back versioned field
 snapshots. Rendering and UI must therefore never rely on direct access to a local
 solver's memory.
+
+The current Interface is named `FieldDataSource` because fields are the first
+vertical slice. The research roadmap must generalize its versioned result stream
+to typed field-and-particle observations—without making trajectories, energy
+histories, or distributions masquerade as field channels.
 
 See [CONTEXT.md](CONTEXT.md) for the domain model and architectural boundaries.
 See [PLAN.md](PLAN.md) for the proposed implementation sequence and review
@@ -112,6 +174,21 @@ level of detail. The compute service remains authoritative for simulation time;
 the visualizer may discard obsolete presentation frames under backpressure, but
 must identify stale or incomplete data instead of presenting it as current.
 
+Research use raises the standard beyond visual plausibility. Each solver must
+state its physical assumptions and validity regime, retain complete provenance,
+provide reference or convergence evidence, and make precision and conservation
+diagnostics inspectable. Early milestones are foundations and are not yet a
+validated atomic or particle-physics package. A familiar template name such as
+“electron” or “Hydrogen under Maxwell” identifies initial values and
+arrangement, not a claim that the active equations include every effect known
+for that system.
+
+“High performance” is likewise a measured requirement, not a branding claim.
+Representative experiments will have named-hardware benchmarks for throughput,
+memory, scaling, and result-transfer cost. Solver state should remain on the
+most suitable CPU, GPU, or dedicated compute resource, with only subscribed
+observations transferred for interaction and analysis.
+
 ## Run the application
 
 With a current Rust toolchain and platform graphics/window dependencies:
@@ -152,9 +229,22 @@ Controls:
   into the plane (the default) or shown in full 3D. A selected probe can attach
   to an object, detach without jumping, edit its local offset, and show bounded
   scalar or x/y/z/magnitude history; and
+- the Inspector's Field systems section lists the fields contributed by each
+  composed equation system, shows its authoritative settings, and enables or
+  disables that system for the scene. Inactive field names and settings remain
+  available for authoring, but are not simulated or published. The Compute
+  section reports domain resolution, precision, and boundary conditions; and
 - under a selected probe, Recorded channels controls which published fields enter
   its bounded history; Open floating plot pins a non-blocking recorder window
   that can display several unit-safe channel plots at once.
+
+The initial desktop scene composes Electrostatics and Electromagnetism.
+Maxwell uses the renderer's existing GPU device through the plugin backend seam;
+its default `dt` is 80% of the Yee Courant limit. Maxwell E is the initial
+visible layer; B is independently available and remains zero for the stationary
+charge. Energy density and both divergence channels are available to the initial
+probe, recorder plots, and Diagnostics window. Moving-charge current deposition
+is still the following physics milestone.
 
 Use `RUST_LOG=fieldcad_desktop=debug` for more application diagnostics.
 
@@ -200,11 +290,14 @@ cargo test -p fieldcad-core -p fieldcad-plugin-api -p fieldcad-simulation \
 │           ├── scene.wgsl    # Grid/axes and instanced object shader
 │           └── ui/           # Panels, compute view, inline/floating plots
 ├── crates/
+│   ├── fieldcad-bench/       # Headless performance workloads and reports
 │   ├── fieldcad-core/        # Units, world, domain, sampling, clock, snapshots
+│   ├── fieldcad-electromagnetic-sources/ # Shared charge schema/source Adapter
+│   ├── fieldcad-particles/   # Generic particles and versioned catalog templates
 │   ├── fieldcad-plugin-api/  # Headless equation-system plugin contract
 │   └── fieldcad-simulation/  # Runtime, data-source boundary, probe history
 └── plugins/
     ├── electrostatics/       # Coulomb CPU oracle and host-injected evaluator
-    ├── electromagnetism/     # Periodic CPU f64 Yee/Maxwell reference
+    ├── electromagnetism/     # Yee/Maxwell fields and particle-coupling oracle
     └── test-field/           # Known analytic scalar/vector contract fixture
 ```

@@ -55,6 +55,16 @@ pub enum UndefinedReason {
     NotConverged,
     /// Arithmetic overflowed the representation's declared precision.
     NumericalOverflow,
+    /// The value would have to be read across a periodic wrap that the
+    /// solver's initial state does not satisfy.
+    ///
+    /// A periodic lattice can only carry a field whose potential is periodic.
+    /// When a solver is constrained by a source whose analytic field is not —
+    /// an isolated charge, for example — the outermost layer of the lattice
+    /// differences two opposite faces of the domain. That is a fabricated
+    /// value, not an approximation, so it is reported as undefined rather than
+    /// drawn as though it were measured.
+    AcrossPeriodicSeam,
 }
 
 /// A regular lattice of samples on a slice plane.

@@ -8,10 +8,15 @@
 //! remote host can expose the same schemas and snapshots over a transport
 //! without loading this Rust object into the visualizer process.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use fieldcad_core::{
-    ChannelSchema, ComponentSchema, Domain, FieldColumn, PluginId, PluginVersion, PropertyBag,
-    PropertySchema, SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic, StepContext,
-    TimeStep, WorldSnapshot, validate_properties,
+    ChannelSchema, ComponentSchema, Domain, FieldColumn, ObjectId, PluginId, PluginVersion,
+    PropertyBag, PropertySchema, SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic,
+    StepContext, TimeStep, Transform, Velocity, WorldSnapshot, validate_properties,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +87,28 @@ pub struct SolverContext<'a> {
     pub domain: &'a Domain,
     /// The world as of the revision the solver is being initialized against.
     pub world: &'a WorldSnapshot,
+    /// The scene time at which this solver becomes active.
+    ///
+    /// A field system can be enabled after other systems have already advanced
+    /// the scene clock. Initializing against this context prevents a fresh
+    /// solver from publishing a time-zero field under a later snapshot time.
+    pub initial_step: StepContext,
+    /// Session-lifetime cooperative cancellation, used by asynchronous GPU
+    /// completion and other work that may be waiting outside Rust code.
+    pub cancellation: SolverCancellation,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SolverCancellation(Arc<AtomicBool>);
+
+impl SolverCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// One channel's values over one geometry, as produced by a solver.
@@ -92,6 +119,29 @@ pub struct SolverContext<'a> {
 pub struct SampledColumn {
     pub values: FieldColumn,
     pub validity: Vec<SampleValidity>,
+}
+
+/// One authoritative object pose and velocity produced by a solver tick.
+///
+/// This deliberately exposes only kinematics rather than arbitrary world
+/// commands. The runtime remains the sole writer of the world, validates the
+/// complete result atomically, and can reject two equation systems attempting
+/// to advance the same object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectKinematicsUpdate {
+    pub object: ObjectId,
+    pub transform: Transform,
+    pub velocity: Velocity,
+}
+
+/// Observable world changes produced while advancing one equation system.
+///
+/// Most equation systems only evolve private field state and return the empty
+/// outcome. Particle-coupled systems use this Interface to publish motion
+/// without receiving mutable access to the world.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SolverStepOutcome {
+    pub object_kinematics: Vec<ObjectKinematicsUpdate>,
 }
 
 impl SampledColumn {
@@ -178,11 +228,20 @@ pub trait EquationSystemSolver: Send {
     /// Adopt a world that `validate_world` has already accepted.
     fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError>;
 
+    /// Objects whose canonical pose and velocity this solver may advance.
+    ///
+    /// The runtime checks ownership conflicts and object existence before any
+    /// solver mutates its tick state. A solver may return fewer updates from a
+    /// particular tick, but it may not update an object it did not declare.
+    fn kinematic_objects(&self) -> &[ObjectId] {
+        &[]
+    }
+
     /// Advance internal state by one fixed step. Analytic solvers need not
     /// implement this.
-    fn step(&mut self, context: StepContext) -> Result<(), PluginError> {
+    fn step(&mut self, context: StepContext) -> Result<SolverStepOutcome, PluginError> {
         let _ = context;
-        Ok(())
+        Ok(SolverStepOutcome::default())
     }
 
     /// Evaluate one channel over a batch of positions.
@@ -257,5 +316,15 @@ mod tests {
     fn analytic_is_the_default_solver_kind() {
         assert!(!SolverKind::default().advances_with_time());
         assert!(SolverKind::TimeStepped.advances_with_time());
+    }
+
+    #[test]
+    fn solver_cancellation_is_shared_across_the_session() {
+        let worker = SolverCancellation::default();
+        let controller = worker.clone();
+
+        assert!(!worker.is_cancelled());
+        controller.cancel();
+        assert!(worker.is_cancelled());
     }
 }

@@ -13,7 +13,7 @@ use fieldcad_core::{
 };
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
-    PluginError, PluginMetadata, SampledColumn, SolverContext, SolverKind,
+    PluginError, PluginMetadata, SampledColumn, SolverContext, SolverKind, SolverStepOutcome,
 };
 
 pub const PLUGIN_ID: &str = "fieldcad.test-field";
@@ -113,7 +113,7 @@ impl EquationSystemPlugin for TestFieldPlugin {
         Ok(Box::new(TestFieldSolver {
             gain,
             domain: *context.domain,
-            time_seconds: 0.0,
+            time_seconds: context.initial_step.time_seconds,
             world_revision: context.world.revision(),
         }))
     }
@@ -148,9 +148,12 @@ impl EquationSystemSolver for TestFieldSolver {
         Ok(())
     }
 
-    fn step(&mut self, context: fieldcad_core::StepContext) -> Result<(), PluginError> {
+    fn step(
+        &mut self,
+        context: fieldcad_core::StepContext,
+    ) -> Result<SolverStepOutcome, PluginError> {
         self.time_seconds = context.time_seconds;
-        Ok(())
+        Ok(SolverStepOutcome::default())
     }
 
     fn sample(
@@ -197,7 +200,7 @@ impl EquationSystemSolver for TestFieldSolver {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{ProbeId, World};
+    use fieldcad_core::{ProbeId, StepContext, TimeStep, World};
     use glam::DVec3;
 
     use super::*;
@@ -211,6 +214,12 @@ mod tests {
                 configuration: &plugin.default_configuration(),
                 domain: &domain,
                 world: &world.snapshot(),
+                initial_step: StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: TimeStep::from_seconds(0.1).unwrap(),
+                },
+                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
             })
             .unwrap()
     }

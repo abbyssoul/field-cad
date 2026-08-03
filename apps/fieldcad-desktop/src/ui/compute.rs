@@ -4,13 +4,14 @@
 //! Built once per frame so that panels take a plain value. Nothing here depends
 //! on whether compute is local or remote, and nothing here can issue a command.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcad_core::{
-    ChannelId, DiagnosticSeverity, FieldValue, SampleValidity, SimulationMode, SnapshotFreshness,
-    UndefinedReason, WorldRevision, WorldSnapshot,
+    BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, FieldValue,
+    SampleValidity, SimulationMode, SnapshotFreshness, UndefinedReason, WorldRevision,
+    WorldSnapshot,
 };
-use fieldcad_simulation::{DataSourceStatus, FieldDataSource, Subscription};
+use fieldcad_simulation::{DataSourceStatus, FieldDataSource, FieldSystemStatus, Subscription};
 
 /// A per-frame, read-only summary of what the data source is reporting.
 ///
@@ -33,6 +34,8 @@ pub struct ComputeView {
     pub domain_summary: String,
     pub probe_readings: Vec<ProbeRow>,
     pub channel_names: BTreeMap<ChannelId, String>,
+    /// All equation systems composed into the scene, including inactive ones.
+    pub field_systems: Vec<FieldSystemStatus>,
     /// Channels a generic vector layer can draw, in published order.
     pub vector_channels: Vec<ChannelId>,
     /// What the source has acknowledged it is sampling.
@@ -53,25 +56,57 @@ impl ComputeView {
         let mut vector_channels = Vec::new();
         let mut total_samples = 0;
         let mut domain_summary = "No data".to_owned();
+        let field_systems = source.field_systems();
+        let active_plugins: BTreeSet<_> = field_systems
+            .iter()
+            .filter(|system| system.enabled)
+            .map(|system| system.plugin.id.clone())
+            .collect();
+
+        // Available field names outlive publication. This keeps inactive
+        // channels identifiable in probe recorders and the scene inspector.
+        for system in &field_systems {
+            for channel in &system.channels {
+                channel_names.insert(channel.id.clone(), channel.display_name.clone());
+            }
+        }
 
         if let Some(snapshot) = &snapshot {
-            total_samples = snapshot.total_samples();
+            // A remote source can acknowledge composition before the replacement
+            // snapshot arrives. Filter the retained complete snapshot by the
+            // acknowledged system state so a disabled field never remains
+            // visible during that delivery gap.
+            total_samples = snapshot
+                .channels
+                .iter()
+                .filter(|(channel, _)| active_plugins.contains(channel.plugin()))
+                .map(|(_, channel)| {
+                    channel
+                        .batches
+                        .iter()
+                        .map(fieldcad_core::FieldBatch::len)
+                        .sum::<usize>()
+                })
+                .sum();
             vector_channels = snapshot
                 .vector_channels()
+                .filter(|channel| active_plugins.contains(channel.schema.id.plugin()))
                 .map(|channel| channel.schema.id.clone())
                 .collect();
             let cells = snapshot.domain.resolution().cells();
             domain_summary = format!(
-                "{}×{}×{} = {} cells, {}",
+                "{}×{}×{} = {} cells, {}, {}",
                 cells.x,
                 cells.y,
                 cells.z,
                 snapshot.domain.resolution().cell_count(),
                 snapshot.domain.precision().label(),
+                format_boundaries(snapshot.domain.boundaries()),
             );
             diagnostics = snapshot
                 .diagnostics
                 .iter()
+                .filter(|diagnostic| active_plugins.contains(&diagnostic.plugin))
                 .map(|diagnostic| {
                     has_errors |= diagnostic.severity == DiagnosticSeverity::Error;
                     format!("[{:?}] {}", diagnostic.severity, diagnostic.message)
@@ -79,6 +114,9 @@ impl ComputeView {
                 .collect();
 
             for (channel_id, channel) in &snapshot.channels {
+                if !active_plugins.contains(channel_id.plugin()) {
+                    continue;
+                }
                 channel_names.insert(channel_id.clone(), channel.schema.display_name.clone());
                 for probe in world.probes().values() {
                     if !probe.channels.contains(channel_id) {
@@ -115,6 +153,7 @@ impl ComputeView {
             domain_summary,
             probe_readings,
             channel_names,
+            field_systems,
             vector_channels,
             subscription: source.subscription(),
             diagnostics,
@@ -150,6 +189,26 @@ impl ComputeView {
                 SimulationMode::Paused => WorkbenchState::Paused,
             },
         }
+    }
+}
+
+fn format_boundaries(boundaries: BoundaryConditions) -> String {
+    let label = |condition| match condition {
+        BoundaryCondition::Periodic => "periodic",
+        BoundaryCondition::Dirichlet => "Dirichlet",
+        BoundaryCondition::Neumann => "Neumann",
+        BoundaryCondition::Absorbing => "absorbing",
+        BoundaryCondition::Open => "open",
+    };
+    if boundaries.x == boundaries.y && boundaries.y == boundaries.z {
+        format!("{} boundaries", label(boundaries.x))
+    } else {
+        format!(
+            "x {}, y {}, z {} boundaries",
+            label(boundaries.x),
+            label(boundaries.y),
+            label(boundaries.z)
+        )
     }
 }
 
@@ -226,6 +285,9 @@ pub(super) fn validity_note(validity: SampleValidity) -> Option<&'static str> {
         SampleValidity::Undefined(UndefinedReason::NumericalOverflow) => {
             Some("undefined — numerical overflow")
         }
+        SampleValidity::Undefined(UndefinedReason::AcrossPeriodicSeam) => {
+            Some("undefined — across periodic seam")
+        }
     }
 }
 
@@ -264,6 +326,7 @@ pub(super) fn parse_playback_speed(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_test_field::{scalar_channel_id, vector_channel_id};
 
     use super::super::tests::{seeded_world, source};
     use super::*;
@@ -277,8 +340,25 @@ mod tests {
         assert_eq!(view.freshness, Some(SnapshotFreshness::Current));
         assert!(view.domain_summary.contains("512"));
         assert!(view.domain_summary.contains("f64"));
+        assert!(view.domain_summary.contains("open boundaries"));
         assert_eq!(view.probe_readings.len(), 1);
         assert_eq!(view.probe_readings[0].probe_name, "Origin probe");
+    }
+
+    #[test]
+    fn boundary_summary_reports_uniform_and_mixed_domains() {
+        assert_eq!(
+            format_boundaries(BoundaryConditions::uniform(BoundaryCondition::Periodic)),
+            "periodic boundaries"
+        );
+        assert_eq!(
+            format_boundaries(BoundaryConditions {
+                x: BoundaryCondition::Periodic,
+                y: BoundaryCondition::Absorbing,
+                z: BoundaryCondition::Open,
+            }),
+            "x periodic, y absorbing, z open boundaries"
+        );
     }
 
     #[test]
@@ -311,6 +391,31 @@ mod tests {
 
         assert!(!view.accepts_commands());
         assert_eq!(view.status.label(), "Disconnected");
+    }
+
+    #[test]
+    fn inactive_systems_and_their_available_fields_remain_visible_to_the_ui() {
+        let world = seeded_world();
+        let mut source = source();
+        let system = source.field_systems()[0].plugin.id.clone();
+        source
+            .execute(fieldcad_simulation::CommandSequencer::default().issue(
+                fieldcad_simulation::CommandPayload::SetFieldSystemEnabled {
+                    plugin: system,
+                    enabled: false,
+                },
+            ))
+            .unwrap();
+
+        let view = ComputeView::build(&source, &world.snapshot());
+
+        assert_eq!(view.field_systems.len(), 1);
+        assert!(!view.field_systems[0].enabled);
+        assert_eq!(view.field_systems[0].configuration.len(), 1);
+        assert!(view.channel_names.contains_key(&scalar_channel_id()));
+        assert!(view.channel_names.contains_key(&vector_channel_id()));
+        assert!(view.vector_channels.is_empty());
+        assert!(view.probe_readings.is_empty());
     }
 
     #[test]

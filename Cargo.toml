@@ -2,7 +2,10 @@
 resolver = "3"
 members = [
     "apps/fieldcad-desktop",
+    "crates/fieldcad-bench",
     "crates/fieldcad-core",
+    "crates/fieldcad-electromagnetic-sources",
+    "crates/fieldcad-particles",
     "crates/fieldcad-plugin-api",
     "crates/fieldcad-simulation",
     "plugins/electrostatics",
@@ -22,13 +25,17 @@ glam = "0.30"
 naga = { version = "29", features = ["wgsl-in"] }
 pollster = "0.4"
 serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wgpu = "29"
 winit = "0.30.13"
 
+fieldcad-bench = { path = "crates/fieldcad-bench" }
 fieldcad-core = { path = "crates/fieldcad-core" }
+fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
+fieldcad-particles = { path = "crates/fieldcad-particles" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
 fieldcad-simulation = { path = "crates/fieldcad-simulation" }
 fieldcad-electrostatics = { path = "plugins/electrostatics" }

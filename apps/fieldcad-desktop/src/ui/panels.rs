@@ -3,13 +3,16 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    ChannelId, ObjectId, ObjectShape, ObjectSpec, ProbeId, ProbePosition, ProbeSpec,
-    SimulationMode, SlicePlane, SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform,
-    WorldCommand, WorldObject, WorldSnapshot,
+    ChannelId, FieldValueKind, ObjectId, ObjectShape, ObjectSpec, ProbeId, ProbePosition,
+    ProbeSpec, PropertyValue, SimulationMode, SlicePlane, SlicePlaneSpec, SnapshotFreshness,
+    TimeStep, Transform, Velocity, WorldCommand, WorldObject, WorldSnapshot,
 };
-use fieldcad_electrostatics::{
-    charge_component_id, charge_properties, charge_property_id, electric_field_channel_id,
-    electric_potential_channel_id,
+use fieldcad_electromagnetic_sources::{
+    charge_component_id, charge_properties, charge_property_id,
+};
+use fieldcad_particles::{
+    CATALOG_VERSION, MotionMode, ParticleTemplate, mass_property_id, motion_mode_property_id,
+    particle_component_id, particle_properties, template_particle_spec, template_property_id,
 };
 use fieldcad_simulation::{CommandPayload, PlaybackSpeed, ProbeHistory};
 use glam::{DVec2, DVec3};
@@ -161,6 +164,24 @@ pub(super) fn scene_tree(
                         ChargeObjectKind::Point,
                     ));
                 }
+                for (label, template) in [
+                    ("+ e−", ParticleTemplate::Electron),
+                    ("+ p+", ParticleTemplate::Proton),
+                    ("+ e+", ParticleTemplate::Positron),
+                    ("+ n", ParticleTemplate::Neutron),
+                ] {
+                    if ui
+                        .button(label)
+                        .on_hover_text(format!(
+                            "Add a dynamic {} from the {} catalog",
+                            template.label(),
+                            CATALOG_VERSION
+                        ))
+                        .clicked()
+                    {
+                        output.submit(new_particle_command(frame.world, template));
+                    }
+                }
                 if ui
                     .button("−Q")
                     .on_hover_text("Add −1 nC point charge")
@@ -184,10 +205,17 @@ pub(super) fn scene_tree(
                     ));
                 }
                 if ui.button("+ Probe").clicked() {
+                    let channels = frame
+                        .compute
+                        .field_systems
+                        .iter()
+                        .flat_map(|system| &system.channels)
+                        .map(|channel| channel.id.clone())
+                        .collect();
                     output.edit(vec![WorldCommand::CreateProbe(ProbeSpec::at(
                         format!("Probe {}", frame.world.probes().len() + 1),
                         DVec3::new(1.0, 0.0, 0.6),
-                        vec![electric_field_channel_id(), electric_potential_channel_id()],
+                        channels,
                     ))]);
                 }
                 if ui.button("+ Plane").clicked() {
@@ -338,6 +366,9 @@ pub(super) fn inspector(
                 }
 
                 ui.add_space(16.0);
+                field_system_controls(ui, frame.compute, output);
+
+                ui.add_space(16.0);
                 ui.heading("View");
                 ui.horizontal(|ui| {
                     for (label, view) in [
@@ -359,6 +390,129 @@ pub(super) fn inspector(
                 compute_panel(ui, frame.compute);
             });
         });
+}
+
+/// Scene-level equation-system composition. A system is the activation unit,
+/// rather than an individual channel, because channels such as Maxwell E and B
+/// may be coupled by one solver.
+fn field_system_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
+    ui.heading("Field systems");
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Inactive systems do not simulate or publish fields. Their object properties remain available in the scene.",
+            )
+            .small(),
+        )
+        .wrap(),
+    );
+
+    if compute.field_systems.is_empty() {
+        ui.weak("No field systems are available.");
+        return;
+    }
+
+    for system in &compute.field_systems {
+        ui.push_id(&system.plugin.id, |ui| {
+            let mut enabled = system.enabled;
+            let response = ui
+                .add_enabled(
+                    compute.accepts_commands(),
+                    egui::Checkbox::new(&mut enabled, &system.plugin.display_name),
+                )
+                .on_hover_text(format!(
+                    "{}\n{} · version {}",
+                    system.plugin.description, system.plugin.id, system.plugin.version
+                ));
+            if response.changed() && enabled != system.enabled {
+                output.submit(CommandPayload::SetFieldSystemEnabled {
+                    plugin: system.plugin.id.clone(),
+                    enabled,
+                });
+            }
+
+            egui::CollapsingHeader::new("Fields and settings")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for channel in &system.channels {
+                        let kind = match channel.value_kind {
+                            FieldValueKind::Scalar(_) => "scalar",
+                            FieldValueKind::Vector(_) => "vector",
+                        };
+                        ui.add_enabled_ui(system.enabled, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{} · {} · {}",
+                                        channel.display_name,
+                                        kind,
+                                        channel.dimension()
+                                    ))
+                                    .small(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
+
+                    if !system.configuration_schema.properties.is_empty() {
+                        ui.add_space(3.0);
+                        ui.strong("Settings");
+                        for property in &system.configuration_schema.properties {
+                            let value = system
+                                .configuration
+                                .get(&property.id)
+                                .map(format_configuration_value)
+                                .unwrap_or_else(|| "not set".to_owned());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{}: {value}",
+                                        property.display_name
+                                    ))
+                                    .small(),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    }
+                });
+        });
+    }
+}
+
+fn format_configuration_value(value: &PropertyValue) -> String {
+    match value {
+        PropertyValue::Scalar(value) => format!(
+            "{} {}",
+            format_configuration_number(value.si_value()),
+            value.dimension()
+        ),
+        PropertyValue::Vector(value) => {
+            let vector = value.si_value();
+            format!(
+                "({}, {}, {}) {}",
+                format_configuration_number(vector.x),
+                format_configuration_number(vector.y),
+                format_configuration_number(vector.z),
+                value.dimension()
+            )
+        }
+        PropertyValue::Boolean(value) => value.to_string(),
+        PropertyValue::Text(value) | PropertyValue::Choice(value) => value.clone(),
+    }
+}
+
+fn format_configuration_number(value: f64) -> String {
+    if value != 0.0 && !(1.0e-3..1.0e6).contains(&value.abs()) {
+        format!("{value:.6e}")
+    } else {
+        let formatted = format!("{value:.6}");
+        formatted
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    }
 }
 
 fn object_properties(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFrameOutput) {
@@ -419,14 +573,22 @@ fn object_properties(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
             }
             ui.end_row();
 
-            let velocity = object.velocity.linear;
-            if velocity.length_squared() > 0.0 {
-                ui.label("Velocity");
-                ui.monospace(format!(
-                    "{:.3}, {:.3}, {:.3} m s^-1",
-                    velocity.x, velocity.y, velocity.z
-                ));
-                ui.end_row();
+            let mut velocity = object.velocity.linear;
+            let mut velocity_changed = false;
+            ui.label("Velocity");
+            ui.horizontal(|ui| {
+                velocity_changed |= coordinate_editor(ui, "vx", &mut velocity.x, " m/s");
+                velocity_changed |= coordinate_editor(ui, "vy", &mut velocity.y, " m/s");
+                velocity_changed |= coordinate_editor(ui, "vz", &mut velocity.z, " m/s");
+            });
+            ui.end_row();
+            if velocity_changed
+                && let Ok(velocity) = Velocity::new(velocity, object.velocity.angular)
+            {
+                output.edit(vec![WorldCommand::SetVelocity {
+                    object: object.id,
+                    velocity,
+                }]);
             }
         });
 
@@ -461,6 +623,76 @@ fn object_properties(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
                 }
             });
         }
+    }
+
+    if let Some(properties) = object.components.get(&particle_component_id()) {
+        ui.add_space(8.0);
+        ui.label("Generic particle");
+        let Some(mut mass_kg) = properties.scalar(&mass_property_id()) else {
+            ui.colored_label(egui::Color32::RED, "Invalid mass property");
+            return;
+        };
+        let mut motion_mode = properties
+            .get(&motion_mode_property_id())
+            .and_then(choice_property)
+            .and_then(MotionMode::parse)
+            .unwrap_or_default();
+        let template = properties
+            .get(&template_property_id())
+            .and_then(choice_property)
+            .and_then(ParticleTemplate::parse)
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.label("Mass");
+            let mass_drag_speed = (mass_kg.abs() * 0.01).max(f64::MIN_POSITIVE);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut mass_kg)
+                        .speed(mass_drag_speed)
+                        .range(f64::MIN_POSITIVE..=f64::MAX)
+                        .custom_formatter(|value, _| format!("{value:.9e}"))
+                        .custom_parser(|text| text.trim().parse().ok())
+                        .update_while_editing(false)
+                        .suffix(" kg"),
+                )
+                .changed()
+                && let Ok(properties) =
+                    particle_properties(mass_kg, motion_mode, ParticleTemplate::Custom)
+            {
+                output.edit(vec![WorldCommand::AttachComponent {
+                    object: object.id,
+                    component: particle_component_id(),
+                    properties,
+                }]);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Motion");
+            let before = motion_mode;
+            egui::ComboBox::from_id_salt(("particle_motion", object.id))
+                .selected_text(motion_mode.label())
+                .show_ui(ui, |ui| {
+                    for candidate in MotionMode::ALL {
+                        ui.selectable_value(&mut motion_mode, candidate, candidate.label());
+                    }
+                });
+            if motion_mode != before
+                && let Ok(properties) = particle_properties(mass_kg, motion_mode, template)
+            {
+                output.edit(vec![WorldCommand::AttachComponent {
+                    object: object.id,
+                    component: particle_component_id(),
+                    properties,
+                }]);
+            }
+        });
+        ui.small(format!(
+            "Template: {} · {}",
+            template.label(),
+            CATALOG_VERSION
+        ));
     }
 
     if ui.button("Focus selection  [F]").clicked() {
@@ -818,6 +1050,27 @@ fn new_charge_command(
     )])
 }
 
+fn new_particle_command(world: &WorldSnapshot, template: ParticleTemplate) -> CommandPayload {
+    let index = world.objects().len() + 1;
+    let x = (index.saturating_sub(1) as f64) * 0.6;
+    let spec = template_particle_spec(
+        template,
+        MotionMode::Dynamic,
+        DVec3::new(x, 0.0, 0.6),
+        DVec3::ZERO,
+        0.15,
+    )
+    .expect("built-in catalog entries are valid");
+    CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(spec)])
+}
+
+fn choice_property(value: &PropertyValue) -> Option<&str> {
+    match value {
+        PropertyValue::Choice(choice) => Some(choice),
+        _ => None,
+    }
+}
+
 /// Choose which published vector channel the generic layers draw.
 ///
 /// Hidden while only one channel exists, so the electrostatic slice gains no
@@ -1023,6 +1276,49 @@ mod tests {
 
     use super::*;
 
+    fn painted_text(shape: &egui::epaint::Shape, output: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                output.push_str(&text.galley.job.text);
+                output.push('\n');
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    painted_text(shape, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn field_system_details_are_collapsed_by_default_in_the_narrow_inspector() {
+        let world = super::super::tests::seeded_world();
+        let source = super::super::tests::source();
+        let compute = ComputeView::build(&source, &world.snapshot());
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let full_output = context.run_ui(input, |ui| {
+            field_system_controls(ui, &compute, &mut UiFrameOutput::default());
+        });
+        let mut text = String::new();
+        for clipped in &full_output.shapes {
+            painted_text(&clipped.shape, &mut text);
+        }
+
+        assert!(text.contains("Analytic test field"));
+        assert!(
+            !text.contains("Linear scalar"),
+            "expanded channel details overcrowd the inspector: {text}"
+        );
+    }
+
     #[test]
     fn attachment_offset_preserves_probe_world_position_under_object_rotation() {
         let transform = Transform::new(
@@ -1074,6 +1370,34 @@ mod tests {
         assert_eq!(
             sphere.components[&charge_component_id()].scalar(&charge_property_id()),
             Some(1.0e-9)
+        );
+    }
+
+    #[test]
+    fn catalog_authoring_creates_a_dynamic_generic_particle() {
+        let world = World::new().snapshot();
+        let command = new_particle_command(&world, ParticleTemplate::Electron);
+        let CommandPayload::CommitWorld(commands) = command else {
+            panic!("particle authoring must issue a world transaction");
+        };
+        let WorldCommand::CreateObject(spec) = &commands[0] else {
+            panic!("particle transaction must create an object");
+        };
+        let properties = &spec.components[&particle_component_id()];
+
+        assert_eq!(
+            properties.scalar(&mass_property_id()),
+            Some(fieldcad_particles::ELECTRON_MASS_KG)
+        );
+        assert_eq!(
+            properties
+                .get(&motion_mode_property_id())
+                .and_then(choice_property),
+            Some(MotionMode::Dynamic.label())
+        );
+        assert_eq!(
+            spec.components[&charge_component_id()].scalar(&charge_property_id()),
+            Some(-fieldcad_particles::ELEMENTARY_CHARGE_COULOMBS)
         );
     }
 }

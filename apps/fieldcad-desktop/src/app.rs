@@ -4,13 +4,22 @@ use std::{
 };
 
 use fieldcad_core::{
-    BoundaryConditions, Domain, DomainBounds, ObjectShape, ObjectSpec, Precision, ProbePosition,
-    ProbeSpec, Resolution, SessionId, SlicePlaneSpec, TimeStep, Transform, WorldCommand,
-    WorldSnapshot,
+    BoundaryCondition, BoundaryConditions, Domain, DomainBounds, ObjectShape, ObjectSpec,
+    Precision, ProbePosition, ProbeSpec, Resolution, SessionId, SlicePlaneSpec, TimeStep,
+    Transform, WorldCommand, WorldSnapshot,
+};
+use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
+use fieldcad_electromagnetism::{
+    ElectromagnetismPlugin, MaxwellSolverBackend, courant_limit,
+    electric_divergence_channel_id as maxwell_electric_divergence_channel_id,
+    electric_field_channel_id as maxwell_electric_field_channel_id,
+    energy_density_channel_id as maxwell_energy_density_channel_id,
+    magnetic_divergence_channel_id as maxwell_magnetic_divergence_channel_id,
+    magnetic_field_channel_id as maxwell_magnetic_field_channel_id,
 };
 use fieldcad_electrostatics::{
-    ElectrostaticBatchEvaluator, ElectrostaticsPlugin, charge_component_id, charge_properties,
-    electric_field_channel_id, electric_potential_channel_id,
+    ElectrostaticBatchEvaluator, ElectrostaticsPlugin, electric_field_channel_id,
+    electric_potential_channel_id,
 };
 use fieldcad_simulation::{
     AsyncLocalDataSource, CommandEvent, CommandSequencer, FieldDataSource, LocalDataSource,
@@ -28,6 +37,7 @@ use winit::{
 
 use crate::{
     camera::{AxisView, OrbitCamera, Viewport},
+    electromagnetism_gpu::GpuMaxwellBackend,
     electrostatics_gpu::GpuElectrostaticEvaluator,
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
@@ -223,10 +233,15 @@ impl WindowState {
 
         let (compute_device, compute_queue) = renderer.compute_handles();
         let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
-            GpuElectrostaticEvaluator::new(compute_device, compute_queue),
+            GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
         );
-        let data_source = create_local_data_source(evaluator)?;
+        let maxwell: Arc<dyn MaxwellSolverBackend> =
+            Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
+        let data_source = create_local_data_source(evaluator, maxwell)?;
         let world = data_source.world();
+        let mut ui_model = UiModel::new();
+        let maxwell_e = maxwell_electric_field_channel_id();
+        ui_model.field_layers.entry(maxwell_e).or_default().visible = true;
 
         Ok(Self {
             egui_state,
@@ -234,7 +249,7 @@ impl WindowState {
             window,
             egui_context,
             camera: OrbitCamera::default(),
-            ui_model: UiModel::new(),
+            ui_model,
             viewport: Viewport::default(),
             data_source: Box::new(data_source),
             world,
@@ -913,25 +928,25 @@ struct PlaneFrame {
 
 fn create_local_data_source(
     evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
+    maxwell: Arc<dyn MaxwellSolverBackend>,
 ) -> Result<AsyncLocalDataSource, String> {
     let domain = Domain::new(
         DomainBounds::centred_cube(5.0).map_err(|error| error.to_string())?,
         Resolution::uniform(32).map_err(|error| error.to_string())?,
-        BoundaryConditions::default(),
+        BoundaryConditions::uniform(BoundaryCondition::Periodic),
         Precision::F32,
     );
+    let time_step =
+        TimeStep::from_seconds(courant_limit(&domain) * 0.8).map_err(|error| error.to_string())?;
     let mut runtime = SimulationRuntime::new(
-        RuntimeConfig::new(
-            domain,
-            TimeStep::from_seconds(1.0 / 60.0).map_err(|error| error.to_string())?,
-            SessionId::from_u128(1),
-        )
-        .with_subscription(
-            Subscription::PROBES_ONLY
-                .with_planes(UVec2::splat(33))
-                .with_domain_stride(8),
-        )
-        .with_plugin(Box::new(ElectrostaticsPlugin::with_evaluator(evaluator))),
+        RuntimeConfig::new(domain, time_step, SessionId::from_u128(1))
+            .with_subscription(
+                Subscription::PROBES_ONLY
+                    .with_planes(UVec2::splat(33))
+                    .with_domain_stride(8),
+            )
+            .with_plugin(Box::new(ElectrostaticsPlugin::with_evaluator(evaluator)))
+            .with_plugin(Box::new(ElectromagnetismPlugin::with_backend(maxwell))),
     )
     .map_err(|error| error.to_string())?;
     runtime
@@ -950,10 +965,18 @@ fn create_local_data_source(
             WorldCommand::CreateProbe(ProbeSpec::at(
                 "Field probe",
                 DVec3::new(1.0, 0.0, 0.6),
-                vec![electric_field_channel_id(), electric_potential_channel_id()],
+                vec![
+                    electric_field_channel_id(),
+                    electric_potential_channel_id(),
+                    maxwell_electric_field_channel_id(),
+                    maxwell_magnetic_field_channel_id(),
+                    maxwell_energy_density_channel_id(),
+                    maxwell_electric_divergence_channel_id(),
+                    maxwell_magnetic_divergence_channel_id(),
+                ],
             )),
             WorldCommand::CreatePlane(
-                SlicePlaneSpec::new("XY electric field", DVec3::ZERO, DVec3::Z)
+                SlicePlaneSpec::new("XY field plane", DVec3::ZERO, DVec3::Z)
                     .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
                     .map_err(|error| error.to_string())?,
             ),

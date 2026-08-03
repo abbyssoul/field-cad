@@ -5,5 +5,10 @@ edition = "2024"
 
 [dependencies]
 fieldcad-core = { workspace = true }
+fieldcad-electromagnetic-sources = { workspace = true }
+fieldcad-particles = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 glam = { workspace = true }
+
+[dev-dependencies]
+fieldcad-electrostatics = { workspace = true }

@@ -9,10 +9,12 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use fieldcad_core::{
-    FieldSnapshot, SimulationMode, TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
+    FieldSnapshot, PluginId, SimulationMode, TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
 };
 
-use crate::runtime::{RuntimeError, SimulationRuntime, SimulationStatus, Subscription, TickPacer};
+use crate::runtime::{
+    FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus, Subscription, TickPacer,
+};
 
 /// Client-issued identity for one command, echoed in its acknowledgement.
 ///
@@ -60,6 +62,12 @@ pub enum CommandPayload {
     /// rather than a local setting because a remote session must renew its
     /// subscriptions after a reconnect.
     SetSubscription(Subscription),
+    /// Activate or deactivate one equation system in this scene. Its declared
+    /// object-component schemas remain registered either way.
+    SetFieldSystemEnabled {
+        plugin: PluginId,
+        enabled: bool,
+    },
     CommitWorld(Vec<WorldCommand>),
 }
 
@@ -169,6 +177,9 @@ pub trait FieldDataSource: Send {
     /// What the source is currently asked to publish. Acknowledged, not hoped
     /// for: it reflects the last accepted [`CommandPayload::SetSubscription`].
     fn subscription(&self) -> Subscription;
+    /// Equation systems composed into the scene, including inactive systems
+    /// that consequently have no channels in the latest snapshot.
+    fn field_systems(&self) -> Vec<FieldSystemStatus>;
 
     /// The world the client currently believes in.
     ///
@@ -348,6 +359,9 @@ impl SessionCore {
                 // no boundary for it to be atomic with.
                 self.runtime.set_subscription(subscription)?;
             }
+            CommandPayload::SetFieldSystemEnabled { plugin, enabled } => {
+                self.runtime.set_field_system_enabled(&plugin, enabled)?;
+            }
             CommandPayload::CommitWorld(commands) => {
                 if self.runtime.status().mode() == SimulationMode::Running {
                     self.pending_world_edits.push_back(commands);
@@ -436,6 +450,10 @@ impl LocalDataSource {
         &mut self.core.runtime
     }
 
+    pub fn cancellation(&self) -> fieldcad_plugin_api::SolverCancellation {
+        self.core.runtime.cancellation()
+    }
+
     fn publish(&mut self) -> Result<bool, SourceError> {
         Ok(self.mailbox.offer(self.core.latest_snapshot())?)
     }
@@ -464,6 +482,10 @@ impl FieldDataSource for LocalDataSource {
 
     fn subscription(&self) -> Subscription {
         self.core.runtime.subscription()
+    }
+
+    fn field_systems(&self) -> Vec<FieldSystemStatus> {
+        self.core.runtime.field_systems()
     }
 
     fn world(&self) -> WorldSnapshot {
@@ -507,6 +529,7 @@ pub struct LoopbackDataSource {
     believed: SimulationStatus,
     /// The client's replica of the authoritative world.
     believed_world: WorldSnapshot,
+    believed_field_systems: Vec<FieldSystemStatus>,
     connected: bool,
 }
 
@@ -514,12 +537,14 @@ impl LoopbackDataSource {
     pub fn new(server: SimulationRuntime) -> Self {
         let believed = server.status();
         let believed_world = server.world_snapshot();
+        let believed_field_systems = server.field_systems();
         let mut source = Self {
             core: SessionCore::new(server),
             link: VecDeque::new(),
             mailbox: SnapshotMailbox::default(),
             believed,
             believed_world,
+            believed_field_systems,
             connected: true,
         };
         source.transmit();
@@ -543,6 +568,7 @@ impl LoopbackDataSource {
     fn adopt(&mut self, status: SimulationStatus) {
         self.believed = status;
         self.believed_world = self.core.runtime.world_snapshot();
+        self.believed_field_systems = self.core.runtime.field_systems();
     }
 
     /// Simulate losing the connection. The last complete snapshot is retained.
@@ -593,6 +619,10 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn subscription(&self) -> Subscription {
         self.core.runtime.subscription()
+    }
+
+    fn field_systems(&self) -> Vec<FieldSystemStatus> {
+        self.believed_field_systems.clone()
     }
 
     fn world(&self) -> WorldSnapshot {
