@@ -35,16 +35,36 @@ impl Default for Viewport {
 impl Viewport {
     /// Convert a logical rectangle and scale factor into whole pixels, clamped
     /// to the surface.
+    ///
+    /// The rounding goes *inward* — up for the near edges, down for the far
+    /// ones — because this rectangle becomes the scissor for the 3D pass, and
+    /// the panels are drawn over that pass afterwards. egui lays panels out in
+    /// logical points, so a panel edge lands mid-pixel at essentially every
+    /// scale factor, including 1.0. Rounding outward hands the scene the pixel
+    /// column the panel edge sits in; egui then feathers that edge over it and
+    /// the scene shows through the inspector's border as a bright seam.
+    /// Rounding inward gives that column to the panel instead, and the most
+    /// that costs is a sub-pixel sliver of scene along an edge, against a clear
+    /// colour that is the scene's own background.
     pub fn from_logical(min: Vec2, size: Vec2, pixels_per_point: f32, surface: (u32, u32)) -> Self {
         let scale = pixels_per_point.max(0.01);
         let (surface_width, surface_height) = surface;
-        let min_x = (min.x * scale).floor().clamp(0.0, surface_width as f32) as u32;
-        let min_y = (min.y * scale).floor().clamp(0.0, surface_height as f32) as u32;
-        let max_x = ((min.x + size.x) * scale)
+        // Leaving a pixel of headroom keeps `x + width` inside the surface even
+        // when the panels have squeezed the scene to nothing, which a narrow
+        // enough window can do. A scissor past the attachment is a validation
+        // error, so the degenerate case has to stay in bounds rather than rely
+        // on never happening.
+        let min_x = (min.x * scale)
             .ceil()
+            .clamp(0.0, surface_width.saturating_sub(1) as f32) as u32;
+        let min_y = (min.y * scale)
+            .ceil()
+            .clamp(0.0, surface_height.saturating_sub(1) as f32) as u32;
+        let max_x = ((min.x + size.x) * scale)
+            .floor()
             .clamp(min_x as f32, surface_width as f32) as u32;
         let max_y = ((min.y + size.y) * scale)
-            .ceil()
+            .floor()
             .clamp(min_y as f32, surface_height as f32) as u32;
 
         Self {
@@ -401,6 +421,60 @@ mod tests {
         assert_eq!(viewport.y, 100);
         assert_eq!(viewport.width, 1_400);
         assert_eq!(viewport.height, 1_100);
+    }
+
+    /// The panels are painted over the 3D pass, so a scissor that rounds
+    /// outward leaves scene pixels beneath a panel's feathered edge and they
+    /// show through as a seam. Panel edges are fractional in physical pixels at
+    /// essentially every scale factor, so this has to hold generally.
+    #[test]
+    fn a_fractional_edge_rounds_away_from_the_neighbouring_panel() {
+        let surface = (1_920, 1_080);
+        // Deliberately awkward: every edge lands mid-pixel once scaled.
+        let min = Vec2::new(180.3, 24.7);
+        let size = Vec2::new(843.4, 611.2);
+
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let viewport = Viewport::from_logical(min, size, scale, surface);
+
+            assert!(
+                viewport.x as f32 >= min.x * scale,
+                "scale {scale}: left edge {} reaches into the panel at {}",
+                viewport.x,
+                min.x * scale
+            );
+            assert!(
+                viewport.y as f32 >= min.y * scale,
+                "scale {scale}: top edge {} reaches into the panel at {}",
+                viewport.y,
+                min.y * scale
+            );
+            assert!(
+                (viewport.x + viewport.width) as f32 <= (min.x + size.x) * scale,
+                "scale {scale}: right edge {} reaches into the panel at {}",
+                viewport.x + viewport.width,
+                (min.x + size.x) * scale
+            );
+            assert!(
+                (viewport.y + viewport.height) as f32 <= (min.y + size.y) * scale,
+                "scale {scale}: bottom edge {} reaches into the panel at {}",
+                viewport.y + viewport.height,
+                (min.y + size.y) * scale
+            );
+        }
+    }
+
+    /// Panels have minimum widths that a narrow enough window cannot satisfy,
+    /// which leaves the scene no room at all. A scissor outside the attachment
+    /// is a validation error, so the degenerate case still has to be in bounds.
+    #[test]
+    fn a_scene_squeezed_to_nothing_stays_inside_the_surface() {
+        let surface = (400, 300);
+        let viewport =
+            Viewport::from_logical(Vec2::new(400.0, 300.0), Vec2::new(0.0, 0.0), 1.0, surface);
+
+        assert!(viewport.x + viewport.width <= surface.0);
+        assert!(viewport.y + viewport.height <= surface.1);
     }
 
     #[test]

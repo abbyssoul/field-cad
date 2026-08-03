@@ -221,8 +221,15 @@ fn viewport(
         .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
         .show(root, |ui| {
             output.viewport = ui.max_rect();
+            // The scene fills the whole central region, but it must not claim
+            // the pointer along the edges: the side panels put their resize
+            // handles there, and this interaction is registered after theirs,
+            // so it wins the hit test and the splitters become undraggable.
+            // Keeping clear of the grab radius leaves the handles reachable and
+            // costs only a gutter the camera never needed.
+            let grab = ui.style().interaction.resize_grab_radius_side;
             let response = ui.interact(
-                output.viewport,
+                output.viewport.shrink(grab),
                 ui.id().with("viewport_interaction"),
                 egui::Sense::click_and_drag(),
             );
@@ -349,6 +356,15 @@ mod tests {
         model: &mut UiModel,
         events: Vec<egui::Event>,
     ) -> UiFrameOutput {
+        frame_sized(context, model, events, egui::vec2(1_280.0, 800.0))
+    }
+
+    fn frame_sized(
+        context: &egui::Context,
+        model: &mut UiModel,
+        events: Vec<egui::Event>,
+        screen: egui::Vec2,
+    ) -> UiFrameOutput {
         // The view model is a plain value, so the panels are exercised without
         // constructing a runtime per frame.
         let world = seeded_world();
@@ -358,10 +374,7 @@ mod tests {
         let mut output = UiFrameOutput::default();
 
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1_280.0, 800.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
             events,
             ..Default::default()
         };
@@ -382,6 +395,135 @@ mod tests {
             );
         });
         output
+    }
+
+    /// The inspector's left edge lands mid-pixel — egui sizes panels in logical
+    /// points, and with this layout the boundary is fractional even at scale
+    /// 1.0. The scene is scissored to the central region and the panels are
+    /// painted over it, so a scissor rounded outward puts scene pixels under
+    /// the inspector's feathered border and they read as a seam between the two.
+    #[test]
+    fn the_scene_is_never_scissored_into_the_side_panels() {
+        for pixels_per_point in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let context = egui::Context::default();
+            context.set_pixels_per_point(pixels_per_point);
+            let mut model = UiModel::new();
+            // The first frame lays the panels out; the second reports settled
+            // rectangles.
+            frame(&context, &mut model, vec![]);
+            let output = frame(&context, &mut model, vec![]);
+
+            let surface = (
+                (1_280.0 * pixels_per_point) as u32,
+                (800.0 * pixels_per_point) as u32,
+            );
+            let viewport = crate::camera::Viewport::from_logical(
+                glam::Vec2::new(output.viewport.min.x, output.viewport.min.y),
+                glam::Vec2::new(output.viewport.width(), output.viewport.height()),
+                pixels_per_point,
+                surface,
+            );
+
+            let inspector_edge = output.viewport.max.x * pixels_per_point;
+            let scene_edge = (viewport.x + viewport.width) as f32;
+            assert!(
+                scene_edge <= inspector_edge,
+                "at {pixels_per_point}x the scene is drawn to {scene_edge} but the \
+                 inspector starts at {inspector_edge}",
+            );
+
+            let scene_tree_edge = output.viewport.min.x * pixels_per_point;
+            assert!(
+                viewport.x as f32 >= scene_tree_edge,
+                "at {pixels_per_point}x the scene starts at {} but the scene tree \
+                 panel ends at {scene_tree_edge}",
+                viewport.x,
+            );
+        }
+    }
+
+    /// A panel's own width must win over its content's. egui reports a rect
+    /// clamped to `size_range` but paints the frame at the size the content
+    /// demanded, so once content overflows, the resize separator and the region
+    /// left for the 3D view are both placed from a rectangle that is not what is
+    /// on screen: the separator lands inside the panel and the scene is drawn
+    /// underneath it. A narrow window is the cheapest way to force the overflow,
+    /// because egui caps a panel's maximum at what the window can spare.
+    #[test]
+    fn the_panels_and_the_3d_view_tile_the_window_without_overlapping() {
+        for width in [1_280.0f32, 900.0, 700.0, 560.0] {
+            let context = egui::Context::default();
+            let mut model = UiModel::new();
+            let screen = egui::vec2(width, 800.0);
+            frame_sized(&context, &mut model, vec![], screen);
+            let output = frame_sized(&context, &mut model, vec![], screen);
+
+            let panel = |name: &str| {
+                egui::containers::panel::PanelState::load(&context, egui::Id::new(name))
+                    .expect("panel should have laid out")
+                    .outer_rect
+            };
+            let scene = panel("scene_panel");
+            let inspector = panel("inspector_panel");
+
+            assert_eq!(
+                scene.min.x, 0.0,
+                "at {width}px the scene panel starts off-screen",
+            );
+            assert_eq!(
+                inspector.max.x, width,
+                "at {width}px the inspector runs past the window edge",
+            );
+            assert_eq!(
+                scene.max.x, output.viewport.min.x,
+                "at {width}px the scene panel and the 3D view do not meet",
+            );
+            assert_eq!(
+                output.viewport.max.x, inspector.min.x,
+                "at {width}px the 3D view and the inspector do not meet",
+            );
+        }
+    }
+
+    /// The scene fills the central region and senses drags there for the camera,
+    /// but it is registered after the panels, so a full-width interaction wins
+    /// the hit test over their resize handles and the splitters stop working —
+    /// the panel appears to resize and the 3D view never takes the space.
+    #[test]
+    fn dragging_a_panel_edge_resizes_the_3d_view() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+        frame(&context, &mut model, vec![]);
+        let settled = frame(&context, &mut model, vec![]);
+        let edge = settled.viewport.min.x;
+
+        let handle = egui::pos2(edge, 400.0);
+        frame(
+            &context,
+            &mut model,
+            vec![egui::Event::PointerMoved(handle)],
+        );
+        frame(
+            &context,
+            &mut model,
+            vec![egui::Event::PointerButton {
+                pos: handle,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let dragged = frame(
+            &context,
+            &mut model,
+            vec![egui::Event::PointerMoved(egui::pos2(edge - 30.0, 400.0))],
+        );
+
+        assert_eq!(
+            dragged.viewport.min.x,
+            edge - 30.0,
+            "the 3D view did not follow the scene panel's edge",
+        );
     }
 
     #[test]

@@ -149,172 +149,188 @@ pub(super) fn scene_tree(
         .default_size(200.0)
         .size_range(160.0..=320.0)
         .show(root, |ui| {
-            ui.heading("Scene");
-            ui.separator();
+            // Object names come from the world and are as long as the user made
+            // them. Without a scroll area that refuses to shrink, the longest
+            // name sets the panel's width; past `size_range` egui then reports a
+            // clamped rect while painting the wider one, and the separator and
+            // the 3D view are both placed from a rectangle that is not what is
+            // on screen. Truncating keeps the common case free of a scrollbar.
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    ui.heading("Scene");
+                    ui.separator();
 
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button("+Q")
-                    .on_hover_text("Add +1 nC point charge")
-                    .clicked()
-                {
-                    output.submit(new_charge_command(
-                        frame.world,
-                        1.0e-9,
-                        ChargeObjectKind::Point,
-                    ));
-                }
-                for (label, template) in [
-                    ("+ e−", ParticleTemplate::Electron),
-                    ("+ p+", ParticleTemplate::Proton),
-                    ("+ e+", ParticleTemplate::Positron),
-                    ("+ n", ParticleTemplate::Neutron),
-                ] {
-                    if ui
-                        .button(label)
-                        .on_hover_text(format!(
-                            "Add a dynamic {} from the {} catalog",
-                            template.label(),
-                            CATALOG_VERSION
-                        ))
-                        .clicked()
-                    {
-                        output.submit(new_particle_command(frame.world, template));
-                    }
-                }
-                if ui
-                    .button("−Q")
-                    .on_hover_text("Add −1 nC point charge")
-                    .clicked()
-                {
-                    output.submit(new_charge_command(
-                        frame.world,
-                        -1.0e-9,
-                        ChargeObjectKind::Point,
-                    ));
-                }
-                if ui
-                    .button("+ Sphere")
-                    .on_hover_text("Add a uniformly charged +1 nC sphere")
-                    .clicked()
-                {
-                    output.submit(new_charge_command(
-                        frame.world,
-                        1.0e-9,
-                        ChargeObjectKind::Sphere,
-                    ));
-                }
-                if ui.button("+ Probe").clicked() {
-                    let channels = frame
-                        .compute
-                        .field_systems
-                        .iter()
-                        .flat_map(|system| &system.channels)
-                        .map(|channel| channel.id.clone())
-                        .collect();
-                    output.edit(vec![WorldCommand::CreateProbe(ProbeSpec::at(
-                        format!("Probe {}", frame.world.probes().len() + 1),
-                        DVec3::new(1.0, 0.0, 0.6),
-                        channels,
-                    ))]);
-                }
-                if ui.button("+ Plane").clicked() {
-                    output.edit(vec![WorldCommand::CreatePlane(
-                        SlicePlaneSpec::new(
-                            format!("XY plane {}", frame.world.planes().len() + 1),
-                            DVec3::ZERO,
-                            DVec3::Z,
-                        )
-                        .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
-                        .expect("static plane parameters are valid"),
-                    )]);
-                }
-            });
-            ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .button("+Q")
+                            .on_hover_text("Add +1 nC point charge")
+                            .clicked()
+                        {
+                            output.submit(new_charge_command(
+                                frame.world,
+                                1.0e-9,
+                                ChargeObjectKind::Point,
+                            ));
+                        }
+                        for (label, template) in [
+                            ("+ e−", ParticleTemplate::Electron),
+                            ("+ p+", ParticleTemplate::Proton),
+                            ("+ e+", ParticleTemplate::Positron),
+                            ("+ n", ParticleTemplate::Neutron),
+                        ] {
+                            if ui
+                                .button(label)
+                                .on_hover_text(format!(
+                                    "Add a dynamic {} from the {} catalog",
+                                    template.label(),
+                                    CATALOG_VERSION
+                                ))
+                                .clicked()
+                            {
+                                output.submit(new_particle_command(frame.world, template));
+                            }
+                        }
+                        if ui
+                            .button("−Q")
+                            .on_hover_text("Add −1 nC point charge")
+                            .clicked()
+                        {
+                            output.submit(new_charge_command(
+                                frame.world,
+                                -1.0e-9,
+                                ChargeObjectKind::Point,
+                            ));
+                        }
+                        if ui
+                            .button("+ Sphere")
+                            .on_hover_text("Add a uniformly charged +1 nC sphere")
+                            .clicked()
+                        {
+                            output.submit(new_charge_command(
+                                frame.world,
+                                1.0e-9,
+                                ChargeObjectKind::Sphere,
+                            ));
+                        }
+                        if ui.button("+ Probe").clicked() {
+                            let channels = frame
+                                .compute
+                                .field_systems
+                                .iter()
+                                .flat_map(|system| &system.channels)
+                                .map(|channel| channel.id.clone())
+                                .collect();
+                            output.edit(vec![WorldCommand::CreateProbe(ProbeSpec::at(
+                                format!("Probe {}", frame.world.probes().len() + 1),
+                                DVec3::new(1.0, 0.0, 0.6),
+                                channels,
+                            ))]);
+                        }
+                        if ui.button("+ Plane").clicked() {
+                            output.edit(vec![WorldCommand::CreatePlane(
+                                SlicePlaneSpec::new(
+                                    format!("XY plane {}", frame.world.planes().len() + 1),
+                                    DVec3::ZERO,
+                                    DVec3::Z,
+                                )
+                                .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
+                                .expect("static plane parameters are valid"),
+                            )]);
+                        }
+                    });
+                    ui.add_space(6.0);
 
-            if frame.world.objects().is_empty() {
-                ui.weak("No objects.");
-            }
-            for object in frame.world.objects().values() {
-                ui.horizontal(|ui| {
-                    if visibility_button(ui, object.visible).clicked() {
-                        output.edit(vec![WorldCommand::SetObjectVisible {
-                            object: object.id,
-                            visible: !object.visible,
-                        }]);
+                    if frame.world.objects().is_empty() {
+                        ui.weak("No objects.");
                     }
-                    if ui
-                        .selectable_label(
-                            model.selection == Some(object.id),
-                            format!("▣  {}", object.name),
-                        )
-                        .clicked()
-                    {
-                        model.set_scene_selection(Some(SceneSelection::Object(object.id)));
+                    for object in frame.world.objects().values() {
+                        ui.horizontal(|ui| {
+                            if visibility_button(ui, object.visible).clicked() {
+                                output.edit(vec![WorldCommand::SetObjectVisible {
+                                    object: object.id,
+                                    visible: !object.visible,
+                                }]);
+                            }
+                            if ui
+                                .selectable_label(
+                                    model.selection == Some(object.id),
+                                    format!("▣  {}", object.name),
+                                )
+                                .on_hover_text(&object.name)
+                                .clicked()
+                            {
+                                model.set_scene_selection(Some(SceneSelection::Object(object.id)));
+                            }
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Delete object")
+                                .clicked()
+                            {
+                                output.edit(vec![WorldCommand::RemoveObject(object.id)]);
+                            }
+                        });
                     }
-                    if ui
-                        .small_button("×")
-                        .on_hover_text("Delete object")
-                        .clicked()
-                    {
-                        output.edit(vec![WorldCommand::RemoveObject(object.id)]);
+
+                    if !frame.world.probes().is_empty() {
+                        ui.add_space(8.0);
+                        ui.label("Probes");
+                        for probe in frame.world.probes().values() {
+                            ui.horizontal(|ui| {
+                                if visibility_button(ui, probe.visible).clicked() {
+                                    output.edit(vec![WorldCommand::SetProbeVisible {
+                                        probe: probe.id,
+                                        visible: !probe.visible,
+                                    }]);
+                                }
+                                if ui
+                                    .selectable_label(
+                                        model.probe_selection == Some(probe.id),
+                                        format!("◉  {}", probe.name),
+                                    )
+                                    .on_hover_text(&probe.name)
+                                    .clicked()
+                                {
+                                    model
+                                        .set_scene_selection(Some(SceneSelection::Probe(probe.id)));
+                                }
+                                if ui.small_button("×").on_hover_text("Delete probe").clicked() {
+                                    output.edit(vec![WorldCommand::RemoveProbe(probe.id)]);
+                                }
+                            });
+                        }
+                    }
+
+                    if !frame.world.planes().is_empty() {
+                        ui.add_space(8.0);
+                        ui.label("Slice planes");
+                        for plane in frame.world.planes().values() {
+                            ui.horizontal(|ui| {
+                                if visibility_button(ui, plane.visible).clicked() {
+                                    output.edit(vec![WorldCommand::SetPlaneVisible {
+                                        plane: plane.id,
+                                        visible: !plane.visible,
+                                    }]);
+                                }
+                                if ui
+                                    .selectable_label(
+                                        model.plane_selection == Some(plane.id),
+                                        format!("▦  {}", plane.name),
+                                    )
+                                    .on_hover_text(&plane.name)
+                                    .clicked()
+                                {
+                                    model
+                                        .set_scene_selection(Some(SceneSelection::Plane(plane.id)));
+                                }
+                                if ui.small_button("×").on_hover_text("Delete plane").clicked() {
+                                    output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
+                                }
+                            });
+                        }
                     }
                 });
-            }
-
-            if !frame.world.probes().is_empty() {
-                ui.add_space(8.0);
-                ui.label("Probes");
-                for probe in frame.world.probes().values() {
-                    ui.horizontal(|ui| {
-                        if visibility_button(ui, probe.visible).clicked() {
-                            output.edit(vec![WorldCommand::SetProbeVisible {
-                                probe: probe.id,
-                                visible: !probe.visible,
-                            }]);
-                        }
-                        if ui
-                            .selectable_label(
-                                model.probe_selection == Some(probe.id),
-                                format!("◉  {}", probe.name),
-                            )
-                            .clicked()
-                        {
-                            model.set_scene_selection(Some(SceneSelection::Probe(probe.id)));
-                        }
-                        if ui.small_button("×").on_hover_text("Delete probe").clicked() {
-                            output.edit(vec![WorldCommand::RemoveProbe(probe.id)]);
-                        }
-                    });
-                }
-            }
-
-            if !frame.world.planes().is_empty() {
-                ui.add_space(8.0);
-                ui.label("Slice planes");
-                for plane in frame.world.planes().values() {
-                    ui.horizontal(|ui| {
-                        if visibility_button(ui, plane.visible).clicked() {
-                            output.edit(vec![WorldCommand::SetPlaneVisible {
-                                plane: plane.id,
-                                visible: !plane.visible,
-                            }]);
-                        }
-                        if ui
-                            .selectable_label(
-                                model.plane_selection == Some(plane.id),
-                                format!("▦  {}", plane.name),
-                            )
-                            .clicked()
-                        {
-                            model.set_scene_selection(Some(SceneSelection::Plane(plane.id)));
-                        }
-                        if ui.small_button("×").on_hover_text("Delete plane").clicked() {
-                            output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
-                        }
-                    });
-                }
-            }
         });
 }
 
@@ -338,57 +354,66 @@ pub(super) fn inspector(
         .default_size(280.0)
         .size_range(240.0..=460.0)
         .show(root, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Inspector");
-                ui.separator();
+            // `auto_shrink` off on the horizontal axis is what keeps this panel
+            // the width it asked for. Left on, the scroll area reports its
+            // content's width, the panel grows to match, and egui then clamps
+            // the *reported* rect back to `size_range` while the frame and its
+            // contents stay painted at the wider size. Everything downstream —
+            // the resize separator, the region left for the 3D view — is
+            // positioned from the clamped rect, so it lands inside the panel.
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.heading("Inspector");
+                    ui.separator();
 
-                if let Some(object) = model.selection.and_then(|id| frame.world.object(id)) {
-                    object_properties(ui, object, output);
-                } else if let Some(plane) = model
-                    .plane_selection
-                    .and_then(|id| frame.world.planes().get(&id))
-                {
-                    plane_properties(ui, plane, &mut model.field_layers, frame.compute, output);
-                } else if let Some(probe) =
-                    model.probe_selection.and_then(|id| frame.world.probe(id))
-                {
-                    probe_properties(
-                        ui,
-                        model,
-                        probe,
-                        frame.world,
-                        frame.compute,
-                        frame.probe_history,
-                        output,
-                    );
-                } else {
-                    ui.weak("Select an object, probe, or plane in the viewport or scene tree.");
-                }
-
-                ui.add_space(16.0);
-                field_system_controls(ui, frame.compute, output);
-
-                ui.add_space(16.0);
-                ui.heading("View");
-                ui.horizontal(|ui| {
-                    for (label, view) in [
-                        ("+X", AxisView::PositiveX),
-                        ("+Y", AxisView::PositiveY),
-                        ("+Z", AxisView::PositiveZ),
-                    ] {
-                        if ui.button(label).clicked() {
-                            output.camera_action = Some(CameraAction::Axis(view));
-                        }
+                    if let Some(object) = model.selection.and_then(|id| frame.world.object(id)) {
+                        object_properties(ui, object, output);
+                    } else if let Some(plane) = model
+                        .plane_selection
+                        .and_then(|id| frame.world.planes().get(&id))
+                    {
+                        plane_properties(ui, plane, &mut model.field_layers, frame.compute, output);
+                    } else if let Some(probe) =
+                        model.probe_selection.and_then(|id| frame.world.probe(id))
+                    {
+                        probe_properties(
+                            ui,
+                            model,
+                            probe,
+                            frame.world,
+                            frame.compute,
+                            frame.probe_history,
+                            output,
+                        );
+                    } else {
+                        ui.weak("Select an object, probe, or plane in the viewport or scene tree.");
                     }
+
+                    ui.add_space(16.0);
+                    field_system_controls(ui, frame.compute, output);
+
+                    ui.add_space(16.0);
+                    ui.heading("View");
+                    ui.horizontal(|ui| {
+                        for (label, view) in [
+                            ("+X", AxisView::PositiveX),
+                            ("+Y", AxisView::PositiveY),
+                            ("+Z", AxisView::PositiveZ),
+                        ] {
+                            if ui.button(label).clicked() {
+                                output.camera_action = Some(CameraAction::Axis(view));
+                            }
+                        }
+                    });
+                    field_layer_controls(ui, model, frame.compute);
+
+                    ui.add_space(16.0);
+                    transport_sampling(ui, frame.compute, output);
+
+                    ui.add_space(16.0);
+                    compute_panel(ui, frame.compute);
                 });
-                field_layer_controls(ui, model, frame.compute);
-
-                ui.add_space(16.0);
-                transport_sampling(ui, frame.compute, output);
-
-                ui.add_space(16.0);
-                compute_panel(ui, frame.compute);
-            });
         });
 }
 
@@ -1151,8 +1176,17 @@ fn compute_panel(ui: &mut egui::Ui, compute: &ComputeView) {
         .num_columns(2)
         .spacing([12.0, 6.0])
         .show(ui, |ui| {
+            // A grid column is as wide as its widest cell, and these values are
+            // read from the running session, so their length is not something
+            // this panel controls. Truncating makes the panel's width the
+            // authority instead: without it one long value — the domain summary
+            // is usually the offender — widens the grid, and with it the whole
+            // inspector, past the width the panel was given.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+
             ui.label("Source");
-            ui.label(&compute.description);
+            ui.add(egui::Label::new(&compute.description).truncate())
+                .on_hover_text(&compute.description);
             ui.end_row();
 
             ui.label("State");
@@ -1199,7 +1233,8 @@ fn compute_panel(ui: &mut egui::Ui, compute: &ComputeView) {
             ui.end_row();
 
             ui.label("Domain");
-            ui.monospace(&compute.domain_summary);
+            ui.monospace(&compute.domain_summary)
+                .on_hover_text(&compute.domain_summary);
             ui.end_row();
 
             ui.label("Samples");
