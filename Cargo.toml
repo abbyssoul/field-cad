@@ -4,7 +4,9 @@ members = [
     "apps/fieldcad-desktop",
     "crates/fieldcad-bench",
     "crates/fieldcad-core",
+    "crates/fieldcad-dynamics",
     "crates/fieldcad-electromagnetic-sources",
+    "crates/fieldcad-mass-sources",
     "crates/fieldcad-particles",
     "crates/fieldcad-plugin-api",
     "crates/fieldcad-simulation",
@@ -45,7 +47,9 @@ winit = "0.30.13"
 
 fieldcad-bench = { path = "crates/fieldcad-bench" }
 fieldcad-core = { path = "crates/fieldcad-core" }
+fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
+fieldcad-mass-sources = { path = "crates/fieldcad-mass-sources" }
 fieldcad-particles = { path = "crates/fieldcad-particles" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
 fieldcad-simulation = { path = "crates/fieldcad-simulation" }

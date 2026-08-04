@@ -6,21 +6,26 @@
 use fieldcad_core::{ObjectId, SlicePlane, WorldSnapshot};
 use glam::{Vec2, Vec3};
 
-use super::{ObjectMesh, SceneSelection, instances};
+use super::{ObjectMesh, SceneSelection, SceneVisibility, instances};
 use crate::camera::{OrbitCamera, Viewport};
 
 /// The nearest visible authoring entity under a pointer.
 pub fn pick_scene(
     world: &WorldSnapshot,
+    show: SceneVisibility,
     camera: &OrbitCamera,
     viewport: Viewport,
     pointer: Vec2,
 ) -> Option<SceneSelection> {
     let ray = camera.ray_from_viewport(pointer, viewport)?;
-    let mut nearest = nearest_object_hit(world, ray)
+    let mut nearest = nearest_object_hit(world, show, ray)
         .map(|(distance, object)| (distance, SceneSelection::Object(object)));
 
-    for plane in world.planes().values().filter(|plane| plane.visible) {
+    for plane in world
+        .planes()
+        .values()
+        .filter(|plane| plane.visible && show.planes)
+    {
         let Some(distance) = ray_plane_hit(ray, plane) else {
             continue;
         };
@@ -29,7 +34,11 @@ pub fn pick_scene(
         }
     }
 
-    for probe in world.probes().values().filter(|probe| probe.visible) {
+    for probe in world
+        .probes()
+        .values()
+        .filter(|probe| probe.visible && show.probes)
+    {
         let Ok(position) = world.resolve_probe_position(probe) else {
             continue;
         };
@@ -48,17 +57,24 @@ pub fn pick_scene(
 /// body remains a reliable free-drag target.
 pub fn pick_object(
     world: &WorldSnapshot,
+    show: SceneVisibility,
     camera: &OrbitCamera,
     viewport: Viewport,
     pointer: Vec2,
 ) -> Option<ObjectId> {
     let ray = camera.ray_from_viewport(pointer, viewport)?;
-    nearest_object_hit(world, ray).map(|(_, object)| object)
+    nearest_object_hit(world, show, ray).map(|(_, object)| object)
 }
 
-fn nearest_object_hit(world: &WorldSnapshot, ray: crate::camera::Ray) -> Option<(f32, ObjectId)> {
+fn nearest_object_hit(
+    world: &WorldSnapshot,
+    show: SceneVisibility,
+    ray: crate::camera::Ray,
+) -> Option<(f32, ObjectId)> {
     let mut nearest = None;
-    for instance in instances(world, None) {
+    // `instances` is already empty when objects are hidden, so the hit-test
+    // inherits the renderer's answer rather than deciding again.
+    for instance in instances(world, None, show) {
         let inverse = instance.model.inverse();
         if !inverse.is_finite() {
             continue;
@@ -175,10 +191,162 @@ mod tests {
         camera.set_axis_view(AxisView::PositiveY);
 
         let centre = Vec2::new(400.0, 300.0);
-        let picked = pick_scene(&snapshot, &camera, viewport, centre);
+        let picked = pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre);
 
         // From +Y looking back at the origin, the box at y = +3 is nearer.
         assert_eq!(picked, Some(SceneSelection::Object(ObjectId::new(1))));
+    }
+
+    /// Hiding a class in the View window must make it unclickable too.
+    ///
+    /// It was previously only filtered out of rendering, so a user could select
+    /// — and then drag — something that was not on screen.
+    #[test]
+    fn hidden_objects_are_not_selectable() {
+        let world = world_with_two_boxes();
+        let snapshot = world.snapshot();
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::ZERO, 1.0);
+        camera.set_axis_view(AxisView::PositiveY);
+        let centre = Vec2::new(400.0, 300.0);
+
+        let hidden = SceneVisibility {
+            objects: false,
+            ..SceneVisibility::ALL
+        };
+
+        assert!(
+            pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre).is_some(),
+            "the fixture must be pickable when shown, or this proves nothing"
+        );
+        assert_eq!(
+            pick_scene(&snapshot, hidden, &camera, viewport, centre),
+            None
+        );
+        // The free-drag hit test is a separate entry point and was equally
+        // affected.
+        assert_eq!(
+            pick_object(&snapshot, hidden, &camera, viewport, centre),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_planes_are_not_selectable() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreatePlane(
+                SlicePlaneSpec::new("xy", DVec3::ZERO, DVec3::Z)
+                    .unwrap()
+                    .with_half_extent(glam::DVec2::splat(2.0))
+                    .unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::ZERO, 2.0);
+        camera.set_axis_view(AxisView::PositiveZ);
+        let centre = Vec2::new(400.0, 300.0);
+
+        assert!(pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre).is_some());
+        assert_eq!(
+            pick_scene(
+                &snapshot,
+                SceneVisibility {
+                    planes: false,
+                    ..SceneVisibility::ALL
+                },
+                &camera,
+                viewport,
+                centre
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_probes_are_not_selectable() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateProbe(fieldcad_core::ProbeSpec::at(
+                "probe",
+                DVec3::ZERO,
+                Vec::new(),
+            ))])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::ZERO, 0.5);
+        let centre = Vec2::new(400.0, 300.0);
+
+        assert!(pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre).is_some());
+        assert_eq!(
+            pick_scene(
+                &snapshot,
+                SceneVisibility {
+                    probes: false,
+                    ..SceneVisibility::ALL
+                },
+                &camera,
+                viewport,
+                centre
+            ),
+            None
+        );
+    }
+
+    /// Hiding one class must not make the others unpickable.
+    #[test]
+    fn hiding_one_class_leaves_the_others_selectable() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("body")
+                    .with_transform(Transform::at(DVec3::new(0.0, 0.0, 0.6)).unwrap())
+                    .with_shape(ObjectShape::sphere(0.25).unwrap()),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let object = *snapshot.objects().keys().next().unwrap();
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+
+        assert_eq!(
+            pick_scene(
+                &snapshot,
+                SceneVisibility {
+                    probes: false,
+                    planes: false,
+                    objects: true,
+                },
+                &OrbitCamera::default(),
+                viewport,
+                Vec2::new(400.0, 300.0),
+            ),
+            Some(SceneSelection::Object(object))
+        );
     }
 
     #[test]
@@ -193,7 +361,13 @@ mod tests {
 
         let corner = Vec2::new(2.0, 2.0);
         assert_eq!(
-            pick_scene(&world.snapshot(), &OrbitCamera::default(), viewport, corner),
+            pick_scene(
+                &world.snapshot(),
+                SceneVisibility::ALL,
+                &OrbitCamera::default(),
+                viewport,
+                corner
+            ),
             None
         );
     }
@@ -223,6 +397,7 @@ mod tests {
         assert_eq!(
             pick_scene(
                 &world.snapshot(),
+                SceneVisibility::ALL,
                 &camera,
                 viewport,
                 Vec2::new(400.0, 300.0)
@@ -252,6 +427,7 @@ mod tests {
         assert_eq!(
             pick_object(
                 &world.snapshot(),
+                SceneVisibility::ALL,
                 &OrbitCamera::default(),
                 viewport,
                 Vec2::new(400.0, 300.0),
@@ -261,6 +437,7 @@ mod tests {
         assert_eq!(
             pick_object(
                 &world.snapshot(),
+                SceneVisibility::ALL,
                 &OrbitCamera::default(),
                 viewport,
                 Vec2::new(2.0, 2.0),
@@ -287,7 +464,7 @@ mod tests {
             )])
             .unwrap();
         let snapshot = world.snapshot();
-        let instance = instances(&snapshot, None)[0];
+        let instance = instances(&snapshot, None, SceneVisibility::ALL)[0];
 
         // A ray along +Y at x = 3 misses the unrotated slab but hits the rotated
         // one, which now extends along X.

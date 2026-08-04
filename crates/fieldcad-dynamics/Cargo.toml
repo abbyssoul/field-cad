@@ -1,11 +1,11 @@
 [package]
-name = "fieldcad-particles"
+name = "fieldcad-dynamics"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 fieldcad-core = { workspace = true }
-fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-mass-sources = { workspace = true }
+fieldcad-plugin-api = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }

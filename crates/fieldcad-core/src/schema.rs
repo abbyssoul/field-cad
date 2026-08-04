@@ -22,15 +22,87 @@ pub enum PropertyKind {
     Choice(Vec<String>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl PropertyKind {
+    /// A schema-valid neutral value of this kind.
+    ///
+    /// Attaching a component from a generic editor needs *some* value for every
+    /// required property before the world will accept the edit. Zero is the
+    /// honest neutral for a physical quantity: a body given mass but not yet a
+    /// charge is uncharged, not invalid. A `Choice` with no options has no
+    /// representable value, which is why this returns an `Option` rather than
+    /// inventing an out-of-schema string.
+    pub fn default_value(&self) -> Option<PropertyValue> {
+        let value = match self {
+            Self::Scalar(dimension) => PropertyValue::Scalar(Quantity::new(0.0, *dimension).ok()?),
+            Self::Vector(dimension) => {
+                PropertyValue::Vector(VectorQuantity::new(glam::DVec3::ZERO, *dimension).ok()?)
+            }
+            Self::Boolean => PropertyValue::Boolean(false),
+            Self::Text => PropertyValue::Text(String::new()),
+            Self::Choice(options) => PropertyValue::Choice(options.first()?.clone()),
+        };
+        Some(value)
+    }
+}
+
+/// A condition on a sibling property within the same component.
+///
+/// Some properties only mean anything in a particular configuration of the
+/// others: a gravitational mass is inert while it is declared equal to the
+/// inertial one. Saying so in the schema lets a generic editor disable the
+/// value rather than letting a user type a number that will be ignored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PropertyCondition {
+    /// The sibling whose value decides this.
+    pub property: PropertyId,
+    /// The value that sibling must hold.
+    pub equals: PropertyValue,
+    /// Why the property is inert, phrased for a tooltip.
+    pub because: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PropertySchema {
     pub id: PropertyId,
     pub display_name: String,
     pub kind: PropertyKind,
     pub required: bool,
+    /// When set, this property only takes effect while the named sibling holds
+    /// the given value.
+    ///
+    /// This is presentation-relevance, not validity: an inert property is still
+    /// stored and still validated, because turning the condition back on must
+    /// return the value the user last chose rather than a blank.
+    pub relevant_when: Option<PropertyCondition>,
+    /// The value to attach before the user has edited anything.
+    ///
+    /// `None` falls back to [`PropertyKind::default_value`]. Declare one
+    /// whenever the kind's neutral value is outside the range a consumer will
+    /// accept: a mass of zero satisfies every dimension check and then fails the
+    /// solver that has to divide by it, so the property that carries a
+    /// constraint is the property that must carry a default satisfying it.
+    pub default_value: Option<PropertyValue>,
 }
 
 impl PropertySchema {
+    /// The value to use when attaching this property unedited.
+    pub fn initial_value(&self) -> Option<PropertyValue> {
+        self.default_value
+            .clone()
+            .or_else(|| self.kind.default_value())
+    }
+
+    /// Whether this property currently takes effect, given its siblings.
+    ///
+    /// A property with no condition is always relevant. A condition whose
+    /// sibling is missing counts as unmet, so an incomplete bag disables the
+    /// dependent field rather than offering an edit that may be discarded.
+    pub fn is_relevant(&self, values: &PropertyBag) -> bool {
+        self.relevant_when
+            .as_ref()
+            .is_none_or(|condition| values.get(&condition.property) == Some(&condition.equals))
+    }
+
     pub fn validate(&self, value: &PropertyValue) -> Result<(), SchemaError> {
         let valid = match (&self.kind, value) {
             (PropertyKind::Scalar(expected), PropertyValue::Scalar(actual)) => {
@@ -125,7 +197,9 @@ impl FromIterator<(PropertyId, PropertyValue)> for PropertyBag {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// Not `Eq`: a declared default may carry an `f64` magnitude, and comparing
+// schemas for conflict detection only ever needs `PartialEq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComponentSchema {
     pub id: ComponentTypeId,
     pub display_name: String,
@@ -135,6 +209,29 @@ pub struct ComponentSchema {
 impl ComponentSchema {
     pub fn validate(&self, values: &PropertyBag) -> Result<(), SchemaError> {
         validate_properties(&self.properties, values)
+    }
+
+    /// A bag that satisfies this schema, for attaching the component before the
+    /// user has typed anything into it.
+    ///
+    /// Only required properties are populated; an optional property left absent
+    /// is what "not set" means. Fails only if a required property has no
+    /// representable default, which the caller must surface rather than attach
+    /// a bag the world will reject.
+    pub fn default_properties(&self) -> Result<PropertyBag, SchemaError> {
+        self.properties
+            .iter()
+            .filter(|property| property.required)
+            .map(|property| {
+                let value =
+                    property
+                        .initial_value()
+                        .ok_or_else(|| SchemaError::NoDefaultValue {
+                            property: property.id.clone(),
+                        })?;
+                Ok((property.id.clone(), value))
+            })
+            .collect::<Result<PropertyBag, SchemaError>>()
     }
 }
 
@@ -215,6 +312,8 @@ pub enum SchemaError {
     UnknownProperty { property: PropertyId },
     #[error("required property '{property}' is missing")]
     MissingProperty { property: PropertyId },
+    #[error("required property '{property}' has no representable default value")]
+    NoDefaultValue { property: PropertyId },
     #[error("property '{property}' does not match expected kind {expected:?}")]
     ValueMismatch {
         property: PropertyId,
@@ -245,7 +344,57 @@ mod tests {
             display_name: "Charge".to_owned(),
             kind: PropertyKind::Scalar(Dimension::CHARGE),
             required: true,
+            default_value: None,
+            relevant_when: None,
         }
+    }
+
+    #[test]
+    fn a_conditional_property_is_inert_until_its_sibling_agrees() {
+        let switch = PropertyId::new("linked").unwrap();
+        let governed = PropertySchema {
+            id: PropertyId::new("value").unwrap(),
+            display_name: "Value".to_owned(),
+            kind: PropertyKind::Scalar(Dimension::MASS),
+            required: true,
+            relevant_when: Some(PropertyCondition {
+                property: switch.clone(),
+                equals: PropertyValue::Boolean(false),
+                because: "linked to something else".to_owned(),
+            }),
+            default_value: None,
+        };
+
+        let linked: PropertyBag = [(switch.clone(), PropertyValue::Boolean(true))]
+            .into_iter()
+            .collect();
+        let unlinked: PropertyBag = [(switch, PropertyValue::Boolean(false))]
+            .into_iter()
+            .collect();
+
+        assert!(!governed.is_relevant(&linked));
+        assert!(governed.is_relevant(&unlinked));
+        // A missing sibling cannot satisfy the condition, so the dependent
+        // property stays inert rather than offering an edit that may be lost.
+        assert!(!governed.is_relevant(&PropertyBag::default()));
+    }
+
+    #[test]
+    fn an_unconditional_property_is_always_relevant() {
+        assert!(charge_schema().is_relevant(&PropertyBag::default()));
+    }
+
+    /// Relevance is presentation, not validity. An inert value is still stored
+    /// and still required, so turning the condition back on returns the value
+    /// the user last chose rather than a blank.
+    #[test]
+    fn an_inert_property_is_still_required_by_validation() {
+        let schemas = vec![charge_schema()];
+
+        assert!(matches!(
+            validate_properties(&schemas, &PropertyBag::default()),
+            Err(SchemaError::MissingProperty { .. })
+        ));
     }
 
     #[test]

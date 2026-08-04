@@ -8,10 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, FieldValue,
-    SampleValidity, SimulationMode, SnapshotFreshness, UndefinedReason, WorldRevision,
-    WorldSnapshot,
+    FieldValueKind, PluginId, SampleValidity, SimulationMode, SnapshotFreshness, UndefinedReason,
+    WorldRevision, WorldSnapshot,
 };
-use fieldcad_simulation::{DataSourceStatus, FieldDataSource, FieldSystemStatus, Subscription};
+use fieldcad_simulation::{
+    DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, Subscription,
+};
 
 /// A per-frame, read-only summary of what the data source is reporting.
 ///
@@ -36,6 +38,10 @@ pub struct ComputeView {
     pub channel_names: BTreeMap<ChannelId, String>,
     /// All equation systems composed into the scene, including inactive ones.
     pub field_systems: Vec<FieldSystemStatus>,
+    /// The physical fields this scene can have, and which model computes each.
+    pub fields: Vec<FieldRow>,
+    /// What undo and redo are currently offering, as the source reports it.
+    pub edit_history: EditHistoryStatus,
     /// Channels a generic vector layer can draw, in published order.
     pub vector_channels: Vec<ChannelId>,
     /// What the source has acknowledged it is sampling.
@@ -79,7 +85,7 @@ impl ComputeView {
             total_samples = snapshot
                 .channels
                 .iter()
-                .filter(|(channel, _)| active_plugins.contains(channel.plugin()))
+                .filter(|(_, channel)| active_plugins.contains(&channel.provider))
                 .map(|(_, channel)| {
                     channel
                         .batches
@@ -90,7 +96,7 @@ impl ComputeView {
                 .sum();
             vector_channels = snapshot
                 .vector_channels()
-                .filter(|channel| active_plugins.contains(channel.schema.id.plugin()))
+                .filter(|channel| active_plugins.contains(&channel.provider))
                 .map(|channel| channel.schema.id.clone())
                 .collect();
             let cells = snapshot.domain.resolution().cells();
@@ -114,7 +120,11 @@ impl ComputeView {
                 .collect();
 
             for (channel_id, channel) in &snapshot.channels {
-                if !active_plugins.contains(channel_id.plugin()) {
+                // Which system produced a value, not which namespace names it:
+                // a field channel is shared, so its identifier cannot say who
+                // computed it and a retained snapshot must be filtered by the
+                // provenance it carries.
+                if !active_plugins.contains(&channel.provider) {
                     continue;
                 }
                 channel_names.insert(channel_id.clone(), channel.schema.display_name.clone());
@@ -153,7 +163,9 @@ impl ComputeView {
             domain_summary,
             probe_readings,
             channel_names,
+            fields: FieldRow::collect(&field_systems),
             field_systems,
+            edit_history: source.edit_history(),
             vector_channels,
             subscription: source.subscription(),
             diagnostics,
@@ -164,6 +176,15 @@ impl ComputeView {
     /// Transport controls are only meaningful against a connected source.
     pub fn accepts_commands(&self) -> bool {
         self.status == DataSourceStatus::Ready
+    }
+
+    /// Whether the scene can be stepped through its edit history right now.
+    ///
+    /// Paused, because an undo names a scene and a running clock is replacing
+    /// that scene underneath it; the authoritative side refuses either way, and
+    /// this is what lets the control say so before it is pressed.
+    pub fn accepts_history_commands(&self) -> bool {
+        self.accepts_commands() && self.mode == SimulationMode::Paused
     }
 
     pub fn workbench_state(&self) -> WorkbenchState {
@@ -209,6 +230,77 @@ fn format_boundaries(boundaries: BoundaryConditions) -> String {
             label(boundaries.y),
             label(boundaries.z)
         )
+    }
+}
+
+/// One physical field the scene can have, and the models that can compute it.
+///
+/// Built by asking which systems *declare* each channel rather than which are
+/// publishing it, so a field with no active model is still listed — a scene that
+/// could have a magnetic field but currently does not is worth saying, and a
+/// control that only appears once you have already switched something on is
+/// unreachable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldRow {
+    pub channel: ChannelId,
+    pub display_name: String,
+    pub value_kind: FieldValueKind,
+    /// Every composed system that can compute this field, in catalog order.
+    pub candidates: Vec<PluginId>,
+    /// The one currently computing it, if any.
+    pub provider: Option<PluginId>,
+}
+
+impl FieldRow {
+    fn collect(systems: &[FieldSystemStatus]) -> Vec<Self> {
+        // A channel in a namespace no composed plugin claims is a quantity of
+        // the scene, declared in a shared domain module so that several models
+        // can compute it. A channel in its own plugin's namespace is that
+        // method's own output — an energy density defined on a Yee lattice, a
+        // divergence residual — and belongs with the system that defines it, not
+        // in a list of fields the world has.
+        let owned: BTreeSet<_> = systems.iter().map(|system| &system.plugin.id).collect();
+        let mut rows: Vec<Self> = Vec::new();
+        for system in systems {
+            for channel in &system.channels {
+                if owned.contains(channel.id.plugin()) {
+                    continue;
+                }
+                let index = match rows.iter().position(|row| row.channel == channel.id) {
+                    Some(index) => index,
+                    None => {
+                        rows.push(Self {
+                            channel: channel.id.clone(),
+                            display_name: channel.display_name.clone(),
+                            value_kind: channel.value_kind,
+                            candidates: Vec::new(),
+                            provider: None,
+                        });
+                        rows.len() - 1
+                    }
+                };
+                rows[index].candidates.push(system.plugin.id.clone());
+                if system.enabled {
+                    rows[index].provider = Some(system.plugin.id.clone());
+                }
+            }
+        }
+        rows.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+        rows
+    }
+
+    /// Whether this field is a choice rather than a fixed consequence of which
+    /// systems exist.
+    pub fn has_alternatives(&self) -> bool {
+        self.candidates.len() > 1
+    }
+
+    pub fn kind_label(&self) -> String {
+        let kind = match self.value_kind {
+            FieldValueKind::Scalar(_) => "scalar",
+            FieldValueKind::Vector(_) => "vector",
+        };
+        format!("{kind} · {}", self.value_kind.dimension())
     }
 }
 
@@ -391,6 +483,100 @@ mod tests {
 
         assert!(!view.accepts_commands());
         assert_eq!(view.status.label(), "Disconnected");
+    }
+
+    /// The defect this exists to prevent: the inspector listing "Electric field
+    /// E" twice because two plugins each called their output that. A scene has
+    /// one electric field, and the models of it are a choice.
+    #[test]
+    fn the_electric_field_appears_once_with_the_models_that_can_compute_it() {
+        use fieldcad_electromagnetic_sources::{
+            electric_field_channel_id, magnetic_field_channel_id,
+        };
+        use fieldcad_simulation::{PluginRegistration, RuntimeConfig, SimulationRuntime};
+
+        let domain = fieldcad_core::Domain::new(
+            fieldcad_core::DomainBounds::centred_cube(2.0).unwrap(),
+            fieldcad_core::Resolution::uniform(8).unwrap(),
+            fieldcad_core::BoundaryConditions::uniform(fieldcad_core::BoundaryCondition::Periodic),
+            fieldcad_core::Precision::F64,
+        );
+        let step = fieldcad_core::TimeStep::from_seconds(
+            fieldcad_electromagnetism::courant_limit(&domain) * 0.8,
+        )
+        .unwrap();
+        let source = fieldcad_simulation::LocalDataSource::new(
+            SimulationRuntime::new(
+                RuntimeConfig::new(domain, step, fieldcad_core::SessionId::from_u128(0x90))
+                    .with_plugin(Box::new(
+                        fieldcad_electrostatics::ElectrostaticsPlugin::new(),
+                    ))
+                    .with_plugin_registration(
+                        PluginRegistration::with_default_configuration(Box::new(
+                            fieldcad_electromagnetism::ElectromagnetismPlugin::new(),
+                        ))
+                        .with_enabled(false),
+                    ),
+            )
+            .unwrap(),
+        );
+
+        let view = ComputeView::build(&source, &fieldcad_core::World::new().snapshot());
+
+        let electric: Vec<_> = view
+            .fields
+            .iter()
+            .filter(|field| field.channel == electric_field_channel_id())
+            .collect();
+        assert_eq!(electric.len(), 1, "one field, not one per plugin");
+        let electric = electric[0];
+        assert_eq!(electric.display_name, "Electric field E");
+        assert!(
+            electric.has_alternatives(),
+            "both composed systems must be offered as models of it"
+        );
+        assert_eq!(
+            electric.provider.as_ref(),
+            Some(&fieldcad_electrostatics::plugin_id())
+        );
+
+        // The magnetic field is listed even though nothing computes it, so the
+        // control that would turn it on is reachable.
+        let magnetic = view
+            .fields
+            .iter()
+            .find(|field| field.channel == magnetic_field_channel_id())
+            .expect("a composed system declares a magnetic field");
+        assert_eq!(magnetic.provider, None);
+        assert!(!magnetic.has_alternatives());
+
+        // No field is listed twice, whatever the models.
+        let mut seen: Vec<_> = view.fields.iter().map(|field| &field.channel).collect();
+        let total = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), total);
+
+        // A residual on a Yee lattice is not a field the world has. It stays
+        // with the method that defines it rather than joining this list.
+        assert!(
+            !view.fields.iter().any(|field| {
+                field.channel == fieldcad_electromagnetism::magnetic_divergence_channel_id()
+            }),
+            "method diagnostics must not be listed as fields of the scene: {:?}",
+            view.fields
+                .iter()
+                .map(|field| &field.display_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            source.field_systems().iter().any(|system| {
+                system.channels.iter().any(|channel| {
+                    channel.id == fieldcad_electromagnetism::magnetic_divergence_channel_id()
+                })
+            }),
+            "but it is still reachable through the system that publishes it"
+        );
     }
 
     #[test]

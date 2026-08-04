@@ -85,8 +85,8 @@ Progress as of 2026-08-03:
   validates, revisions, and publishes returned object transforms/velocities.
   See ADRs 0017 and 0018 and the
   [readiness assessment](docs/reviews/2026-08-03-milestone-6-readiness-assessment.md).
-- Milestone 6 is implemented. One generic particle schema and a NIST CODATA
-  catalog feed fixed, prescribed, or dynamically integrated objects to Maxwell.
+- Milestone 6 is implemented. Independent mass and charge components and a NIST
+  CODATA catalog feed pinned or solver-integrated objects to Maxwell.
   Periodic CIC charge, six-path continuity-preserving current deposition,
   Gauss-consistent Poisson initialization, Yee interpolation, and a relativistic
   Boris pusher are shared by CPU and host-owned GPU field backends. Runtime
@@ -111,7 +111,8 @@ crates/
   fieldcad-bench/        headless compute performance harness        [present]
   fieldcad-core/         world, domain, sampling, units, time        [present]
   fieldcad-electromagnetic-sources/ shared charge schema/sources     [present]
-  fieldcad-particles/     generic particle schema/catalog           [present]
+  fieldcad-mass-sources/ shared mass schema/sources                  [present]
+  fieldcad-particles/    catalog provenance and particle view        [present]
   fieldcad-plugin-api/   equation-system contract and schemas        [present]
   fieldcad-simulation/   runtime and data-source boundary            [present]
   fieldcad-render/       wgpu renderer and visualization layers      [planned]
@@ -407,15 +408,19 @@ Exit criteria:
 Implement a minimal gravity plugin to test that abstractions are not secretly
 electromagnetic:
 
-- mass as an independently declared object component;
+- mass as an independently declared object component — **done** ahead of this
+  milestone by ADR 0021: `fieldcad-mass-sources` owns the schema, and one object
+  may already carry both charge and mass;
 - gravitational potential and acceleration channels;
 - analytic point/sphere sources first; and
 - reuse of generic planes, glyphs, colour maps, probes, and property editing.
+  Property editing is **done**: the inspector is schema-driven, so gravity's
+  component becomes authorable with no desktop change.
 
 Exit criteria:
 
 - gravity adds no dependency to electromagnetism;
-- one object may carry both charge and mass components;
+- one object may carry both charge and mass components — **met**;
 - the application can enable and inspect both equation systems without channel
   ID or unit ambiguity; and
 - any plugin API change is documented with the concrete need that forced it.

@@ -1,5 +1,8 @@
 # 0019 — the particle catalog creates one generic representation
 
+Status: **accepted**, revisited by
+[0021](0021-objects-are-composed-from-independent-components.md)
+
 ## Context
 
 Milestone 6 needs familiar electron, proton, positron, and neutron authoring
@@ -13,8 +16,15 @@ branch.
 - One shared particle component stores positive mass, motion mode, and catalog
   provenance. Charge remains the independently shared electromagnetic-source
   component; transform and velocity remain ordinary world state.
+  *(Superseded by [0021](0021-objects-are-composed-from-independent-components.md):
+  mass moved to its own shared component so a body can be massive without being a
+  catalog particle, and the particle component now records provenance only.)*
 - `Fixed`, `Prescribed`, and `Dynamic` are explicit motion modes. Only the latter
   two grant a solver kinematic authority.
+  *(Superseded by [0021](0021-objects-are-composed-from-independent-components.md):
+  replaced by `WorldObject::pinned`, which applies to any object rather than only
+  to particles. Pinned with zero velocity is `Fixed`; pinned with authored
+  velocity is `Prescribed`.)*
 - Electron, proton, positron, and neutron templates create the same component
   layout. Their only runtime inputs are the authored numerical properties.
 - Catalog release 1 records the NIST 2022 CODATA values: exact elementary
@@ -25,6 +35,9 @@ branch.
   and the [2022 CODATA recommended values](https://physics.nist.gov/cuu/pdf/wall_2022.pdf).
 - Editing a catalog mass changes its provenance to `Custom`; no UI edit may
   continue claiming the catalog value after changing it.
+  *(Since [0021](0021-objects-are-composed-from-independent-components.md) this is
+  enforced by checking the claim against the authored values rather than by asking
+  the editor to reset it — a generic property editor cannot know to.)*
 
 ## Consequences
 

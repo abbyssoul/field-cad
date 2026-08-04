@@ -5,14 +5,13 @@ use std::{
 
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, Domain, DomainBounds, ObjectShape, ObjectSpec,
-    Precision, ProbePosition, ProbeSpec, Resolution, SessionId, SlicePlaneSpec, TimeStep,
-    Transform, WorldCommand, WorldSnapshot,
+    Precision, ProbePosition, ProbeSpec, Resolution, SessionId, SimulationMode, SlicePlaneSpec,
+    TimeStep, Transform, WorldCommand, WorldSnapshot,
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electromagnetism::{
     ElectromagnetismPlugin, MaxwellSolverBackend, courant_limit,
     electric_divergence_channel_id as maxwell_electric_divergence_channel_id,
-    electric_field_channel_id as maxwell_electric_field_channel_id,
     energy_density_channel_id as maxwell_energy_density_channel_id,
     magnetic_divergence_channel_id as maxwell_magnetic_divergence_channel_id,
     magnetic_field_channel_id as maxwell_magnetic_field_channel_id,
@@ -22,8 +21,9 @@ use fieldcad_electrostatics::{
     electric_potential_channel_id,
 };
 use fieldcad_simulation::{
-    AsyncLocalDataSource, CommandEvent, CommandSequencer, FieldDataSource, LocalDataSource,
-    ProbeHistory, RuntimeConfig, SimulationRuntime, Subscription,
+    AsyncLocalDataSource, CommandEvent, CommandPayload, CommandSequencer, FieldDataSource,
+    LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig, SimulationRuntime,
+    Subscription,
 };
 use glam::{DQuat, DVec2, DVec3, UVec2, Vec2};
 use winit::{
@@ -192,6 +192,10 @@ struct WindowState {
     probe_history: ProbeHistory,
     commands: CommandSequencer,
     active_transform: Option<ActiveTransformDrag>,
+    /// Set from the last UI frame: an inspector control is being held.
+    inspector_editing: bool,
+    /// The interactive edit currently in progress, if any.
+    edit_gesture: Option<EditGesture>,
     frame_stats: FrameStats,
     /// When the next frame is due. Drives the event loop's control flow.
     next_redraw: Instant,
@@ -239,9 +243,10 @@ impl WindowState {
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
         let data_source = create_local_data_source(evaluator, maxwell)?;
         let world = data_source.world();
-        let mut ui_model = UiModel::new();
-        let maxwell_e = maxwell_electric_field_channel_id();
-        ui_model.field_layers.entry(maxwell_e).or_default().visible = true;
+        // Which layer opens visible is `UiModel`'s own rule — it reveals the
+        // first field a session sees — so the shell does not also decide it here
+        // and leave two places that can disagree.
+        let ui_model = UiModel::new();
 
         Ok(Self {
             egui_state,
@@ -256,6 +261,8 @@ impl WindowState {
             probe_history: ProbeHistory::default(),
             commands: CommandSequencer::default(),
             active_transform: None,
+            inspector_editing: false,
+            edit_gesture: None,
             frame_stats: FrameStats::default(),
             next_redraw: Instant::now(),
             occluded: false,
@@ -408,6 +415,9 @@ impl WindowState {
                     plane_normal_active: self
                         .active_transform
                         .is_some_and(|drag| drag.constraint == ManipulationConstraint::PlaneNormal),
+                    paused_for_edit: self.edit_gesture.is_some_and(|gesture| gesture.resume),
+                    edit_in_progress: self.edit_gesture.is_some(),
+                    projection: self.camera.projection(),
                 },
             );
         });
@@ -423,7 +433,12 @@ impl WindowState {
         }
 
         self.apply_camera_action(ui_frame.camera_action);
-        self.apply_viewport_gesture(ui_frame.viewport_gesture, pixels_per_point)?;
+        // Before the frame's own commands are dispatched: a held inspector
+        // control submits an edit every frame, and the pause has to precede the
+        // first of them rather than arrive a frame late.
+        self.inspector_editing = ui_frame.scene_edit_in_progress;
+        self.synchronize_edit_gesture(compute.mode)?;
+        self.apply_viewport_gesture(ui_frame.viewport_gesture, pixels_per_point, compute.mode)?;
 
         // In submission order, which is also the order queued edits are applied
         // in at a tick boundary (ADR 0011).
@@ -466,7 +481,8 @@ impl WindowState {
             platform_output,
         );
         let primitives = self.egui_context.tessellate(shapes, pixels_per_point);
-        let instances = scene::instances(&self.world, self.ui_model.selection);
+        let show = self.scene_visibility();
+        let instances = scene::instances(&self.world, self.ui_model.selection, show);
         // Every visible layer names a channel declared by the snapshot. Several
         // channels (for example Maxwell E and B) can be drawn independently.
         let mut field = scene::FieldGeometry::default();
@@ -483,11 +499,19 @@ impl WindowState {
                 field.vector_lines.extend(layer_geometry.vector_lines);
             }
         }
-        scene::append_authoring_geometry(&mut field, &self.world, self.ui_model.scene_selection());
-        scene::append_transform_gizmo(
+        scene::append_authoring_geometry(
             &mut field,
             &self.world,
             self.ui_model.scene_selection(),
+            show,
+        );
+        // The gizmo is drawn only for a selection that is actually on screen.
+        // Handles floating over a hidden object would be draggable targets for
+        // something the user cannot see.
+        scene::append_transform_gizmo(
+            &mut field,
+            &self.world,
+            self.visible_selection(),
             self.active_transform
                 .and_then(|drag| drag.constraint.handle()),
             transform_preview,
@@ -497,8 +521,8 @@ impl WindowState {
             SceneFrame {
                 camera: &self.camera,
                 viewport: self.viewport,
-                grid_visible: self.ui_model.grid_visible,
-                axes_visible: self.ui_model.axes_visible,
+                grid_visible: self.ui_model.view.grid,
+                axes_visible: self.ui_model.view.axes,
                 instances: &instances,
                 field: &field,
             },
@@ -580,6 +604,10 @@ impl WindowState {
         match action {
             Some(CameraAction::Axis(view)) => self.camera.set_axis_view(view),
             Some(CameraAction::FocusSelection) => self.focus_selection(),
+            Some(CameraAction::Reset) => self.camera.reset(),
+            Some(CameraAction::SetProjection(projection)) => {
+                self.camera.set_projection(projection);
+            }
             None => {}
         }
     }
@@ -588,6 +616,7 @@ impl WindowState {
         &mut self,
         gesture: ViewportGesture,
         pixels_per_point: f32,
+        mode: SimulationMode,
     ) -> Result<(), String> {
         let drag_delta = Vec2::new(gesture.drag_delta.x, gesture.drag_delta.y);
         if gesture.middle_dragged {
@@ -606,8 +635,10 @@ impl WindowState {
         let pointer_delta = drag_delta * pixels_per_point.max(0.01);
         let was_active = self.active_transform.is_some();
 
+        // `visible_selection` rather than `scene_selection`: a hidden entity
+        // has no handles on screen, so it must not start a drag either.
         if gesture.primary_pressed
-            && let (Some(selection), Some(pointer)) = (self.ui_model.scene_selection(), pointer)
+            && let (Some(selection), Some(pointer)) = (self.visible_selection(), pointer)
             && let Some(origin) = scene::selection_origin(&self.world, selection)
         {
             let picked_handle = scene::pick_transform_handle(
@@ -620,8 +651,13 @@ impl WindowState {
             let constraint = match picked_handle {
                 Some(TransformHandle::PlaneNormal) => Some(ManipulationConstraint::PlaneNormal),
                 Some(handle) => Some(ManipulationConstraint::Handle(handle)),
-                None if scene::pick_scene(&self.world, &self.camera, self.viewport, pointer)
-                    == Some(selection) =>
+                None if scene::pick_scene(
+                    &self.world,
+                    self.scene_visibility(),
+                    &self.camera,
+                    self.viewport,
+                    pointer,
+                ) == Some(selection) =>
                 {
                     Some(ManipulationConstraint::ViewPlane)
                 }
@@ -643,6 +679,9 @@ impl WindowState {
                     origin: origin.as_dvec3(),
                     plane_frame,
                 });
+                // Immediately, not at the end of the frame: the same frame that
+                // starts the drag can already submit its first move.
+                self.synchronize_edit_gesture(mode)?;
             }
         }
 
@@ -693,6 +732,7 @@ impl WindowState {
         {
             self.ui_model.set_scene_selection(scene::pick_scene(
                 &self.world,
+                self.scene_visibility(),
                 &self.camera,
                 self.viewport,
                 pointer,
@@ -701,7 +741,30 @@ impl WindowState {
         if gesture.primary_released {
             self.active_transform = None;
         }
-        Ok(())
+        self.synchronize_edit_gesture(mode)
+    }
+
+    /// What the 3D view is currently drawing, as the scene module sees it.
+    ///
+    /// One accessor, so drawing, gizmos, and hit-testing cannot be given
+    /// different answers.
+    fn scene_visibility(&self) -> scene::SceneVisibility {
+        scene::SceneVisibility {
+            objects: self.ui_model.view.objects,
+            probes: self.ui_model.view.probes,
+            planes: self.ui_model.view.planes,
+        }
+    }
+
+    /// The current selection, but only while it is on screen.
+    ///
+    /// Selection itself survives a class being hidden — the scene list and the
+    /// inspector still show it — but nothing that requires seeing the thing is
+    /// offered for it.
+    fn visible_selection(&self) -> Option<scene::SceneSelection> {
+        self.ui_model
+            .scene_selection()
+            .filter(|selection| self.scene_visibility().shows(*selection))
     }
 
     fn translate_selection(
@@ -823,15 +886,47 @@ impl WindowState {
         world_command: WorldCommand,
         operation: &str,
     ) -> Result<(), String> {
-        let command = self
-            .commands
-            .issue(fieldcad_simulation::CommandPayload::CommitWorld(vec![
-                world_command,
-            ]));
+        self.submit(
+            fieldcad_simulation::CommandPayload::CommitWorld(vec![world_command]),
+            operation,
+        )?;
+        self.refresh_world();
+        Ok(())
+    }
+
+    fn submit(
+        &mut self,
+        payload: fieldcad_simulation::CommandPayload,
+        operation: &str,
+    ) -> Result<(), String> {
+        let command = self.commands.issue(payload);
         self.data_source
             .execute(command)
             .map_err(|error| format!("{operation} failed: {error}"))?;
-        self.refresh_world();
+        Ok(())
+    }
+
+    /// Whether anything is currently editing the scene.
+    ///
+    /// One accessor over both input paths, so a drag in the viewport and a value
+    /// held in the inspector cannot be treated as different kinds of edit.
+    const fn scene_is_being_edited(&self) -> bool {
+        self.active_transform.is_some() || self.inspector_editing
+    }
+
+    /// Open or close the interactive edit to match what the user is doing.
+    ///
+    /// Idempotent, and called at every point in a frame where either input path
+    /// can change: the gesture's boundaries have to be exact, because the pause
+    /// must land before the first edit it brackets and the resume after the
+    /// last.
+    fn synchronize_edit_gesture(&mut self, mode: SimulationMode) -> Result<(), String> {
+        let (next, commands) =
+            EditGesture::transition(self.edit_gesture, self.scene_is_being_edited(), mode);
+        self.edit_gesture = next;
+        for payload in commands {
+            self.submit(payload, "scene edit")?;
+        }
         Ok(())
     }
 
@@ -863,6 +958,62 @@ impl WindowState {
                 }
             }
         };
+    }
+}
+
+/// A scene edit that spans frames: a viewport drag, or an inspector control
+/// held down or being typed into.
+///
+/// Dragging a body from one place to another is authoring, not motion: it
+/// teleports the object, and the intermediate poses are not states the equations
+/// ever produced. Letting a simulation advance through that would interleave
+/// solver ticks with values nothing computed, and the result would be neither
+/// the trajectory the solver was following nor the experiment the user is
+/// building. So the gesture suspends the run and hands it back when it commits.
+///
+/// The gesture is the desktop's, not the runtime's — it is made of pointer
+/// events — but its effect is authoritative and reaches the source as ordinary
+/// correlated commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EditGesture {
+    /// The simulation was advancing when this gesture began, and so is resumed
+    /// when it commits. A run the user had already paused stays paused.
+    resume: bool,
+}
+
+impl EditGesture {
+    /// What opening or closing a gesture asks of the source, and the state that
+    /// leaves behind.
+    ///
+    /// Pure, because the ordering here is the whole contract and it is not worth
+    /// standing up a window to check: the pause precedes the edits it brackets,
+    /// the commit precedes the resume, and a run the user had already paused is
+    /// given back exactly as it was found.
+    fn transition(
+        current: Option<Self>,
+        editing: bool,
+        mode: SimulationMode,
+    ) -> (Option<Self>, Vec<CommandPayload>) {
+        match (editing, current) {
+            (true, None) => {
+                let resume = mode == SimulationMode::Running;
+                let mut commands = Vec::new();
+                if resume {
+                    commands.push(CommandPayload::Pause);
+                }
+                commands.push(CommandPayload::SetInteractiveEdit(true));
+                (Some(Self { resume }), commands)
+            }
+            (false, Some(gesture)) => {
+                let mut commands = vec![CommandPayload::SetInteractiveEdit(false)];
+                if gesture.resume {
+                    commands.push(CommandPayload::Play);
+                }
+                (None, commands)
+            }
+            (true, Some(gesture)) => (Some(gesture), Vec::new()),
+            (false, None) => (None, Vec::new()),
+        }
     }
 }
 
@@ -945,8 +1096,19 @@ fn create_local_data_source(
                     .with_planes(UVec2::splat(33))
                     .with_domain_stride(8),
             )
+            // Two models of one electric field. Both are composed into the
+            // scene so either can compute it, and the analytic one is active
+            // because the default scene is a single stationary charge — a case
+            // it answers exactly and immediately. Choosing Maxwell instead is
+            // one control in the inspector's Fields section, and brings the
+            // magnetic field with it.
             .with_plugin(Box::new(ElectrostaticsPlugin::with_evaluator(evaluator)))
-            .with_plugin(Box::new(ElectromagnetismPlugin::with_backend(maxwell))),
+            .with_plugin_registration(
+                PluginRegistration::with_default_configuration(Box::new(
+                    ElectromagnetismPlugin::with_backend(maxwell),
+                ))
+                .with_enabled(false),
+            ),
     )
     .map_err(|error| error.to_string())?;
     runtime
@@ -965,10 +1127,12 @@ fn create_local_data_source(
             WorldCommand::CreateProbe(ProbeSpec::at(
                 "Field probe",
                 DVec3::new(1.0, 0.0, 0.6),
+                // One entry for the electric field, whichever model computes
+                // it. The rest are Maxwell's own method diagnostics, recorded
+                // when that model is the active one.
                 vec![
                     electric_field_channel_id(),
                     electric_potential_channel_id(),
-                    maxwell_electric_field_channel_id(),
                     maxwell_magnetic_field_channel_id(),
                     maxwell_energy_density_channel_id(),
                     maxwell_electric_divergence_channel_id(),
@@ -982,6 +1146,9 @@ fn create_local_data_source(
             ),
         ])
         .map_err(|error| error.to_string())?;
+    // The default scene is where this session starts, not the user's first
+    // edit. Without this the opening undo would empty the workspace.
+    runtime.clear_edit_history();
 
     Ok(AsyncLocalDataSource::new(LocalDataSource::new(runtime)))
 }
@@ -1022,8 +1189,66 @@ impl FrameStats {
 
 #[cfg(test)]
 mod tests {
-    use super::FrameStats;
+    use super::{EditGesture, FrameStats};
+    use fieldcad_core::SimulationMode;
+    use fieldcad_simulation::CommandPayload;
     use std::time::Duration;
+
+    /// The order is the point: the pause has to arrive before the first edit of
+    /// the gesture, and the resume after the commit that brings deferred systems
+    /// current — otherwise the resumed run starts from a field nothing
+    /// recomputed.
+    #[test]
+    fn a_running_simulation_is_suspended_for_an_edit_and_resumed_when_it_commits() {
+        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Running);
+
+        assert_eq!(
+            commands,
+            vec![
+                CommandPayload::Pause,
+                CommandPayload::SetInteractiveEdit(true)
+            ]
+        );
+
+        // Nothing further while the gesture is held, however many frames it
+        // spans.
+        let (held, commands) = EditGesture::transition(opened, true, SimulationMode::Paused);
+        assert_eq!(held, opened);
+        assert!(commands.is_empty());
+
+        let (closed, commands) = EditGesture::transition(held, false, SimulationMode::Paused);
+        assert_eq!(closed, None);
+        assert_eq!(
+            commands,
+            vec![
+                CommandPayload::SetInteractiveEdit(false),
+                CommandPayload::Play
+            ]
+        );
+    }
+
+    /// The gesture hands the transport back as it found it. Resuming a run the
+    /// user had deliberately paused would make dragging a body start the
+    /// simulation.
+    #[test]
+    fn editing_an_already_paused_simulation_leaves_it_paused() {
+        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Paused);
+
+        assert_eq!(commands, vec![CommandPayload::SetInteractiveEdit(true)]);
+
+        let (closed, commands) = EditGesture::transition(opened, false, SimulationMode::Paused);
+
+        assert_eq!(closed, None);
+        assert_eq!(commands, vec![CommandPayload::SetInteractiveEdit(false)]);
+    }
+
+    #[test]
+    fn no_edit_in_progress_asks_nothing_of_the_source() {
+        let (gesture, commands) = EditGesture::transition(None, false, SimulationMode::Running);
+
+        assert_eq!(gesture, None);
+        assert!(commands.is_empty());
+    }
 
     #[test]
     fn frame_diagnostics_measure_work_not_time_spent_idle() {

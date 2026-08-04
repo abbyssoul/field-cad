@@ -67,7 +67,8 @@ impl ChannelHandle {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// Not `Eq`: a property's declared default may carry an `f64` magnitude.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginConfigurationSchema {
     pub properties: Vec<PropertySchema>,
 }
@@ -119,6 +120,21 @@ impl SolverCancellation {
 pub struct SampledColumn {
     pub values: FieldColumn,
     pub validity: Vec<SampleValidity>,
+}
+
+/// One body the dynamics system will move, as a field system sees it.
+///
+/// Deliberately carries only kinematics and inertia. A plugin's own coupling
+/// charge — electric charge, gravitational mass — is read from the world it
+/// already adopted in `on_world_changed`, so this type never has to name every
+/// quantity a future field might couple to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DynamicBody {
+    pub object: ObjectId,
+    /// The inertia a total force will be divided by. Always finite and positive.
+    pub inertial_mass_kg: f64,
+    pub position: glam::DVec3,
+    pub velocity: glam::DVec3,
 }
 
 /// One authoritative object pose and velocity produced by a solver tick.
@@ -237,6 +253,28 @@ pub trait EquationSystemSolver: Send {
         &[]
     }
 
+    /// The total force this system exerts on each dynamic body, in newtons.
+    ///
+    /// One entry per body, in the order given. A system that exerts no force on
+    /// a body returns zero for it rather than omitting it, so the runtime can
+    /// sum contributions positionally without matching identifiers per body.
+    ///
+    /// This is where coupling happens. Each field system converts its own field
+    /// and its own coupling charge into a force — `qE` for an electric field,
+    /// `m_g·g` for a gravitational one — and the dynamics system, which knows
+    /// about neither, sums them and divides by inertia. A new field becomes
+    /// dynamically coupled by implementing this and nothing else.
+    ///
+    /// Forces are evaluated at the body's *current* position and velocity, so a
+    /// velocity-dependent force such as `qv×B` is expressible; note that
+    /// collapsing it into a single vector here is what costs the exact magnetic
+    /// rotation a Boris push would have given ([ADR 0022]).
+    ///
+    /// [ADR 0022]: ../../../docs/adr/0022-dynamics-is-a-first-party-system.md
+    fn forces(&self, bodies: &[DynamicBody]) -> Result<Vec<glam::DVec3>, PluginError> {
+        Ok(vec![glam::DVec3::ZERO; bodies.len()])
+    }
+
     /// Advance internal state by one fixed step. Analytic solvers need not
     /// implement this.
     fn step(&mut self, context: StepContext) -> Result<SolverStepOutcome, PluginError> {
@@ -288,6 +326,8 @@ mod tests {
                 display_name: "Gain".to_owned(),
                 kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
                 required: true,
+                default_value: None,
+                relevant_when: None,
             }],
         };
         let values: PropertyBag = [(

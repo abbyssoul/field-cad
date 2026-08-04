@@ -81,6 +81,8 @@ impl EquationSystemPlugin for TestFieldPlugin {
                 display_name: "Gain".to_owned(),
                 kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
                 required: true,
+                default_value: None,
+                relevant_when: None,
             }],
         }
     }

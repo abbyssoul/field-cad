@@ -7,13 +7,13 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    ChannelId, FieldColumn, FieldSnapshot, PlaneId, SampleGeometry, SampleValidity,
+    ChannelId, FieldColumn, FieldSnapshot, GridLattice, PlaneId, SampleGeometry, SampleValidity,
 };
 use glam::{DVec3, Vec3};
 
 use super::{
     ColoredVertex, FieldGeometry, FieldLayerSettings, PlaneLayerSettings, PlaneVectorMode,
-    append_arrow,
+    VectorDisplay, append_arrow,
 };
 
 /// Convert one vector channel's batches into generic coloured triangles and
@@ -41,6 +41,13 @@ pub fn field_geometry(
         match batch.geometry() {
             SampleGeometry::Plane { plane, lattice } => {
                 let plane_settings = plane_layers.get(plane).copied().unwrap_or_default();
+                // Whether this plane draws this field is the plane's own
+                // setting. The channel's visibility is checked by the caller,
+                // which is what keeps the two independent: hiding a field here
+                // leaves every other plane showing it.
+                if !plane_settings.visible {
+                    continue;
+                }
                 let normal = lattice_normal(*lattice);
                 let displayed_values: Vec<_> = values
                     .iter()
@@ -64,37 +71,29 @@ pub fn field_geometry(
                         plane_settings.magnitude_density,
                     );
                 }
-                if plane_settings.vectors_visible {
+                if plane_settings.vectors.visible {
                     // Lifted clear of the colour mesh so the arrows are not
                     // z-fighting with the surface they describe.
                     append_plane_vectors(
                         &mut output.vector_lines,
                         &field,
                         offset + normal * 0.008,
-                        plane_settings.vector_density,
+                        plane_settings.vectors,
                     );
                 }
             }
-            SampleGeometry::Grid(lattice) if settings.domain_vectors => {
+            SampleGeometry::Grid(lattice) if settings.vectors.visible => {
                 let scale = MagnitudeScale::over(values, batch.validity());
                 let colors = scale.colors(values, batch.validity());
-                let characteristic_length = lattice.step().min_element().abs() as f32;
-                for index in 0..lattice.len() {
-                    if !batch.validity()[index].is_usable() {
-                        continue;
-                    }
-                    let vector = values[index].as_vec3();
-                    append_arrow(
-                        &mut output.vector_lines,
-                        lattice
-                            .position(index)
-                            .expect("index is inside lattice")
-                            .as_vec3(),
-                        vector,
-                        characteristic_length * scale.glyph_length(vector.length()),
-                        colors[index].extend(1.0),
-                    );
-                }
+                append_domain_vectors(
+                    &mut output.vector_lines,
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    &colors,
+                    scale,
+                    settings.vectors,
+                );
             }
             _ => {}
         }
@@ -170,7 +169,7 @@ fn append_plane_vectors(
     lines: &mut Vec<ColoredVertex>,
     field: &PlaneField<'_>,
     offset: Vec3,
-    density: u32,
+    display: VectorDisplay,
 ) {
     let PlaneField {
         lattice,
@@ -180,8 +179,8 @@ fn append_plane_vectors(
         scale,
     } = *field;
     let counts = lattice.counts();
-    let xs = uniform_axis(counts.x, density);
-    let ys = uniform_axis(counts.y, density);
+    let xs = uniform_axis(counts.x, display.density);
+    let ys = uniform_axis(counts.y, display.density);
     let step_length = uniform_glyph_spacing(lattice, &xs, &ys);
     for &y in &ys {
         for &x in &xs {
@@ -196,11 +195,152 @@ fn append_plane_vectors(
                 lines,
                 interpolation.position + offset,
                 vector,
-                step_length * scale.glyph_length(vector.length()),
+                step_length * scale.glyph_length(vector.length()) * display.scale,
                 interpolation.vec3(colors).extend(1.0),
             );
         }
     }
+}
+
+/// Sparse glyphs distributed uniformly through the published domain lattice.
+///
+/// Resampled the same way a plane is, rather than drawing one arrow per
+/// published point: the transport stride and the display density answer
+/// different questions, and tying them together means a user who wants a
+/// legible volume has to ask the solver for fewer samples to get it.
+fn append_domain_vectors(
+    lines: &mut Vec<ColoredVertex>,
+    lattice: GridLattice,
+    values: &[DVec3],
+    validity: &[SampleValidity],
+    colors: &[Vec3],
+    scale: MagnitudeScale,
+    display: VectorDisplay,
+) {
+    let counts = lattice.counts();
+    let xs = uniform_axis(counts.x, display.density);
+    let ys = uniform_axis(counts.y, display.density);
+    let zs = uniform_axis(counts.z, display.density);
+    let step_length = uniform_domain_spacing(lattice, &xs, &ys, &zs);
+    for &z in &zs {
+        for &y in &ys {
+            for &x in &xs {
+                let Some(interpolation) = grid_interpolation(lattice, x, y, z) else {
+                    continue;
+                };
+                if !interpolation.is_usable(validity) {
+                    continue;
+                }
+                let vector = interpolation.dvec3(values).as_vec3();
+                append_arrow(
+                    lines,
+                    interpolation.position,
+                    vector,
+                    step_length * scale.glyph_length(vector.length()) * display.scale,
+                    interpolation.vec3(colors).extend(1.0),
+                );
+            }
+        }
+    }
+}
+
+/// Trilinear interpolation of the published domain lattice, mirroring
+/// [`PlaneInterpolation`] one dimension up.
+#[derive(Clone, Copy, Debug)]
+struct GridInterpolation {
+    position: Vec3,
+    indices: [usize; 8],
+    weights: [f64; 8],
+}
+
+impl GridInterpolation {
+    fn is_usable(self, validity: &[SampleValidity]) -> bool {
+        self.indices
+            .iter()
+            .all(|&index| validity[index].is_usable())
+    }
+
+    fn dvec3(self, values: &[DVec3]) -> DVec3 {
+        self.indices
+            .into_iter()
+            .zip(self.weights)
+            .map(|(index, weight)| values[index] * weight)
+            .sum()
+    }
+
+    fn vec3(self, values: &[Vec3]) -> Vec3 {
+        self.indices
+            .into_iter()
+            .zip(self.weights)
+            .map(|(index, weight)| values[index] * weight as f32)
+            .sum()
+    }
+}
+
+fn grid_interpolation(lattice: GridLattice, x: f64, y: f64, z: f64) -> Option<GridInterpolation> {
+    let counts = lattice.counts();
+    let axis = |value: f64, count: u32| {
+        let value = value.clamp(0.0, f64::from(count.saturating_sub(1)));
+        let low = value.floor();
+        (low as usize, value.ceil() as usize, value - low)
+    };
+    let (x0, x1, fx) = axis(x, counts.x);
+    let (y0, y1, fy) = axis(y, counts.y);
+    let (z0, z1, fz) = axis(z, counts.z);
+    let width = counts.x as usize;
+    let height = counts.y as usize;
+    let at = |x: usize, y: usize, z: usize| x + width * (y + height * z);
+    let indices = [
+        at(x0, y0, z0),
+        at(x1, y0, z0),
+        at(x0, y1, z0),
+        at(x1, y1, z0),
+        at(x0, y0, z1),
+        at(x1, y0, z1),
+        at(x0, y1, z1),
+        at(x1, y1, z1),
+    ];
+    let weights = [
+        (1.0 - fx) * (1.0 - fy) * (1.0 - fz),
+        fx * (1.0 - fy) * (1.0 - fz),
+        (1.0 - fx) * fy * (1.0 - fz),
+        fx * fy * (1.0 - fz),
+        (1.0 - fx) * (1.0 - fy) * fz,
+        fx * (1.0 - fy) * fz,
+        (1.0 - fx) * fy * fz,
+        fx * fy * fz,
+    ];
+    if indices.iter().any(|&index| index >= lattice.len()) {
+        return None;
+    }
+    Some(GridInterpolation {
+        position: grid_point(lattice, x, y, z)?.as_vec3(),
+        indices,
+        weights,
+    })
+}
+
+/// The lattice is axis-aligned with a uniform step, so a fractional coordinate
+/// resolves without interpolating positions.
+fn grid_point(lattice: GridLattice, x: f64, y: f64, z: f64) -> Option<DVec3> {
+    Some(lattice.position(0)? + lattice.step() * DVec3::new(x, y, z))
+}
+
+fn uniform_domain_spacing(lattice: GridLattice, xs: &[f64], ys: &[f64], zs: &[f64]) -> f32 {
+    let step = lattice.step();
+    let spacing = |axis: &[f64], step: f64| {
+        (axis.len() > 1).then(|| ((axis[1] - axis[0]) * step).abs() as f32)
+    };
+    [
+        spacing(xs, step.x),
+        spacing(ys, step.y),
+        spacing(zs, step.z),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|spacing| *spacing > f32::EPSILON)
+    .reduce(f32::min)
+    .unwrap_or(0.25)
 }
 
 /// Coordinates in snapshot-lattice space, distributed uniformly across its
@@ -402,7 +542,7 @@ fn field_color(value: f32) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{PlaneLattice, SampleValidity, UndefinedReason};
-    use glam::{DVec3, UVec2};
+    use glam::{DVec3, UVec2, UVec3};
 
     use super::*;
 
@@ -500,7 +640,7 @@ mod tests {
             &mut lines,
             &uniform_plane_field(lattice, &values, &validity, &colors),
             Vec3::ZERO,
-            25,
+            VectorDisplay::new(true, 25),
         );
 
         let origins: Vec<_> = lines
@@ -525,11 +665,204 @@ mod tests {
         let mut lines = Vec::new();
         let field = uniform_plane_field(lattice, &values, &validity, &colors);
 
-        append_plane_vectors(&mut lines, &field, Vec3::ZERO, 0);
+        append_plane_vectors(&mut lines, &field, Vec3::ZERO, VectorDisplay::new(true, 0));
         assert!(lines.is_empty());
 
-        append_plane_vectors(&mut lines, &field, Vec3::ZERO, 8);
+        append_plane_vectors(&mut lines, &field, Vec3::ZERO, VectorDisplay::new(true, 8));
         assert_eq!(lines.len() / 6, 8 * 8);
+    }
+
+    /// A snapshot publishing one vector channel on two slice planes.
+    fn two_plane_snapshot() -> (FieldSnapshot, ChannelId, [PlaneId; 2]) {
+        use fieldcad_core::{
+            ChannelSchema, Dimension, Domain, FieldValueKind, PluginId, SessionId,
+            SnapshotCompleteness, SnapshotIdentity, WorldRevision,
+        };
+        use std::sync::Arc;
+
+        let plugin = PluginId::new("test").unwrap();
+        let channel = ChannelId::new(plugin.clone(), "vector").unwrap();
+        let planes = [PlaneId::new(0), PlaneId::new(1)];
+        let batches: Vec<_> = planes
+            .iter()
+            .map(|plane| {
+                let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(2));
+                fieldcad_core::FieldBatch::new(
+                    SampleGeometry::Plane {
+                        plane: *plane,
+                        lattice,
+                    },
+                    FieldColumn::vectors(vec![DVec3::X; 4]),
+                    vec![SampleValidity::Exact; 4],
+                )
+                .unwrap()
+            })
+            .collect();
+        let snapshot = FieldSnapshot {
+            identity: SnapshotIdentity {
+                session: SessionId::from_u128(1),
+                sequence: 0,
+                world_revision: WorldRevision::INITIAL,
+                tick: 0,
+                time_seconds: 0.0,
+            },
+            completeness: SnapshotCompleteness::Complete,
+            domain: Domain::centred_cube(4.0, 4).unwrap(),
+            plugins: Arc::from([]),
+            channels: BTreeMap::from([(
+                channel.clone(),
+                fieldcad_core::ChannelSnapshot {
+                    schema: Arc::new(ChannelSchema {
+                        id: channel.clone(),
+                        display_name: "Vector".to_owned(),
+                        value_kind: FieldValueKind::Vector(Dimension::ELECTRIC_FIELD),
+                    }),
+                    provider: plugin,
+                    batches: batches.into(),
+                },
+            )]),
+            diagnostics: Arc::from([]),
+        };
+        (snapshot, channel, planes)
+    }
+
+    /// Two controls, two questions. Whether a field is drawn at all belongs to
+    /// the view; whether *this* plane draws it belongs to the plane. Reaching one
+    /// through the other is what made turning a field off on a plane turn it off
+    /// everywhere.
+    #[test]
+    fn a_plane_hides_a_field_without_hiding_it_on_other_planes() {
+        let (snapshot, channel, planes) = two_plane_snapshot();
+        let arrows = |layers: BTreeMap<PlaneId, PlaneLayerSettings>| {
+            field_geometry(&snapshot, &channel, FieldLayerSettings::default(), &layers)
+                .vector_lines
+                .len()
+        };
+
+        let both = arrows(BTreeMap::new());
+        assert!(both > 0, "an unconfigured plane draws the visible layer");
+
+        let hidden_here = PlaneLayerSettings {
+            visible: false,
+            ..PlaneLayerSettings::default()
+        };
+        let one_hidden = arrows(BTreeMap::from([(planes[0], hidden_here)]));
+
+        assert_eq!(
+            one_hidden,
+            both / 2,
+            "hiding the field on one plane must leave the other drawing it"
+        );
+        assert_eq!(
+            arrows(BTreeMap::from([
+                (planes[0], hidden_here),
+                (planes[1], hidden_here),
+            ])),
+            0
+        );
+    }
+
+    /// A uniform 3×3×3 domain batch of unit +X vectors.
+    fn uniform_domain(counts: u32) -> (GridLattice, Vec<DVec3>, Vec<SampleValidity>, Vec<Vec3>) {
+        let lattice = GridLattice::new(DVec3::splat(-1.0), DVec3::splat(1.0), UVec3::splat(counts));
+        let values = vec![DVec3::X; lattice.len()];
+        let validity = vec![SampleValidity::Exact; lattice.len()];
+        let colors = vec![Vec3::ONE; lattice.len()];
+        (lattice, values, validity, colors)
+    }
+
+    fn domain_arrows(display: VectorDisplay) -> Vec<ColoredVertex> {
+        let (lattice, values, validity, colors) = uniform_domain(3);
+        let mut lines = Vec::new();
+        append_domain_vectors(
+            &mut lines,
+            lattice,
+            &values,
+            &validity,
+            &colors,
+            MagnitudeScale::over(&values, &validity),
+            display,
+        );
+        lines
+    }
+
+    /// The whole-domain view resamples the published lattice like a plane does,
+    /// rather than drawing one arrow per transported sample. Asking for a
+    /// legible volume must not mean asking the solver for less.
+    #[test]
+    fn domain_density_is_a_display_setting_not_the_published_sample_count() {
+        // Nine samples per axis were published; four arrows per axis are drawn.
+        let sparse = domain_arrows(VectorDisplay::new(true, 4));
+        assert_eq!(sparse.len() / 6, 4 * 4 * 4);
+
+        // And a density above the published one interpolates rather than
+        // refusing — the same latitude a plane already has.
+        let dense = domain_arrows(VectorDisplay::new(true, 5));
+        assert_eq!(dense.len() / 6, 5 * 5 * 5);
+
+        assert!(domain_arrows(VectorDisplay::new(true, 0)).is_empty());
+    }
+
+    #[test]
+    fn domain_arrows_span_the_published_lattice_uniformly() {
+        let arrows = domain_arrows(VectorDisplay::new(true, 3));
+        let origins: Vec<_> = arrows
+            .chunks_exact(6)
+            .map(|arrow| arrow[0].position)
+            .collect();
+
+        // The lattice runs from -1 to +1 on each axis in steps of one.
+        assert!((origins[0].x + 1.0).abs() < 1.0e-5);
+        assert!((origins[2].x - 1.0).abs() < 1.0e-5);
+        assert!((origins[0].z + 1.0).abs() < 1.0e-5);
+        assert!((origins[26].z - 1.0).abs() < 1.0e-5);
+        assert!(origins.iter().all(|origin| origin.is_finite()));
+    }
+
+    /// Scale is a multiplier on the automatic length and nothing else: the same
+    /// arrows, in the same places, drawn longer.
+    #[test]
+    fn the_scale_factor_lengthens_arrows_without_moving_them() {
+        let plain = domain_arrows(VectorDisplay::new(true, 3));
+        let doubled = domain_arrows(VectorDisplay {
+            scale: 2.0,
+            ..VectorDisplay::new(true, 3)
+        });
+
+        assert_eq!(plain.len(), doubled.len());
+        for (plain, doubled) in plain.chunks_exact(6).zip(doubled.chunks_exact(6)) {
+            assert_eq!(plain[0].position, doubled[0].position);
+            let plain_length = plain[1].position.distance(plain[0].position);
+            let doubled_length = doubled[1].position.distance(doubled[0].position);
+            assert!((doubled_length - plain_length * 2.0).abs() < 1.0e-5);
+        }
+    }
+
+    /// The same setting, applied the same way, wherever the arrows are drawn.
+    #[test]
+    fn the_scale_factor_applies_on_a_plane_too() {
+        let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(3));
+        let values = vec![DVec3::X; lattice.len()];
+        let validity = vec![SampleValidity::Exact; lattice.len()];
+        let colors = vec![Vec3::ONE; lattice.len()];
+        let field = uniform_plane_field(lattice, &values, &validity, &colors);
+
+        let length = |scale: f32| {
+            let mut lines = Vec::new();
+            append_plane_vectors(
+                &mut lines,
+                &field,
+                Vec3::ZERO,
+                VectorDisplay {
+                    scale,
+                    ..VectorDisplay::new(true, 3)
+                },
+            );
+            lines[1].position.distance(lines[0].position)
+        };
+
+        assert!((length(2.0) - length(1.0) * 2.0).abs() < 1.0e-5);
+        assert!((length(0.5) - length(1.0) * 0.5).abs() < 1.0e-5);
     }
 
     #[test]

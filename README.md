@@ -8,10 +8,11 @@ or dedicated compute.
 
 The long-term objective includes modelling atoms, subatomic particles, and
 particle-physics experiments from the perspective of fields. Electron, proton,
-positron, and neutron entries are catalog templates: selecting one creates the
-same generic particle object with preset mass and charge values. The template
-does not bring hidden species-specific interactions; the active field equations
-and solver determine how the particle behaves.
+positron, and neutron entries are catalog templates: each attaches the same
+independent mass and charge components with published values, and the identical
+object can be composed by hand. The template does not bring hidden
+species-specific interactions; the active field equations and solver determine
+how the particle behaves.
 
 For example, a user can place one proton and one electron with chosen initial
 velocities and run a Hydrogen experiment under the Maxwell model. It may
@@ -51,10 +52,13 @@ The prescribed plane wave remains an explicit validation configuration. The
 scene inspector shows the active periodic domain, precision, resolution, and
 initial-condition settings alongside the system's published channels.
 
-Milestone 6 adds generic particles and physical field feedback. The Scene panel
-can create electron, proton, positron, and neutron catalog templates; the object
-inspector exposes mass, fixed/prescribed/dynamic motion mode, and editable
-velocity. Moving particles deposit charge and current with a discrete
+Milestone 6 adds generic particles and physical field feedback. Objects are built
+by composition: the Scene panel adds a bare object, and the inspector attaches
+charge to couple it to the electromagnetic field or mass to make it respond to
+force. A `Pinned` control decides whether a solver integrates the motion or the
+authored position and velocity are followed exactly. The inspector renders every
+component from its registered schema, so a new plugin's property becomes
+editable without a UI change. Moving particles deposit charge and current with a discrete
 continuity-preserving CIC scheme, sample reconstructed Yee fields, and use a
 relativistic Boris pusher before returning canonical motion through the runtime.
 Periodic Poisson initialization makes the coupled E field satisfy the lattice
@@ -85,11 +89,13 @@ fields together using Maxwell's equations and now couples generic moving
 particles through deposited charge/current and Lorentz-force feedback. A
 gravitational model remains a likely later addition.
 
-Charge authoring is shared infrastructure rather than an electrostatics-owned
-detail: electrostatics and Maxwell consume the same schema/source Module without
-depending on one another. The runtime remains the sole validated world writer:
-the Maxwell solver claims kinematic authority only for prescribed or dynamic
-particles and returns complete transform/velocity outcomes. Solver-produced
+Charge and mass authoring is shared infrastructure rather than a solver-owned
+detail: each quantity owns its schema in its own Module, so electrostatics and
+Maxwell consume charge without depending on one another, and a future gravity
+plugin consumes mass without depending on either. The runtime remains the sole
+validated world writer: the Maxwell solver claims kinematic authority only for
+objects that will actually move, and returns complete transform/velocity
+outcomes. Solver-produced
 revisions continue the integration; authored physical changes are reported as
 external interventions and reset the coupled conservation reference.
 
@@ -99,22 +105,28 @@ The extension unit is an **equation-system plugin**, not an individual rendered
 field. A plugin may expose one or more related field channels, object properties,
 and solvers. For example:
 
-- a shared electromagnetic-source Module defines authored charge;
+- a shared electromagnetic-source Module defines authored charge, and a shared
+  mass-source Module defines inertial and gravitational mass separately;
+- a first-party dynamics system moves every body with inertial mass, summing the
+  forces the active field systems contribute. A plugin couples to motion by
+  answering what force its field exerts, never by integrating a trajectory;
 - an electrostatics plugin exposes electric field `E` and electric potential;
 - an electromagnetism plugin consumes charge and exposes the coupled `E` and
   `B` fields, current, and its time integrator;
-- a particle catalog creates generic objects from electron, proton, positron,
-  neutron, and other mass/charge templates;
+- a particle catalog records where electron, proton, positron, and neutron
+  values came from, over the same components any object can carry;
 - future field systems may test alternative couplings, correction terms, or
   approximations against the same particle arrangement; and
-- a gravity plugin could expose gravitational acceleration, potential, and mass.
+- a gravity plugin could consume the same mass and expose gravitational
+  acceleration and potential, adding no dependency on electromagnetism.
 
 The application owns the scene, time controls, input, generic visualization,
 and probes. Plugins own the physical equations and the state needed to solve
 them. This keeps a new physical theory from requiring a new application.
 
-Equation systems are composed per scene. The Inspector lists every available
-system and the scalar/vector field channels it provides. Disabling a system
+Equation systems are composed per scene. Selecting the **Simulation** node at the
+top of the Scene panel lists every available system in the Inspector, together
+with the scalar/vector field channels it provides. Disabling a system
 stops its solver and removes its channels from new snapshots, while objects keep
 the plugin-contributed properties—such as charge or mass—that were authored on
 them. Coupled channels such as Maxwell `E` and `B` are activated together.
@@ -220,20 +232,30 @@ Controls:
   camera-oriented view plane; dragging empty space never moves it;
 - a selected slice plane additionally shows a proportional dashed purple normal
   arrow labelled `N`. Drag its outer tip to rotate and reorient the plane;
-- the Scene panel creates positive/negative point charges, uniformly charged
-  spheres, probes, and slice planes. Each row has viewport visibility and delete
-  controls; and
+- the Scene panel is the scene's contents: a Simulation node holding the domain
+  and its field systems, then the objects, then probes and slice planes under a
+  Measurement heading that marks them as instruments rather than physics. One
+  button adds an object; each row has viewport visibility and delete controls;
 - the Inspector edits position, charge, source radius, probe position, and plane
   orientation/extent. Each plane independently controls magnitude and arrow
   density with non-negative numeric inputs, and whether vectors are projected
   into the plane (the default) or shown in full 3D. A selected probe can attach
   to an object, detach without jumping, edit its local offset, and show bounded
   scalar or x/y/z/magnitude history; and
-- the Inspector's Field systems section lists the fields contributed by each
-  composed equation system, shows its authoritative settings, and enables or
-  disables that system for the scene. Inactive field names and settings remain
-  available for authoring, but are not simulated or published. The Compute
-  section reports domain resolution, precision, and boundary conditions; and
+- the Inspector describes exactly one selected thing and nothing else. With the
+  Simulation node selected it lists the fields contributed by each composed
+  equation system, shows its authoritative settings, and enables or disables that
+  system for the scene. Inactive field names and settings remain available for
+  authoring, but are not simulated or published. The Compute section there
+  reports domain resolution, precision, and boundary conditions;
+- the View window, floating over the 3D view, holds the six axis viewpoints,
+  focus and camera reset, and what is drawn — grid, origin axes, objects, probes,
+  slice planes, and which field channels are shown. Nothing in it changes the
+  physics. The top bar is the simulation transport: Play, Pause, Step, `dt`, and
+  playback speed;
+- a Getting started window opens on a first run and is reachable from `? Help`.
+  It covers building a scene by composition, where each panel's responsibility
+  lies, and the navigation and drag controls; and
 - under a selected probe, Recorded channels controls which published fields enter
   its bounded history; Open floating plot pins a non-blocking recorder window
   that can display several unit-safe channel plots at once.

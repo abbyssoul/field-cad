@@ -7,18 +7,20 @@
 use std::sync::{Arc, Mutex};
 
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, DiagnosticSeverity, Dimension, Domain, FieldColumn,
-    FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry, SampleValidity,
-    SolverDiagnostic, UndefinedReason, WorldSnapshot,
+    ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, ObjectId, PluginId,
+    PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic, UndefinedReason,
+    WorldSnapshot,
 };
-use fieldcad_electromagnetic_sources::charge_component_schema;
 pub use fieldcad_electromagnetic_sources::{
     ChargeDistribution, ChargeSource, charge_component_id, charge_properties, charge_property_id,
     collect_charge_sources as collect_sources,
 };
+use fieldcad_electromagnetic_sources::{
+    charge_component_schema, electric_field_channel_schema, electric_potential_channel_schema,
+};
 use fieldcad_plugin_api::{
-    ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginError, PluginMetadata,
-    SampledColumn, SolverContext, SolverKind,
+    ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
+    PluginMetadata, SampledColumn, SolverContext, SolverKind,
 };
 use glam::DVec3;
 
@@ -26,8 +28,6 @@ use glam::DVec3;
 use fieldcad_core::PropertyBag;
 
 pub const PLUGIN_ID: &str = "fieldcad.electrostatics";
-pub const ELECTRIC_FIELD_CHANNEL: &str = "electric-field";
-pub const ELECTRIC_POTENTIAL_CHANNEL: &str = "electric-potential";
 
 /// Coulomb constant in N·m²/C² (CODATA conventional value used by the oracle).
 pub const COULOMB_CONSTANT: f64 = 8.987_551_792_3e9;
@@ -39,13 +39,12 @@ pub fn plugin_id() -> PluginId {
     PluginId::new(PLUGIN_ID).expect("static plugin ID is valid")
 }
 
-pub fn electric_field_channel_id() -> ChannelId {
-    ChannelId::new(plugin_id(), ELECTRIC_FIELD_CHANNEL).expect("static channel ID is valid")
-}
-
-pub fn electric_potential_channel_id() -> ChannelId {
-    ChannelId::new(plugin_id(), ELECTRIC_POTENTIAL_CHANNEL).expect("static channel ID is valid")
-}
+/// The electric field this system computes is *the* electric field, not this
+/// plugin's own. Re-exported so callers need not know which module owns the
+/// name, and so a future third model of the same field is a drop-in.
+pub use fieldcad_electromagnetic_sources::{
+    electric_field_channel_id, electric_potential_channel_id,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ElectrostaticSample {
@@ -209,16 +208,8 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
 
     fn channels(&self) -> Vec<ChannelSchema> {
         vec![
-            ChannelSchema {
-                id: electric_field_channel_id(),
-                display_name: "Electric field".to_owned(),
-                value_kind: FieldValueKind::Vector(Dimension::ELECTRIC_FIELD),
-            },
-            ChannelSchema {
-                id: electric_potential_channel_id(),
-                display_name: "Electric potential".to_owned(),
-                value_kind: FieldValueKind::Scalar(Dimension::ELECTRIC_POTENTIAL),
-            },
+            electric_field_channel_schema(),
+            electric_potential_channel_schema(),
         ]
     }
 
@@ -303,6 +294,44 @@ impl EquationSystemSolver for ElectrostaticsSolver {
         }
     }
 
+    /// The Coulomb force on each dynamic body: `F = qE`.
+    ///
+    /// Note the field, not the potential. `qφ` is the potential *energy* in
+    /// joules; the force is the charge times the field, which is minus the
+    /// gradient of that potential. The evaluator already returns `E`, so this is
+    /// the one multiplication.
+    ///
+    /// A body's own charge is excluded from the field acting on it — a point
+    /// charge does not accelerate itself, and its own Coulomb singularity would
+    /// dominate everything else if it were included.
+    fn forces(&self, bodies: &[DynamicBody]) -> Result<Vec<DVec3>, PluginError> {
+        if bodies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let charges: Vec<f64> = bodies
+            .iter()
+            .map(|body| {
+                self.sources
+                    .iter()
+                    .find(|source| source.object == body.object)
+                    .map_or(0.0, |source| source.charge_coulombs)
+            })
+            .collect();
+
+        bodies
+            .iter()
+            .zip(&charges)
+            .map(|(body, charge)| {
+                if *charge == 0.0 {
+                    // Uncharged: this field does not act on it at all.
+                    return Ok(DVec3::ZERO);
+                }
+                let field = self.field_excluding(body.object, body.position)?;
+                Ok(field * *charge)
+            })
+            .collect()
+    }
+
     fn diagnostics(&self) -> Vec<SolverDiagnostic> {
         vec![SolverDiagnostic {
             plugin: plugin_id(),
@@ -321,6 +350,36 @@ impl EquationSystemSolver for ElectrostaticsSolver {
 const POISONED_CACHE: &str = "electrostatics evaluation cache is poisoned";
 
 impl ElectrostaticsSolver {
+    /// The electric field at `position` from every source except `object`.
+    ///
+    /// Evaluated directly rather than through the batched evaluator, because the
+    /// source list differs per body and the evaluator's contract is one field
+    /// for one geometry from *all* sources.
+    fn field_excluding(&self, object: ObjectId, position: DVec3) -> Result<DVec3, PluginError> {
+        let mut field = DVec3::ZERO;
+        for source in self.sources.iter().filter(|source| source.object != object) {
+            let offset = position - source.position;
+            let distance = offset.length();
+            let exclusion = match source.distribution {
+                ChargeDistribution::Point { exclusion_radius } => exclusion_radius,
+                ChargeDistribution::UniformSphere { radius } => radius,
+            };
+            if distance <= exclusion || distance == 0.0 {
+                // Inside a source's own radius the analytic point field is not
+                // merely large but undefined. Contributing nothing is honest;
+                // contributing a huge number would look like physics.
+                continue;
+            }
+            field += offset * (COULOMB_CONSTANT * source.charge_coulombs / distance.powi(3));
+        }
+        if !field.is_finite() {
+            return Err(PluginError::Solver(
+                "electrostatic force evaluation produced a non-finite field".to_owned(),
+            ));
+        }
+        Ok(field)
+    }
+
     fn samples_for(
         &self,
         geometry: &SampleGeometry,
@@ -361,8 +420,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use fieldcad_core::{
-        BoundaryConditions, DomainBounds, ObjectId, ObjectSpec, PlaneLattice, Resolution,
-        Transform, Velocity, World, WorldCommand,
+        BoundaryConditions, DomainBounds, ObjectId, ObjectShape, ObjectSpec, PlaneLattice,
+        Resolution, Transform, Velocity, World, WorldCommand,
     };
     use glam::UVec2;
 
@@ -478,35 +537,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plugin_rejects_charged_objects_without_a_supported_shape() {
+    /// Build a world holding one charged object with the given shape, and try
+    /// to create a solver against it.
+    fn solver_for_charged_shape(
+        shape: Option<ObjectShape>,
+    ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
         let mut world = World::new();
+        let mut spec = ObjectSpec::new("charged")
+            .with_transform(Transform::at(DVec3::ZERO).unwrap())
+            .with_component(charge_component_id(), charge_properties(1.0).unwrap());
+        if let Some(shape) = shape {
+            spec = spec.with_shape(shape);
+        }
         world
             .commit([
                 WorldCommand::RegisterComponentSchema(
                     ElectrostaticsPlugin::new().component_schemas().remove(0),
                 ),
-                WorldCommand::CreateObject(
-                    ObjectSpec::new("invalid")
-                        .with_transform(Transform::at(DVec3::ZERO).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0).unwrap()),
-                ),
+                WorldCommand::CreateObject(spec),
             ])
             .unwrap();
         let domain = Domain::centred_cube(2.0, 8).unwrap();
 
+        ElectrostaticsPlugin::new().create_solver(SolverContext {
+            configuration: &PropertyBag::default(),
+            domain: &domain,
+            world: &world.snapshot(),
+            initial_step: fieldcad_core::StepContext {
+                tick: 0,
+                time_seconds: 0.0,
+                time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+            },
+            cancellation: fieldcad_plugin_api::SolverCancellation::default(),
+        })
+    }
+
+    #[test]
+    fn a_charged_object_with_no_shape_is_a_point_charge() {
+        // Composing an object means creating it bare and attaching charge
+        // afterwards. That intermediate object has no shape and must still be
+        // solvable, or the authoring flow cannot reach a valid world.
+        assert!(solver_for_charged_shape(None).is_ok());
+    }
+
+    #[test]
+    fn plugin_rejects_charged_objects_without_a_supported_shape() {
+        // A box is genuinely unsupported: there is no closed-form field for a
+        // uniformly charged cuboid in this solver.
         assert!(matches!(
-            ElectrostaticsPlugin::new().create_solver(SolverContext {
-                configuration: &PropertyBag::default(),
-                domain: &domain,
-                world: &world.snapshot(),
-                initial_step: fieldcad_core::StepContext {
-                    tick: 0,
-                    time_seconds: 0.0,
-                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
-                },
-                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
-            }),
+            solver_for_charged_shape(Some(ObjectShape::boxed(DVec3::ONE).unwrap())),
             Err(PluginError::UnsupportedWorld(_))
         ));
     }

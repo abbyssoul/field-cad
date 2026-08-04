@@ -99,6 +99,13 @@ pub struct SolverDiagnostic {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChannelSnapshot {
     pub schema: Arc<ChannelSchema>,
+    /// Which equation system computed these values.
+    ///
+    /// A field channel names a physical quantity, not a plugin's output: the
+    /// same electric field may be computed by an electrostatic solver or by a
+    /// time-domain one. The identity therefore cannot say who produced it, and
+    /// a result has to carry its model to remain attributable (ADR 0025).
+    pub provider: PluginId,
     pub batches: Arc<[FieldBatch]>,
 }
 
@@ -215,8 +222,9 @@ mod tests {
 
     #[test]
     fn probe_samples_are_found_across_batches() {
+        let plugin = PluginId::new("test").unwrap();
         let schema = Arc::new(ChannelSchema {
-            id: ChannelId::new(PluginId::new("test").unwrap(), "potential").unwrap(),
+            id: ChannelId::new(plugin.clone(), "potential").unwrap(),
             display_name: "Potential".to_owned(),
             value_kind: FieldValueKind::Scalar(Dimension::ELECTRIC_POTENTIAL),
         });
@@ -228,6 +236,7 @@ mod tests {
         .unwrap();
         let channel = ChannelSnapshot {
             schema,
+            provider: plugin,
             batches: Arc::from([batch]),
         };
 

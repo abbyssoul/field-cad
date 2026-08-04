@@ -158,11 +158,21 @@ fn runtime_for(scene: &Scene) -> SimulationRuntime {
             SessionId::from_u128(1),
         )
         .with_subscription(scene.subscription())
-        .with_plugin(Box::new(ElectrostaticsPlugin::new()))
+        // Composed but inactive: these scenes measure the Maxwell model of the
+        // electric field, and two active models of one field is exactly what the
+        // runtime refuses. The electrostatic workloads below drive that solver
+        // directly rather than through a runtime.
+        .with_plugin_registration(
+            fieldcad_simulation::PluginRegistration::with_default_configuration(Box::new(
+                ElectrostaticsPlugin::new(),
+            ))
+            .with_enabled(false),
+        )
         .with_plugin_registration(fieldcad_simulation::PluginRegistration {
             plugin: Box::new(plugin),
             configuration,
             enabled: true,
+            realtime: true,
         }),
     )
     .expect("benchmark scenes compose a valid runtime");

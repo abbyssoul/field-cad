@@ -26,8 +26,9 @@ use fieldcad_core::{
 };
 use fieldcad_electromagnetic_sources::{
     ChargeDistribution, ChargeSource, charge_component_id, charge_component_schema,
-    collect_charge_sources,
+    collect_charge_sources, electric_field_channel_schema, magnetic_field_channel_schema,
 };
+use fieldcad_mass_sources::mass_component_schemas;
 use fieldcad_particles::particle_component_schema;
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
@@ -39,8 +40,6 @@ use glam::{DVec3, UVec3};
 use coupling::{ParticleCoupling, collect_coupled_particles, coupling_is_requested};
 
 pub const PLUGIN_ID: &str = "fieldcad.electromagnetism";
-pub const ELECTRIC_FIELD_CHANNEL: &str = "electric-field";
-pub const MAGNETIC_FIELD_CHANNEL: &str = "magnetic-flux-density";
 pub const ENERGY_DENSITY_CHANNEL: &str = "energy-density";
 pub const ELECTRIC_DIVERGENCE_CHANNEL: &str = "electric-divergence-residual";
 pub const MAGNETIC_DIVERGENCE_CHANNEL: &str = "magnetic-divergence-residual";
@@ -57,8 +56,8 @@ pub const ENERGY_DENSITY_HANDLE: ChannelHandle = ChannelHandle::new(2);
 pub const ELECTRIC_DIVERGENCE_HANDLE: ChannelHandle = ChannelHandle::new(3);
 pub const MAGNETIC_DIVERGENCE_HANDLE: ChannelHandle = ChannelHandle::new(4);
 
-/// Exact SI definition, in metres per second.
-pub const SPEED_OF_LIGHT: f64 = 299_792_458.0;
+/// Re-exported so this plugin and the dynamics integrator cannot disagree.
+pub use fieldcad_core::SPEED_OF_LIGHT;
 /// Vacuum permeability used by the reference energy diagnostic.
 pub const VACUUM_PERMEABILITY: f64 = 1.256_637_062_12e-6;
 /// Kept algebraically consistent with `c` and `mu0` for the discrete update.
@@ -74,13 +73,11 @@ fn channel_id(name: &str) -> ChannelId {
     ChannelId::new(plugin_id(), name).expect("static channel ID is valid")
 }
 
-pub fn electric_field_channel_id() -> ChannelId {
-    channel_id(ELECTRIC_FIELD_CHANNEL)
-}
-
-pub fn magnetic_field_channel_id() -> ChannelId {
-    channel_id(MAGNETIC_FIELD_CHANNEL)
-}
+/// `E` and `B` are the scene's fields, which this system is one model of. The
+/// energy density and divergence residuals below stay in this plugin's own
+/// namespace: they are diagnostics of a Yee discretization, not quantities the
+/// world has independently of how it was discretized.
+pub use fieldcad_electromagnetic_sources::{electric_field_channel_id, magnetic_field_channel_id};
 
 pub fn energy_density_channel_id() -> ChannelId {
     channel_id(ENERGY_DENSITY_CHANNEL)
@@ -252,16 +249,8 @@ impl EquationSystemPlugin for ElectromagnetismPlugin {
 
     fn channels(&self) -> Vec<ChannelSchema> {
         vec![
-            ChannelSchema {
-                id: electric_field_channel_id(),
-                display_name: "Electric field E".to_owned(),
-                value_kind: FieldValueKind::Vector(Dimension::ELECTRIC_FIELD),
-            },
-            ChannelSchema {
-                id: magnetic_field_channel_id(),
-                display_name: "Magnetic flux density B".to_owned(),
-                value_kind: FieldValueKind::Vector(Dimension::MAGNETIC_FLUX_DENSITY),
-            },
+            electric_field_channel_schema(),
+            magnetic_field_channel_schema(),
             ChannelSchema {
                 id: energy_density_channel_id(),
                 display_name: "Electromagnetic energy density".to_owned(),
@@ -281,7 +270,15 @@ impl EquationSystemPlugin for ElectromagnetismPlugin {
     }
 
     fn component_schemas(&self) -> Vec<ComponentSchema> {
-        vec![charge_component_schema(), particle_component_schema()]
+        // Mass is declared here because this system integrates inertia, not
+        // because it is electromagnetic. A gravity plugin will declare the same
+        // shared schema, and the runtime registers one identical definition
+        // once — which is what lets one object carry both without either plugin
+        // depending on the other.
+        [charge_component_schema(), particle_component_schema()]
+            .into_iter()
+            .chain(mass_component_schemas())
+            .collect()
     }
 
     fn configuration_schema(&self) -> PluginConfigurationSchema {
@@ -295,18 +292,24 @@ impl EquationSystemPlugin for ElectromagnetismPlugin {
                         PLANE_WAVE_OPTION.to_owned(),
                     ]),
                     required: true,
+                    default_value: None,
+                    relevant_when: None,
                 },
                 PropertySchema {
                     id: amplitude_property_id(),
                     display_name: "Initial plane-wave amplitude".to_owned(),
                     kind: PropertyKind::Scalar(Dimension::ELECTRIC_FIELD),
                     required: true,
+                    default_value: None,
+                    relevant_when: None,
                 },
                 PropertySchema {
                     id: mode_property_id(),
                     display_name: "Initial plane-wave mode".to_owned(),
                     kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
                     required: true,
+                    default_value: None,
+                    relevant_when: None,
                 },
             ],
         }
@@ -548,7 +551,7 @@ pub fn validate_initial_condition_world(
                     })
             {
                 return Err(PluginError::UnsupportedWorld(format!(
-                    "moving charge '{}' must carry the generic particle component and a Prescribed or Dynamic motion mode",
+                    "moving charge '{}' must carry a mass component, so that its motion is either integrated from the fields or authored by pinning it",
                     object.name
                 )));
             }

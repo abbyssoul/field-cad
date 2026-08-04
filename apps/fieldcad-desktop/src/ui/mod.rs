@@ -9,13 +9,17 @@
 //! individual panels and property editors, and [`plot`] the probe history plot.
 
 mod compute;
+mod help;
 mod panels;
 mod plot;
+mod viewcontrols;
 
 pub use compute::ComputeView;
 
+use help::help_window;
 use panels::{diagnostics_window, inspector, menu_bar, scene_tree};
 use plot::floating_probe_plots;
+use viewcontrols::view_controls;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,21 +27,95 @@ use fieldcad_core::{ChannelId, ObjectId, PlaneId, ProbeId, WorldCommand, WorldSn
 use fieldcad_simulation::{CommandPayload, ProbeHistory};
 
 use crate::{
-    camera::AxisView,
-    scene::{FieldLayerSettings, PlaneLayerSettings, SceneSelection},
+    camera::{AxisView, Projection},
+    scene::{FieldLayerSettings, PlaneLayerSettings, SceneSelection, VectorDisplay},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CameraAction {
     Axis(AxisView),
     FocusSelection,
+    Reset,
+    SetProjection(Projection),
+}
+
+/// What the 3D view draws, as distinct from what the world contains.
+///
+/// These are presentation filters and nothing else: hiding probes does not stop
+/// them recording, and hiding objects does not stop them sourcing a field. They
+/// live with the view controls in the viewport because that is where their
+/// effect is visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewOptions {
+    pub grid: bool,
+    pub axes: bool,
+    pub objects: bool,
+    pub probes: bool,
+    pub planes: bool,
+}
+
+impl Default for ViewOptions {
+    fn default() -> Self {
+        Self {
+            grid: true,
+            axes: true,
+            objects: true,
+            probes: true,
+            planes: true,
+        }
+    }
+}
+
+/// One display toggle: its label, its hover text, and how to reach the flag.
+///
+/// Declared as data so the view panel iterates rather than repeating five nearly
+/// identical checkbox calls, and so a test can assert every toggle is offered
+/// without naming them a second time.
+pub type ViewToggle = (
+    &'static str,
+    &'static str,
+    fn(&mut ViewOptions) -> &mut bool,
+);
+
+impl ViewOptions {
+    pub const ENTRIES: [ViewToggle; 5] = [
+        ("Grid", "Construction grid on the XY plane", |view| {
+            &mut view.grid
+        }),
+        ("Origin axes", "World X, Y, and Z at the origin", |view| {
+            &mut view.axes
+        }),
+        (
+            "Objects",
+            "Simulated bodies. Hiding them does not remove them from the simulation.",
+            |view| &mut view.objects,
+        ),
+        (
+            "Probes",
+            "Point recorders. Hidden probes keep recording.",
+            |view| &mut view.probes,
+        ),
+        (
+            "Slice planes",
+            "Field sampling planes and their drawn values",
+            |view| &mut view.planes,
+        ),
+    ];
 }
 
 #[derive(Debug, Default)]
 pub struct UiModel {
-    pub grid_visible: bool,
-    pub axes_visible: bool,
+    pub view: ViewOptions,
     pub diagnostics_visible: bool,
+    /// The getting-started window. Open on a first run, because the composition
+    /// model is the part of this application a user cannot guess.
+    pub help_visible: bool,
+    /// Whether the scene's world/simulation node is the inspector's subject.
+    ///
+    /// The domain, active field systems, and sampling settings are properties of
+    /// the scene itself, so they are reached by selecting a node in the scene
+    /// list like anything else rather than by deselecting everything.
+    pub world_selected: bool,
     pub selection: Option<ObjectId>,
     pub plane_selection: Option<PlaneId>,
     pub probe_selection: Option<ProbeId>,
@@ -53,9 +131,13 @@ pub struct UiModel {
 impl UiModel {
     pub fn new() -> Self {
         Self {
-            grid_visible: true,
-            axes_visible: true,
+            view: ViewOptions::default(),
             diagnostics_visible: true,
+            help_visible: true,
+            // A new session opens on the world node, so the inspector explains
+            // the scene's domain and field systems before anything is selected
+            // rather than showing an empty panel.
+            world_selected: true,
             selection: None,
             plane_selection: None,
             probe_selection: None,
@@ -63,6 +145,12 @@ impl UiModel {
             field_layers: BTreeMap::new(),
             command_error: None,
         }
+    }
+
+    /// Make the world/simulation node the inspector's subject.
+    pub fn select_world(&mut self) {
+        self.set_scene_selection(None);
+        self.world_selected = true;
     }
 
     pub fn open_probe_plot(&mut self, probe: &fieldcad_core::Probe) {
@@ -73,19 +161,23 @@ impl UiModel {
             });
     }
 
-    /// Ensure every declared vector channel has presentation state. If none of
-    /// the currently available channels is visible, reveal the first one; later
-    /// channels remain opt-in to avoid an unexpected overlay.
+    /// Ensure every declared vector channel has presentation state, and reveal
+    /// the first field a session ever sees.
+    ///
+    /// The reveal happens once, not whenever nothing is visible. Re-deciding it
+    /// every frame cannot tell "this scene has never shown a field" from "the
+    /// user just hid the last one", and answers both by switching a layer on —
+    /// which makes the only vector channel in a scene impossible to hide,
+    /// because clearing the checkbox is undone before the next frame is drawn.
+    /// A channel that already has presentation state belongs to the user, and
+    /// one arriving later stays opt-in rather than overlaying itself on a view
+    /// they deliberately cleared.
     pub fn synchronize_field_layers(&mut self, compute: &ComputeView) {
+        let first_field_of_the_session = self.field_layers.is_empty();
         for channel in &compute.vector_channels {
             self.field_layers.entry(channel.clone()).or_default();
         }
-        let any_visible = compute.vector_channels.iter().any(|channel| {
-            self.field_layers
-                .get(channel)
-                .is_some_and(|layer| layer.visible)
-        });
-        if !any_visible
+        if first_field_of_the_session
             && let Some(first) = compute.vector_channels.first()
             && let Some(layer) = self.field_layers.get_mut(first)
         {
@@ -104,6 +196,9 @@ impl UiModel {
         self.selection = None;
         self.plane_selection = None;
         self.probe_selection = None;
+        // Selecting anything in the scene — including nothing — takes the
+        // inspector off the world node, so the two can never both look selected.
+        self.world_selected = false;
         match selection {
             Some(SceneSelection::Object(id)) => self.selection = Some(id),
             Some(SceneSelection::Plane(id)) => self.plane_selection = Some(id),
@@ -119,7 +214,7 @@ pub struct ProbePlotWindow {
     pub channels: BTreeSet<ChannelId>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChannelLayerSettings {
     pub visible: bool,
     pub whole_domain: FieldLayerSettings,
@@ -137,6 +232,13 @@ pub struct UiFrameOutput {
     /// changing in one frame lost an edit with no error and no symptom beyond a
     /// widget that appeared not to work.
     pub commands: Vec<CommandPayload>,
+    /// Whether a control that edits the world is being held this frame: a drag
+    /// in progress, or a value being typed but not yet committed.
+    ///
+    /// Only the held part of an edit counts. A checkbox or a menu choice is
+    /// already atomic — it produces one command and is over — so it has no
+    /// duration for the simulation to be held across.
+    pub scene_edit_in_progress: bool,
 }
 
 impl UiFrameOutput {
@@ -157,6 +259,7 @@ impl Default for UiFrameOutput {
             viewport_gesture: ViewportGesture::default(),
             camera_action: None,
             commands: Vec::new(),
+            scene_edit_in_progress: false,
         }
     }
 }
@@ -184,6 +287,87 @@ pub struct FrameContext<'a> {
     /// Screen-space annotation at the selected plane normal's arrow tip.
     pub plane_normal_label: Option<egui::Pos2>,
     pub plane_normal_active: bool,
+    /// The simulation was advancing and an interactive edit has suspended it.
+    /// Said plainly in the transport bar, because a run that stops on its own is
+    /// otherwise indistinguishable from one that broke.
+    pub paused_for_edit: bool,
+    /// An interactive edit is open, whether or not it suspended a run. Controls
+    /// that act on a *completed* edit — undo and redo — stand down while one is
+    /// still being made.
+    pub edit_in_progress: bool,
+    /// How the camera is currently mapping the scene to the screen, so the
+    /// control that changes it can show which is in force.
+    pub projection: Projection,
+}
+
+/// The controls for drawing a vector field over any region.
+///
+/// One widget wherever vectors are drawn — a slice plane, the whole domain —
+/// because the questions are the same each time. Only the plane adds one of its
+/// own, projection, and it adds it beside this rather than inside it.
+///
+/// Density resamples the published lattice by interpolation, so raising it draws
+/// more arrows without claiming more accuracy; the hover says where real detail
+/// comes from instead.
+fn vector_display_controls(
+    ui: &mut egui::Ui,
+    display: &mut VectorDisplay,
+    label: &str,
+    hover: &str,
+) {
+    ui.checkbox(&mut display.visible, label)
+        .on_hover_text(hover);
+    ui.add_enabled_ui(display.visible, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Arrows");
+            ui.add(
+                egui::DragValue::new(&mut display.density)
+                    .speed(0.25)
+                    .range(0..=256),
+            )
+            .on_hover_text(
+                "Arrows along the longest axis, interpolated from the published samples.\n\
+                 This is how densely the field is drawn, not how densely it was solved — \
+                 for that, raise the Simulation node's transport sampling.",
+            );
+
+            ui.label("Scale");
+            ui.add(
+                egui::DragValue::new(&mut display.scale)
+                    .speed(0.01)
+                    .range(0.05..=20.0)
+                    .custom_formatter(|scale, _| format!("{scale:.2}×")),
+            )
+            .on_hover_text(
+                "Multiplies the arrow length. Arrows are sized to their spacing by default; \
+                 shorten them to read a dense field, lengthen them to read a sparse one.",
+            );
+        });
+    });
+}
+
+/// One foldable group, in the single style both side panels use.
+///
+/// A scene grows without bound and an inspected subject can carry more than
+/// fits on screen, so anything a user is not looking at right now has to be
+/// possible to put away. Routing every group through one helper is what keeps a
+/// section of the scene tree and a section of the inspector recognisably the
+/// same idea rather than two conventions that drifted apart.
+///
+/// Fold state lives in egui's memory, keyed by `id`, so it survives selection
+/// changes and re-layout for as long as the session does.
+fn section<R>(
+    ui: &mut egui::Ui,
+    id: impl egui::AsIdSalt,
+    title: impl Into<String>,
+    default_open: bool,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+        .id_salt(id)
+        .default_open(default_open)
+        .show(ui, body)
+        .body_returned
 }
 
 pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -> UiFrameOutput {
@@ -202,6 +386,9 @@ pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -
         &mut output,
     );
 
+    // After `viewport`, which is what establishes the rect these anchor to.
+    view_controls(&context, model, &frame, &mut output);
+    help_window(&context, model);
     if model.diagnostics_visible {
         diagnostics_window(&context, &frame, model.command_error.as_deref());
     }
@@ -359,6 +546,70 @@ mod tests {
         frame_sized(context, model, events, egui::vec2(1_280.0, 800.0))
     }
 
+    /// Everything a frame painted, as text. Used to assert which panel a control
+    /// ended up in, which is the substance of the layout contract.
+    fn frame_text(context: &egui::Context, model: &mut UiModel) -> String {
+        frame_text_editing(context, model, false)
+    }
+
+    fn frame_text_editing(
+        context: &egui::Context,
+        model: &mut UiModel,
+        paused_for_edit: bool,
+    ) -> String {
+        let world = seeded_world();
+        let snapshot = world.snapshot();
+        let compute = ComputeView::build(&source(), &snapshot);
+        let history = ProbeHistory::default();
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let full_output = context.run_ui(input, |root| {
+            show(
+                root,
+                model,
+                FrameContext {
+                    compute: &compute,
+                    world: &snapshot,
+                    probe_history: &history,
+                    adapter_name: "Test adapter",
+                    frame_time_ms: 16.0,
+                    active_translation: None,
+                    plane_normal_label: None,
+                    plane_normal_active: false,
+                    paused_for_edit,
+                    edit_in_progress: false,
+                    projection: Projection::default(),
+                },
+            );
+        });
+
+        fn collect(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    out.push_str(&text.galley.job.text);
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for clipped in &full_output.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        text
+    }
+
     fn frame_sized(
         context: &egui::Context,
         model: &mut UiModel,
@@ -391,6 +642,9 @@ mod tests {
                     active_translation: None,
                     plane_normal_label: None,
                     plane_normal_active: false,
+                    paused_for_edit: false,
+                    edit_in_progress: false,
+                    projection: Projection::default(),
                 },
             );
         });
@@ -530,8 +784,10 @@ mod tests {
     fn central_viewport_reports_middle_drag() {
         let context = egui::Context::default();
         let mut model = UiModel::new();
-        let start = egui::pos2(750.0, 500.0);
-        let end = egui::pos2(850.0, 560.0);
+        // Low in the viewport, clear of the floating View, Help, and
+        // Diagnostics windows, which legitimately capture the pointer.
+        let start = egui::pos2(880.0, 700.0);
+        let end = egui::pos2(980.0, 760.0);
 
         frame(&context, &mut model, vec![egui::Event::PointerMoved(start)]);
         frame(
@@ -554,7 +810,7 @@ mod tests {
     fn central_viewport_reports_wheel_input() {
         let context = egui::Context::default();
         let mut model = UiModel::new();
-        let pointer = egui::pos2(750.0, 500.0);
+        let pointer = egui::pos2(880.0, 700.0);
 
         frame(
             &context,
@@ -665,8 +921,24 @@ mod tests {
         let settings = PlaneLayerSettings::default();
 
         assert_eq!(settings.vector_mode, PlaneVectorMode::InPlane);
-        assert!(settings.vectors_visible);
+        assert!(settings.vectors.visible);
         assert!(settings.magnitude_visible);
+    }
+
+    /// Both regions configure their arrows with the same value, so a control
+    /// added for one is a control the other has too. What differs is where the
+    /// arrows go and how many are legible there, not what can be set.
+    #[test]
+    fn a_plane_and_the_whole_domain_configure_their_arrows_identically() {
+        let plane = PlaneLayerSettings::default().vectors;
+        let domain = FieldLayerSettings::default().vectors;
+
+        assert_eq!(plane.scale, 1.0);
+        assert_eq!(domain.scale, plane.scale);
+        // Volume glyphs occlude, so they start off and sparser than a plane's.
+        assert!(plane.visible);
+        assert!(!domain.visible);
+        assert!(domain.density < plane.density);
     }
 
     #[test]
@@ -728,21 +1000,366 @@ mod tests {
         model.field_layers.get_mut(&second).unwrap().visible = true;
         assert!(model.field_layers[&published].visible);
         assert!(model.field_layers[&second].visible);
+    }
 
-        // If an equation system changes, a visible but unavailable old layer
-        // must not leave the replacement snapshot blank.
-        model.field_layers.get_mut(&second).unwrap().visible = false;
-        view.vector_channels = vec![second.clone()];
+    /// Turning the last visible layer off has to stay off.
+    ///
+    /// Revealing a layer is for a scene that has never shown one, so that a
+    /// first run is not an unexplained blank view. Re-deciding that every frame
+    /// meant the only vector channel in a scene could never be switched off: the
+    /// checkbox cleared and the next frame set it again. With one active model
+    /// publishing one vector field — which is now the default scene — that made
+    /// the control useless rather than merely surprising.
+    #[test]
+    fn hiding_the_only_field_layer_is_not_undone_on_the_next_frame() {
+        let mut view = ComputeView::build(&source(), &seeded_world().snapshot());
+        view.vector_channels = vec![vector_channel_id()];
+        let mut model = UiModel::new();
+
         model.synchronize_field_layers(&view);
-        assert!(model.field_layers[&second].visible);
+        assert!(
+            model.field_layers[&vector_channel_id()].visible,
+            "a scene that has never shown a field opens showing one"
+        );
+
+        // Exactly what clearing the checkbox does.
+        model
+            .field_layers
+            .get_mut(&vector_channel_id())
+            .unwrap()
+            .visible = false;
+        for _ in 0..3 {
+            model.synchronize_field_layers(&view);
+            assert!(
+                !model.field_layers[&vector_channel_id()].visible,
+                "the layer was hidden by the user and must stay hidden"
+            );
+        }
+    }
+
+    /// A field that arrives later is still opt-in, and does not switch itself on
+    /// because the user has everything else hidden.
+    #[test]
+    fn a_new_channel_does_not_reveal_itself_over_a_hidden_scene() {
+        let mut view = ComputeView::build(&source(), &seeded_world().snapshot());
+        view.vector_channels = vec![vector_channel_id()];
+        let mut model = UiModel::new();
+        model.synchronize_field_layers(&view);
+        model
+            .field_layers
+            .get_mut(&vector_channel_id())
+            .unwrap()
+            .visible = false;
+
+        // Choosing a model that computes a second field, with everything hidden.
+        let arrived = scalar_channel_id();
+        view.vector_channels.push(arrived.clone());
+        model.synchronize_field_layers(&view);
+
+        assert!(model.field_layers.contains_key(&arrived));
+        assert!(!model.field_layers[&arrived].visible);
+        assert!(!model.field_layers[&vector_channel_id()].visible);
+    }
+
+    /// The inspector's job is to describe one selected thing. Simulation
+    /// settings used to be appended to it unconditionally, which meant the panel
+    /// answered two questions at once and the domain had no home in the scene.
+    #[test]
+    fn the_inspector_shows_simulation_settings_only_for_the_world_node() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+
+        model.select_world();
+        frame_text(&context, &mut model);
+        let world_node = frame_text(&context, &mut model);
+        assert!(
+            world_node.contains("Field systems"),
+            "the world node must own the field-system controls: {world_node}"
+        );
+
+        model.set_scene_selection(Some(SceneSelection::Object(ObjectId::new(0))));
+        frame_text(&context, &mut model);
+        let object = frame_text(&context, &mut model);
+        assert!(
+            !object.contains("Field systems"),
+            "selecting an object must not also show scene settings: {object}"
+        );
+        assert!(
+            !object.contains("Transport sampling"),
+            "selecting an object must not also show transport sampling: {object}"
+        );
+    }
+
+    /// Camera and display controls belong to the 3D view, not to a side panel.
+    #[test]
+    fn camera_and_display_controls_live_over_the_3d_view() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+        model.select_world();
+
+        frame_text(&context, &mut model);
+        let text = frame_text(&context, &mut model);
+
+        // Every axis button and every display toggle is reachable there.
+        for label in AxisView::ALL.map(AxisView::label) {
+            assert!(
+                text.contains(label),
+                "{label} view button is missing: {text}"
+            );
+        }
+        for (label, _, _) in ViewOptions::ENTRIES {
+            assert!(text.contains(label), "{label} toggle is missing: {text}");
+        }
+        assert!(text.contains("Reset"), "camera reset is missing: {text}");
+
+        // And it is positioned inside the 3D view rather than over a panel.
+        let output = frame_sized(&context, &mut model, vec![], egui::vec2(1_280.0, 800.0));
+        let window = egui::AreaState::load(&context, egui::Id::new(viewcontrols::WINDOW_ID))
+            .map(|state| state.rect())
+            .expect("the view window should have laid out");
+        assert!(
+            output.viewport.contains_rect(window),
+            "view controls at {window:?} escape the 3D view {:?}",
+            output.viewport,
+        );
+    }
+
+    /// Projection belongs with the camera controls it changes the meaning of,
+    /// and reaches the shell as an action rather than by the panel reaching into
+    /// the camera.
+    #[test]
+    fn the_view_window_offers_both_projections_and_reports_the_active_one() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+        model.select_world();
+
+        frame_text(&context, &mut model);
+        let text = frame_text(&context, &mut model);
+        for projection in Projection::ALL {
+            assert!(
+                text.contains(projection.label()),
+                "{} is not offered: {text}",
+                projection.label()
+            );
+        }
+    }
+
+    /// A getting-started window that opens on a first run has to teach without
+    /// hiding the thing it is teaching about.
+    #[test]
+    fn the_help_window_opens_without_burying_the_scene() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+        assert!(model.help_visible, "a first run should offer guidance");
+
+        frame(&context, &mut model, vec![]);
+        let output = frame(&context, &mut model, vec![]);
+        let help = egui::AreaState::load(&context, egui::Id::new(help::WINDOW_ID))
+            .map(|state| state.rect())
+            .expect("the help window should have laid out");
+
+        let covered =
+            (help.width() * help.height()) / (output.viewport.width() * output.viewport.height());
+        assert!(
+            covered < 0.5,
+            "help covers {:.0}% of the 3D view",
+            covered * 100.0
+        );
+
+        // And it is dismissible, leaving the view entirely clear. egui fades a
+        // closing window out against the wall clock, which this harness never
+        // advances, so the fade is switched off rather than waited on.
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        model.help_visible = false;
+        frame_text(&context, &mut model);
+        let text = frame_text(&context, &mut model);
+        assert!(
+            !text.contains("Build a scene"),
+            "help did not close: {text}"
+        );
+    }
+
+    /// The whole point of a section: putting away what you are not looking at.
+    /// A header that folds but leaves its contents painted would be decoration.
+    #[test]
+    fn folding_a_section_puts_its_contents_away() {
+        let context = egui::Context::default();
+        // egui fades a body out against the wall clock, which this harness never
+        // advances, so the fade is switched off rather than waited on.
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+
+        let run = |events: Vec<egui::Event>| {
+            let mut rect = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let full_output = context.run_ui(input, |ui| {
+                section(ui, "folding_test_section", "Group", true, |ui| {
+                    ui.label("contents");
+                });
+                rect = ui.min_rect();
+            });
+            let mut text = String::new();
+            for clipped in &full_output.shapes {
+                if let egui::epaint::Shape::Text(shape) = &clipped.shape {
+                    text.push_str(&shape.galley.job.text);
+                    text.push('\n');
+                }
+            }
+            (text, rect)
+        };
+
+        let (text, rect) = run(Vec::new());
+        assert!(text.contains("Group"), "the header is missing: {text}");
+        assert!(text.contains("contents"), "a section opens open: {text}");
+
+        // The header row sits at the top of the section, the toggle at its left.
+        let header = rect.left_top() + egui::vec2(6.0, 8.0);
+        run(vec![egui::Event::PointerMoved(header)]);
+        run(vec![egui::Event::PointerButton {
+            pos: header,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let (text, _) = run(vec![egui::Event::PointerButton {
+            pos: header,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert!(
+            text.contains("Group"),
+            "a folded section still has to say what it is: {text}"
+        );
+        assert!(!text.contains("contents"), "folding hid nothing: {text}");
+    }
+
+    /// Both panels are lists that grow without bound, so both are divided into
+    /// named groups rather than one scroll of everything.
+    #[test]
+    fn the_scene_panel_groups_its_contents_into_named_sections() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+
+        frame_text(&context, &mut model);
+        let text = frame_text(&context, &mut model);
+
+        for heading in ["Simulation", "Objects", "Measurement"] {
+            assert!(
+                text.contains(heading),
+                "the scene panel has no {heading} section: {text}"
+            );
+        }
+        // Counts belong in the header, so a folded section still says how much
+        // is behind it. The seeded world has one object and one probe.
+        assert!(text.contains("Objects (1)"), "{text}");
+        assert!(text.contains("Measurement (1)"), "{text}");
+    }
+
+    #[test]
+    fn every_inspector_subject_groups_its_properties_into_named_sections() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+        let world = seeded_world().snapshot();
+
+        let subjects: [(SceneSelection, &[&str]); 2] = [
+            (
+                SceneSelection::Object(ObjectId::new(0)),
+                &["Placement", "Components"],
+            ),
+            (
+                SceneSelection::Probe(*world.probes().keys().next().unwrap()),
+                &["Position", "Recorded channels", "History"],
+            ),
+        ];
+        for (selection, sections) in subjects {
+            model.set_scene_selection(Some(selection));
+            frame_text(&context, &mut model);
+            let text = frame_text(&context, &mut model);
+            for heading in sections {
+                assert!(
+                    text.contains(heading),
+                    "{selection:?} is missing its {heading} section: {text}"
+                );
+            }
+        }
+
+        model.select_world();
+        frame_text(&context, &mut model);
+        let text = frame_text(&context, &mut model);
+        for heading in ["Field systems", "Transport sampling", "Compute"] {
+            assert!(
+                text.contains(heading),
+                "the simulation node is missing its {heading} section: {text}"
+            );
+        }
+    }
+
+    /// A run that stops by itself is indistinguishable from one that broke, so
+    /// the transport bar has to say which it is — and stop saying it the moment
+    /// the run is handed back.
+    #[test]
+    fn the_transport_bar_says_when_an_edit_is_holding_the_simulation() {
+        let context = egui::Context::default();
+        let mut model = UiModel::new();
+
+        frame_text_editing(&context, &mut model, true);
+        let editing = frame_text_editing(&context, &mut model, true);
+        assert!(
+            editing.contains("paused for edit"),
+            "a suspended run must say why: {editing}"
+        );
+
+        let resumed = frame_text_editing(&context, &mut model, false);
+        assert!(!resumed.contains("paused for edit"));
+    }
+
+    #[test]
+    fn a_session_opens_on_the_world_node_rather_than_an_empty_inspector() {
+        let model = UiModel::new();
+
+        assert!(model.world_selected);
+        assert_eq!(model.scene_selection(), None);
+    }
+
+    #[test]
+    fn the_world_node_and_a_scene_selection_are_mutually_exclusive() {
+        let mut model = UiModel::new();
+        let object = ObjectId::new(4);
+
+        model.set_scene_selection(Some(SceneSelection::Object(object)));
+        assert!(!model.world_selected);
+        assert_eq!(
+            model.scene_selection(),
+            Some(SceneSelection::Object(object))
+        );
+
+        model.select_world();
+        assert!(model.world_selected);
+        assert_eq!(model.scene_selection(), None);
+
+        // Clearing the scene selection is not the same as selecting the world:
+        // deselecting must leave the inspector genuinely empty.
+        model.set_scene_selection(None);
+        assert!(!model.world_selected);
     }
 
     #[test]
     fn viewport_helpers_are_independently_visible_by_default() {
         let model = UiModel::new();
 
-        assert!(model.grid_visible);
-        assert!(model.axes_visible);
+        assert!(model.view.grid);
+        assert!(model.view.axes);
+        assert!(model.view.objects);
+        assert!(model.view.probes);
+        assert!(model.view.planes);
     }
 
     #[test]

@@ -9,11 +9,13 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use fieldcad_core::{
-    FieldSnapshot, PluginId, SimulationMode, TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
+    ChannelId, FieldSnapshot, PluginId, SimulationMode, TimeStep, WorldCommand, WorldRevision,
+    WorldSnapshot,
 };
 
 use crate::runtime::{
-    FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus, Subscription, TickPacer,
+    EditHistoryStatus, FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus,
+    Subscription, TickPacer,
 };
 
 /// Client-issued identity for one command, echoed in its acknowledgement.
@@ -68,7 +70,43 @@ pub enum CommandPayload {
         plugin: PluginId,
         enabled: bool,
     },
+    /// Choose whether one equation system follows every intermediate value of an
+    /// interactive edit, or waits for the edit to be committed.
+    ///
+    /// Purely a cost/latency choice: the same committed world produces the same
+    /// result either way. It is a command rather than a local setting because
+    /// the deferral has to happen where the solving does.
+    SetFieldSystemRealtime {
+        plugin: PluginId,
+        realtime: bool,
+    },
+    /// Choose which equation system computes one field, or none.
+    ///
+    /// A scene has one electric field however many models of it are composed
+    /// in, so this is one command rather than a deactivation followed by an
+    /// activation: the state in between, where nothing computes the field, is
+    /// not one a user asked for.
+    SetFieldModel {
+        channel: ChannelId,
+        provider: Option<PluginId>,
+    },
+    /// Open or close an interactive edit — a scene edit that spans frames, such
+    /// as a viewport drag or an inspector control being held.
+    ///
+    /// Never queued: it carries no world change of its own, and queueing it
+    /// behind a tick boundary would open the gesture after the edits it is
+    /// supposed to bracket.
+    SetInteractiveEdit(bool),
     CommitWorld(Vec<WorldCommand>),
+    /// Step the scene back to how it stood before the most recent authored edit,
+    /// or forward again.
+    ///
+    /// Authoritative, like any other world change: the history belongs with the
+    /// world it describes, because only that side can say what the scene was
+    /// and validate that it may be restored. A client that kept its own stack
+    /// would be guessing.
+    Undo,
+    Redo,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -180,6 +218,8 @@ pub trait FieldDataSource: Send {
     /// Equation systems composed into the scene, including inactive systems
     /// that consequently have no channels in the latest snapshot.
     fn field_systems(&self) -> Vec<FieldSystemStatus>;
+    /// What undo and redo currently offer, for a control that presents them.
+    fn edit_history(&self) -> EditHistoryStatus;
 
     /// The world the client currently believes in.
     ///
@@ -362,12 +402,32 @@ impl SessionCore {
             CommandPayload::SetFieldSystemEnabled { plugin, enabled } => {
                 self.runtime.set_field_system_enabled(&plugin, enabled)?;
             }
+            CommandPayload::SetFieldSystemRealtime { plugin, realtime } => {
+                self.runtime.set_field_system_realtime(&plugin, realtime)?;
+            }
+            CommandPayload::SetFieldModel { channel, provider } => {
+                self.runtime.set_field_model(&channel, provider.as_ref())?;
+            }
+            CommandPayload::SetInteractiveEdit(editing) => {
+                self.runtime.set_interactive_edit(editing)?;
+            }
             CommandPayload::CommitWorld(commands) => {
                 if self.runtime.status().mode() == SimulationMode::Running {
                     self.pending_world_edits.push_back(commands);
                     return Ok(CommandDisposition::Queued);
                 }
                 self.runtime.commit_world_commands(commands)?;
+            }
+            CommandPayload::Undo => {
+                // Never queued. An edit waiting for a tick boundary is an edit
+                // the history has not recorded yet, so undoing past it would
+                // step over an edit that is still on its way in.
+                self.flush_pending_world_edits()?;
+                self.runtime.undo()?;
+            }
+            CommandPayload::Redo => {
+                self.flush_pending_world_edits()?;
+                self.runtime.redo()?;
             }
         }
         Ok(CommandDisposition::Applied)
@@ -488,6 +548,10 @@ impl FieldDataSource for LocalDataSource {
         self.core.runtime.field_systems()
     }
 
+    fn edit_history(&self) -> EditHistoryStatus {
+        self.core.runtime.edit_history()
+    }
+
     fn world(&self) -> WorldSnapshot {
         self.core.runtime.world_snapshot()
     }
@@ -530,6 +594,7 @@ pub struct LoopbackDataSource {
     /// The client's replica of the authoritative world.
     believed_world: WorldSnapshot,
     believed_field_systems: Vec<FieldSystemStatus>,
+    believed_edit_history: EditHistoryStatus,
     connected: bool,
 }
 
@@ -538,6 +603,7 @@ impl LoopbackDataSource {
         let believed = server.status();
         let believed_world = server.world_snapshot();
         let believed_field_systems = server.field_systems();
+        let believed_edit_history = server.edit_history();
         let mut source = Self {
             core: SessionCore::new(server),
             link: VecDeque::new(),
@@ -545,6 +611,7 @@ impl LoopbackDataSource {
             believed,
             believed_world,
             believed_field_systems,
+            believed_edit_history,
             connected: true,
         };
         source.transmit();
@@ -569,6 +636,7 @@ impl LoopbackDataSource {
         self.believed = status;
         self.believed_world = self.core.runtime.world_snapshot();
         self.believed_field_systems = self.core.runtime.field_systems();
+        self.believed_edit_history = self.core.runtime.edit_history();
     }
 
     /// Simulate losing the connection. The last complete snapshot is retained.
@@ -623,6 +691,10 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn field_systems(&self) -> Vec<FieldSystemStatus> {
         self.believed_field_systems.clone()
+    }
+
+    fn edit_history(&self) -> EditHistoryStatus {
+        self.believed_edit_history.clone()
     }
 
     fn world(&self) -> WorldSnapshot {

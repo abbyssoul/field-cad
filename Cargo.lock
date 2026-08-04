@@ -686,6 +686,7 @@ dependencies = [
  "fieldcad-electromagnetic-sources",
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
+ "fieldcad-mass-sources",
  "fieldcad-particles",
  "fieldcad-plugin-api",
  "fieldcad-simulation",
@@ -698,6 +699,17 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "fieldcad-dynamics"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "fieldcad-mass-sources",
+ "fieldcad-plugin-api",
+ "glam",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -716,6 +728,7 @@ dependencies = [
  "fieldcad-core",
  "fieldcad-electromagnetic-sources",
  "fieldcad-electrostatics",
+ "fieldcad-mass-sources",
  "fieldcad-particles",
  "fieldcad-plugin-api",
  "glam",
@@ -732,11 +745,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldcad-mass-sources"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "glam",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "fieldcad-particles"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
  "fieldcad-electromagnetic-sources",
+ "fieldcad-mass-sources",
  "glam",
  "thiserror 2.0.19",
 ]
@@ -755,9 +778,11 @@ name = "fieldcad-simulation"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
+ "fieldcad-dynamics",
  "fieldcad-electromagnetic-sources",
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
+ "fieldcad-mass-sources",
  "fieldcad-particles",
  "fieldcad-plugin-api",
  "fieldcad-test-field",

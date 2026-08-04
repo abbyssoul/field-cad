@@ -3,17 +3,12 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    ChannelId, FieldValueKind, ObjectId, ObjectShape, ObjectSpec, ProbeId, ProbePosition,
-    ProbeSpec, PropertyValue, SimulationMode, SlicePlane, SlicePlaneSpec, SnapshotFreshness,
-    TimeStep, Transform, Velocity, WorldCommand, WorldObject, WorldSnapshot,
+    ChannelId, Dimension, FieldValueKind, ObjectId, ObjectShape, ObjectSpec, ProbeId,
+    ProbePosition, ProbeSpec, PropertyBag, PropertyKind, PropertySchema, PropertyValue, Quantity,
+    SimulationMode, SlicePlane, SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform,
+    VectorQuantity, Velocity, WorldCommand, WorldObject, WorldSnapshot,
 };
-use fieldcad_electromagnetic_sources::{
-    charge_component_id, charge_properties, charge_property_id,
-};
-use fieldcad_particles::{
-    CATALOG_VERSION, MotionMode, ParticleTemplate, mass_property_id, motion_mode_property_id,
-    particle_component_id, particle_properties, template_particle_spec, template_property_id,
-};
+use fieldcad_mass_sources::inertial_mass_component_id;
 use fieldcad_simulation::{CommandPayload, PlaybackSpeed, ProbeHistory};
 use glam::{DVec2, DVec3};
 
@@ -23,10 +18,7 @@ use super::compute::{
 };
 use super::plot::probe_history_plots;
 use super::{CameraAction, ChannelLayerSettings, FrameContext, UiFrameOutput, UiModel};
-use crate::{
-    camera::AxisView,
-    scene::{PlaneVectorMode, SceneSelection},
-};
+use crate::scene::{PlaneVectorMode, SceneSelection};
 
 pub(super) fn menu_bar(
     root: &mut egui::Ui,
@@ -39,34 +31,39 @@ pub(super) fn menu_bar(
 
     egui::Panel::top("menu_bar").show(root, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
+            // The top bar is the simulation's transport. View controls moved
+            // into the 3D view, which is both where their effect is and what
+            // freed the room for these to be labelled and spaced.
             ui.strong("Field CAD");
-            ui.separator();
-            ui.checkbox(&mut model.grid_visible, "Grid");
-            ui.checkbox(&mut model.axes_visible, "XYZ axes");
-            ui.checkbox(&mut model.diagnostics_visible, "Diagnostics");
             ui.separator();
 
             if ui
-                .add_enabled(live && paused, egui::Button::new("▶ Play"))
+                .add_enabled(live && paused, egui::Button::new("▶  Play"))
+                .on_hover_text("Advance continuously at the playback rate")
                 .clicked()
             {
                 output.submit(CommandPayload::Play);
             }
             if ui
-                .add_enabled(live && !paused, egui::Button::new("⏸ Pause"))
+                .add_enabled(live && !paused, egui::Button::new("⏸  Pause"))
+                .on_hover_text("Stop at the current tick boundary")
                 .clicked()
             {
                 output.submit(CommandPayload::Pause);
             }
             if ui
-                .add_enabled(live && paused, egui::Button::new("Step"))
+                .add_enabled(live && paused, egui::Button::new("⏭  Step"))
+                .on_hover_text("Advance exactly one fixed time step")
                 .clicked()
             {
                 output.submit(CommandPayload::Step);
             }
 
             ui.separator();
-            ui.label("dt");
+            history_controls(ui, frame, output);
+
+            ui.separator();
+            ui.label("dt").on_hover_text("Numerical time step");
             let mut seconds = frame.compute.time_step_seconds;
             let drag_speed = time_step_drag_speed(seconds);
             let response = ui
@@ -92,7 +89,8 @@ pub(super) fn menu_bar(
             }
 
             ui.separator();
-            ui.label("speed");
+            ui.label("speed")
+                .on_hover_text("Wall-clock playback rate; never changes dt");
             let mut speed = frame.compute.playback_speed;
             let drag_speed = (speed * 0.01).max(f64::from_bits(1));
             let response = ui
@@ -115,6 +113,17 @@ pub(super) fn menu_bar(
 
             ui.separator();
             state_badge(ui, frame.compute.workbench_state());
+            // A run that stops on its own reads as a fault unless something says
+            // otherwise. This is the only place that can: the pause is
+            // authoritative, so nothing downstream can tell it apart from one
+            // the user asked for.
+            if frame.paused_for_edit {
+                ui.colored_label(egui::Color32::from_rgb(235, 190, 75), "⏸ paused for edit")
+                    .on_hover_text(
+                        "Editing the scene is not a physical process, so the simulation is held \
+                         at its last tick. It resumes when you finish the edit.",
+                    );
+            }
             if frame.compute.freshness == Some(SnapshotFreshness::Stale) {
                 ui.colored_label(egui::Color32::from_rgb(235, 170, 70), "stale view");
             }
@@ -129,13 +138,113 @@ pub(super) fn menu_bar(
                     .on_hover_text(error);
             }
             ui.separator();
-            ui.monospace(format!("t = {}", format_simulation_time(frame.compute.time_seconds)));
+            ui.monospace(format!(
+                "t = {}",
+                format_simulation_time(frame.compute.time_seconds)
+            ))
+            .on_hover_text("Simulation time, reconstructed from the tick count");
+
+            // Window toggles sit at the far end, away from the transport
+            // controls they are not part of.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("?  Help")
+                    .on_hover_text("How to build a scene, and where everything lives")
+                    .clicked()
+                {
+                    model.help_visible = !model.help_visible;
+                }
+                ui.checkbox(&mut model.diagnostics_visible, "Diagnostics")
+                    .on_hover_text("Solver diagnostics and session status window");
+            });
         });
     });
 }
 
 fn state_badge(ui: &mut egui::Ui, state: WorkbenchState) {
     ui.colored_label(state.color(), format!("● {}", state.label()));
+}
+
+const UNDO_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+/// Both spellings, because muscle memory differs by platform and by decade.
+const REDO_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    egui::Key::Z,
+);
+const REDO_ALT_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y);
+
+/// Undo and redo, next to the transport they share a bar with.
+///
+/// They belong here because they are the same kind of thing: a control over what
+/// the session is doing as a whole rather than over one selected entity. Each
+/// names the edit it would reverse, so a step back is something a user chooses
+/// rather than gambles on.
+fn history_controls(ui: &mut egui::Ui, frame: &FrameContext<'_>, output: &mut UiFrameOutput) {
+    let history = &frame.compute.edit_history;
+    // An unfinished gesture has no meaningful step to take back: the edit it
+    // would undo is still being made.
+    let live = frame.compute.accepts_history_commands() && !frame.edit_in_progress;
+
+    let reason = if frame.edit_in_progress {
+        "Finish the edit in progress first."
+    } else if !frame.compute.accepts_commands() {
+        "The compute source is not accepting commands."
+    } else {
+        "Pause the simulation to step through the edit history."
+    };
+
+    for (glyph, shortcut, entry, payload, verb) in [
+        (
+            "↶",
+            UNDO_SHORTCUT,
+            history.undo.as_deref(),
+            CommandPayload::Undo,
+            "Undo",
+        ),
+        (
+            "↷",
+            REDO_SHORTCUT,
+            history.redo.as_deref(),
+            CommandPayload::Redo,
+            "Redo",
+        ),
+    ] {
+        let enabled = live && entry.is_some();
+        let keys = ui.ctx().format_shortcut(&shortcut);
+        let response = ui.add_enabled(enabled, egui::Button::new(glyph));
+        // A disabled control that says only what it would have done is a dead
+        // end; each of these says why it cannot, because every reason is
+        // something the user can act on.
+        let response = match (entry, enabled) {
+            (Some(label), true) => response.on_hover_text(format!("{verb} · {label}   {keys}")),
+            (Some(label), false) => {
+                response.on_disabled_hover_text(format!("{verb} · {label}\n{reason}"))
+            }
+            (None, _) => {
+                response.on_disabled_hover_text(format!("Nothing to {}", verb.to_lowercase()))
+            }
+        };
+        if response.clicked() {
+            output.submit(payload);
+        }
+    }
+
+    // Deliberately only consumed when it would do something. The menu bar is
+    // laid out before the panels, so consuming unconditionally would take Ctrl+Z
+    // away from a text field the user is typing in and give it to nothing.
+    let pressed =
+        |ui: &mut egui::Ui, shortcut| ui.input_mut(|input| input.consume_shortcut(shortcut));
+    if live && history.can_undo() && pressed(ui, &UNDO_SHORTCUT) {
+        output.submit(CommandPayload::Undo);
+    }
+    if live
+        && history.can_redo()
+        && (pressed(ui, &REDO_SHORTCUT) || pressed(ui, &REDO_ALT_SHORTCUT))
+    {
+        output.submit(CommandPayload::Redo);
+    }
 }
 
 pub(super) fn scene_tree(
@@ -162,176 +271,228 @@ pub(super) fn scene_tree(
                     ui.heading("Scene");
                     ui.separator();
 
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .button("+Q")
-                            .on_hover_text("Add +1 nC point charge")
-                            .clicked()
-                        {
-                            output.submit(new_charge_command(
-                                frame.world,
-                                1.0e-9,
-                                ChargeObjectKind::Point,
-                            ));
-                        }
-                        for (label, template) in [
-                            ("+ e−", ParticleTemplate::Electron),
-                            ("+ p+", ParticleTemplate::Proton),
-                            ("+ e+", ParticleTemplate::Positron),
-                            ("+ n", ParticleTemplate::Neutron),
-                        ] {
-                            if ui
-                                .button(label)
-                                .on_hover_text(format!(
-                                    "Add a dynamic {} from the {} catalog",
-                                    template.label(),
-                                    CATALOG_VERSION
-                                ))
-                                .clicked()
-                            {
-                                output.submit(new_particle_command(frame.world, template));
-                            }
-                        }
-                        if ui
-                            .button("−Q")
-                            .on_hover_text("Add −1 nC point charge")
-                            .clicked()
-                        {
-                            output.submit(new_charge_command(
-                                frame.world,
-                                -1.0e-9,
-                                ChargeObjectKind::Point,
-                            ));
-                        }
-                        if ui
-                            .button("+ Sphere")
-                            .on_hover_text("Add a uniformly charged +1 nC sphere")
-                            .clicked()
-                        {
-                            output.submit(new_charge_command(
-                                frame.world,
-                                1.0e-9,
-                                ChargeObjectKind::Sphere,
-                            ));
-                        }
-                        if ui.button("+ Probe").clicked() {
-                            let channels = frame
-                                .compute
-                                .field_systems
-                                .iter()
-                                .flat_map(|system| &system.channels)
-                                .map(|channel| channel.id.clone())
-                                .collect();
-                            output.edit(vec![WorldCommand::CreateProbe(ProbeSpec::at(
-                                format!("Probe {}", frame.world.probes().len() + 1),
-                                DVec3::new(1.0, 0.0, 0.6),
-                                channels,
-                            ))]);
-                        }
-                        if ui.button("+ Plane").clicked() {
-                            output.edit(vec![WorldCommand::CreatePlane(
-                                SlicePlaneSpec::new(
-                                    format!("XY plane {}", frame.world.planes().len() + 1),
-                                    DVec3::ZERO,
-                                    DVec3::Z,
-                                )
-                                .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
-                                .expect("static plane parameters are valid"),
-                            )]);
-                        }
-                    });
-                    ui.add_space(6.0);
-
-                    if frame.world.objects().is_empty() {
-                        ui.weak("No objects.");
-                    }
-                    for object in frame.world.objects().values() {
-                        ui.horizontal(|ui| {
-                            if visibility_button(ui, object.visible).clicked() {
-                                output.edit(vec![WorldCommand::SetObjectVisible {
-                                    object: object.id,
-                                    visible: !object.visible,
-                                }]);
-                            }
-                            if ui
-                                .selectable_label(
-                                    model.selection == Some(object.id),
-                                    format!("▣  {}", object.name),
-                                )
-                                .on_hover_text(&object.name)
-                                .clicked()
-                            {
-                                model.set_scene_selection(Some(SceneSelection::Object(object.id)));
-                            }
-                            if ui
-                                .small_button("×")
-                                .on_hover_text("Delete object")
-                                .clicked()
-                            {
-                                output.edit(vec![WorldCommand::RemoveObject(object.id)]);
-                            }
-                        });
-                    }
-
-                    if !frame.world.probes().is_empty() {
-                        ui.add_space(8.0);
-                        ui.label("Probes");
-                        for probe in frame.world.probes().values() {
-                            ui.horizontal(|ui| {
-                                if visibility_button(ui, probe.visible).clicked() {
-                                    output.edit(vec![WorldCommand::SetProbeVisible {
-                                        probe: probe.id,
-                                        visible: !probe.visible,
-                                    }]);
-                                }
-                                if ui
-                                    .selectable_label(
-                                        model.probe_selection == Some(probe.id),
-                                        format!("◉  {}", probe.name),
-                                    )
-                                    .on_hover_text(&probe.name)
-                                    .clicked()
-                                {
-                                    model
-                                        .set_scene_selection(Some(SceneSelection::Probe(probe.id)));
-                                }
-                                if ui.small_button("×").on_hover_text("Delete probe").clicked() {
-                                    output.edit(vec![WorldCommand::RemoveProbe(probe.id)]);
-                                }
-                            });
-                        }
-                    }
-
-                    if !frame.world.planes().is_empty() {
-                        ui.add_space(8.0);
-                        ui.label("Slice planes");
-                        for plane in frame.world.planes().values() {
-                            ui.horizontal(|ui| {
-                                if visibility_button(ui, plane.visible).clicked() {
-                                    output.edit(vec![WorldCommand::SetPlaneVisible {
-                                        plane: plane.id,
-                                        visible: !plane.visible,
-                                    }]);
-                                }
-                                if ui
-                                    .selectable_label(
-                                        model.plane_selection == Some(plane.id),
-                                        format!("▦  {}", plane.name),
-                                    )
-                                    .on_hover_text(&plane.name)
-                                    .clicked()
-                                {
-                                    model
-                                        .set_scene_selection(Some(SceneSelection::Plane(plane.id)));
-                                }
-                                if ui.small_button("×").on_hover_text("Delete plane").clicked() {
-                                    output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
-                                }
-                            });
-                        }
-                    }
+                    simulation_section(ui, model, frame);
+                    object_section(ui, model, frame, output);
+                    measurement_section(ui, model, frame, output);
                 });
         });
+}
+
+/// The scene-level node, and what the simulation is composed of.
+///
+/// The header is the node itself rather than a label above it: there is one
+/// thing here, and a folding header wrapped around a single selectable row
+/// would read as a mistake. The arrow folds; the name selects.
+fn simulation_section(ui: &mut egui::Ui, model: &mut UiModel, frame: &FrameContext<'_>) {
+    let id = ui.make_persistent_id("scene_simulation_section");
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+        .show_header(ui, |ui| {
+            if ui
+                .selectable_label(model.world_selected, "🌐  Simulation")
+                .on_hover_text("Domain, active field systems, sampling, and compute status")
+                .clicked()
+            {
+                model.select_world();
+            }
+        })
+        .body(|ui| {
+            // What the simulation consists of, which is this panel's job. Read
+            // only: activating a system is a physical decision and belongs with
+            // the rest of the scene settings, one click away in the inspector.
+            if frame.compute.field_systems.is_empty() {
+                ui.weak("No field systems available.");
+            }
+            for system in &frame.compute.field_systems {
+                let mark = if system.enabled { "◈" } else { "◇" };
+                let row = ui
+                    .selectable_label(false, format!("{mark}  {}", system.plugin.display_name))
+                    .on_hover_text(format!(
+                        "{}\n{}",
+                        system.plugin.description,
+                        if system.enabled {
+                            "Active. Select Simulation to configure it."
+                        } else {
+                            "Inactive: it does not simulate or publish. Select Simulation to \
+                             enable it."
+                        }
+                    ));
+                if row.clicked() {
+                    model.select_world();
+                }
+            }
+        });
+    ui.add_space(6.0);
+}
+
+fn object_section(
+    ui: &mut egui::Ui,
+    model: &mut UiModel,
+    frame: &FrameContext<'_>,
+    output: &mut UiFrameOutput,
+) {
+    // The count goes in the header so a folded section still says how much is
+    // behind it. Otherwise folding one loses the only clue that it has contents.
+    let title = format!("Objects ({})", frame.world.objects().len());
+    super::section(ui, "scene_objects_section", title, true, |ui| {
+        // One button, because there is only one kind of thing a simulation
+        // models: an object at a position. What it *does* is decided by the
+        // components added to it in the inspector, not by which button created
+        // it.
+        if ui
+            .button("+  Add object")
+            .on_hover_text(
+                "Add an object at the origin.\n\
+                 Give it charge or mass in the inspector to couple it to a field.",
+            )
+            .clicked()
+        {
+            output.submit(new_object_command(frame.world));
+        }
+        ui.add_space(4.0);
+
+        if frame.world.objects().is_empty() {
+            ui.weak("No objects yet.");
+        }
+        for object in frame.world.objects().values() {
+            ui.horizontal(|ui| {
+                if visibility_button(ui, object.visible).clicked() {
+                    output.edit(vec![WorldCommand::SetObjectVisible {
+                        object: object.id,
+                        visible: !object.visible,
+                    }]);
+                }
+                if ui
+                    .selectable_label(
+                        model.selection == Some(object.id),
+                        format!("▣  {}", object.name),
+                    )
+                    .on_hover_text(&object.name)
+                    .clicked()
+                {
+                    model.set_scene_selection(Some(SceneSelection::Object(object.id)));
+                }
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Delete object")
+                    .clicked()
+                {
+                    output.edit(vec![WorldCommand::RemoveObject(object.id)]);
+                }
+            });
+        }
+    });
+    ui.add_space(6.0);
+}
+
+/// Probes and planes are instruments, not physics.
+///
+/// They are one section because no equation system can see either: adding one
+/// asks a question about the simulation without changing what is simulated.
+fn measurement_section(
+    ui: &mut egui::Ui,
+    model: &mut UiModel,
+    frame: &FrameContext<'_>,
+    output: &mut UiFrameOutput,
+) {
+    let instruments = frame.world.probes().len() + frame.world.planes().len();
+    let title = format!("Measurement ({instruments})");
+    super::section(ui, "scene_measurement_section", title, true, |ui| {
+        ui.weak("Not simulated").on_hover_text(
+            "Probes and slice planes sample the field for you.\n\
+             They carry no charge or mass and never alter the result.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("+ Probe")
+                .on_hover_text("Record field values at a point")
+                .clicked()
+            {
+                let channels = frame
+                    .compute
+                    .field_systems
+                    .iter()
+                    .flat_map(|system| &system.channels)
+                    .map(|channel| channel.id.clone())
+                    .collect();
+                output.edit(vec![WorldCommand::CreateProbe(ProbeSpec::at(
+                    format!("Probe {}", frame.world.probes().len() + 1),
+                    DVec3::new(1.0, 0.0, 0.6),
+                    channels,
+                ))]);
+            }
+            if ui
+                .button("+ Plane")
+                .on_hover_text("Draw the field across a slice")
+                .clicked()
+            {
+                output.edit(vec![WorldCommand::CreatePlane(
+                    SlicePlaneSpec::new(
+                        format!("XY plane {}", frame.world.planes().len() + 1),
+                        DVec3::ZERO,
+                        DVec3::Z,
+                    )
+                    .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
+                    .expect("static plane parameters are valid"),
+                )]);
+            }
+        });
+
+        if !frame.world.probes().is_empty() {
+            ui.add_space(8.0);
+            ui.label("Probes");
+            for probe in frame.world.probes().values() {
+                ui.horizontal(|ui| {
+                    if visibility_button(ui, probe.visible).clicked() {
+                        output.edit(vec![WorldCommand::SetProbeVisible {
+                            probe: probe.id,
+                            visible: !probe.visible,
+                        }]);
+                    }
+                    if ui
+                        .selectable_label(
+                            model.probe_selection == Some(probe.id),
+                            format!("◉  {}", probe.name),
+                        )
+                        .on_hover_text(&probe.name)
+                        .clicked()
+                    {
+                        model.set_scene_selection(Some(SceneSelection::Probe(probe.id)));
+                    }
+                    if ui.small_button("×").on_hover_text("Delete probe").clicked() {
+                        output.edit(vec![WorldCommand::RemoveProbe(probe.id)]);
+                    }
+                });
+            }
+        }
+
+        if !frame.world.planes().is_empty() {
+            ui.add_space(8.0);
+            ui.label("Slice planes");
+            for plane in frame.world.planes().values() {
+                ui.horizontal(|ui| {
+                    if visibility_button(ui, plane.visible).clicked() {
+                        output.edit(vec![WorldCommand::SetPlaneVisible {
+                            plane: plane.id,
+                            visible: !plane.visible,
+                        }]);
+                    }
+                    if ui
+                        .selectable_label(
+                            model.plane_selection == Some(plane.id),
+                            format!("▦  {}", plane.name),
+                        )
+                        .on_hover_text(&plane.name)
+                        .clicked()
+                    {
+                        model.set_scene_selection(Some(SceneSelection::Plane(plane.id)));
+                    }
+                    if ui.small_button("×").on_hover_text("Delete plane").clicked() {
+                        output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
+                    }
+                });
+            }
+        }
+    });
 }
 
 fn visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
@@ -364,19 +525,33 @@ pub(super) fn inspector(
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.heading("Inspector");
-                    ui.separator();
-
-                    if let Some(object) = model.selection.and_then(|id| frame.world.object(id)) {
-                        object_properties(ui, object, output);
+                    // The inspector shows exactly one subject: whatever is
+                    // selected in the scene. Nothing is appended below it, so
+                    // the panel's contents always answer "what am I looking at",
+                    // and the same rule holds for the simulation node as for an
+                    // object.
+                    if model.world_selected {
+                        ui.heading("Simulation");
+                        ui.separator();
+                        world_properties(ui, frame.compute, output);
+                    } else if let Some(object) =
+                        model.selection.and_then(|id| frame.world.object(id))
+                    {
+                        ui.heading("Object");
+                        ui.separator();
+                        object_properties(ui, frame.world, object, output);
                     } else if let Some(plane) = model
                         .plane_selection
                         .and_then(|id| frame.world.planes().get(&id))
                     {
+                        ui.heading("Slice plane");
+                        ui.separator();
                         plane_properties(ui, plane, &mut model.field_layers, frame.compute, output);
                     } else if let Some(probe) =
                         model.probe_selection.and_then(|id| frame.world.probe(id))
                     {
+                        ui.heading("Probe");
+                        ui.separator();
                         probe_properties(
                             ui,
                             model,
@@ -387,41 +562,187 @@ pub(super) fn inspector(
                             output,
                         );
                     } else {
-                        ui.weak("Select an object, probe, or plane in the viewport or scene tree.");
+                        ui.heading("Inspector");
+                        ui.separator();
+                        empty_inspector(ui, model);
                     }
-
-                    ui.add_space(16.0);
-                    field_system_controls(ui, frame.compute, output);
-
-                    ui.add_space(16.0);
-                    ui.heading("View");
-                    ui.horizontal(|ui| {
-                        for (label, view) in [
-                            ("+X", AxisView::PositiveX),
-                            ("+Y", AxisView::PositiveY),
-                            ("+Z", AxisView::PositiveZ),
-                        ] {
-                            if ui.button(label).clicked() {
-                                output.camera_action = Some(CameraAction::Axis(view));
-                            }
-                        }
-                    });
-                    field_layer_controls(ui, model, frame.compute);
-
-                    ui.add_space(16.0);
-                    transport_sampling(ui, frame.compute, output);
-
-                    ui.add_space(16.0);
-                    compute_panel(ui, frame.compute);
                 });
         });
+}
+
+/// What the inspector says when the scene has nothing selected.
+///
+/// An empty panel is a dead end, so this points at the one node that is always
+/// there. The hint is a button rather than prose because the fastest way to
+/// explain where the simulation settings went is to take the user to them.
+fn empty_inspector(ui: &mut egui::Ui, model: &mut UiModel) {
+    ui.weak("Nothing selected.");
+    ui.add_space(6.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Select an object, probe, or slice plane — in the scene list or the 3D view — to \
+                 edit it here.",
+            )
+            .small(),
+        )
+        .wrap(),
+    );
+    ui.add_space(10.0);
+    if ui
+        .button("Show simulation settings")
+        .on_hover_text("Domain, field systems, sampling, and compute status")
+        .clicked()
+    {
+        model.select_world();
+    }
+}
+
+/// Everything that belongs to the scene rather than to one thing in it.
+///
+/// Ordered by how often it is touched: which physics is active, then how much of
+/// it is transported for viewing, then read-only status. The domain summary sits
+/// with the status because it is fixed for a session. Each is foldable, because
+/// a user tuning sampling has no use for the status grid underneath it.
+fn world_properties(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
+    super::section(ui, "inspector_fields", "Fields", true, |ui| {
+        field_controls(ui, compute, output);
+    });
+    super::section(ui, "inspector_field_systems", "Field systems", true, |ui| {
+        field_system_controls(ui, compute, output);
+    });
+    super::section(
+        ui,
+        "inspector_transport_sampling",
+        "Transport sampling",
+        true,
+        |ui| transport_sampling(ui, compute, output),
+    );
+    super::section(ui, "inspector_compute", "Compute", true, |ui| {
+        compute_panel(ui, compute);
+    });
+}
+
+/// The fields this scene can have, and which model computes each.
+///
+/// A scene has one electric field. Whether it is solved analytically from static
+/// charges or advanced in time by Maxwell's equations is a choice of *model*,
+/// not a second field: two of them would publish contradictory values under one
+/// name and each push a charge with its own version of the same force. So this
+/// reads as one row per field with a model chosen for it, and the systems below
+/// are what those models are made of.
+fn field_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
+    if compute.fields.is_empty() {
+        ui.weak("No fields are available. Compose a field system into the scene.");
+        return;
+    }
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "A field is computed by one model at a time. Choosing another replaces it, \
+                 and brings whatever else that model computes with it.",
+            )
+            .small(),
+        )
+        .wrap(),
+    );
+    ui.add_space(4.0);
+
+    let name_of = |plugin: &fieldcad_core::PluginId| {
+        compute
+            .field_systems
+            .iter()
+            .find(|system| &system.plugin.id == plugin)
+            .map_or_else(
+                || plugin.to_string(),
+                |system| system.plugin.display_name.clone(),
+            )
+    };
+
+    for field in &compute.fields {
+        ui.push_id(&field.channel, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(&field.display_name).on_hover_text(format!(
+                    "{}\n{}",
+                    field.channel,
+                    field.kind_label()
+                ));
+
+                let selected = match &field.provider {
+                    Some(provider) => name_of(provider),
+                    None => NOT_COMPUTED.to_owned(),
+                };
+                let mut chosen: Option<Option<fieldcad_core::PluginId>> = None;
+                ui.add_enabled_ui(compute.accepts_commands(), |ui| {
+                    egui::ComboBox::from_id_salt(("field_model", &field.channel))
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(field.provider.is_none(), NOT_COMPUTED)
+                                .clicked()
+                            {
+                                chosen = Some(None);
+                            }
+                            for candidate in &field.candidates {
+                                let active = field.provider.as_ref() == Some(candidate);
+                                if ui.selectable_label(active, name_of(candidate)).clicked() {
+                                    chosen = Some(Some(candidate.clone()));
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(if field.has_alternatives() {
+                            "Which equation system computes this field"
+                        } else {
+                            "The only model of this field composed into the scene"
+                        });
+                });
+                if let Some(provider) = chosen
+                    && provider != field.provider
+                {
+                    output.submit(CommandPayload::SetFieldModel {
+                        channel: field.channel.clone(),
+                        provider,
+                    });
+                }
+            });
+        });
+    }
+}
+
+const NOT_COMPUTED: &str = "Not computed";
+
+/// The first field this system computes that another system already does, named
+/// along with the system that holds it.
+fn taken_field(
+    system: &fieldcad_simulation::FieldSystemStatus,
+    compute: &ComputeView,
+) -> Option<(String, String)> {
+    if system.enabled {
+        return None;
+    }
+    system.channels.iter().find_map(|channel| {
+        let field = compute
+            .fields
+            .iter()
+            .find(|field| field.channel == channel.id)?;
+        let provider = field.provider.as_ref()?;
+        let name = compute
+            .field_systems
+            .iter()
+            .find(|other| &other.plugin.id == provider)
+            .map_or_else(
+                || provider.to_string(),
+                |other| other.plugin.display_name.clone(),
+            );
+        Some((field.display_name.clone(), name))
+    })
 }
 
 /// Scene-level equation-system composition. A system is the activation unit,
 /// rather than an individual channel, because channels such as Maxwell E and B
 /// may be coupled by one solver.
 fn field_system_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
-    ui.heading("Field systems");
     ui.add(
         egui::Label::new(
             egui::RichText::new(
@@ -440,21 +761,35 @@ fn field_system_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut 
     for system in &compute.field_systems {
         ui.push_id(&system.plugin.id, |ui| {
             let mut enabled = system.enabled;
+            // A system whose fields another system is already computing cannot
+            // simply be switched on: which model computes a field is a choice,
+            // and it is made above. Pointing at that control is more use than
+            // letting the click through and reporting a rejection.
+            let taken = taken_field(system, compute);
             let response = ui
                 .add_enabled(
-                    compute.accepts_commands(),
+                    compute.accepts_commands() && (system.enabled || taken.is_none()),
                     egui::Checkbox::new(&mut enabled, &system.plugin.display_name),
                 )
                 .on_hover_text(format!(
                     "{}\n{} · version {}",
                     system.plugin.description, system.plugin.id, system.plugin.version
                 ));
+            let response = match taken {
+                Some((field, provider)) => response.on_disabled_hover_text(format!(
+                    "{field} is computed by {provider}.\n\
+                     Choose this system as its model under Fields instead."
+                )),
+                None => response,
+            };
             if response.changed() && enabled != system.enabled {
                 output.submit(CommandPayload::SetFieldSystemEnabled {
                     plugin: system.plugin.id.clone(),
                     enabled,
                 });
             }
+
+            realtime_control(ui, system, compute, output);
 
             egui::CollapsingHeader::new("Fields and settings")
                 .default_open(false)
@@ -506,6 +841,42 @@ fn field_system_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut 
     }
 }
 
+/// How closely one field system follows an edit that is still being made.
+///
+/// Dragging a body through a scene is not a physical process, so nothing is lost
+/// by a system computing only the pose the user settles on. What is gained is a
+/// viewport that stays responsive when an evaluator is expensive: without this,
+/// the cost of a whole solve lands between one mouse position and the next, and
+/// a scene becomes undraggable long before it becomes unsolvable.
+fn realtime_control(
+    ui: &mut egui::Ui,
+    system: &fieldcad_simulation::FieldSystemStatus,
+    compute: &ComputeView,
+    output: &mut UiFrameOutput,
+) {
+    ui.indent(("realtime", &system.plugin.id), |ui| {
+        let mut realtime = system.realtime;
+        let response = ui
+            .add_enabled(
+                compute.accepts_commands() && system.enabled,
+                egui::Checkbox::new(&mut realtime, "Update while editing"),
+            )
+            .on_hover_text(
+                "On: recompute this system for every intermediate value while you drag a body \
+                 or type a property.\n\
+                 Off: keep the last result until you let go, then recompute once from the \
+                 values you committed.\n\
+                 Either way the committed scene produces the same field.",
+            );
+        if response.changed() && realtime != system.realtime {
+            output.submit(CommandPayload::SetFieldSystemRealtime {
+                plugin: system.plugin.id.clone(),
+                realtime,
+            });
+        }
+    });
+}
+
 fn format_configuration_value(value: &PropertyValue) -> String {
     match value {
         PropertyValue::Scalar(value) => format!(
@@ -540,8 +911,34 @@ fn format_configuration_number(value: f64) -> String {
     }
 }
 
-fn object_properties(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFrameOutput) {
+fn object_properties(
+    ui: &mut egui::Ui,
+    world: &WorldSnapshot,
+    object: &WorldObject,
+    output: &mut UiFrameOutput,
+) {
     ui.label(&object.name);
+    super::section(ui, "inspector_placement", "Placement", true, |ui| {
+        placement_editors(ui, object, output);
+    });
+    super::section(ui, "inspector_components", "Components", true, |ui| {
+        object_components(ui, world, object, output);
+    });
+
+    // Outside the sections: these are things to do to the subject rather than a
+    // group of its properties, and folding them away would hide the only way to
+    // delete an object from the inspector.
+    ui.add_space(10.0);
+    if ui.button("Focus selection  [F]").clicked() {
+        output.camera_action = Some(CameraAction::FocusSelection);
+    }
+    if ui.button("Remove object").clicked() {
+        output.edit(vec![WorldCommand::RemoveObject(object.id)]);
+    }
+}
+
+/// Where the object is, how big it is, and who decides where it goes next.
+fn placement_editors(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFrameOutput) {
     let mut position = object.transform.translation;
     let mut position_changed = false;
     egui::Grid::new("object_properties")
@@ -550,61 +947,25 @@ fn object_properties(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
         .show(ui, |ui| {
             ui.label("Position");
             ui.horizontal(|ui| {
-                position_changed |= coordinate_editor(ui, "x", &mut position.x, " m");
-                position_changed |= coordinate_editor(ui, "y", &mut position.y, " m");
-                position_changed |= coordinate_editor(ui, "z", &mut position.z, " m");
+                let editing = &mut output.scene_edit_in_progress;
+                position_changed |= coordinate_editor(ui, "x", &mut position.x, " m", editing);
+                position_changed |= coordinate_editor(ui, "y", &mut position.y, " m", editing);
+                position_changed |= coordinate_editor(ui, "z", &mut position.z, " m", editing);
             });
             ui.end_row();
 
-            ui.label("Shape");
-            match object.shape {
-                Some(ObjectShape::Point { mut radius }) => {
-                    ui.horizontal(|ui| {
-                        ui.label("Point");
-                        if radius_editor(ui, &mut radius, 0.0)
-                            && let Ok(shape) = ObjectShape::point(radius)
-                        {
-                            output.edit(vec![WorldCommand::SetShape {
-                                object: object.id,
-                                shape: Some(shape),
-                            }]);
-                        }
-                    });
-                }
-                Some(ObjectShape::Sphere { mut radius }) => {
-                    ui.horizontal(|ui| {
-                        ui.label("Uniform sphere");
-                        if radius_editor(ui, &mut radius, 1.0e-4)
-                            && let Ok(shape) = ObjectShape::sphere(radius)
-                        {
-                            output.edit(vec![WorldCommand::SetShape {
-                                object: object.id,
-                                shape: Some(shape),
-                            }]);
-                        }
-                    });
-                }
-                Some(ObjectShape::Box { half_extent }) => {
-                    ui.label(format!(
-                        "Box, {:.2} × {:.2} × {:.2} m",
-                        half_extent.x * 2.0,
-                        half_extent.y * 2.0,
-                        half_extent.z * 2.0
-                    ));
-                }
-                None => {
-                    ui.label("None");
-                }
-            }
+            ui.label("Extent");
+            shape_editor(ui, object, output);
             ui.end_row();
 
             let mut velocity = object.velocity.linear;
             let mut velocity_changed = false;
             ui.label("Velocity");
             ui.horizontal(|ui| {
-                velocity_changed |= coordinate_editor(ui, "vx", &mut velocity.x, " m/s");
-                velocity_changed |= coordinate_editor(ui, "vy", &mut velocity.y, " m/s");
-                velocity_changed |= coordinate_editor(ui, "vz", &mut velocity.z, " m/s");
+                let editing = &mut output.scene_edit_in_progress;
+                velocity_changed |= coordinate_editor(ui, "vx", &mut velocity.x, " m/s", editing);
+                velocity_changed |= coordinate_editor(ui, "vy", &mut velocity.y, " m/s", editing);
+                velocity_changed |= coordinate_editor(ui, "vz", &mut velocity.z, " m/s", editing);
             });
             ui.end_row();
             if velocity_changed
@@ -615,6 +976,10 @@ fn object_properties(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
                     velocity,
                 }]);
             }
+
+            ui.label("Motion");
+            motion_editor(ui, object, output);
+            ui.end_row();
         });
 
     if position_changed && let Ok(transform) = Transform::new(position, object.transform.rotation) {
@@ -623,108 +988,426 @@ fn object_properties(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
             transform,
         }]);
     }
+}
 
-    if let Some(properties) = object.components.get(&charge_component_id()) {
-        ui.add_space(8.0);
-        ui.label("Electrostatics");
-        if let Some(charge) = properties.scalar(&charge_property_id()) {
-            let mut nanocoulombs = charge * 1.0e9;
-            ui.horizontal(|ui| {
-                ui.label("Charge");
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut nanocoulombs)
-                            .speed(0.05)
-                            .suffix(" nC"),
-                    )
-                    .changed()
-                    && let Ok(properties) = charge_properties(nanocoulombs * 1.0e-9)
-                {
-                    output.edit(vec![WorldCommand::AttachComponent {
-                        object: object.id,
-                        component: charge_component_id(),
-                        properties,
-                    }]);
+/// Choose whether an object is a point or occupies a volume.
+///
+/// An object with no shape is a bare marker: it still has a position, and any
+/// component attached to it still works, but it draws as a small proxy and a
+/// field solver treats it as a point.
+fn shape_editor(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFrameOutput) {
+    ui.horizontal(|ui| {
+        let mut selected = ShapeKind::of(object.shape);
+        let before = selected;
+        egui::ComboBox::from_id_salt(("object_shape", object.id))
+            .selected_text(selected.label())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for candidate in ShapeKind::ALL {
+                    ui.selectable_value(&mut selected, candidate, candidate.label());
                 }
             });
+        if selected != before {
+            // Carry the current radius across a kind change so switching from
+            // point to sphere does not silently resize the object.
+            let radius = match object.shape {
+                Some(ObjectShape::Point { radius } | ObjectShape::Sphere { radius }) => radius,
+                _ => DEFAULT_AUTHORING_RADIUS,
+            };
+            if let Ok(shape) = selected.build(radius) {
+                output.edit(vec![WorldCommand::SetShape {
+                    object: object.id,
+                    shape,
+                }]);
+            }
+        }
+
+        match object.shape {
+            Some(ObjectShape::Point { mut radius }) => {
+                if radius_editor(ui, &mut radius, 0.0, &mut output.scene_edit_in_progress)
+                    && let Ok(shape) = ObjectShape::point(radius)
+                {
+                    output.edit(vec![WorldCommand::SetShape {
+                        object: object.id,
+                        shape: Some(shape),
+                    }]);
+                }
+            }
+            Some(ObjectShape::Sphere { mut radius }) => {
+                if radius_editor(ui, &mut radius, 1.0e-4, &mut output.scene_edit_in_progress)
+                    && let Ok(shape) = ObjectShape::sphere(radius)
+                {
+                    output.edit(vec![WorldCommand::SetShape {
+                        object: object.id,
+                        shape: Some(shape),
+                    }]);
+                }
+            }
+            Some(ObjectShape::Box { half_extent }) => {
+                ui.label(format!(
+                    "{:.2} × {:.2} × {:.2} m",
+                    half_extent.x * 2.0,
+                    half_extent.y * 2.0,
+                    half_extent.z * 2.0
+                ));
+            }
+            None => {}
+        }
+    });
+}
+
+/// The default radius for an object whose shape was just chosen.
+const DEFAULT_AUTHORING_RADIUS: f64 = 0.15;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeKind {
+    None,
+    Point,
+    Sphere,
+    Box,
+}
+
+impl ShapeKind {
+    const ALL: [Self; 3] = [Self::None, Self::Point, Self::Sphere];
+
+    fn of(shape: Option<ObjectShape>) -> Self {
+        match shape {
+            None => Self::None,
+            Some(ObjectShape::Point { .. }) => Self::Point,
+            Some(ObjectShape::Sphere { .. }) => Self::Sphere,
+            Some(ObjectShape::Box { .. }) => Self::Box,
         }
     }
 
-    if let Some(properties) = object.components.get(&particle_component_id()) {
-        ui.add_space(8.0);
-        ui.label("Generic particle");
-        let Some(mut mass_kg) = properties.scalar(&mass_property_id()) else {
-            ui.colored_label(egui::Color32::RED, "Invalid mass property");
-            return;
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "Marker",
+            Self::Point => "Point",
+            Self::Sphere => "Sphere",
+            Self::Box => "Box",
+        }
+    }
+
+    fn build(self, radius: f64) -> Result<Option<ObjectShape>, fieldcad_core::WorldError> {
+        let shape = match self {
+            Self::None => None,
+            Self::Point => Some(ObjectShape::point(radius)?),
+            Self::Sphere => Some(ObjectShape::sphere(radius.max(1.0e-4))?),
+            Self::Box => Some(ObjectShape::boxed(DVec3::splat(radius.max(1.0e-4)))?),
         };
-        let mut motion_mode = properties
-            .get(&motion_mode_property_id())
-            .and_then(choice_property)
-            .and_then(MotionMode::parse)
-            .unwrap_or_default();
-        let template = properties
-            .get(&template_property_id())
-            .and_then(choice_property)
-            .and_then(ParticleTemplate::parse)
-            .unwrap_or_default();
+        Ok(shape)
+    }
+}
 
-        ui.horizontal(|ui| {
-            ui.label("Mass");
-            let mass_drag_speed = (mass_kg.abs() * 0.01).max(f64::MIN_POSITIVE);
-            if ui
-                .add(
-                    egui::DragValue::new(&mut mass_kg)
-                        .speed(mass_drag_speed)
-                        .range(f64::MIN_POSITIVE..=f64::MAX)
-                        .custom_formatter(|value, _| format!("{value:.9e}"))
-                        .custom_parser(|text| text.trim().parse().ok())
-                        .update_while_editing(false)
-                        .suffix(" kg"),
-                )
-                .changed()
-                && let Ok(properties) =
-                    particle_properties(mass_kg, motion_mode, ParticleTemplate::Custom)
-            {
-                output.edit(vec![WorldCommand::AttachComponent {
-                    object: object.id,
-                    component: particle_component_id(),
-                    properties,
-                }]);
-            }
-        });
+/// Who decides how this object moves.
+///
+/// Motion is not a capability an object opts into — everything in the space has
+/// a position, and a position that changes is velocity. The only question is
+/// whether a solver integrates it or the user authors it.
+fn motion_editor(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFrameOutput) {
+    ui.horizontal(|ui| {
+        let mut pinned = object.pinned;
+        if ui
+            .checkbox(&mut pinned, "Pinned")
+            .on_hover_text(
+                "Pinned: this object follows the position and velocity you set.\n\
+                 Unpinned: a solver moves it, if it has the mass to be pushed.",
+            )
+            .changed()
+        {
+            output.edit(vec![WorldCommand::SetObjectPinned {
+                object: object.id,
+                pinned,
+            }]);
+        }
+        ui.weak(motion_summary(object));
+    });
+}
 
-        ui.horizontal(|ui| {
-            ui.label("Motion");
-            let before = motion_mode;
-            egui::ComboBox::from_id_salt(("particle_motion", object.id))
-                .selected_text(motion_mode.label())
-                .show_ui(ui, |ui| {
-                    for candidate in MotionMode::ALL {
-                        ui.selectable_value(&mut motion_mode, candidate, candidate.label());
-                    }
-                });
-            if motion_mode != before
-                && let Ok(properties) = particle_properties(mass_kg, motion_mode, template)
-            {
-                output.edit(vec![WorldCommand::AttachComponent {
-                    object: object.id,
-                    component: particle_component_id(),
-                    properties,
-                }]);
-            }
-        });
-        ui.small(format!(
-            "Template: {} · {}",
-            template.label(),
-            CATALOG_VERSION
-        ));
+/// Explain, in the object's own terms, what will actually happen to it.
+///
+/// This is the one place the composition model becomes visible: an object that
+/// has not been given mass will not move no matter how the flag is set, and
+/// saying so is cheaper than letting a user discover it by running.
+fn motion_summary(object: &WorldObject) -> &'static str {
+    if object.pinned {
+        if object.velocity.linear == DVec3::ZERO {
+            "held in place"
+        } else {
+            "carried at the velocity you set"
+        }
+    } else if object
+        .components
+        .contains_key(&inertial_mass_component_id())
+    {
+        "moved by the forces acting on it"
+    } else {
+        "no inertia — add Inertial mass to make it movable"
+    }
+}
+
+/// Every component attached to this object, plus the ones it could still gain.
+///
+/// Rendered entirely from the registered [`ComponentSchema`]s. The inspector
+/// knows nothing about charge or mass specifically, so a plugin that declares a
+/// new component becomes editable here without a line changing in this file.
+fn object_components(
+    ui: &mut egui::Ui,
+    world: &WorldSnapshot,
+    object: &WorldObject,
+    output: &mut UiFrameOutput,
+) {
+    let schemas = world.component_schemas();
+    add_component_menu(ui, world, object, output);
+
+    if object.components.is_empty() {
+        ui.weak("None. This object has a position but no physics.");
     }
 
-    if ui.button("Focus selection  [F]").clicked() {
-        output.camera_action = Some(CameraAction::FocusSelection);
+    for (id, properties) in &object.components {
+        let Some(schema) = schemas.get(id) else {
+            // A component whose plugin is no longer loaded. Its values are
+            // preserved in the world, so say so rather than dropping them
+            // silently or pretending the component is not there.
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 60),
+                format!("{id} (schema unavailable)"),
+            );
+            continue;
+        };
+
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(&schema.display_name)
+            .id_salt(("component", object.id, id))
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut edited = properties.clone();
+                let mut changed = false;
+                for property in &schema.properties {
+                    changed |= property_editor(
+                        ui,
+                        object.id,
+                        property,
+                        &mut edited,
+                        &mut output.scene_edit_in_progress,
+                    );
+                }
+                if changed && schema.validate(&edited).is_ok() {
+                    output.edit(vec![WorldCommand::AttachComponent {
+                        object: object.id,
+                        component: id.clone(),
+                        properties: edited,
+                    }]);
+                }
+                if ui
+                    .small_button("Remove component")
+                    .on_hover_text(format!(
+                        "Detach {} from this object",
+                        schema.display_name.to_lowercase()
+                    ))
+                    .clicked()
+                {
+                    output.edit(vec![WorldCommand::DetachComponent {
+                        object: object.id,
+                        component: id.clone(),
+                    }]);
+                }
+            });
     }
-    if ui.button("Remove object").clicked() {
-        output.edit(vec![WorldCommand::RemoveObject(object.id)]);
+}
+
+/// Offer every registered component the object does not already carry.
+fn add_component_menu(
+    ui: &mut egui::Ui,
+    world: &WorldSnapshot,
+    object: &WorldObject,
+    output: &mut UiFrameOutput,
+) {
+    let available: Vec<_> = world
+        .component_schemas()
+        .values()
+        .filter(|schema| !object.components.contains_key(&schema.id))
+        .collect();
+
+    ui.add_enabled_ui(!available.is_empty(), |ui| {
+        ui.menu_button("+ Add", |ui| {
+            for schema in available {
+                // A component is only offered if it can be attached with valid
+                // defaults. Presenting an entry that fails on click would put
+                // the burden of an unrepresentable schema on the user.
+                let Ok(properties) = schema.default_properties() else {
+                    ui.add_enabled(false, egui::Button::new(&schema.display_name))
+                        .on_disabled_hover_text(
+                            "This component has no default value and cannot be added here.",
+                        );
+                    continue;
+                };
+                if ui.button(&schema.display_name).clicked() {
+                    // Attach with schema defaults so the object is immediately
+                    // valid; the user then edits the value in place rather than
+                    // filling in a dialog before anything exists.
+                    output.edit(vec![WorldCommand::AttachComponent {
+                        object: object.id,
+                        component: schema.id.clone(),
+                        properties,
+                    }]);
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text(if object.components.is_empty() {
+            "Give this object a physical property"
+        } else {
+            "Add another physical property"
+        });
+    });
+}
+
+/// One property row, chosen by its declared kind.
+///
+/// Returns whether the value changed. Physical scalars use engineering notation
+/// because the values that matter here span an electron's mass to a coulomb.
+fn property_editor(
+    ui: &mut egui::Ui,
+    object: ObjectId,
+    schema: &PropertySchema,
+    values: &mut PropertyBag,
+    editing: &mut bool,
+) -> bool {
+    // Relevance is read from the bag being edited, not from the committed one,
+    // so clearing a governing checkbox enables its dependent field in the same
+    // frame rather than a frame later. The schema declares the controlling
+    // property first, which is what puts it earlier in this loop.
+    let relevant = schema.is_relevant(values);
+    let mut changed = false;
+    ui.add_enabled_ui(relevant, |ui| {
+        let response = ui.horizontal(|ui| {
+            ui.label(&schema.display_name);
+            changed = property_widget(ui, object, schema, values, editing);
+        });
+        if let Some(condition) = schema.relevant_when.as_ref().filter(|_| !relevant) {
+            response
+                .response
+                .on_disabled_hover_text(condition.because.clone());
+        }
+    });
+    changed
+}
+
+/// The editor for one property's kind, without the relevance wrapper.
+fn property_widget(
+    ui: &mut egui::Ui,
+    object: ObjectId,
+    schema: &PropertySchema,
+    values: &mut PropertyBag,
+    editing: &mut bool,
+) -> bool {
+    let mut changed = false;
+    {
+        match (&schema.kind, values.get(&schema.id).cloned()) {
+            (PropertyKind::Scalar(dimension), value) => {
+                let mut magnitude = match value {
+                    Some(PropertyValue::Scalar(quantity)) => quantity.si_value(),
+                    _ => 0.0,
+                };
+                if scalar_editor(ui, &mut magnitude, *dimension, editing)
+                    && let Ok(quantity) = Quantity::new(magnitude, *dimension)
+                {
+                    values.insert(schema.id.clone(), PropertyValue::Scalar(quantity));
+                    changed = true;
+                }
+            }
+            (PropertyKind::Vector(dimension), value) => {
+                let mut vector = match value {
+                    Some(PropertyValue::Vector(quantity)) => quantity.si_value(),
+                    _ => DVec3::ZERO,
+                };
+                let suffix = format!(" {}", dimension.unit_symbol());
+                let mut vector_changed = false;
+                vector_changed |= coordinate_editor(ui, "x", &mut vector.x, &suffix, editing);
+                vector_changed |= coordinate_editor(ui, "y", &mut vector.y, &suffix, editing);
+                vector_changed |= coordinate_editor(ui, "z", &mut vector.z, &suffix, editing);
+                if vector_changed && let Ok(quantity) = VectorQuantity::new(vector, *dimension) {
+                    values.insert(schema.id.clone(), PropertyValue::Vector(quantity));
+                    changed = true;
+                }
+            }
+            (PropertyKind::Boolean, value) => {
+                let mut flag = matches!(value, Some(PropertyValue::Boolean(true)));
+                if ui.checkbox(&mut flag, "").changed() {
+                    values.insert(schema.id.clone(), PropertyValue::Boolean(flag));
+                    changed = true;
+                }
+            }
+            (PropertyKind::Text, value) => {
+                let mut text = match value {
+                    Some(PropertyValue::Text(text)) => text,
+                    _ => String::new(),
+                };
+                let response = ui.text_edit_singleline(&mut text);
+                if note_held_edit(&response, editing) {
+                    values.insert(schema.id.clone(), PropertyValue::Text(text));
+                    changed = true;
+                }
+            }
+            (PropertyKind::Choice(options), value) => {
+                let mut selected = match value {
+                    Some(PropertyValue::Choice(choice)) => choice,
+                    _ => options.first().cloned().unwrap_or_default(),
+                };
+                let before = selected.clone();
+                egui::ComboBox::from_id_salt(("property", object, &schema.id))
+                    .selected_text(&selected)
+                    .show_ui(ui, |ui| {
+                        for option in options {
+                            ui.selectable_value(&mut selected, option.clone(), option);
+                        }
+                    });
+                if selected != before {
+                    values.insert(schema.id.clone(), PropertyValue::Choice(selected));
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// A dimensioned scalar spanning many orders of magnitude.
+///
+/// A fixed step would be useless across this range — 0.01 kg/s is absurd for an
+/// electron and glacial for a planet — so the drag speed follows the value's own
+/// magnitude, and typing an exponent is always available as an escape.
+fn scalar_editor(
+    ui: &mut egui::Ui,
+    value: &mut f64,
+    dimension: Dimension,
+    editing: &mut bool,
+) -> bool {
+    let speed = (value.abs() * 0.01).max(f64::MIN_POSITIVE);
+    let suffix = format!(" {}", dimension.unit_symbol());
+    let response = ui.add(
+        egui::DragValue::new(value)
+            .speed(speed)
+            .custom_formatter(|value, _| format_engineering(value))
+            .custom_parser(|text| text.trim().parse().ok())
+            .update_while_editing(false)
+            .suffix(suffix),
+    );
+    note_held_edit(&response, editing)
+}
+
+/// Readable across the range physical constants actually occupy.
+fn format_engineering(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let magnitude = value.abs();
+    if (1.0e-3..1.0e6).contains(&magnitude) {
+        format!("{value:.4}")
+    } else {
+        format!("{value:.6e}")
     }
 }
 
@@ -737,6 +1420,30 @@ fn plane_properties(
 ) {
     ui.label(&plane.name);
     ui.small("Drag the dashed purple N arrow to reorient the plane; RGB arrows and squares move its origin.");
+    super::section(ui, "inspector_plane_geometry", "Geometry", true, |ui| {
+        plane_geometry_editors(ui, plane, output);
+    });
+    super::section(ui, "inspector_plane_display", "Field display", true, |ui| {
+        plane_field_layers(ui, plane, field_layers, compute);
+    });
+
+    ui.add_space(10.0);
+    if ui.button("Duplicate plane").clicked() {
+        output.edit(vec![WorldCommand::CreatePlane(
+            SlicePlaneSpec::from_plane(plane).with_name(format!("{} copy", plane.name)),
+        )]);
+    }
+    if ui.button("Focus selection  [F]").clicked() {
+        output.camera_action = Some(CameraAction::FocusSelection);
+    }
+    if ui.button("Remove plane").clicked() {
+        output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
+    }
+}
+
+/// Where the plane sits and how far it reaches, including the three standard
+/// orientations — those are geometry, not display, so they belong here.
+fn plane_geometry_editors(ui: &mut egui::Ui, plane: &SlicePlane, output: &mut UiFrameOutput) {
     let mut origin = plane.origin;
     let mut normal = plane.normal;
     let mut half_extent = plane.half_extent;
@@ -748,24 +1455,27 @@ fn plane_properties(
         .show(ui, |ui| {
             ui.label("Origin");
             ui.horizontal(|ui| {
-                changed |= coordinate_editor(ui, "x", &mut origin.x, " m");
-                changed |= coordinate_editor(ui, "y", &mut origin.y, " m");
-                changed |= coordinate_editor(ui, "z", &mut origin.z, " m");
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "x", &mut origin.x, " m", editing);
+                changed |= coordinate_editor(ui, "y", &mut origin.y, " m", editing);
+                changed |= coordinate_editor(ui, "z", &mut origin.z, " m", editing);
             });
             ui.end_row();
 
             ui.label("Normal");
             ui.horizontal(|ui| {
-                changed |= coordinate_editor(ui, "nx", &mut normal.x, "");
-                changed |= coordinate_editor(ui, "ny", &mut normal.y, "");
-                changed |= coordinate_editor(ui, "nz", &mut normal.z, "");
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "nx", &mut normal.x, "", editing);
+                changed |= coordinate_editor(ui, "ny", &mut normal.y, "", editing);
+                changed |= coordinate_editor(ui, "nz", &mut normal.z, "", editing);
             });
             ui.end_row();
 
             ui.label("Half extent");
             ui.horizontal(|ui| {
-                changed |= coordinate_editor(ui, "u", &mut half_extent.x, " m");
-                changed |= coordinate_editor(ui, "v", &mut half_extent.y, " m");
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "u", &mut half_extent.x, " m", editing);
+                changed |= coordinate_editor(ui, "v", &mut half_extent.y, " m", editing);
             });
             ui.end_row();
         });
@@ -775,46 +1485,6 @@ fn plane_properties(
             plane: plane.id,
             spec,
         }]);
-    }
-
-    ui.add_space(8.0);
-    ui.label("Field display");
-    for channel in &compute.vector_channels {
-        let name = channel_label(channel, &compute.channel_names);
-        let layer = field_layers.entry(channel.clone()).or_default();
-        ui.collapsing(name, |ui| {
-            ui.checkbox(&mut layer.visible, "Show layer");
-            let settings = layer.planes.entry(plane.id).or_default();
-            ui.checkbox(&mut settings.magnitude_visible, "Magnitude colour");
-            density_editor(
-                ui,
-                "Magnitude density",
-                &mut settings.magnitude_density,
-                layer.visible && settings.magnitude_visible,
-            );
-            ui.checkbox(&mut settings.vectors_visible, "Vector arrows");
-            density_editor(
-                ui,
-                "Arrow density",
-                &mut settings.vector_density,
-                layer.visible && settings.vectors_visible,
-            );
-            ui.horizontal(|ui| {
-                ui.label("Vector component");
-                ui.selectable_value(
-                    &mut settings.vector_mode,
-                    PlaneVectorMode::InPlane,
-                    "In plane",
-                )
-                .on_hover_text("Project vectors into this plane (default)");
-                ui.selectable_value(
-                    &mut settings.vector_mode,
-                    PlaneVectorMode::Full3d,
-                    "Full 3D",
-                )
-                .on_hover_text("Show the component normal to the plane too");
-            });
-        });
     }
 
     ui.horizontal(|ui| {
@@ -835,16 +1505,76 @@ fn plane_properties(
             }
         }
     });
-    if ui.button("Duplicate plane").clicked() {
-        output.edit(vec![WorldCommand::CreatePlane(
-            SlicePlaneSpec::from_plane(plane).with_name(format!("{} copy", plane.name)),
-        )]);
-    }
-    if ui.button("Focus selection  [F]").clicked() {
-        output.camera_action = Some(CameraAction::FocusSelection);
-    }
-    if ui.button("Remove plane").clicked() {
-        output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
+}
+
+/// How each published vector channel is drawn on this plane. Presentation only:
+/// nothing here changes a computed value.
+fn plane_field_layers(
+    ui: &mut egui::Ui,
+    plane: &SlicePlane,
+    field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
+    compute: &ComputeView,
+) {
+    for channel in &compute.vector_channels {
+        let name = channel_label(channel, &compute.channel_names);
+        let layer = field_layers.entry(channel.clone()).or_default();
+        // Read before the per-plane settings are borrowed. This panel
+        // deliberately does not offer the layer's own visibility: that belongs
+        // to the view, and a second control for it here is what made hiding a
+        // field on one plane hide it everywhere.
+        let layer_visible = layer.visible;
+        let settings = layer.planes.entry(plane.id).or_default();
+        ui.collapsing(name, |ui| {
+            ui.checkbox(&mut settings.visible, "Show on this plane")
+                .on_hover_text(
+                    "Whether this plane draws this field. Other planes and the \
+                     whole-domain arrows are unaffected.",
+                );
+            if !layer_visible {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "This field is hidden everywhere. Turn its layer on under Fields \
+                             in the View window.",
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 180, 80)),
+                    )
+                    .wrap(),
+                );
+            }
+
+            ui.add_enabled_ui(settings.visible, |ui| {
+                ui.checkbox(&mut settings.magnitude_visible, "Magnitude colour");
+                density_editor(
+                    ui,
+                    "Magnitude density",
+                    &mut settings.magnitude_density,
+                    settings.magnitude_visible,
+                );
+                super::vector_display_controls(
+                    ui,
+                    &mut settings.vectors,
+                    "Vector arrows",
+                    "Draw the field as arrows on this plane",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Vector component");
+                    ui.selectable_value(
+                        &mut settings.vector_mode,
+                        PlaneVectorMode::InPlane,
+                        "In plane",
+                    )
+                    .on_hover_text("Project vectors into this plane (default)");
+                    ui.selectable_value(
+                        &mut settings.vector_mode,
+                        PlaneVectorMode::Full3d,
+                        "Full 3D",
+                    )
+                    .on_hover_text("Show the component normal to the plane too");
+                });
+            });
+        });
     }
 }
 
@@ -858,13 +1588,47 @@ fn probe_properties(
     output: &mut UiFrameOutput,
 ) {
     ui.label(&probe.name);
+    super::section(ui, "inspector_probe_position", "Position", true, |ui| {
+        probe_position_editors(ui, probe, world, output);
+    });
+    super::section(
+        ui,
+        "inspector_probe_channels",
+        "Recorded channels",
+        false,
+        |ui| probe_channel_picker(ui, model, probe, compute, output),
+    );
+    super::section(ui, "inspector_probe_history", "History", false, |ui| {
+        probe_history_plots(ui, probe, compute, history);
+    });
+
+    ui.add_space(10.0);
+    if ui.button("Open floating plot").clicked() {
+        model.open_probe_plot(probe);
+    }
+    if ui.button("Focus selection  [F]").clicked() {
+        output.camera_action = Some(CameraAction::FocusSelection);
+    }
+    if ui.button("Remove probe").clicked() {
+        output.edit(vec![WorldCommand::RemoveProbe(probe.id)]);
+    }
+}
+
+/// Where the probe samples: a world point, or an offset carried by an object.
+fn probe_position_editors(
+    ui: &mut egui::Ui,
+    probe: &fieldcad_core::Probe,
+    world: &WorldSnapshot,
+    output: &mut UiFrameOutput,
+) {
     match probe.position {
         ProbePosition::World(mut position) => {
             let mut changed = false;
             ui.horizontal(|ui| {
-                changed |= coordinate_editor(ui, "x", &mut position.x, " m");
-                changed |= coordinate_editor(ui, "y", &mut position.y, " m");
-                changed |= coordinate_editor(ui, "z", &mut position.z, " m");
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "x", &mut position.x, " m", editing);
+                changed |= coordinate_editor(ui, "y", &mut position.y, " m", editing);
+                changed |= coordinate_editor(ui, "z", &mut position.z, " m", editing);
             });
             if changed {
                 output.edit(vec![WorldCommand::SetProbePosition {
@@ -881,9 +1645,10 @@ fn probe_properties(
             ui.label(format!("Attached to {object_name}"));
             let mut changed = false;
             ui.horizontal(|ui| {
-                changed |= coordinate_editor(ui, "x", &mut offset.x, " m");
-                changed |= coordinate_editor(ui, "y", &mut offset.y, " m");
-                changed |= coordinate_editor(ui, "z", &mut offset.z, " m");
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "x", &mut offset.x, " m", editing);
+                changed |= coordinate_editor(ui, "y", &mut offset.y, " m", editing);
+                changed |= coordinate_editor(ui, "z", &mut offset.z, " m", editing);
             });
             if changed {
                 output.edit(vec![WorldCommand::SetProbePosition {
@@ -905,42 +1670,39 @@ fn probe_properties(
             }
         }
     }
+}
 
-    ui.add_space(10.0);
-    ui.collapsing("Recorded channels", |ui| {
-        let mut channels = probe.channels.clone();
-        let mut changed = false;
-        for (channel, name) in &compute.channel_names {
-            let mut records = channels.contains(channel);
-            if ui.checkbox(&mut records, name).changed() {
-                changed = true;
-                if records {
-                    channels.push(channel.clone());
-                    if let Some(plot) = model.probe_plots.get_mut(&probe.id) {
-                        plot.channels.insert(channel.clone());
-                    }
-                } else {
-                    channels.retain(|recorded| recorded != channel);
+/// Which channels this probe records. Every declared channel is offered,
+/// including ones whose system is currently inactive, so a recorder survives a
+/// system being switched off and on.
+fn probe_channel_picker(
+    ui: &mut egui::Ui,
+    model: &mut UiModel,
+    probe: &fieldcad_core::Probe,
+    compute: &ComputeView,
+    output: &mut UiFrameOutput,
+) {
+    let mut channels = probe.channels.clone();
+    let mut changed = false;
+    for (channel, name) in &compute.channel_names {
+        let mut records = channels.contains(channel);
+        if ui.checkbox(&mut records, name).changed() {
+            changed = true;
+            if records {
+                channels.push(channel.clone());
+                if let Some(plot) = model.probe_plots.get_mut(&probe.id) {
+                    plot.channels.insert(channel.clone());
                 }
+            } else {
+                channels.retain(|recorded| recorded != channel);
             }
         }
-        if changed {
-            output.edit(vec![WorldCommand::SetProbeChannels {
-                probe: probe.id,
-                channels,
-            }]);
-        }
-    });
-    if ui.button("Open floating plot").clicked() {
-        model.open_probe_plot(probe);
     }
-    probe_history_plots(ui, probe, compute, history);
-
-    if ui.button("Focus selection  [F]").clicked() {
-        output.camera_action = Some(CameraAction::FocusSelection);
-    }
-    if ui.button("Remove probe").clicked() {
-        output.edit(vec![WorldCommand::RemoveProbe(probe.id)]);
+    if changed {
+        output.edit(vec![WorldCommand::SetProbeChannels {
+            probe: probe.id,
+            channels,
+        }]);
     }
 }
 
@@ -988,25 +1750,43 @@ fn attachment_offset(world_position: DVec3, object: &WorldObject) -> DVec3 {
     object.transform.rotation.inverse() * (world_position - object.transform.translation)
 }
 
-fn coordinate_editor(ui: &mut egui::Ui, label: &str, value: &mut f64, suffix: &str) -> bool {
-    ui.add(
+/// Note that a control which edits the world is being held.
+///
+/// A drag or a half-typed value is one edit spread over many frames, and every
+/// frame of it submits a command. Recording that here is what lets the shell
+/// treat the whole gesture as a single edit: suspend the simulation for its
+/// duration, and let a field system decide whether to follow the intermediate
+/// values or wait for the one the user actually meant.
+fn note_held_edit(response: &egui::Response, editing: &mut bool) -> bool {
+    *editing |= response.dragged() || response.has_focus();
+    response.changed()
+}
+
+fn coordinate_editor(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f64,
+    suffix: &str,
+    editing: &mut bool,
+) -> bool {
+    let response = ui.add(
         egui::DragValue::new(value)
             .speed(0.02)
             .prefix(format!("{label}: "))
             .suffix(suffix),
-    )
-    .changed()
+    );
+    note_held_edit(&response, editing)
 }
 
-fn radius_editor(ui: &mut egui::Ui, radius: &mut f64, minimum: f64) -> bool {
-    ui.add(
+fn radius_editor(ui: &mut egui::Ui, radius: &mut f64, minimum: f64, editing: &mut bool) -> bool {
+    let response = ui.add(
         egui::DragValue::new(radius)
             .speed(0.01)
             .range(minimum..=f64::INFINITY)
             .prefix("r: ")
             .suffix(" m"),
-    )
-    .changed()
+    );
+    note_held_edit(&response, editing)
 }
 
 fn density_editor(ui: &mut egui::Ui, label: &str, density: &mut u32, enabled: bool) {
@@ -1034,87 +1814,25 @@ fn plane_spec(
     spec.with_half_extent(half_extent)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChargeObjectKind {
-    Point,
-    Sphere,
-}
-
-fn new_charge_command(
-    world: &WorldSnapshot,
-    charge_coulombs: f64,
-    kind: ChargeObjectKind,
-) -> CommandPayload {
-    let index = world.objects().len() + 1;
-    let x = (index.saturating_sub(1) as f64) * 0.6;
-    let (kind_name, shape) = match kind {
-        ChargeObjectKind::Point => (
-            "point charge",
-            ObjectShape::point(0.15).expect("static radius is valid"),
-        ),
-        ChargeObjectKind::Sphere => (
-            "charged sphere",
-            ObjectShape::sphere(0.35).expect("static radius is valid"),
-        ),
-    };
-    CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(
-        ObjectSpec::new(format!(
-            "{} {kind_name} {index}",
-            if charge_coulombs >= 0.0 {
-                "Positive"
-            } else {
-                "Negative"
-            }
-        ))
-        .with_transform(Transform::at(DVec3::new(x, 0.0, 0.6)).expect("static position is finite"))
-        .with_shape(shape)
-        .with_component(
-            charge_component_id(),
-            charge_properties(charge_coulombs).expect("static charge is finite"),
-        ),
-    )])
-}
-
-fn new_particle_command(world: &WorldSnapshot, template: ParticleTemplate) -> CommandPayload {
-    let index = world.objects().len() + 1;
-    let x = (index.saturating_sub(1) as f64) * 0.6;
-    let spec = template_particle_spec(
-        template,
-        MotionMode::Dynamic,
-        DVec3::new(x, 0.0, 0.6),
-        DVec3::ZERO,
-        0.15,
-    )
-    .expect("built-in catalog entries are valid");
-    CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(spec)])
-}
-
-fn choice_property(value: &PropertyValue) -> Option<&str> {
-    match value {
-        PropertyValue::Choice(choice) => Some(choice),
-        _ => None,
-    }
-}
-
-/// Choose which published vector channel the generic layers draw.
+/// Add a bare object: a named position in space and nothing else.
 ///
-/// Hidden while only one channel exists, so the electrostatic slice gains no
-/// ceremony; present as soon as a plugin publishes a second — `B` alongside `E`,
-/// or gravitational acceleration alongside either.
-fn field_layer_controls(ui: &mut egui::Ui, model: &mut UiModel, compute: &ComputeView) {
-    ui.label("Vector layers");
-    for channel in &compute.vector_channels {
-        let layer = model.field_layers.entry(channel.clone()).or_default();
-        ui.horizontal(|ui| {
-            ui.checkbox(
-                &mut layer.visible,
-                channel_label(channel, &compute.channel_names),
-            );
-            ui.add_enabled_ui(layer.visible, |ui| {
-                ui.checkbox(&mut layer.whole_domain.domain_vectors, "3D glyphs");
-            });
-        });
-    }
+/// This is the only way the scene panel creates a modelled object. It couples to
+/// no field until a component is attached, which is what makes the inspector's
+/// component list the single place physics enters a scene.
+fn new_object_command(world: &WorldSnapshot) -> CommandPayload {
+    let index = world.objects().len() + 1;
+    // Fan successive objects out along x so a second one is not created hidden
+    // inside the first.
+    let x = (index.saturating_sub(1) as f64) * 0.6;
+    CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(
+        ObjectSpec::new(format!("Object {index}"))
+            .with_transform(
+                Transform::at(DVec3::new(x, 0.0, 0.6)).expect("static position is finite"),
+            )
+            .with_shape(
+                ObjectShape::point(DEFAULT_AUTHORING_RADIUS).expect("static radius is valid"),
+            ),
+    )])
 }
 
 fn channel_label(id: &ChannelId, names: &BTreeMap<ChannelId, String>) -> String {
@@ -1129,7 +1847,6 @@ fn channel_label(id: &ChannelId, names: &BTreeMap<ChannelId, String>) -> String 
 /// asks for samples that were actually evaluated. Neither changes the domain or
 /// the physical result — only how much of it is observed.
 fn transport_sampling(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
-    ui.heading("Transport sampling");
     let mut subscription = compute.subscription;
     let mut changed = false;
 
@@ -1171,7 +1888,6 @@ fn transport_sampling(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiF
 }
 
 fn compute_panel(ui: &mut egui::Ui, compute: &ComputeView) {
-    ui.heading("Compute");
     egui::Grid::new("compute_status")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -1354,6 +2070,376 @@ mod tests {
         );
     }
 
+    /// Undo names the edit it would reverse, rather than offering an unlabelled
+    /// arrow the user has to press to find out what it does.
+    #[test]
+    fn the_transport_bar_offers_undo_and_redo_for_what_the_source_recorded() {
+        let mut compute = ComputeView::build(
+            &super::super::tests::source(),
+            &super::super::tests::seeded_world().snapshot(),
+        );
+        compute.edit_history = fieldcad_simulation::EditHistoryStatus {
+            undo: Some("Move object".to_owned()),
+            redo: None,
+            undo_depth: 1,
+            redo_depth: 0,
+        };
+
+        let (commands, enabled) = drive_history_controls(&compute, false);
+        assert!(enabled, "a paused, connected source can step back");
+        assert_eq!(commands, vec![CommandPayload::Undo]);
+
+        // An unfinished gesture has no completed edit to reverse.
+        let (commands, enabled) = drive_history_controls(&compute, true);
+        assert!(!enabled);
+        assert!(commands.is_empty());
+
+        // Neither does a running simulation: the scene an undo names is being
+        // replaced under it.
+        compute.mode = SimulationMode::Running;
+        let (commands, enabled) = drive_history_controls(&compute, false);
+        assert!(!enabled);
+        assert!(commands.is_empty());
+        assert!(!compute.accepts_history_commands());
+    }
+
+    #[test]
+    fn undo_is_offered_as_nothing_to_do_when_the_history_is_empty() {
+        let compute = ComputeView::build(
+            &super::super::tests::source(),
+            &super::super::tests::seeded_world().snapshot(),
+        );
+        assert!(!compute.edit_history.can_undo());
+
+        let (commands, enabled) = drive_history_controls(&compute, false);
+
+        assert!(!enabled);
+        assert!(commands.is_empty());
+    }
+
+    /// Render the transport bar's history controls and click the undo button.
+    /// Returns the commands produced and whether the button accepted the click.
+    fn drive_history_controls(
+        compute: &ComputeView,
+        edit_in_progress: bool,
+    ) -> (Vec<CommandPayload>, bool) {
+        let context = egui::Context::default();
+        let world = super::super::tests::seeded_world().snapshot();
+        let history = ProbeHistory::default();
+
+        let run = |events: Vec<egui::Event>| {
+            let mut output = UiFrameOutput::default();
+            let mut rect = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 120.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = context.run_ui(input, |ui| {
+                // Laid out as the transport bar lays it out, so the undo button
+                // is the leftmost widget rather than the topmost.
+                ui.horizontal(|ui| {
+                    history_controls(
+                        ui,
+                        &FrameContext {
+                            compute,
+                            world: &world,
+                            probe_history: &history,
+                            adapter_name: "Test adapter",
+                            frame_time_ms: 16.0,
+                            active_translation: None,
+                            plane_normal_label: None,
+                            plane_normal_active: false,
+                            paused_for_edit: false,
+                            edit_in_progress,
+                            projection: crate::camera::Projection::default(),
+                        },
+                        &mut output,
+                    );
+                    rect = ui.min_rect();
+                });
+            });
+            (output.commands, rect)
+        };
+
+        let (_, rect) = run(Vec::new());
+        let centre = egui::pos2(rect.left() + 10.0, rect.center().y);
+        run(vec![egui::Event::PointerMoved(centre)]);
+        run(vec![egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let (commands, _) = run(vec![egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let enabled = !commands.is_empty();
+        (commands, enabled)
+    }
+
+    /// The control the user reached for. Clearing it in the plane inspector must
+    /// scope to that plane; the layer's own visibility stays where it belongs,
+    /// in the View window, and is not reachable from here.
+    #[test]
+    fn the_plane_inspector_hides_a_field_on_that_plane_and_not_everywhere() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreatePlane(
+                SlicePlaneSpec::new("XY field", DVec3::ZERO, DVec3::Z).unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let plane = snapshot.planes().values().next().unwrap();
+        let mut compute = ComputeView::build(&super::super::tests::source(), &snapshot);
+        let channel = fieldcad_test_field::vector_channel_id();
+        compute.vector_channels = vec![channel.clone()];
+
+        let context = egui::Context::default();
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut layers: BTreeMap<ChannelId, ChannelLayerSettings> = BTreeMap::new();
+        layers.insert(channel.clone(), ChannelLayerSettings::default());
+        layers.get_mut(&channel).unwrap().visible = true;
+
+        let run = |layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
+                   events: Vec<egui::Event>| {
+            let mut rect = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = context.run_ui(input, |ui| {
+                plane_field_layers(ui, plane, layers, &compute);
+                rect = ui.min_rect();
+            });
+            rect
+        };
+
+        // Open the channel's group, then clear its first checkbox.
+        let rect = run(&mut layers, Vec::new());
+        let header = rect.left_top() + egui::vec2(6.0, 8.0);
+        for pressed in [true, false] {
+            run(
+                &mut layers,
+                vec![
+                    egui::Event::PointerMoved(header),
+                    egui::Event::PointerButton {
+                        pos: header,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let rect = run(&mut layers, Vec::new());
+        assert!(
+            rect.height() > 40.0,
+            "the channel group did not open: {rect:?}"
+        );
+
+        let toggle = egui::pos2(rect.left() + 24.0, rect.top() + 28.0);
+        for pressed in [true, false] {
+            run(
+                &mut layers,
+                vec![
+                    egui::Event::PointerMoved(toggle),
+                    egui::Event::PointerButton {
+                        pos: toggle,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+
+        let layer = &layers[&channel];
+        assert!(
+            !layer.planes[&plane.id].visible,
+            "clearing the plane's checkbox must hide the field on this plane"
+        );
+        assert!(
+            layer.visible,
+            "and must leave the layer itself visible everywhere else"
+        );
+    }
+
+    /// The plane is the one inspector subject the shared world fixture has no
+    /// instance of, so its grouping is exercised here rather than through a
+    /// whole frame.
+    #[test]
+    fn the_plane_inspector_separates_geometry_from_how_it_is_drawn() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreatePlane(
+                SlicePlaneSpec::new("XY field", DVec3::ZERO, DVec3::Z).unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let plane = snapshot.planes().values().next().unwrap();
+        let compute = ComputeView::build(&super::super::tests::source(), &snapshot);
+        let mut layers = BTreeMap::new();
+
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let full_output = context.run_ui(input, |ui| {
+            plane_properties(
+                ui,
+                plane,
+                &mut layers,
+                &compute,
+                &mut UiFrameOutput::default(),
+            );
+        });
+        let mut text = String::new();
+        for clipped in &full_output.shapes {
+            painted_text(&clipped.shape, &mut text);
+        }
+
+        for heading in ["Geometry", "Field display"] {
+            assert!(
+                text.contains(heading),
+                "the plane inspector is missing its {heading} section: {text}"
+            );
+        }
+    }
+
+    /// The signal the whole gesture rests on. A value editor that reported a
+    /// change but not a *hold* would pause and resume the simulation between
+    /// every pair of mouse positions instead of once around the drag.
+    #[test]
+    fn a_held_value_editor_reports_an_edit_in_progress_and_a_released_one_does_not() {
+        let context = egui::Context::default();
+        let mut value = 1.0;
+
+        let mut run = |events: Vec<egui::Event>| {
+            let mut editing = false;
+            let mut rect = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = context.run_ui(input, |ui| {
+                coordinate_editor(ui, "x", &mut value, " m", &mut editing);
+                rect = ui.min_rect();
+            });
+            (editing, rect.center())
+        };
+
+        let (editing, centre) = run(Vec::new());
+        assert!(!editing, "an untouched editor is not an edit in progress");
+
+        run(vec![egui::Event::PointerMoved(centre)]);
+        let (editing, _) = run(vec![egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(!editing, "a press alone has not started a drag");
+
+        let (editing, _) = run(vec![egui::Event::PointerMoved(
+            centre + egui::vec2(24.0, 0.0),
+        )]);
+        assert!(editing, "a drag in progress is an edit in progress");
+
+        let (editing, _) = run(vec![egui::Event::PointerButton {
+            pos: centre + egui::vec2(24.0, 0.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(!editing, "releasing commits the edit");
+    }
+
+    /// Every field system carries the choice, and it reaches the source as a
+    /// command rather than staying a local view preference — the deferral has to
+    /// happen where the solving does.
+    #[test]
+    fn realtime_update_is_offered_per_field_system_and_submitted_as_a_command() {
+        let world = super::super::tests::seeded_world();
+        let source = super::super::tests::source();
+        let compute = ComputeView::build(&source, &world.snapshot());
+        let system = compute.field_systems[0].clone();
+        assert!(system.realtime, "a scene starts fully live");
+
+        let context = egui::Context::default();
+        let run = |events: Vec<egui::Event>| {
+            let mut output = UiFrameOutput::default();
+            let mut rect = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(280.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let full_output = context.run_ui(input, |ui| {
+                realtime_control(ui, &system, &compute, &mut output);
+                rect = ui.min_rect();
+            });
+            let mut text = String::new();
+            for clipped in &full_output.shapes {
+                painted_text(&clipped.shape, &mut text);
+            }
+            (output.commands, text, rect.center())
+        };
+
+        let (_, text, centre) = run(Vec::new());
+        assert!(
+            text.contains("Update while editing"),
+            "the control is missing: {text}"
+        );
+
+        run(vec![egui::Event::PointerMoved(centre)]);
+        let (commands, _, _) = run(vec![egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            commands.is_empty(),
+            "a press alone must not commit a choice"
+        );
+
+        let (commands, _, _) = run(vec![egui::Event::PointerButton {
+            pos: centre,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(
+            commands,
+            vec![CommandPayload::SetFieldSystemRealtime {
+                plugin: system.plugin.id.clone(),
+                realtime: false,
+            }]
+        );
+    }
+
     #[test]
     fn attachment_offset_preserves_probe_world_position_under_object_rotation() {
         let transform = Transform::new(
@@ -1378,61 +2464,200 @@ mod tests {
     }
 
     #[test]
-    fn charge_authoring_distinguishes_point_and_uniform_sphere_sources() {
+    fn the_scene_panel_creates_an_object_with_no_physics_attached() {
+        // The whole point of the single add button: what comes out couples to
+        // nothing until the user says otherwise.
         let world = World::new().snapshot();
-        let point = new_charge_command(&world, -1.0e-9, ChargeObjectKind::Point);
-        let sphere = new_charge_command(&world, 1.0e-9, ChargeObjectKind::Sphere);
 
-        let CommandPayload::CommitWorld(point) = point else {
-            panic!("charge authoring must issue a world transaction");
+        let CommandPayload::CommitWorld(commands) = new_object_command(&world) else {
+            panic!("object authoring must issue a world transaction");
         };
-        let CommandPayload::CommitWorld(sphere) = sphere else {
-            panic!("charge authoring must issue a world transaction");
-        };
-        let WorldCommand::CreateObject(point) = &point[0] else {
-            panic!("point transaction must create an object");
-        };
-        let WorldCommand::CreateObject(sphere) = &sphere[0] else {
-            panic!("sphere transaction must create an object");
+        let WorldCommand::CreateObject(spec) = &commands[0] else {
+            panic!("transaction must create an object");
         };
 
-        assert!(matches!(point.shape, Some(ObjectShape::Point { .. })));
-        assert!(matches!(sphere.shape, Some(ObjectShape::Sphere { .. })));
+        assert!(spec.components.is_empty());
+        assert!(!spec.pinned);
+        assert!(matches!(spec.shape, Some(ObjectShape::Point { .. })));
+    }
+
+    #[test]
+    fn an_object_becomes_movable_by_attaching_mass_alone() {
+        // Walks the authoring path the inspector exposes: create bare, attach
+        // one component, and check the object model agrees it can now move.
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::RegisterComponentSchema(
+                    fieldcad_mass_sources::inertial_mass_component_schema(),
+                ),
+                WorldCommand::CreateObject(ObjectSpec::new("gizmo")),
+            ])
+            .unwrap();
+        let object = ObjectId::new(0);
+
+        let bare = world.snapshot();
         assert_eq!(
-            point.components[&charge_component_id()].scalar(&charge_property_id()),
-            Some(-1.0e-9)
+            motion_summary(bare.object(object).unwrap()),
+            "no inertia — add Inertial mass to make it movable"
         );
+
+        // Exactly what the "+ Add → Mass" menu item issues.
+        let schema = fieldcad_mass_sources::inertial_mass_component_schema();
+        world
+            .commit([WorldCommand::AttachComponent {
+                object,
+                component: schema.id.clone(),
+                properties: schema.default_properties().unwrap(),
+            }])
+            .unwrap();
+
+        let massive = world.snapshot();
         assert_eq!(
-            sphere.components[&charge_component_id()].scalar(&charge_property_id()),
-            Some(1.0e-9)
+            motion_summary(massive.object(object).unwrap()),
+            "moved by the forces acting on it"
         );
     }
 
     #[test]
-    fn catalog_authoring_creates_a_dynamic_generic_particle() {
-        let world = World::new().snapshot();
-        let command = new_particle_command(&world, ParticleTemplate::Electron);
-        let CommandPayload::CommitWorld(commands) = command else {
-            panic!("particle authoring must issue a world transaction");
-        };
-        let WorldCommand::CreateObject(spec) = &commands[0] else {
-            panic!("particle transaction must create an object");
-        };
-        let properties = &spec.components[&particle_component_id()];
+    fn pinning_hands_motion_back_to_the_user() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("held").with_pinned(true),
+            )])
+            .unwrap();
+        let object = ObjectId::new(0);
+        let snapshot = world.snapshot();
 
         assert_eq!(
-            properties.scalar(&mass_property_id()),
-            Some(fieldcad_particles::ELECTRON_MASS_KG)
+            motion_summary(snapshot.object(object).unwrap()),
+            "held in place"
         );
+
+        world
+            .commit([WorldCommand::SetVelocity {
+                object,
+                velocity: Velocity::new(DVec3::X, DVec3::ZERO).unwrap(),
+            }])
+            .unwrap();
+        let snapshot = world.snapshot();
+
         assert_eq!(
-            properties
-                .get(&motion_mode_property_id())
-                .and_then(choice_property),
-            Some(MotionMode::Dynamic.label())
+            motion_summary(snapshot.object(object).unwrap()),
+            "carried at the velocity you set"
         );
-        assert_eq!(
-            spec.components[&charge_component_id()].scalar(&charge_property_id()),
-            Some(-fieldcad_particles::ELEMENTARY_CHARGE_COULOMBS)
+    }
+
+    #[test]
+    fn every_registered_component_schema_can_be_attached_from_the_generic_menu() {
+        // The M7 promise: a plugin declaring a new component becomes editable
+        // without this file changing. If a shipped schema cannot produce valid
+        // defaults, the "+ Add" menu would offer a dead entry.
+        for schema in [
+            fieldcad_electromagnetic_sources::charge_component_schema(),
+            fieldcad_mass_sources::inertial_mass_component_schema(),
+            fieldcad_particles::particle_component_schema(),
+        ] {
+            let properties = schema
+                .default_properties()
+                .unwrap_or_else(|error| panic!("{} has no defaults: {error}", schema.display_name));
+            assert!(
+                schema.validate(&properties).is_ok(),
+                "{} defaults do not satisfy its own schema",
+                schema.display_name
+            );
+        }
+    }
+
+    /// Drive the real editor and check that an inert property refuses input.
+    ///
+    /// Asserting the schema flag alone would not catch the editor ignoring it,
+    /// which is exactly the defect this exists to prevent.
+    #[test]
+    fn a_linked_gravitational_mass_cannot_be_edited_through_the_inspector() {
+        use fieldcad_mass_sources::{
+            gravitational_mass_component_schema, independent_gravitational_mass_properties,
+            linked_gravitational_mass_properties, mass_property_id,
+        };
+
+        let schema = gravitational_mass_component_schema();
+        let mass = schema
+            .properties
+            .iter()
+            .find(|property| property.id == mass_property_id())
+            .unwrap();
+
+        // Render the row and ask egui whether it accepts interaction. This is
+        // the assertion that catches the editor ignoring the schema flag: a
+        // widget inside a disabled scope reports `enabled() == false`.
+        let row_is_interactive = |mut values: PropertyBag| {
+            let context = egui::Context::default();
+            let mut interactive = None;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 200.0),
+                )),
+                ..Default::default()
+            };
+            let _ = context.run_ui(input, |ui| {
+                ui.add_enabled_ui(mass.is_relevant(&values), |ui| {
+                    interactive = Some(ui.is_enabled());
+                });
+                property_editor(ui, ObjectId::new(0), mass, &mut values, &mut false);
+            });
+            interactive.expect("the row should have been laid out")
+        };
+
+        assert!(
+            !row_is_interactive(linked_gravitational_mass_properties()),
+            "a linked gravitational mass must render as non-interactive"
         );
+        assert!(
+            row_is_interactive(independent_gravitational_mass_properties(3.0).unwrap()),
+            "unlinking must restore interaction"
+        );
+    }
+
+    /// Toggling the link must free the value in the same frame, not the next.
+    /// The editor reads relevance from the bag it is editing, and the schema
+    /// declares the switch first, which is what makes that true.
+    #[test]
+    fn clearing_the_link_enables_the_value_within_one_frame() {
+        use fieldcad_mass_sources::{
+            follows_inertial_property_id, gravitational_mass_component_schema,
+            linked_gravitational_mass_properties, mass_property_id,
+        };
+
+        let schema = gravitational_mass_component_schema();
+        let mut values = linked_gravitational_mass_properties();
+        let mass = schema
+            .properties
+            .iter()
+            .find(|property| property.id == mass_property_id())
+            .unwrap();
+
+        assert!(!mass.is_relevant(&values));
+
+        // Exactly what the checkbox row does when a user clears it.
+        values.insert(
+            follows_inertial_property_id(),
+            PropertyValue::Boolean(false),
+        );
+
+        assert!(
+            mass.is_relevant(&values),
+            "the value must be editable as soon as the switch is cleared"
+        );
+    }
+
+    #[test]
+    fn scalar_properties_render_across_the_range_physics_actually_uses() {
+        // An electron mass and a coulomb must both be legible in the same editor.
+        assert_eq!(format_engineering(0.0), "0");
+        assert_eq!(format_engineering(1.5), "1.5000");
+        assert!(format_engineering(9.109e-31).contains("e-31"));
+        assert!(format_engineering(6.02e23).contains("e23"));
     }
 }

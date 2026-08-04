@@ -16,8 +16,9 @@ pub use async_source::{AsyncLocalDataSource, CommandEvent};
 pub use history::{ProbeHistory, ProbeReading};
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
 pub use runtime::{
-    FieldSystemStatus, PluginRegistration, RuntimeConfig, RuntimeError, SamplingBudget,
-    SimulationRuntime, SimulationStatus, Subscription, TickDemand, TickPacer,
+    DEFAULT_UNDO_DEPTH, EditHistoryStatus, FieldSystemStatus, PluginRegistration, RuntimeConfig,
+    RuntimeError, SamplingBudget, SimulationRuntime, SimulationStatus, Subscription, TickDemand,
+    TickPacer,
 };
 pub use source::{
     Command, CommandDisposition, CommandId, CommandPayload, CommandReceipt, CommandSequencer,
@@ -260,11 +261,12 @@ mod tests {
         assert!(runtime.latest_snapshot().channels.is_empty());
 
         // A charged object can still carry the plugin-contributed property while
-        // the solver is inactive. This object deliberately has no shape, which
-        // the electrostatics solver itself cannot represent.
+        // the solver is inactive. This object deliberately has a box shape,
+        // which the electrostatics solver itself cannot represent.
         let report = runtime
             .commit_world_commands(vec![WorldCommand::CreateObject(
                 ObjectSpec::new("unfinished charged object")
+                    .with_shape(ObjectShape::boxed(glam::DVec3::ONE).unwrap())
                     .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
             )])
             .unwrap();
@@ -310,12 +312,33 @@ mod tests {
         let runtime = SimulationRuntime::new(
             RuntimeConfig::new(domain, step, SessionId::from_u128(0x52))
                 .with_plugin(Box::new(ElectrostaticsPlugin::new()))
-                .with_plugin(Box::new(ElectromagnetismPlugin::new())),
+                // Composed as an available model of the same electric field,
+                // and therefore not active alongside the one that is.
+                .with_plugin_registration(
+                    PluginRegistration::with_default_configuration(Box::new(
+                        ElectromagnetismPlugin::new(),
+                    ))
+                    .with_enabled(false),
+                ),
         )
         .unwrap();
 
         assert_eq!(runtime.field_systems().len(), 2);
-        assert_eq!(runtime.world_snapshot().component_schemas().len(), 2);
+        // Charge, inertial mass, gravitational mass, and catalog provenance.
+        // Charge is declared by both plugins and registered once.
+        assert_eq!(runtime.world_snapshot().component_schemas().len(), 4);
+        for shared in [
+            fieldcad_mass_sources::inertial_mass_component_id(),
+            fieldcad_mass_sources::gravitational_mass_component_id(),
+        ] {
+            assert!(
+                runtime
+                    .world_snapshot()
+                    .component_schemas()
+                    .contains_key(&shared),
+                "{shared} should be registered once for every consumer"
+            );
+        }
         assert!(
             runtime
                 .world_snapshot()
@@ -328,6 +351,240 @@ mod tests {
                 .component_schemas()
                 .contains_key(&particle_component_id())
         );
+    }
+
+    /// Every component the inspector's "+ Add" menu can offer must survive the
+    /// solvers that consume it, not merely its own schema.
+    ///
+    /// Schema validation only checks dimensions, so a mass of zero passes it and
+    /// is then rejected by the pusher that has to divide by it — which made the
+    /// menu item impossible to use. The gap is between the schema and its
+    /// consumer, so the test has to cross that boundary: it commits the same
+    /// `AttachComponent` the menu issues and lets validate-before-adopt rule.
+    #[test]
+    fn every_offered_component_can_actually_be_attached_to_a_bare_object() {
+        let domain = Domain::new(
+            DomainBounds::centred_cube(2.0).unwrap(),
+            Resolution::uniform(8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.8).unwrap();
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain, step, SessionId::from_u128(0x53))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new()))
+                .with_plugin_registration(
+                    PluginRegistration::with_default_configuration(Box::new(
+                        ElectromagnetismPlugin::new(),
+                    ))
+                    .with_enabled(false),
+                ),
+        )
+        .unwrap();
+
+        let schemas: Vec<_> = runtime
+            .world_snapshot()
+            .component_schemas()
+            .values()
+            .cloned()
+            .collect();
+        assert!(!schemas.is_empty(), "no component schemas to exercise");
+
+        for schema in schemas {
+            let report = runtime
+                .commit_world_commands(vec![WorldCommand::CreateObject(ObjectSpec::new(format!(
+                    "bare {}",
+                    schema.display_name
+                )))])
+                .unwrap_or_else(|error| panic!("creating a bare object failed: {error}"));
+            let object = report.created_objects[0];
+            let properties = schema.default_properties().unwrap_or_else(|error| {
+                panic!(
+                    "{} has no attachable defaults: {error}",
+                    schema.display_name
+                )
+            });
+
+            runtime
+                .commit_world_commands(vec![WorldCommand::AttachComponent {
+                    object,
+                    component: schema.id.clone(),
+                    properties,
+                }])
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "attaching {} with its own defaults was rejected: {error}",
+                        schema.display_name
+                    )
+                });
+        }
+    }
+
+    /// The whole coupling path in one test: an electrostatic field produces a
+    /// force, the dynamics system turns it into motion, and the runtime adopts
+    /// the result — with no equation system integrating anything itself.
+    #[test]
+    fn a_field_moves_a_body_through_the_dynamics_system() {
+        use fieldcad_mass_sources::{
+            inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+        };
+
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x60))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+        )
+        .unwrap();
+
+        // A heavy pinned source, and a light free body to its right. Pinning the
+        // source keeps the test about one body's trajectory.
+        let report = runtime
+            .commit_world_commands(
+                mass_component_schemas()
+                    .into_iter()
+                    .map(WorldCommand::RegisterComponentSchema)
+                    .chain([
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("source")
+                                .with_pinned(true)
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("free")
+                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-9).unwrap(),
+                                )
+                                .with_component(
+                                    inertial_mass_component_id(),
+                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                    ])
+                    .collect(),
+            )
+            .unwrap();
+        let free = report.created_objects[1];
+
+        runtime.step_once().unwrap();
+        let moved = runtime.world_snapshot().object(free).unwrap().clone();
+
+        // Like charges repel, so the free body accelerates away along +x and
+        // nowhere else.
+        assert!(
+            moved.velocity.linear.x > 0.0,
+            "expected repulsion, got {:?}",
+            moved.velocity.linear
+        );
+        assert!(moved.transform.translation.x > 1.0);
+        assert!(moved.velocity.linear.y.abs() < 1.0e-15);
+        assert!(moved.velocity.linear.z.abs() < 1.0e-15);
+    }
+
+    /// Inertia is the only thing dividing the force, so doubling it must halve
+    /// the acceleration — whatever field supplied the force.
+    #[test]
+    fn inertial_mass_alone_sets_the_response_to_a_force() {
+        use fieldcad_mass_sources::{
+            inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+        };
+
+        let velocity_after_one_step = |mass_kg: f64| {
+            let mut runtime = SimulationRuntime::new(
+                RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x61))
+                    .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+            )
+            .unwrap();
+            let report = runtime
+                .commit_world_commands(
+                    mass_component_schemas()
+                        .into_iter()
+                        .map(WorldCommand::RegisterComponentSchema)
+                        .chain([
+                            WorldCommand::CreateObject(
+                                ObjectSpec::new("source")
+                                    .with_pinned(true)
+                                    .with_shape(ObjectShape::point(0.05).unwrap())
+                                    .with_component(
+                                        charge_component_id(),
+                                        charge_properties(1.0e-6).unwrap(),
+                                    ),
+                            ),
+                            WorldCommand::CreateObject(
+                                ObjectSpec::new("free")
+                                    .with_transform(
+                                        Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap(),
+                                    )
+                                    .with_shape(ObjectShape::point(0.05).unwrap())
+                                    .with_component(
+                                        charge_component_id(),
+                                        charge_properties(1.0e-9).unwrap(),
+                                    )
+                                    .with_component(
+                                        inertial_mass_component_id(),
+                                        inertial_mass_properties(mass_kg).unwrap(),
+                                    ),
+                            ),
+                        ])
+                        .collect(),
+                )
+                .unwrap();
+            let free = report.created_objects[1];
+            runtime.step_once().unwrap();
+            runtime
+                .world_snapshot()
+                .object(free)
+                .unwrap()
+                .velocity
+                .linear
+                .x
+        };
+
+        let light = velocity_after_one_step(1.0e-6);
+        let heavy = velocity_after_one_step(2.0e-6);
+
+        assert!(
+            (light / heavy - 2.0).abs() < 1.0e-6,
+            "doubling inertia should halve the response: {light} vs {heavy}"
+        );
+    }
+
+    /// A charged body with no inertial mass is a source, not a projectile.
+    #[test]
+    fn a_body_without_inertial_mass_is_never_moved() {
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x62))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+        )
+        .unwrap();
+        let report = runtime
+            .commit_world_commands(vec![
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("source")
+                        .with_shape(ObjectShape::point(0.05).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-6).unwrap()),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("massless")
+                        .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                        .with_shape(ObjectShape::point(0.05).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                ),
+            ])
+            .unwrap();
+        let massless = report.created_objects[1];
+        let before = runtime.world_snapshot().object(massless).unwrap().clone();
+
+        runtime.step_once().unwrap();
+        let after = runtime.world_snapshot().object(massless).unwrap().clone();
+
+        assert_eq!(before.transform, after.transform);
+        assert_eq!(before.velocity, after.velocity);
     }
 
     #[test]
@@ -1102,6 +1359,8 @@ mod tests {
                 ),
             ])
             .unwrap();
+        // Setting the fixture up is not something a user did.
+        runtime.clear_edit_history();
         runtime
     }
 
@@ -1225,6 +1484,705 @@ mod tests {
             &before.channels[&electric_field_channel_id()].batches,
             &after.channels[&electric_field_channel_id()].batches
         ));
+    }
+
+    /// A system that declares one arbitrary channel and computes nothing.
+    ///
+    /// Enough to stand in for a third-party model of a field this scene already
+    /// has, which is what the composition rules have to be checked against.
+    struct ChannelPlugin(fieldcad_core::ChannelSchema);
+
+    impl fieldcad_plugin_api::EquationSystemPlugin for ChannelPlugin {
+        fn metadata(&self) -> fieldcad_plugin_api::PluginMetadata {
+            fieldcad_plugin_api::PluginMetadata {
+                id: fieldcad_core::PluginId::new("fieldcad.impostor").unwrap(),
+                version: fieldcad_core::PluginVersion::new(0, 1, 0),
+                display_name: "Impostor".to_owned(),
+                description: "Declares one channel for composition tests".to_owned(),
+            }
+        }
+
+        fn channels(&self) -> Vec<fieldcad_core::ChannelSchema> {
+            vec![self.0.clone()]
+        }
+
+        fn create_solver(
+            &self,
+            _context: fieldcad_plugin_api::SolverContext<'_>,
+        ) -> Result<
+            Box<dyn fieldcad_plugin_api::EquationSystemSolver>,
+            fieldcad_plugin_api::PluginError,
+        > {
+            Ok(Box::new(ChannelSolver))
+        }
+    }
+
+    struct ChannelSolver;
+
+    impl fieldcad_plugin_api::EquationSystemSolver for ChannelSolver {
+        fn on_world_changed(
+            &mut self,
+            _world: &fieldcad_core::WorldSnapshot,
+        ) -> Result<(), fieldcad_plugin_api::PluginError> {
+            Ok(())
+        }
+
+        fn sample(
+            &self,
+            channel: fieldcad_plugin_api::ChannelHandle,
+            _geometry: &SampleGeometry,
+        ) -> Result<fieldcad_plugin_api::SampledColumn, fieldcad_plugin_api::PluginError> {
+            Err(fieldcad_plugin_api::PluginError::UnknownChannel(
+                channel.index(),
+            ))
+        }
+    }
+
+    /// A scene composing both models of the electric field, with one active.
+    fn two_model_runtime(session: u128) -> SimulationRuntime {
+        let domain = Domain::new(
+            DomainBounds::centred_cube(2.0).unwrap(),
+            Resolution::uniform(8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.8).unwrap();
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain, step, SessionId::from_u128(session))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new()))
+                .with_plugin_registration(
+                    PluginRegistration::with_default_configuration(Box::new(
+                        ElectromagnetismPlugin::new(),
+                    ))
+                    .with_enabled(false),
+                ),
+        )
+        .unwrap();
+        runtime
+            .commit_world_commands(vec![
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("charge")
+                        .with_shape(ObjectShape::point(0.1).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                ),
+                // Both fields are recorded from the start. A probe names
+                // channels, not systems, so it keeps asking for the magnetic
+                // field across a change of model — and simply receives nothing
+                // while no active model computes one.
+                WorldCommand::CreateProbe(ProbeSpec::at(
+                    "field recorder",
+                    DVec3::X * 0.5,
+                    vec![
+                        electric_field_channel_id(),
+                        fieldcad_electromagnetism::magnetic_field_channel_id(),
+                    ],
+                )),
+            ])
+            .unwrap();
+        runtime
+    }
+
+    /// The point of the whole arrangement: a scene has *one* electric field.
+    /// Two systems that model it declare the same channel, so the identity a
+    /// probe records and a layer draws does not change when the model does.
+    #[test]
+    fn both_models_of_the_electric_field_declare_the_same_field() {
+        assert_eq!(
+            fieldcad_electrostatics::electric_field_channel_id(),
+            fieldcad_electromagnetism::electric_field_channel_id(),
+            "electrostatics and Maxwell must compute one electric field, not two"
+        );
+
+        let runtime = two_model_runtime(0x80);
+        let electric: Vec<_> = runtime
+            .field_systems()
+            .iter()
+            .filter(|system| {
+                system
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == electric_field_channel_id())
+            })
+            .map(|system| system.plugin.id.clone())
+            .collect();
+
+        assert_eq!(electric.len(), 2, "both systems offer the same field");
+        // And exactly one of them is computing it.
+        assert_eq!(
+            runtime.field_provider(&electric_field_channel_id()),
+            Some(electrostatics_plugin_id())
+        );
+    }
+
+    /// Two active models of one field would publish contradictory values under
+    /// one name and each contribute the force their own version exerts. The
+    /// composition is refused rather than double-solved.
+    #[test]
+    fn one_field_cannot_be_computed_by_two_active_models() {
+        let domain = Domain::new(
+            DomainBounds::centred_cube(2.0).unwrap(),
+            Resolution::uniform(8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.8).unwrap();
+
+        let refused = SimulationRuntime::new(
+            RuntimeConfig::new(domain, step, SessionId::from_u128(0x81))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new()))
+                .with_plugin(Box::new(ElectromagnetismPlugin::new())),
+        );
+
+        match refused {
+            Ok(_) => panic!("two active models of one field must not compose"),
+            Err(error) => assert_eq!(error.code(), "conflicting-field-provider"),
+        }
+
+        // Nor by switching the second on afterwards.
+        let mut runtime = two_model_runtime(0x82);
+        let maxwell = fieldcad_electromagnetism::plugin_id();
+        let error = runtime
+            .set_field_system_enabled(&maxwell, true)
+            .unwrap_err();
+
+        assert_eq!(error.code(), "conflicting-field-provider");
+        assert_eq!(
+            runtime.field_provider(&electric_field_channel_id()),
+            Some(electrostatics_plugin_id()),
+            "a refused activation leaves the model that was computing the field"
+        );
+    }
+
+    /// Choosing a model swaps which system computes the field, in one step, and
+    /// brings whatever else that model computes with it.
+    #[test]
+    fn choosing_a_model_replaces_the_one_computing_the_field() {
+        let mut source = LocalDataSource::new(two_model_runtime(0x83));
+        let maxwell = fieldcad_electromagnetism::plugin_id();
+        let magnetic = fieldcad_electromagnetism::magnetic_field_channel_id();
+        let probe = *source.world().probes().keys().next().unwrap();
+        let analytic = source
+            .latest_snapshot()
+            .unwrap()
+            .probe_sample(&electric_field_channel_id(), probe)
+            .unwrap()
+            .value
+            .magnitude();
+        assert!(analytic > 0.0);
+        assert!(
+            source
+                .latest_snapshot()
+                .unwrap()
+                .channel(&magnetic)
+                .is_none()
+        );
+
+        source
+            .execute(command(CommandPayload::SetFieldModel {
+                channel: electric_field_channel_id(),
+                provider: Some(maxwell.clone()),
+            }))
+            .unwrap();
+
+        // Same field identity, different model — and the magnetic field the
+        // chosen model also computes has arrived with it.
+        let snapshot = source.latest_snapshot().unwrap();
+        let channel = snapshot.channel(&electric_field_channel_id()).unwrap();
+        assert_eq!(channel.provider, maxwell);
+        assert!(snapshot.channel(&magnetic).is_some());
+        assert_eq!(
+            source
+                .field_systems()
+                .iter()
+                .filter(|system| system.enabled)
+                .count(),
+            1,
+            "choosing a model must not leave the previous one also active"
+        );
+
+        // And back again, without the electric field ever becoming two things.
+        source
+            .execute(command(CommandPayload::SetFieldModel {
+                channel: electric_field_channel_id(),
+                provider: Some(electrostatics_plugin_id()),
+            }))
+            .unwrap();
+        let snapshot = source.latest_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .channel(&electric_field_channel_id())
+                .unwrap()
+                .provider,
+            electrostatics_plugin_id()
+        );
+        assert!(snapshot.channel(&magnetic).is_none());
+    }
+
+    /// One solver computes all of its fields or none of them — Maxwell cannot
+    /// advance `E` without `B` — so asking for a magnetic field takes the
+    /// electric one with it. Refusing instead would leave the magnetic field
+    /// unreachable from its own control, since its only model overlaps the
+    /// active one.
+    #[test]
+    fn choosing_a_model_from_one_field_takes_the_rest_of_that_model_with_it() {
+        let mut runtime = two_model_runtime(0x86);
+        let maxwell = fieldcad_electromagnetism::plugin_id();
+        let magnetic = fieldcad_electromagnetism::magnetic_field_channel_id();
+        assert_eq!(
+            runtime.field_provider(&electric_field_channel_id()),
+            Some(electrostatics_plugin_id())
+        );
+        assert_eq!(runtime.field_provider(&magnetic), None);
+
+        runtime.set_field_model(&magnetic, Some(&maxwell)).unwrap();
+
+        assert_eq!(runtime.field_provider(&magnetic), Some(maxwell.clone()));
+        assert_eq!(
+            runtime.field_provider(&electric_field_channel_id()),
+            Some(maxwell),
+            "the model that computes B is now the model of E too"
+        );
+        // Which is a swap, not an addition.
+        assert_eq!(
+            runtime
+                .field_systems()
+                .iter()
+                .filter(|system| system.enabled)
+                .count(),
+            1
+        );
+    }
+
+    /// A field may also have no model, which is a scene with no such field
+    /// rather than a scene with a broken one.
+    #[test]
+    fn a_field_can_be_left_uncomputed() {
+        let mut runtime = two_model_runtime(0x84);
+
+        runtime
+            .set_field_model(&electric_field_channel_id(), None)
+            .unwrap();
+
+        assert_eq!(runtime.field_provider(&electric_field_channel_id()), None);
+        assert!(runtime.latest_snapshot().channels.is_empty());
+        assert!(runtime.field_systems().iter().all(|system| !system.enabled));
+    }
+
+    /// Systems declaring one field must describe it identically, or they are
+    /// not models of the same thing. Caught before any solver exists.
+    #[test]
+    fn systems_disagreeing_about_a_field_do_not_compose() {
+        let mismatched = fieldcad_core::ChannelSchema {
+            id: electric_field_channel_id(),
+            display_name: "Electric field, but in different units".to_owned(),
+            value_kind: fieldcad_core::FieldValueKind::Scalar(fieldcad_core::Dimension::CHARGE),
+        };
+        let config = RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x85))
+            .with_plugin(Box::new(ElectrostaticsPlugin::new()))
+            .with_plugin(Box::new(ChannelPlugin(mismatched)));
+
+        match SimulationRuntime::new(config) {
+            Ok(_) => panic!("incompatible descriptions of one field must not compose"),
+            Err(error) => assert_eq!(error.code(), "conflicting-channel-schema"),
+        }
+    }
+
+    /// The base case, and the invariant that shapes everything else: undo
+    /// restores *contents*, and does so as a new revision. A revision is a point
+    /// in history, not a place to go back to.
+    #[test]
+    fn an_authored_edit_is_stepped_back_and_forward_by_moving_history_forward() {
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        let before = source.world().revision();
+        assert!(!source.edit_history().can_undo());
+
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("second charge")),
+            ])))
+            .unwrap();
+        let added = source.world().revision();
+        assert_eq!(source.world().objects().len(), 2);
+        assert_eq!(source.edit_history().undo.as_deref(), Some("Add object"));
+
+        source.execute(command(CommandPayload::Undo)).unwrap();
+
+        assert_eq!(source.world().objects().len(), 1);
+        assert!(
+            source.world().revision() > added,
+            "undo must not rewind the revision"
+        );
+        assert_eq!(source.edit_history().redo.as_deref(), Some("Add object"));
+        assert!(!source.edit_history().can_undo());
+
+        source.execute(command(CommandPayload::Redo)).unwrap();
+
+        assert_eq!(source.world().objects().len(), 2);
+        assert!(source.edit_history().can_undo());
+        assert!(!source.edit_history().can_redo());
+        assert!(source.world().revision() > before);
+    }
+
+    /// Undoing a creation frees nothing. If the next object could take the
+    /// undone one's identifier, anything keyed by identifier — a probe
+    /// attachment, a recorded series — would silently inherit its past.
+    #[test]
+    fn undo_does_not_recycle_identifiers() {
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("first")),
+            ])))
+            .unwrap();
+        let first = *source.world().objects().keys().next_back().unwrap();
+
+        source.execute(command(CommandPayload::Undo)).unwrap();
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("second")),
+            ])))
+            .unwrap();
+        let second = *source.world().objects().keys().next_back().unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    /// A drag submits an edit every frame. Undo has to reverse the gesture the
+    /// user made, not the last mouse position they passed through.
+    #[test]
+    fn one_interactive_edit_is_one_undo_step() {
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        let object = *source.world().objects().keys().next().unwrap();
+        let start = source.world().object(object).unwrap().transform.translation;
+
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(true)))
+            .unwrap();
+        for x in [0.1, 0.2, 0.3, 0.4, 0.5] {
+            drag_charge_to(&mut source, x);
+        }
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(false)))
+            .unwrap();
+        assert_eq!(source.edit_history().undo_depth, 1);
+
+        source.execute(command(CommandPayload::Undo)).unwrap();
+
+        assert_eq!(
+            source.world().object(object).unwrap().transform.translation,
+            start,
+            "one gesture must step back to where the drag began"
+        );
+        assert!(!source.edit_history().can_undo());
+    }
+
+    /// A step back followed by a new edit is a new branch. Offering the
+    /// abandoned one would reapply an edit that no longer follows from anything.
+    #[test]
+    fn a_new_edit_discards_the_redo_branch() {
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("abandoned")),
+            ])))
+            .unwrap();
+        source.execute(command(CommandPayload::Undo)).unwrap();
+        assert!(source.edit_history().can_redo());
+
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateProbe(ProbeSpec::at("kept", DVec3::X, Vec::new())),
+            ])))
+            .unwrap();
+
+        assert!(!source.edit_history().can_redo());
+        assert_eq!(source.edit_history().undo.as_deref(), Some("Add probe"));
+    }
+
+    /// A rejected edit changed nothing, so offering to undo it would step the
+    /// user back past an edit they did make.
+    #[test]
+    fn a_rejected_edit_leaves_nothing_to_undo() {
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        assert!(!source.edit_history().can_undo());
+
+        let rejected = source.execute(command(CommandPayload::CommitWorld(vec![
+            WorldCommand::RemoveObject(ObjectId::new(500)),
+        ])));
+
+        assert!(rejected.is_err());
+        assert!(!source.edit_history().can_undo());
+    }
+
+    /// An undo names a scene. While the clock advances, the scene it names is
+    /// being replaced underneath it, so the answer is to pause — the same one
+    /// click single-stepping already needs.
+    #[test]
+    fn stepping_through_history_while_running_is_refused() {
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("added")),
+            ])))
+            .unwrap();
+        source.execute(command(CommandPayload::Play)).unwrap();
+
+        assert!(matches!(
+            source.execute(command(CommandPayload::Undo)),
+            Err(SourceError::Solver { ref code, .. })
+                if code == "cannot-edit-history-while-running"
+        ));
+
+        source.execute(command(CommandPayload::Pause)).unwrap();
+        assert!(source.execute(command(CommandPayload::Undo)).is_ok());
+        assert_eq!(source.world().objects().len(), 1);
+    }
+
+    /// Once a solver has moved a body, the authored scene the entries describe
+    /// is not the world any more. Restoring one would drag every integrated body
+    /// back without rewinding the clock, which is not an undo of anything a user
+    /// did.
+    #[test]
+    fn solver_motion_discards_the_authored_history() {
+        use fieldcad_mass_sources::{
+            inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+        };
+
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x70))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+        )
+        .unwrap();
+        runtime
+            .commit_world_commands(
+                mass_component_schemas()
+                    .into_iter()
+                    .map(WorldCommand::RegisterComponentSchema)
+                    .collect(),
+            )
+            .unwrap();
+        runtime
+            .commit_world_commands(vec![
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("source")
+                        .with_pinned(true)
+                        .with_shape(ObjectShape::point(0.05).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-6).unwrap()),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("free")
+                        .with_transform(Transform::at(DVec3::X).unwrap())
+                        .with_shape(ObjectShape::point(0.05).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap())
+                        .with_component(
+                            inertial_mass_component_id(),
+                            inertial_mass_properties(1.0e-6).unwrap(),
+                        ),
+                ),
+            ])
+            .unwrap();
+        assert!(runtime.edit_history().can_undo());
+
+        runtime.step_once().unwrap();
+
+        assert!(
+            !runtime.edit_history().can_undo(),
+            "a tick that moves a body leaves no authored scene to return to"
+        );
+    }
+
+    /// The depth is a bound, not a promise to retain everything.
+    #[test]
+    fn the_undo_stack_is_bounded_and_drops_its_oldest_entries() {
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x71))
+                .with_undo_depth(2)
+                .with_plugin(Box::new(TestFieldPlugin)),
+        )
+        .unwrap();
+
+        for index in 0..5 {
+            runtime
+                .commit_world_commands(vec![WorldCommand::CreateObject(ObjectSpec::new(format!(
+                    "object {index}"
+                )))])
+                .unwrap();
+        }
+
+        assert_eq!(runtime.edit_history().undo_depth, 2);
+        runtime.undo().unwrap();
+        runtime.undo().unwrap();
+        assert!(!runtime.edit_history().can_undo());
+        // Two of five creations were stepped back; the rest are beyond the bound.
+        assert_eq!(runtime.world_snapshot().objects().len(), 3);
+    }
+
+    /// Read one probe's electric field magnitude out of the published snapshot.
+    fn published_field(source: &dyn FieldDataSource) -> f64 {
+        let world = source.world();
+        let probe = *world.probes().keys().next().unwrap();
+        source
+            .latest_snapshot()
+            .unwrap()
+            .probe_sample(&electric_field_channel_id(), probe)
+            .unwrap()
+            .value
+            .magnitude()
+    }
+
+    /// Move the charge to `x`, as one frame of a drag would.
+    fn drag_charge_to(source: &mut dyn FieldDataSource, x: f64) {
+        let object = *source.world().objects().keys().next().unwrap();
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::SetTransform {
+                    object,
+                    transform: Transform::at(DVec3::X * x).unwrap(),
+                },
+            ])))
+            .unwrap();
+    }
+
+    /// The default: every intermediate pose of a drag is solved, which is what
+    /// makes a cheap analytic field feel attached to the object being moved.
+    #[test]
+    fn a_realtime_system_follows_every_intermediate_value_of_an_edit() {
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        assert!(source.field_systems()[0].realtime);
+        let before = published_field(&source);
+
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(true)))
+            .unwrap();
+        drag_charge_to(&mut source, 0.5);
+
+        assert!(
+            (published_field(&source) - before * 4.0).abs() < 1.0e-12,
+            "a realtime system must republish mid-gesture"
+        );
+    }
+
+    /// Turning realtime update off is a cost choice, not a physical one: the
+    /// same committed world has to produce the same field, just once instead of
+    /// once per frame of the gesture.
+    #[test]
+    fn a_non_realtime_system_holds_its_result_until_the_edit_is_committed() {
+        let plugin = electrostatics_plugin_id();
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        source
+            .execute(command(CommandPayload::SetFieldSystemRealtime {
+                plugin,
+                realtime: false,
+            }))
+            .unwrap();
+        let before = published_field(&source);
+        let sequence = source.latest_snapshot().unwrap().identity.sequence;
+
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(true)))
+            .unwrap();
+        for x in [0.9, 0.8, 0.7, 0.6, 0.5] {
+            drag_charge_to(&mut source, x);
+            assert_eq!(
+                published_field(&source),
+                before,
+                "an intermediate pose of a gesture must not be solved for"
+            );
+        }
+        // The world itself moved all along — only the solving waited.
+        assert!(source.latest_snapshot().unwrap().identity.sequence > sequence);
+        assert_eq!(
+            source
+                .world()
+                .objects()
+                .values()
+                .next()
+                .unwrap()
+                .transform
+                .translation,
+            DVec3::X * 0.5
+        );
+        assert!(
+            source
+                .latest_snapshot()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "deferred-during-edit"),
+            "a held result must say that it is held"
+        );
+
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(false)))
+            .unwrap();
+
+        // Exactly what continuous update would have arrived at: half the
+        // distance is four times the field.
+        assert!((published_field(&source) - before * 4.0).abs() < 1.0e-12);
+        assert!(
+            !source
+                .latest_snapshot()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "deferred-during-edit")
+        );
+    }
+
+    /// A gesture is not a licence to accept a world the solver cannot represent.
+    /// Deferral skips the recompute, never the validation.
+    #[test]
+    fn an_edit_a_deferred_solver_cannot_represent_is_still_rejected_mid_gesture() {
+        let plugin = electrostatics_plugin_id();
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        source
+            .execute(command(CommandPayload::SetFieldSystemRealtime {
+                plugin,
+                realtime: false,
+            }))
+            .unwrap();
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(true)))
+            .unwrap();
+        let object = *source.world().objects().keys().next().unwrap();
+        let revision = source.world().revision();
+
+        let rejected = source.execute(command(CommandPayload::CommitWorld(vec![
+            WorldCommand::SetShape {
+                object,
+                shape: Some(ObjectShape::boxed(DVec3::ONE).unwrap()),
+            },
+        ])));
+
+        assert!(rejected.is_err());
+        assert_eq!(source.world().revision(), revision);
+    }
+
+    /// A drag that never moved anything, or a value typed and left unchanged,
+    /// must not cost a solve on release.
+    #[test]
+    fn a_gesture_that_commits_nothing_republishes_nothing() {
+        let plugin = electrostatics_plugin_id();
+        let mut source = LocalDataSource::new(electrostatic_runtime());
+        source
+            .execute(command(CommandPayload::SetFieldSystemRealtime {
+                plugin,
+                realtime: false,
+            }))
+            .unwrap();
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(true)))
+            .unwrap();
+        let sequence = source.latest_snapshot().unwrap().identity.sequence;
+
+        source
+            .execute(command(CommandPayload::SetInteractiveEdit(false)))
+            .unwrap();
+
+        assert_eq!(
+            source.latest_snapshot().unwrap().identity.sequence,
+            sequence
+        );
     }
 
     #[test]

@@ -174,6 +174,7 @@ mod tests {
                 channel_id(),
                 ChannelSnapshot {
                     schema,
+                    provider: PluginId::new("test").unwrap(),
                     batches: Arc::from([batch]),
                 },
             )]),

@@ -632,9 +632,8 @@ mod tests {
         ElectromagnetismPlugin, MAGNETIC_DIVERGENCE_HANDLE, MAGNETIC_FIELD_HANDLE, courant_limit,
         prescribed_plane_wave_configuration,
     };
-    use fieldcad_particles::{
-        MotionMode, ParticleTemplate, particle_component_schema, template_particle_spec,
-    };
+    use fieldcad_mass_sources::mass_component_schemas;
+    use fieldcad_particles::{ParticleTemplate, particle_component_schema, template_particle_spec};
     use fieldcad_plugin_api::{EquationSystemPlugin, SolverContext};
     use glam::UVec3;
 
@@ -844,20 +843,22 @@ mod tests {
             let clock = SimulationClock::new(time_step);
             let mut world = World::new();
             world
-                .commit([
-                    WorldCommand::RegisterComponentSchema(charge_component_schema()),
-                    WorldCommand::RegisterComponentSchema(particle_component_schema()),
-                    WorldCommand::CreateObject(
-                        template_particle_spec(
-                            ParticleTemplate::Electron,
-                            MotionMode::Prescribed,
-                            DVec3::new(-0.2, 0.0, 0.0),
-                            DVec3::X * 1.0e8,
-                            0.01,
-                        )
-                        .unwrap(),
-                    ),
-                ])
+                .commit(
+                    [charge_component_schema(), particle_component_schema()]
+                        .into_iter()
+                        .chain(mass_component_schemas())
+                        .map(WorldCommand::RegisterComponentSchema)
+                        .chain([WorldCommand::CreateObject(
+                            template_particle_spec(
+                                ParticleTemplate::Electron,
+                                true,
+                                DVec3::new(-0.2, 0.0, 0.0),
+                                DVec3::X * 1.0e8,
+                                0.01,
+                            )
+                            .unwrap(),
+                        )]),
+                )
                 .unwrap();
             let world = world.snapshot();
             let configuration = ElectromagnetismPlugin::new().default_configuration();

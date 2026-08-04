@@ -1,6 +1,7 @@
 # 0002 — A plain object model, not an ECS
 
-Status: **accepted** (Milestone 0)
+Status: **accepted** (Milestone 0), revisited by
+[0021](0021-objects-are-composed-from-independent-components.md)
 
 ## Context
 
@@ -37,3 +38,14 @@ bottleneck; a field solve is.
   measurement, not a projection.
 - The plugin contract stays expressible over a serializable snapshot, which is
   what keeps the remote and WebAssembly options open.
+
+## Revisited (0021)
+
+The question came back as an authoring requirement rather than a storage one:
+build an object by adding a charge, then a mass, and have it couple to each field
+in turn. That is composition, and it turned out to need finer components and a
+schema-driven inspector — not a different `World`.
+[0021](0021-objects-are-composed-from-independent-components.md) delivers it on
+this object model. The decision above is unchanged, and the reasoning for it has
+strengthened: the atomic, validated `commit` that the later records depend on is
+the part an ECS would have been most awkward to keep.

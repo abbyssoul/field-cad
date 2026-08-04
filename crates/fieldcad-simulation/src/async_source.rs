@@ -20,9 +20,9 @@ use fieldcad_core::{FieldSnapshot, WorldSnapshot};
 use fieldcad_plugin_api::SolverCancellation;
 
 use crate::{
-    Command, CommandDisposition, CommandId, CommandReceipt, DataSourceStatus, FieldDataSource,
-    FieldSystemStatus, LocalDataSource, PlaybackSpeed, PollOutcome, SimulationStatus,
-    SnapshotMailbox, SourceError, Subscription,
+    Command, CommandDisposition, CommandId, CommandReceipt, DataSourceStatus, EditHistoryStatus,
+    FieldDataSource, FieldSystemStatus, LocalDataSource, PlaybackSpeed, PollOutcome,
+    SimulationStatus, SnapshotMailbox, SourceError, Subscription,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +63,7 @@ struct SourceState {
     pending_commands: usize,
     subscription: Subscription,
     field_systems: Vec<FieldSystemStatus>,
+    edit_history: EditHistoryStatus,
     world: WorldSnapshot,
     snapshot: Option<Arc<FieldSnapshot>>,
 }
@@ -75,6 +76,7 @@ impl SourceState {
             pending_commands: source.pending_command_count(),
             subscription: source.subscription(),
             field_systems: source.field_systems(),
+            edit_history: source.edit_history(),
             world: source.world(),
             snapshot: source.latest_snapshot(),
         }
@@ -94,6 +96,7 @@ pub struct AsyncLocalDataSource {
     submitted_commands: BTreeSet<CommandId>,
     subscription: Subscription,
     field_systems: Vec<FieldSystemStatus>,
+    edit_history: EditHistoryStatus,
     world: WorldSnapshot,
     mailbox: SnapshotMailbox,
     poll_in_flight: bool,
@@ -131,6 +134,7 @@ impl AsyncLocalDataSource {
             submitted_commands: BTreeSet::new(),
             subscription: initial.subscription,
             field_systems: initial.field_systems,
+            edit_history: initial.edit_history,
             world: initial.world,
             mailbox,
             poll_in_flight: false,
@@ -146,6 +150,7 @@ impl AsyncLocalDataSource {
         self.worker_pending_commands = state.pending_commands;
         self.subscription = state.subscription;
         self.field_systems = state.field_systems;
+        self.edit_history = state.edit_history;
         self.world = state.world;
         match state.snapshot {
             Some(snapshot) => Ok(self.mailbox.offer(snapshot)?),
@@ -247,6 +252,10 @@ impl FieldDataSource for AsyncLocalDataSource {
 
     fn field_systems(&self) -> Vec<FieldSystemStatus> {
         self.field_systems.clone()
+    }
+
+    fn edit_history(&self) -> EditHistoryStatus {
+        self.edit_history.clone()
     }
 
     fn world(&self) -> WorldSnapshot {

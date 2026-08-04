@@ -38,4 +38,14 @@ pushing remains inside the coupled equation system; the runtime does not impose
 one integrator on future gravity or other plugins. Authored drag/edit commands
 remain external interventions and are not confused with solver-produced motion.
 
-Status: accepted.
+Status: accepted, revisited by
+[0022](0022-dynamics-is-a-first-party-system.md).
+
+## Revisited (0022)
+
+The runtime is still the sole world writer and still validates every returned
+kinematic result — that part is unchanged. What changed is who produces them:
+a first-party dynamics system now moves any body with inertial mass, and a
+solver contributes a force instead of a trajectory. `kinematic_objects` survives
+as the way a solver reserves a body it must integrate itself, which is currently
+only the coupled Maxwell particle path.

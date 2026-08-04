@@ -69,9 +69,9 @@ evolve over time.
 
 The long-term scientific scope includes atoms, subatomic particles, and
 particle-physics experiments viewed through fields. Electron, proton, positron,
-and neutron names belong to an authoring catalog: each template creates the same
-generic particle object with preset mass and charge. It does not select hidden
-species-specific behaviour. The active equation systems, coupling, boundaries,
+and neutron names belong to an authoring catalog: each template attaches the same
+independent mass and charge components with published values. It does not select
+hidden species-specific behaviour, and the same object can be composed by hand. The active equation systems, coupling, boundaries,
 and numerical methods determine the result and must declare the physical regime
 they represent.
 
@@ -92,13 +92,19 @@ and enough diagnostics to judge whether it is valid for the experiment.
 | --- | --- |
 | **World** | The user-authored objects, common transforms and velocities, attached plugin properties, probes, and visualization planes. |
 | **Experiment** | A reproducible specification of a world, active physical models, parameters, initial and boundary conditions, interventions, run controls, and requested observations. |
-| **Object** | An identifiable entity with a transform and optional shape, velocity, and plugin-defined components such as charge or mass. |
-| **Particle template** | A catalog entry, such as electron, proton, positron, or neutron, that creates a generic particle with preset physical properties such as mass and charge. It is an authoring convenience and provenance record, not a separate runtime behaviour. |
+| **Object** | An identifiable entity with a transform, optional shape, and velocity. It couples to a field only through attached components. |
+| **Component** | An independently attachable, schema-described set of physical properties, such as charge or mass. No component implies another, and any combination is authorable. |
+| **Pinned** | An object whose motion is authored rather than solver-integrated. Pinned with zero velocity holds it still; pinned with a velocity carries it at exactly that velocity. |
+| **Particle template** | A catalog entry, such as electron, proton, positron, or neutron, that attaches mass, charge, and provenance together with published values. It is an authoring convenience and provenance record, not a separate runtime behaviour. A template whose values are subsequently edited stops claiming the catalog. |
 | **Equation system** | A physical model and its coupled equations, such as electrostatics or electromagnetism. |
 | **Equation-system plugin** | A module that declares fields and object properties, validates configuration, and evaluates or advances its equation system. |
-| **Physical-source schema** | A stable object-property schema, such as charge, that may be consumed by several independent equation systems and is not owned by one solver Implementation. |
+| **Physical-source schema** | A stable object-property schema, such as charge or mass, that may be consumed by several independent equation systems and is not owned by one solver Implementation. |
+| **Inertial mass** | The constant relating total force to acceleration. Having it is what makes a body dynamic; it says nothing about which field acts on the body. |
+| **Gravitational mass** | The coupling charge a gravitational field acts on, as electric charge is to the electromagnetic field. Opt-in, and equal to the inertial mass unless a user unlinks it. |
+| **Dynamics system** | The first-party system that sums the forces contributed by every active field system and advances each body. It reads inertial mass and nothing else. |
 | **Field system** | One equation-system plugin composed into a scene, with an authoritative active/inactive state. Its field channels are coupled at this activation boundary. |
-| **Field channel** | One observable scalar or vector output of a plugin, such as electric field `E`, magnetic field `B`, potential, or an error residual. |
+| **Field channel** | One observable scalar or vector quantity of the scene, such as electric field `E`, magnetic field `B`, or potential. Its identity is shared: several equation systems may model the same field, and at most one computes it at a time. A quantity meaningful only to one numerical method — a divergence residual, a lattice energy density — belongs to that plugin instead. |
+| **Field model** | Which active equation system computes a given field. A choice of method, not a second field: an electric field solved from static charges and one advanced by Maxwell's equations are the same field. |
 | **Observation** | A versioned experiment output with model and run provenance. Field samples are one kind; particle trajectories, probe/energy histories, integrated quantities, and statistical distributions are others. |
 | **Domain** | The finite 3D region over which a numerical field is represented, including resolution and boundary conditions. |
 | **Field snapshot** | Immutable, versioned solver output for a particular simulation time and world revision. |
@@ -109,6 +115,9 @@ and enough diagnostics to judge whether it is valid for the experiment.
 | **Visualization layer** | A view of one field channel using glyphs, colour, contours, streamlines, or another generic rendering technique. |
 | **Slice plane** | A transformable plane on which a field is sampled and drawn. The XY plane is only a default. |
 | **Probe** | A recorder, currently point-shaped and optionally attached to an object, that samples selected channels and stores bounded time-series values. |
+| **Interactive edit** | A scene edit that spans frames — a viewport drag, or an inspector control held down or being typed into. Its intermediate values are authored rather than computed, so the simulation is suspended for its duration and resumed when it commits. |
+| **Edit history** | The authored scenes a session can be stepped back through and forward again. An entry is a captured scene rather than an inverse edit, and restoring one produces a new revision. |
+| **Realtime update** | Per-field-system scene state: whether that system recomputes for every intermediate value of an interactive edit, or keeps its last complete result until the edit commits. A cost choice; the committed world produces the same field either way. |
 | **Simulation tick** | One deterministic, fixed-duration advance of authoritative simulation state. |
 | **Kinematic authority** | The one active solver permitted to publish the canonical transform and velocity of a particular dynamically integrated object during a tick. |
 | **Frame** | One screen presentation. Frames and simulation ticks are intentionally independent. |
@@ -159,15 +168,16 @@ and B is zero, so Maxwell agrees with the electrostatic picture instead of
 inventing a source-free wave. A periodic lattice can only carry a field whose
 potential is periodic, and an isolated charge's is not, so the outermost layer
 is undefined rather than fabricated. The legacy stationary-charge initialization
-remains available for non-particle sources; a moving generic particle switches
-Maxwell to the periodic coupled state.
+remains available for massless charges, which cannot move; a massive charged
+object switches Maxwell to the periodic coupled state.
 
 ### Particle templates and field-model experiments
 
 Milestone 6 introduces charged-particle/field feedback. The simulated entity is
-a generic particle carrying ordinary world properties such as mass, charge,
-position, and velocity. Electron, proton, positron, and neutron templates fill
-those values from a versioned catalog; after creation they do not dispatch to
+an ordinary object carrying mass and charge components alongside its position and
+velocity — mass is what gives it inertia to be pushed, so mass is what makes it a
+particle. Electron, proton, positron, and neutron templates fill those values
+from a versioned catalog; after creation they do not dispatch to
 species-specific solver code. A neutral template simply has zero charge and is
 unaffected by an electromagnetic field unless another enabled field system
 couples to one of its properties.
@@ -211,7 +221,7 @@ experiment provenance.
 keyboard / mouse / UI
           |
           v
-     world commands  ----->  undo/history (later)
+     world commands  ----->  undo/redo history
           |
           v
     field data source <-----------------------+
@@ -243,22 +253,83 @@ Owns the native window, event loop, high-level application state, keyboard
 shortcuts, selection, command routing, and lifecycle. It translates input into
 world or view commands; it does not calculate fields.
 
+Each region of the window has one responsibility, and controls live with the
+thing they affect:
+
+- **Scene** (left) — what the simulation consists of. A Simulation node carries
+  the domain, field-system activation, and sampling; below it the objects; below
+  those, probes and slice planes grouped as measurement instruments. Adding and
+  removing anything happens here.
+- **Inspector** (right) — the properties of the one selected entry, and nothing
+  else. The Simulation node leads with the scene's fields and the model chosen
+  for each, then the systems those models are made of. The Simulation node is inspected like any other selection, so scene-level
+  settings are reached by selecting them rather than by deselecting everything.
+  With nothing selected the panel is empty.
+- **3D view** (centre) — the scene, and floating over it the view controls:
+  viewpoint, framing, and which classes of thing are drawn. These are
+  presentation only. A hidden probe still records and a hidden object still
+  sources its field, so nothing reachable here can change a result.
+- **Top bar** — simulation transport: run state, time step, playback rate, and
+  undo/redo over the scene.
+
+Both side panels are divided into named, foldable sections — Simulation,
+Objects, and Measurement in the scene; one group per aspect of the inspected
+subject — because an experiment grows without bound and a user working on one
+part of it should be able to put the rest away. A folded section still reports
+how much is behind it, so folding never hides that something exists. Fold state
+is view state: it never leaves the desktop and cannot change a result.
+
+The split that matters is between editing the world and choosing how to look at
+it. The first is a validated command against the world; the second is local view
+state that never leaves the desktop.
+
 ### World model
 
 Owns stable object identifiers and common authoring state:
 
 - transform and optional geometry;
 - linear velocity initially, with angular motion later if needed;
+- whether motion is authored (`pinned`) or integrated by a solver;
 - plugin components described by typed schemas;
 - probes, slice planes, and visualization-layer configuration; and
 - a monotonically increasing revision.
 
+An object is a named pose in space, and nothing more. It couples to a field only
+through the components attached to it, which is the only way physics enters a
+scene: charge couples it to the electromagnetic field, mass makes it respond to
+force and — once that plugin exists — sources gravity. Objects are created bare
+and composed afterwards, so components attach and detach independently and no
+component implies another. Adding mass to a charge is how a static source becomes
+a moving one.
+
+Motion is not a component. Everything in the space has a position, and a position
+that changes over time is velocity, so what a user chooses is *who decides* the
+motion rather than whether the object may move at all. An unpinned object with
+mass is advanced by whichever equation system claims it; a pinned one follows the
+authored transform and velocity exactly, which is how a static charge
+configuration is held in place and how a source is carried at a fixed velocity
+without integrating a force on it.
+
 Physical values are attachments to world objects. A shared source Module owns
-the stable `charge` schema consumed by electrostatics and electromagnetism; a
-future gravity Module can add `mass` to the same object. Multiple plugins may
-contribute one identical schema, which the runtime registers once, while
-incompatible definitions with the same identity are rejected before solver
-creation. A plugin does not privately own the canonical object transform.
+each quantity's stable schema: `charge` is consumed by electrostatics and
+electromagnetism, and `mass` by anything that integrates inertia or, later,
+gravitates. Multiple plugins may contribute one identical schema, which the
+runtime registers once, while incompatible definitions with the same identity are
+rejected before solver creation. A plugin does not privately own the canonical
+object transform.
+
+The same rule holds at the other end. A field is a property of the scene, so its
+channel identity is shared too: the electric field is one field whether an
+electrostatic evaluator or a time-domain lattice computes it. Several systems may
+declare it, identical declarations compose, and at most one active system
+computes it — otherwise the scene would carry two contradictory values under one
+name and each model would push a charge with its own version of the same force.
+Which system computes a field is therefore a choice of model, made per field, and
+every published channel records the model that produced it (ADR 0025).
+
+Probes and slice planes are not objects. They exist only in the user's space:
+they carry no components, no equation system can observe them, and adding one
+asks a question about the simulation without changing what is simulated.
 
 Field-system activation is scene/session state, distinct from schema
 registration. Inactive systems remain discoverable and their component schemas
@@ -272,6 +343,53 @@ can commit immediately at the current boundary. While running it is queued in
 submission order and committed immediately before the next fixed tick; a pause
 flushes accepted edits at the current boundary. This avoids a solver observing
 half of a UI edit and creates a future seam for undo/redo and record/replay.
+
+An edit that is still being made is treated differently, because it is not one
+command but a stream of them. Dragging a body teleports it: the intermediate
+poses are authored, not integrated, and advancing a simulation through them
+produces a trajectory belonging to neither the equations nor the arrangement
+being built. So an interactive edit suspends the run for its duration and hands
+it back exactly as it was found — a run the user had already paused stays
+paused. Field systems may additionally opt out of following the gesture, keeping
+their last complete result until it commits; validation is never deferred, so an
+edit no active solver can represent is still rejected while the gesture is open
+(ADR 0023).
+
+Authored edits accumulate into an edit history that can be stepped back through
+and forward again. An entry is a captured scene rather than an inverse of the
+edit, because inverting a removal would have to reissue an identifier that only
+ever belongs to one thing. Restoring one is an ordinary world change: it is
+validated by every active solver first, it advances the revision rather than
+returning to an old one, and it does not rewind the clock or free an identifier.
+One interactive edit is one step, so a drag undoes as the gesture the user made
+rather than as the frames it took. A solver tick that moves a body discards the
+history — the authored scene the entries describe is not the world any more — and
+undo is refused while the simulation is running, as single-stepping already is
+(ADR 0024).
+
+### Dynamics system
+
+Motion has one implementation, not one per plugin. Each field system answers
+what force its field exerts on a body; the dynamics system sums those forces,
+divides by inertial mass, and advances the body. It reads inertia and nothing
+else, so a new field becomes dynamically coupled by contributing a force and
+gains no ability to move things by itself.
+
+Coupling is force, not potential: `F = qE` and `F = m_g·g`, where the field is
+minus the gradient of the potential. A charge times a potential is an energy, so
+a potential is an observable rather than an input to motion.
+
+Inertial and gravitational mass are separate components. Inertial mass is what
+makes a body dynamic — somewhere for a force to act. Gravitational mass is a
+coupling charge like electric charge, carried only by bodies that gravitate, and
+it follows the inertial mass unless a user unlinks it. Their equality is the weak
+equivalence principle, which is a measured result rather than a definition, and
+keeping them separate is what makes "what if they differed?" an experiment this
+tool can run.
+
+The integrator advances momentum rather than velocity, so a body cannot be
+pushed past `c` and a relativistic body responds to a force as one. It does not
+apply a magnetic force as a rotation; see ADR 0022 for what that costs.
 
 ### Simulation runtime
 
@@ -428,25 +546,50 @@ normal component when that is useful. These density and projection choices are
 visualizer-owned presentation state; they do not change the simulation or the
 field values published by local or remote compute.
 
-Each vector channel owns an independent presentation layer, including plane
-visibility/density/projection and sparse whole-domain glyph visibility. Several
-layers may be active at once; this is how coupled `E` and `B` are compared
-without a renderer that understands Maxwell's equations.
+Each vector channel owns an independent presentation layer, on a slice plane and
+through the whole domain. Several layers may be active at once; this is how
+coupled `E` and `B` are compared without a renderer that understands Maxwell's
+equations.
 
-Plane display density is a non-negative glyph/mesh count per axis. The
-visualizer distributes those presentation samples uniformly across the complete
-plane and bilinearly interpolates immutable snapshot columns when the requested
-density differs from the published lattice. This avoids clustered integer-index
-decimation and allows display density above the transport sampling density
-without claiming additional solver accuracy.
+Whether a field is drawn at all and whether a particular plane draws it are two
+settings, reachable from two places: the layer's visibility lives with the view,
+and each plane decides for itself which of the visible fields it shows. Both must
+be on for anything to appear, and neither is reachable through the other's
+control — hiding a field on one plane says nothing about the others, and a plane
+set up to show `E` keeps that arrangement while the layer is hidden.
+
+Wherever vectors are drawn, they are configured the same way: whether to draw
+them, how many along the longest axis, and a scale factor on the arrow length.
+Arrows are sized to their own spacing by default, so the scale factor exists for
+what that fit does not serve — reading direction in a dense field, or magnitude
+in a sparse one. A region that has an extra question of its own asks it beside
+this rather than inside it, which is where a plane's projection mode lives.
+
+Display density is a non-negative glyph/mesh count per axis. The visualizer
+distributes those presentation samples uniformly across the complete region and
+interpolates immutable snapshot columns — bilinearly on a plane, trilinearly
+through the domain — when the requested density differs from the published
+lattice. This avoids clustered integer-index decimation and allows display
+density above the transport sampling density without claiming additional solver
+accuracy. Transport sampling is where real detail is asked for; display density
+only decides how much of what arrived is drawn.
+
+A volume needs no extent control of its own: what it draws is the domain the
+solver published, and framing it is the camera's job.
 
 The analytic electrostatic model evaluates requested plane samples beyond the
 finite grid domain used by future numerical representations: Coulomb's law is
 defined throughout space except at the explicitly excluded point-source radius.
 Grid-backed equation systems may instead report `OutsideDomain` validity.
 
-The initial camera is perspective with orbit, pan, dolly/zoom, focus-selection,
-and view-axis shortcuts. Input bindings will be remappable. Scene grid, world
+The camera orbits, pans, dollies, frames a selection, and offers view-axis
+shortcuts. It opens perspective and can be switched to orthographic, because the
+two answer different questions: perspective shows depth, so an arrangement in
+space reads directly, while orthographic removes foreshortening, so equal lengths
+measure equal anywhere on screen and values across a slice are comparable. The
+two share one framing — the orthographic extent is derived from the same
+viewpoint distance — so switching compares two readings of one arrangement rather
+than moving to a different one. Input bindings will be remappable. Scene grid, world
 XYZ axes, and field sampling grids are distinct, independently visible layers.
 
 The viewport also has an authoring layer independent of field rendering. Charges
@@ -538,7 +681,15 @@ compromise the host.
 - Solver-produced object motion has one declared owner per object and reaches
   the canonical world only through the runtime's validated kinematic outcome
   Interface.
-- A field channel has explicit dimensional units and scalar/vector shape.
+- A field channel has explicit dimensional units and scalar/vector shape, and at
+  most one active equation system computes it.
+- A published value records the model that computed it, not only the field it
+  belongs to.
+- Simulation state does not advance through an interactive edit, and a field
+  system that defers one recomputes the same result from the committed world as
+  one that followed it.
+- Restoring a scene from the edit history is a validated world change like any
+  other: it never rewinds a revision, the simulation clock, or an identifier.
 - Visualization sampling density does not alter simulation resolution.
 - Presentation subscriptions are bounded by authoritative source budgets, not
   only by widget ranges.

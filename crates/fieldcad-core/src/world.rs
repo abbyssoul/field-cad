@@ -169,6 +169,11 @@ pub struct ObjectSpec {
     /// Presentation visibility. Hidden objects still participate in equation
     /// systems; hiding a charge must never alter the physical result.
     pub visible: bool,
+    /// Whether this object's motion is authored rather than solver-integrated.
+    ///
+    /// See [`WorldObject::pinned`]. Objects default to unpinned, so attaching
+    /// mass is by itself enough to make a body respond to fields.
+    pub pinned: bool,
     pub components: BTreeMap<ComponentTypeId, PropertyBag>,
 }
 
@@ -180,6 +185,7 @@ impl ObjectSpec {
             velocity: Velocity::default(),
             shape: None,
             visible: true,
+            pinned: false,
             components: BTreeMap::new(),
         }
     }
@@ -201,6 +207,11 @@ impl ObjectSpec {
 
     pub fn with_visibility(mut self, visible: bool) -> Self {
         self.visible = visible;
+        self
+    }
+
+    pub fn with_pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
         self
     }
 
@@ -227,6 +238,15 @@ pub struct WorldObject {
     pub velocity: Velocity,
     pub shape: Option<ObjectShape>,
     pub visible: bool,
+    /// Whether this object's motion is authored rather than solver-integrated.
+    ///
+    /// Every object in the space has a pose, and a pose that changes over time
+    /// is velocity — so movement is not a property an object opts into. What a
+    /// user chooses is *who decides* the motion. An unpinned body with mass is
+    /// advanced by whichever equation system claims it; a pinned one follows the
+    /// authored transform and velocity exactly, which is how a static charge
+    /// configuration is held in place.
+    pub pinned: bool,
     pub components: BTreeMap<ComponentTypeId, PropertyBag>,
 }
 
@@ -521,6 +541,23 @@ pub struct World {
     counters: Counters,
 }
 
+/// World contents captured at one revision, for later restoration.
+///
+/// Opaque on purpose: it is a thing to hand back to [`World::restore`], not a
+/// second way to read a world. Reading goes through [`WorldSnapshot`], which
+/// carries the revision that identifies what is being read.
+#[derive(Clone, Debug)]
+pub struct WorldCheckpoint(Arc<WorldState>);
+
+impl WorldCheckpoint {
+    /// The revision these contents were captured at.
+    ///
+    /// Provenance, not identity: restoring them produces a later revision.
+    pub fn captured_at(&self) -> WorldRevision {
+        self.0.revision
+    }
+}
+
 impl Default for World {
     fn default() -> Self {
         Self::new()
@@ -547,6 +584,42 @@ impl World {
 
     pub fn revision(&self) -> WorldRevision {
         self.state.revision
+    }
+
+    /// Capture the current contents so they can be restored later.
+    ///
+    /// Cheap, and deliberately so: the state is already reference-counted, so a
+    /// checkpoint is a pointer rather than a copy of the scene. That is what
+    /// makes it affordable to take one before every edit.
+    pub fn checkpoint(&self) -> WorldCheckpoint {
+        WorldCheckpoint(Arc::clone(&self.state))
+    }
+
+    /// Restore captured contents as a **new** revision.
+    ///
+    /// A revision is a point in this world's history, not a place to return to.
+    /// Restoring contents that once existed still produces a revision that never
+    /// existed before, so a value remains attributable to exactly one revision
+    /// and a consumer that cached one is not handed different data under the
+    /// same number.
+    ///
+    /// Identifier counters are not rewound either. Undoing the creation of an
+    /// object frees nothing: the next object is a different object and gets a
+    /// different identifier, so no consumer keyed by identifier — a probe
+    /// attachment, a recorded history — can silently inherit a predecessor's
+    /// past.
+    ///
+    /// Returns the revision now in force, which is unchanged if the checkpoint
+    /// is already the current state.
+    pub fn restore(&mut self, checkpoint: &WorldCheckpoint) -> WorldRevision {
+        if Arc::ptr_eq(&self.state, &checkpoint.0) {
+            return self.state.revision;
+        }
+        let mut restored = (*checkpoint.0).clone();
+        restored.revision = self.state.revision.next();
+        let revision = restored.revision;
+        self.state = Arc::new(restored);
+        revision
     }
 
     /// Apply a batch of commands as one atomic edit.
@@ -602,6 +675,11 @@ pub enum WorldCommand {
         object: ObjectId,
         visible: bool,
     },
+    /// Hand authority over an object's motion to the user, or back to solvers.
+    SetObjectPinned {
+        object: ObjectId,
+        pinned: bool,
+    },
     AttachComponent {
         object: ObjectId,
         component: ComponentTypeId,
@@ -635,6 +713,50 @@ pub enum WorldCommand {
         visible: bool,
     },
     RemoveProbe(ProbeId),
+}
+
+impl WorldCommand {
+    /// A short name for this edit, in the user's terms.
+    ///
+    /// Lives with the command rather than in the desktop because an undo entry,
+    /// a history log, and a remote client's transaction list all need the same
+    /// words for the same edit, and a command a plugin adds later should not be
+    /// nameable in three places that can disagree.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::RegisterComponentSchema(_) => "Register component schema",
+            Self::CreateObject(_) => "Add object",
+            Self::RemoveObject(_) => "Remove object",
+            Self::SetTransform { .. } => "Move object",
+            Self::SetVelocity { .. } => "Set velocity",
+            Self::SetShape { .. } => "Change shape",
+            Self::SetObjectVisible { .. } => "Show or hide object",
+            Self::SetObjectPinned { .. } => "Change motion authority",
+            Self::AttachComponent { .. } => "Edit component",
+            Self::DetachComponent { .. } => "Remove component",
+            Self::CreatePlane(_) => "Add slice plane",
+            Self::SetPlane { .. } => "Move slice plane",
+            Self::SetPlaneVisible { .. } => "Show or hide slice plane",
+            Self::RemovePlane(_) => "Remove slice plane",
+            Self::CreateProbe(_) => "Add probe",
+            Self::SetProbePosition { .. } => "Move probe",
+            Self::SetProbeChannels { .. } => "Change recorded channels",
+            Self::SetProbeVisible { .. } => "Show or hide probe",
+            Self::RemoveProbe(_) => "Remove probe",
+        }
+    }
+
+    /// Name a batch committed as one atomic edit.
+    ///
+    /// A transaction is one step to a user however many commands it took, so it
+    /// is named after the first and counts the rest rather than listing them.
+    pub fn batch_label(commands: &[Self]) -> String {
+        match commands {
+            [] => "Edit scene".to_owned(),
+            [only] => only.label().to_owned(),
+            [first, rest @ ..] => format!("{} and {} more", first.label(), rest.len()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -716,6 +838,7 @@ fn apply_command(
                     velocity: spec.velocity,
                     shape: spec.shape,
                     visible: spec.visible,
+                    pinned: spec.pinned,
                     components: spec.components,
                 },
             );
@@ -748,6 +871,9 @@ fn apply_command(
         }
         WorldCommand::SetObjectVisible { object, visible } => {
             object_mut(state, object)?.visible = visible;
+        }
+        WorldCommand::SetObjectPinned { object, pinned } => {
+            object_mut(state, object)?.pinned = pinned;
         }
         WorldCommand::AttachComponent {
             object,
@@ -945,6 +1071,8 @@ mod tests {
                 display_name: "Charge".to_owned(),
                 kind: PropertyKind::Scalar(Dimension::CHARGE),
                 required: true,
+                default_value: None,
+                relevant_when: None,
             }],
         }
     }

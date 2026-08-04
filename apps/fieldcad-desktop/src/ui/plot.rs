@@ -16,15 +16,15 @@ pub(super) fn probe_history_plots(
     compute: &ComputeView,
     history: &ProbeHistory,
 ) {
-    ui.collapsing("History", |ui| {
-        ui.small(format!(
-            "Bounded to {} samples per channel",
-            history.capacity()
-        ));
-        for channel in &probe.channels {
-            probe_channel_plot(ui, probe.id, channel, compute, history);
-        }
-    });
+    // The caller owns the fold. This used to open its own collapsing header,
+    // which became a second one nested inside the inspector's History section.
+    ui.small(format!(
+        "Bounded to {} samples per channel",
+        history.capacity()
+    ));
+    for channel in &probe.channels {
+        probe_channel_plot(ui, probe.id, channel, compute, history);
+    }
 }
 
 /// Draw every pinned probe recorder independently of current scene selection.

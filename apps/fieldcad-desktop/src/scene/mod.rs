@@ -15,7 +15,7 @@ mod field;
 mod gizmo;
 mod pick;
 
-pub use authoring::append_authoring_geometry;
+pub use authoring::{SceneVisibility, append_authoring_geometry};
 pub use field::field_geometry;
 pub use gizmo::{
     TransformHandle, TransformPreview, append_transform_gizmo, constrained_translation,
@@ -95,9 +95,60 @@ pub struct ColoredVertex {
     pub color: Vec4,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// How one vector field is drawn over one region.
+///
+/// The same three questions arise wherever vectors are drawn — whether to draw
+/// them, how many, and how long — so a slice plane and the whole domain settle
+/// them with one value and one control rather than each growing its own. What
+/// differs between regions is where the arrows go, not how they are configured.
+///
+/// Presentation only: density resamples the published lattice by interpolation
+/// and claims no accuracy the solver did not produce, and scale changes nothing
+/// but a length on screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorDisplay {
+    pub visible: bool,
+    /// Target arrows along the longest axis of the region being drawn.
+    pub density: u32,
+    /// Multiplier on the automatic arrow length.
+    ///
+    /// The automatic length already fits the glyph spacing, so this exists for
+    /// the cases that fit does not serve: reading direction in a dense field, or
+    /// magnitude in a sparse one.
+    pub scale: f32,
+}
+
+impl VectorDisplay {
+    pub const fn new(visible: bool, density: u32) -> Self {
+        Self {
+            visible,
+            density,
+            scale: 1.0,
+        }
+    }
+}
+
+impl Default for VectorDisplay {
+    fn default() -> Self {
+        Self::new(true, 15)
+    }
+}
+
+/// Whole-domain presentation for one channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FieldLayerSettings {
-    pub domain_vectors: bool,
+    pub vectors: VectorDisplay,
+}
+
+impl Default for FieldLayerSettings {
+    fn default() -> Self {
+        Self {
+            // Off by default, and sparser than a plane when switched on: glyphs
+            // through a volume occlude each other and the scene behind them, so
+            // this is opt-in and starts at a density a user can see through.
+            vectors: VectorDisplay::new(false, 6),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -107,24 +158,33 @@ pub enum PlaneVectorMode {
     Full3d,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlaneLayerSettings {
+    /// Whether *this plane* draws this field.
+    ///
+    /// Independent of the channel's own visibility, which decides whether the
+    /// field is drawn anywhere at all. Both have to be on for anything to
+    /// appear, and neither is reachable from the other's control: a plane set up
+    /// to show `E` keeps that arrangement while the layer is hidden, and hiding
+    /// one plane's copy of a field says nothing about the others.
+    pub visible: bool,
     pub magnitude_visible: bool,
-    pub vectors_visible: bool,
     /// Target samples along the larger plane axis used to draw the colour mesh.
     pub magnitude_density: u32,
-    /// Target arrows along the larger plane axis.
-    pub vector_density: u32,
+    pub vectors: VectorDisplay,
+    /// The one setting a plane has and a volume does not: a 2D view cannot
+    /// depict depth it has no room for, so vectors project into the plane
+    /// unless asked otherwise.
     pub vector_mode: PlaneVectorMode,
 }
 
 impl Default for PlaneLayerSettings {
     fn default() -> Self {
         Self {
+            visible: true,
             magnitude_visible: true,
-            vectors_visible: true,
             magnitude_density: 33,
-            vector_density: 15,
+            vectors: VectorDisplay::default(),
             vector_mode: PlaneVectorMode::InPlane,
         }
     }
@@ -193,7 +253,18 @@ fn push_quad_outline(lines: &mut Vec<ColoredVertex>, corners: [Vec3; 4], color: 
 }
 
 /// Every drawable object in the world, in stable identifier order.
-pub fn instances(world: &WorldSnapshot, selection: Option<ObjectId>) -> Vec<ObjectInstance> {
+///
+/// Empty when the view is hiding objects. Returning nothing rather than leaving
+/// the filter to each caller is what keeps the renderer and the hit-test
+/// agreeing about what is on screen.
+pub fn instances(
+    world: &WorldSnapshot,
+    selection: Option<ObjectId>,
+    show: SceneVisibility,
+) -> Vec<ObjectInstance> {
+    if !show.objects {
+        return Vec::new();
+    }
     world
         .objects()
         .values()
@@ -233,7 +304,7 @@ mod tests {
         let world = world_with_two_boxes();
         let snapshot = world.snapshot();
 
-        let built = instances(&snapshot, Some(ObjectId::new(1)));
+        let built = instances(&snapshot, Some(ObjectId::new(1)), SceneVisibility::ALL);
 
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].id, ObjectId::new(0));
@@ -249,7 +320,7 @@ mod tests {
             .commit([WorldCommand::CreateObject(ObjectSpec::new("bare"))])
             .unwrap();
 
-        let built = instances(&world.snapshot(), None);
+        let built = instances(&world.snapshot(), None, SceneVisibility::ALL);
 
         assert_eq!(built.len(), 1);
         assert!(built[0].half_extent.min_element() > 0.0);
@@ -274,7 +345,7 @@ mod tests {
             ])
             .unwrap();
 
-        let built = instances(&world.snapshot(), None);
+        let built = instances(&world.snapshot(), None, SceneVisibility::ALL);
 
         assert_eq!(built.len(), 2);
         assert!(
@@ -287,7 +358,7 @@ mod tests {
     #[test]
     fn instance_bounding_spheres_frame_the_drawn_geometry() {
         let world = world_with_two_boxes();
-        let built = instances(&world.snapshot(), None);
+        let built = instances(&world.snapshot(), None, SceneVisibility::ALL);
         let (centre, radius) = built[0].bounding_sphere();
 
         assert_eq!(centre, Vec3::new(0.0, -3.0, 0.0));

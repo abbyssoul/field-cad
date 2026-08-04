@@ -92,11 +92,94 @@ impl Viewport {
     }
 }
 
+/// A standard orthographic-style viewpoint, looking down one world axis.
+///
+/// Both signs of each axis are offered because "front" and "back" of an
+/// arrangement are different questions, and a user who can only reach three of
+/// the six faces has to orbit past the geometry to see the other side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AxisView {
     PositiveX,
+    NegativeX,
     PositiveY,
+    NegativeY,
     PositiveZ,
+    NegativeZ,
+}
+
+impl AxisView {
+    /// The six views in the order a view panel should present them.
+    pub const ALL: [Self; 6] = [
+        Self::PositiveX,
+        Self::NegativeX,
+        Self::PositiveY,
+        Self::NegativeY,
+        Self::PositiveZ,
+        Self::NegativeZ,
+    ];
+
+    /// The short button label, naming the axis the camera looks *along*.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PositiveX => "+X",
+            Self::NegativeX => "−X",
+            Self::PositiveY => "+Y",
+            Self::NegativeY => "−Y",
+            Self::PositiveZ => "+Z",
+            Self::NegativeZ => "−Z",
+        }
+    }
+
+    /// What the user will be looking at, in the language of a drawing.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::PositiveX => "Look along +X (YZ plane, right)",
+            Self::NegativeX => "Look along −X (YZ plane, left)",
+            Self::PositiveY => "Look along +Y (XZ plane, back)",
+            Self::NegativeY => "Look along −Y (XZ plane, front)",
+            Self::PositiveZ => "Look along +Z (XY plane, top)",
+            Self::NegativeZ => "Look along −Z (XY plane, bottom)",
+        }
+    }
+}
+
+/// How the camera maps the scene onto the screen.
+///
+/// Both are wanted for different reading tasks and neither replaces the other.
+/// A perspective view shows depth, which is how an arrangement in space is
+/// understood. An orthographic one removes it, so equal lengths measure equal on
+/// screen wherever they are — which is what makes a field's decay comparable
+/// across a slice, and what makes an axis view an engineering drawing rather
+/// than a photograph of one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Projection {
+    #[default]
+    Perspective,
+    Orthographic,
+}
+
+impl Projection {
+    pub const ALL: [Self; 2] = [Self::Perspective, Self::Orthographic];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Perspective => "Perspective",
+            Self::Orthographic => "Orthographic",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Perspective => {
+                "Distant things are smaller. Shows depth, so the arrangement of a scene in \
+                 space reads directly."
+            }
+            Self::Orthographic => {
+                "No foreshortening. Equal lengths measure equal anywhere on screen, so values \
+                 across a slice are comparable and an axis view reads as a drawing."
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -178,6 +261,7 @@ pub struct OrbitCamera {
     vertical_fov: f32,
     near: f32,
     far: f32,
+    projection: Projection,
 }
 
 impl Default for OrbitCamera {
@@ -190,6 +274,7 @@ impl Default for OrbitCamera {
             vertical_fov: 45.0_f32.to_radians(),
             near: 0.01,
             far: 10_000.0,
+            projection: Projection::default(),
         }
     }
 }
@@ -213,17 +298,64 @@ impl OrbitCamera {
         self.target + offset * self.distance
     }
 
+    pub const fn projection(&self) -> Projection {
+        self.projection
+    }
+
+    /// Switch projection without disturbing the framing.
+    ///
+    /// The two share the orbit, the target, and the distance, and the
+    /// orthographic extent is derived from that same distance, so a scene keeps
+    /// its size and position on screen across the change. Toggling to compare
+    /// the two readings of one arrangement is the point; having to re-frame
+    /// afterwards would defeat it.
+    pub const fn set_projection(&mut self, projection: Projection) {
+        self.projection = projection;
+    }
+
+    /// Half the world-space height the viewport spans at the target distance.
+    ///
+    /// The single quantity both projections are built from. Deriving the
+    /// orthographic extent from it rather than storing a separate zoom is what
+    /// lets dolly, focus, pan, and the framing itself mean the same thing in
+    /// either mode — including `screen_delta_to_world`, which needs no branch of
+    /// its own because the answer is identical.
+    fn half_extent_at_target(&self) -> f32 {
+        self.distance * (self.vertical_fov * 0.5).tan()
+    }
+
     pub fn view_projection(&self, aspect_ratio: f32) -> Mat4 {
         // `directx` is glam's name for the WebGPU clip convention — Z in [0, 1],
         // Y-up — which is the one wgpu expects. The `opengl` variant's [-1, 1]
         // depth range would halve the usable precision of the depth buffer and
         // clip everything in front of the camera's midpoint.
-        let projection = glam::camera::rh::proj::directx::perspective(
-            self.vertical_fov,
-            aspect_ratio.max(0.01),
-            self.near,
-            self.far,
-        );
+        let aspect_ratio = aspect_ratio.max(0.01);
+        let projection = match self.projection {
+            Projection::Perspective => glam::camera::rh::proj::directx::perspective(
+                self.vertical_fov,
+                aspect_ratio,
+                self.near,
+                self.far,
+            ),
+            Projection::Orthographic => {
+                let half_height = self.half_extent_at_target();
+                let half_width = half_height * aspect_ratio;
+                // The depth range is symmetric about the eye rather than
+                // starting just in front of it. Without foreshortening, dollying
+                // is a zoom and not an approach, so a near plane at the eye
+                // would silently cut the scene in half as the user zoomed in —
+                // clipping geometry that has not moved and is not in front of
+                // anything.
+                glam::camera::rh::proj::directx::orthographic(
+                    -half_width,
+                    half_width,
+                    -half_height,
+                    half_height,
+                    -self.far,
+                    self.far,
+                )
+            }
+        };
         projection * glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Z)
     }
 
@@ -242,8 +374,10 @@ impl OrbitCamera {
         let forward = (self.target - self.eye()).normalize();
         let right = forward.cross(Vec3::Z).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
-        let world_units_per_point =
-            2.0 * self.distance * (self.vertical_fov * 0.5).tan() / viewport_height.max(1.0);
+        // Deliberately not branched on projection: an orthographic view spans
+        // exactly what the perspective one spans at the target distance, so a
+        // pointer delta is worth the same in either.
+        let world_units_per_point = 2.0 * self.half_extent_at_target() / viewport_height.max(1.0);
 
         (right * pointer_delta.x - up * pointer_delta.y) * world_units_per_point
     }
@@ -261,20 +395,30 @@ impl OrbitCamera {
     }
 
     pub fn set_axis_view(&mut self, view: AxisView) {
-        match view {
-            AxisView::PositiveX => {
-                self.yaw = 0.0;
-                self.pitch = 0.0;
-            }
-            AxisView::PositiveY => {
-                self.yaw = std::f32::consts::FRAC_PI_2;
-                self.pitch = 0.0;
-            }
-            AxisView::PositiveZ => {
-                self.yaw = -std::f32::consts::FRAC_PI_2;
-                self.pitch = PITCH_LIMIT;
-            }
-        }
+        // The top and bottom views clamp to `PITCH_LIMIT` rather than a true
+        // pole: looking exactly along Z would make the up vector parallel to the
+        // view direction and the look-at matrix degenerate.
+        (self.yaw, self.pitch) = match view {
+            AxisView::PositiveX => (0.0, 0.0),
+            AxisView::NegativeX => (std::f32::consts::PI, 0.0),
+            AxisView::PositiveY => (std::f32::consts::FRAC_PI_2, 0.0),
+            AxisView::NegativeY => (-std::f32::consts::FRAC_PI_2, 0.0),
+            AxisView::PositiveZ => (-std::f32::consts::FRAC_PI_2, PITCH_LIMIT),
+            AxisView::NegativeZ => (-std::f32::consts::FRAC_PI_2, -PITCH_LIMIT),
+        };
+    }
+
+    /// Return to the framing a new session opens with, keeping nothing of the
+    /// current orbit. A user who has lost the scene off-screen needs one control
+    /// that is guaranteed to bring it back.
+    ///
+    /// Projection survives, because it is not framing: a user who has chosen to
+    /// read the scene without foreshortening has not asked to stop.
+    pub fn reset(&mut self) {
+        *self = Self {
+            projection: self.projection,
+            ..Self::default()
+        };
     }
 
     /// A picking ray for a pointer position in the viewport's pixel space.
@@ -332,6 +476,142 @@ mod tests {
 
         let to_target = (camera.target() - ray.origin).normalize();
         assert!(ray.direction.dot(to_target) > 0.999);
+    }
+
+    /// Picking is built from the inverse of whatever matrix drew the frame, so
+    /// it follows the projection without knowing which one it is. What changes
+    /// is the shape of the answer: perspective rays fan out from one eye,
+    /// orthographic rays are parallel and start where the pointer is.
+    #[test]
+    fn picking_follows_the_projection_it_was_drawn_with() {
+        let mut camera = OrbitCamera::default();
+        camera.set_projection(Projection::Orthographic);
+
+        let centre = camera
+            .ray_from_viewport(Vec2::new(400.0, 300.0), VIEWPORT)
+            .expect("centre is inside viewport");
+        let corner = camera
+            .ray_from_viewport(Vec2::new(120.0, 90.0), VIEWPORT)
+            .expect("corner is inside viewport");
+
+        // Parallel, and still pointing at the scene.
+        assert!(
+            centre.direction.dot(corner.direction) > 0.9999,
+            "orthographic rays must not fan out"
+        );
+        assert!(
+            centre
+                .direction
+                .dot((camera.target() - centre.origin).normalize())
+                > 0.999
+        );
+        // ...from different places, which is what makes them able to hit
+        // different things.
+        assert!(centre.origin.distance(corner.origin) > 0.1);
+
+        // The perspective camera at the same framing does fan out.
+        camera.set_projection(Projection::Perspective);
+        let centre = camera
+            .ray_from_viewport(Vec2::new(400.0, 300.0), VIEWPORT)
+            .unwrap();
+        let corner = camera
+            .ray_from_viewport(Vec2::new(120.0, 90.0), VIEWPORT)
+            .unwrap();
+        assert!(centre.direction.dot(corner.direction) < 0.99);
+    }
+
+    /// Switching projection is for comparing two readings of one arrangement, so
+    /// it must not also move the scene. Both spans are built from the same
+    /// distance, so what fills the viewport at the target stays put.
+    #[test]
+    fn switching_projection_keeps_the_framing() {
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::new(1.0, -2.0, 0.5), 3.0);
+        let eye = camera.eye();
+        let target = camera.target();
+
+        // A point one target-plane half-height above the target sits at the top
+        // of the viewport in either projection.
+        let up = (camera.target() - camera.eye())
+            .normalize()
+            .cross(Vec3::Z)
+            .normalize()
+            .cross((camera.target() - camera.eye()).normalize())
+            .normalize();
+        let edge = target + up * camera.half_extent_at_target();
+        let ndc_y = |camera: &OrbitCamera| {
+            let clip = camera.view_projection(VIEWPORT.aspect_ratio()) * edge.extend(1.0);
+            clip.y / clip.w
+        };
+
+        let perspective = ndc_y(&camera);
+        camera.set_projection(Projection::Orthographic);
+        let orthographic = ndc_y(&camera);
+
+        assert_eq!(camera.eye(), eye, "the viewpoint must not move");
+        assert_eq!(camera.target(), target);
+        assert!(
+            (perspective - 1.0).abs() < 1.0e-4,
+            "expected the top edge, got {perspective}"
+        );
+        assert!(
+            (orthographic - perspective).abs() < 1.0e-4,
+            "the same point left the viewport edge: {perspective} then {orthographic}"
+        );
+    }
+
+    /// Without foreshortening, dollying is a zoom rather than an approach, so it
+    /// must not clip away the half of the scene it has zoomed past.
+    #[test]
+    fn zooming_an_orthographic_view_does_not_clip_the_scene_in_half() {
+        let mut camera = OrbitCamera::default();
+        camera.set_projection(Projection::Orthographic);
+        camera.dolly(4_000.0);
+        assert!(camera.distance() < 1.0, "the camera should be zoomed in");
+
+        // A point well behind the eye, which a near plane at the eye would cut.
+        let behind = camera.eye() + (camera.eye() - camera.target()).normalize() * 50.0;
+        let clip = camera.view_projection(VIEWPORT.aspect_ratio()) * behind.extend(1.0);
+        let depth = clip.z / clip.w;
+
+        assert!(
+            (0.0..=1.0).contains(&depth),
+            "geometry behind the zoomed viewpoint was clipped away: depth {depth}"
+        );
+    }
+
+    #[test]
+    fn a_scene_reset_reframes_without_changing_how_the_scene_is_projected() {
+        let mut camera = OrbitCamera::default();
+        camera.set_projection(Projection::Orthographic);
+        camera.orbit(Vec2::new(120.0, 65.0));
+
+        camera.reset();
+
+        assert_eq!(camera.projection(), Projection::Orthographic);
+        assert_eq!(camera.eye(), {
+            let mut default = OrbitCamera::default();
+            default.set_projection(Projection::Orthographic);
+            default.eye()
+        });
+    }
+
+    #[test]
+    fn every_projection_produces_a_finite_matrix_from_every_axis_view() {
+        for projection in Projection::ALL {
+            for view in AxisView::ALL {
+                let mut camera = OrbitCamera::default();
+                camera.set_projection(projection);
+                camera.set_axis_view(view);
+
+                assert!(
+                    camera.view_projection(16.0 / 9.0).is_finite(),
+                    "{} in {} produced a degenerate matrix",
+                    view.label(),
+                    projection.label()
+                );
+            }
+        }
     }
 
     #[test]
@@ -406,6 +686,73 @@ mod tests {
         camera.set_axis_view(AxisView::PositiveZ);
 
         assert!(camera.view_projection(16.0 / 9.0).is_finite());
+    }
+
+    /// Every standard viewpoint has to be usable, including the two that look
+    /// along the up axis and would make the look-at matrix degenerate if they
+    /// reached the pole exactly.
+    #[test]
+    fn all_six_axis_views_are_distinct_and_finite() {
+        let mut eyes: Vec<Vec3> = Vec::new();
+        for view in AxisView::ALL {
+            let mut camera = OrbitCamera::default();
+            camera.set_axis_view(view);
+
+            assert!(
+                camera.view_projection(16.0 / 9.0).is_finite(),
+                "{} produced a degenerate view matrix",
+                view.label()
+            );
+            let eye = camera.eye();
+            assert!(
+                eyes.iter().all(|seen| (*seen - eye).length() > 1.0e-3),
+                "{} put the camera where another view already was",
+                view.label()
+            );
+            eyes.push(eye);
+        }
+        assert_eq!(eyes.len(), 6);
+    }
+
+    /// Opposite views must sit on opposite sides of the target, or the pair of
+    /// buttons is not showing the user the front and the back of the scene.
+    #[test]
+    fn opposite_axis_views_look_from_opposite_sides() {
+        for (one, other) in [
+            (AxisView::PositiveX, AxisView::NegativeX),
+            (AxisView::PositiveY, AxisView::NegativeY),
+            (AxisView::PositiveZ, AxisView::NegativeZ),
+        ] {
+            let mut first = OrbitCamera::default();
+            first.set_axis_view(one);
+            let mut second = OrbitCamera::default();
+            second.set_axis_view(other);
+
+            let a = (first.eye() - first.target()).normalize();
+            let b = (second.eye() - second.target()).normalize();
+            assert!(
+                a.dot(b) < -0.9,
+                "{} and {} are not opposed (dot {})",
+                one.label(),
+                other.label(),
+                a.dot(b)
+            );
+        }
+    }
+
+    #[test]
+    fn reset_restores_the_default_framing_from_any_orbit() {
+        let mut camera = OrbitCamera::default();
+        camera.orbit(Vec2::new(120.0, 65.0));
+        camera.pan(Vec2::new(40.0, -20.0), 600.0);
+        camera.focus(Vec3::new(9.0, -4.0, 2.0), 3.0);
+        assert_ne!(camera.target(), OrbitCamera::default().target());
+
+        camera.reset();
+
+        assert_eq!(camera.target(), OrbitCamera::default().target());
+        assert_eq!(camera.distance(), OrbitCamera::default().distance());
+        assert_eq!(camera.eye(), OrbitCamera::default().eye());
     }
 
     #[test]

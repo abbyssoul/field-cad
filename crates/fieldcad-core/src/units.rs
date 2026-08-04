@@ -3,6 +3,14 @@ use std::fmt;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
+/// The speed of light in vacuum, exact by the SI definition of the metre.
+///
+/// Lives in the core because more than one system needs it and they must agree:
+/// the relativistic integrator uses it to relate momentum to velocity, and a
+/// time-domain field solver uses it for its stability limit. Two copies that
+/// drifted would put the pusher and the field on different physics.
+pub const SPEED_OF_LIGHT: f64 = 299_792_458.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Dimension {
     pub mass: i8,
@@ -35,6 +43,34 @@ impl Dimension {
     pub const ELECTRIC_FIELD_DIVERGENCE: Self = Self::new(1, 0, -3, -1, 0, 0, 0);
     /// Magnetic flux-density divergence, tesla per metre.
     pub const MAGNETIC_FIELD_DIVERGENCE: Self = Self::new(1, -1, -2, -1, 0, 0, 0);
+
+    /// The familiar symbol for this dimension, where SI names one.
+    ///
+    /// [`Display`](fmt::Display) always spells a dimension out in base units,
+    /// which is unambiguous but reads badly in a property editor: charge shows
+    /// as `s A` rather than `C`. A generic, schema-driven editor has only the
+    /// dimension to work from, so the lookup lives here — this is knowledge
+    /// about SI, not about any one plugin's component.
+    pub fn unit_symbol(self) -> String {
+        let named = [
+            (Self::DIMENSIONLESS, ""),
+            (Self::MASS, "kg"),
+            (Self::LENGTH, "m"),
+            (Self::TIME, "s"),
+            (Self::CURRENT, "A"),
+            (Self::CHARGE, "C"),
+            (Self::VELOCITY, "m/s"),
+            (Self::ACCELERATION, "m/s²"),
+            (Self::ELECTRIC_FIELD, "V/m"),
+            (Self::ELECTRIC_POTENTIAL, "V"),
+            (Self::MAGNETIC_FLUX_DENSITY, "T"),
+            (Self::ENERGY_DENSITY, "J/m³"),
+        ];
+        named
+            .into_iter()
+            .find(|(dimension, _)| *dimension == self)
+            .map_or_else(|| self.to_string(), |(_, symbol)| symbol.to_owned())
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -171,5 +207,17 @@ mod tests {
         assert_eq!(Dimension::VELOCITY.to_string(), "m s^-1");
         assert_eq!(Dimension::DIMENSIONLESS.to_string(), "1");
         assert_eq!(Dimension::ELECTRIC_FIELD.to_string(), "kg m s^-3 A^-1");
+    }
+
+    #[test]
+    fn named_units_read_the_way_a_physicist_writes_them() {
+        assert_eq!(Dimension::CHARGE.unit_symbol(), "C");
+        assert_eq!(Dimension::MASS.unit_symbol(), "kg");
+        assert_eq!(Dimension::DIMENSIONLESS.unit_symbol(), "");
+        // An unnamed combination still has to render as something correct.
+        assert_eq!(
+            Dimension::ELECTRIC_FIELD_DIVERGENCE.unit_symbol(),
+            Dimension::ELECTRIC_FIELD_DIVERGENCE.to_string()
+        );
     }
 }

@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 fieldcad-core = { workspace = true }
+fieldcad-dynamics = { workspace = true }
+fieldcad-mass-sources = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }

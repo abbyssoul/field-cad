@@ -8,7 +8,7 @@
 
 use fieldcad_core::{Domain, ObjectId, ObjectShape, Transform, Velocity, WorldSnapshot};
 use fieldcad_electromagnetic_sources::ChargeSource;
-use fieldcad_particles::{MotionMode, Particle, collect_particles};
+use fieldcad_particles::{Particle, collect_particles};
 use fieldcad_plugin_api::{ObjectKinematicsUpdate, PluginError, SolverStepOutcome};
 use glam::{DVec3, UVec3};
 
@@ -35,7 +35,10 @@ pub(crate) struct ParticleCoupling {
     reference_total_energy_joules: f64,
     continuity_residual: f64,
     intervention_count: u64,
-    prescribed_motion: bool,
+    /// Whether any body is carried along at an authored velocity rather than
+    /// integrated from the fields. Such a body exchanges work with whatever is
+    /// holding it, which the energy budget cannot see.
+    authored_motion: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,15 +55,15 @@ impl ParticleCoupling {
     ) -> Result<Self, PluginError> {
         let kinematic_objects = particles
             .iter()
-            .filter(|particle| particle.motion_mode.has_kinematic_authority())
+            .filter(|particle| particle.needs_kinematic_authority())
             .map(|particle| particle.object)
             .collect();
         let particle_energy_joules = particle_kinetic_energy(&particles);
         let total_charge_coulombs = sources.iter().map(|source| source.charge_coulombs).sum();
         Ok(Self {
-            prescribed_motion: particles
+            authored_motion: particles
                 .iter()
-                .any(|particle| particle.motion_mode == MotionMode::Prescribed),
+                .any(|particle| particle.pinned && particle.velocity != DVec3::ZERO),
             particles,
             kinematic_objects,
             total_charge_coulombs,
@@ -93,16 +96,16 @@ impl ParticleCoupling {
         self.kinematic_objects = self
             .particles
             .iter()
-            .filter(|particle| particle.motion_mode.has_kinematic_authority())
+            .filter(|particle| particle.needs_kinematic_authority())
             .map(|particle| particle.object)
             .collect();
         self.total_charge_coulombs = sources.iter().map(|source| source.charge_coulombs).sum();
         self.neutralizing_background_coulombs = -self.total_charge_coulombs;
         self.particle_energy_joules = particle_kinetic_energy(&self.particles);
-        self.prescribed_motion = self
+        self.authored_motion = self
             .particles
             .iter()
-            .any(|particle| particle.motion_mode == MotionMode::Prescribed);
+            .any(|particle| particle.pinned && particle.velocity != DVec3::ZERO);
         self.intervention_count += 1;
     }
 
@@ -122,22 +125,28 @@ impl ParticleCoupling {
         let old_charge = deposit_particle_charge(domain, &self.particles);
 
         for particle in &mut self.particles {
+            // A pinned, stationary body cannot move and deposits no current, so
+            // it is skipped rather than pushed through the deposition path to
+            // produce zeros.
+            if !particle.needs_kinematic_authority() {
+                continue;
+            }
             let old_position = particle.position;
-            let new_velocity = match particle.motion_mode {
-                MotionMode::Fixed => continue,
-                MotionMode::Prescribed => particle.velocity,
-                MotionMode::Dynamic => {
-                    let (electric, magnetic) =
-                        interpolate_particle_fields(domain, fields, particle.position)?;
-                    relativistic_boris_velocity(
-                        particle.velocity,
-                        particle.charge_coulombs,
-                        particle.mass_kg,
-                        electric,
-                        magnetic,
-                        seconds,
-                    )?
-                }
+            let new_velocity = if particle.pinned {
+                // The user owns this body's motion: carry it at the authored
+                // velocity without integrating any force on it.
+                particle.velocity
+            } else {
+                let (electric, magnetic) =
+                    interpolate_particle_fields(domain, fields, particle.position)?;
+                relativistic_boris_velocity(
+                    particle.velocity,
+                    particle.charge_coulombs,
+                    particle.mass_kg,
+                    electric,
+                    magnetic,
+                    seconds,
+                )?
             };
             let unwrapped_position = old_position + new_velocity * seconds;
             let new_position = wrap_position(domain, unwrapped_position);
@@ -188,8 +197,8 @@ impl ParticleCoupling {
             drift,
             self.continuity_residual,
             self.intervention_count,
-            if self.prescribed_motion {
-                "; prescribed motion can exchange untracked external work"
+            if self.authored_motion {
+                "; authored (pinned) motion can exchange untracked external work"
             } else {
                 ""
             }
@@ -200,9 +209,7 @@ impl ParticleCoupling {
 pub(crate) fn coupling_is_requested(world: &WorldSnapshot) -> Result<bool, PluginError> {
     let particles = collect_particles(world)
         .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?;
-    Ok(particles
-        .iter()
-        .any(|particle| particle.motion_mode.has_kinematic_authority()))
+    Ok(particles.iter().any(Particle::needs_kinematic_authority))
 }
 
 pub(crate) fn collect_coupled_particles(
