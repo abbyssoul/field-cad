@@ -850,7 +850,7 @@ mod tests {
                         .map(WorldCommand::RegisterComponentSchema)
                         .chain([WorldCommand::CreateObject(
                             template_particle_spec(
-                                ParticleTemplate::Electron,
+                                ParticleTemplate::Catalog("Electron"),
                                 true,
                                 DVec3::new(-0.2, 0.0, 0.0),
                                 DVec3::X * 1.0e8,

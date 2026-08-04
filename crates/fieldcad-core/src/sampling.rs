@@ -14,7 +14,10 @@ use std::sync::Arc;
 use glam::{DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{Dimension, FieldValue, FieldValueKind, PlaneId, ProbeId, Quantity, VectorQuantity};
+use crate::{
+    BoxId, Dimension, FieldValue, FieldValueKind, PlaneId, ProbeId, Quantity, SphereId,
+    VectorQuantity,
+};
 
 /// How a returned value was obtained, and whether it means anything.
 ///
@@ -157,6 +160,118 @@ impl GridLattice {
     }
 }
 
+/// A regular, arbitrarily oriented three-dimensional lattice of samples.
+///
+/// The natural generalization of [`PlaneLattice`] to a third in-region axis:
+/// `origin` is sample `(0, 0, 0)` and `u_step`/`v_step`/`w_step` need not be
+/// axis-aligned, which is what lets an oriented [`FieldBox`](crate::FieldBox)
+/// reuse the same construction a [`SlicePlane`](crate::SlicePlane) already
+/// uses rather than needing a rotation carried alongside an axis-aligned grid.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoxLattice {
+    origin: DVec3,
+    u_step: DVec3,
+    v_step: DVec3,
+    w_step: DVec3,
+    counts: UVec3,
+}
+
+impl BoxLattice {
+    pub fn new(origin: DVec3, u_step: DVec3, v_step: DVec3, w_step: DVec3, counts: UVec3) -> Self {
+        Self {
+            origin,
+            u_step,
+            v_step,
+            w_step,
+            counts: counts.max(UVec3::ONE),
+        }
+    }
+
+    pub const fn counts(self) -> UVec3 {
+        self.counts
+    }
+
+    pub fn len(self) -> usize {
+        self.counts.x as usize * self.counts.y as usize * self.counts.z as usize
+    }
+
+    pub fn is_empty(self) -> bool {
+        false
+    }
+
+    pub fn position(self, index: usize) -> Option<DVec3> {
+        if index >= self.len() {
+            return None;
+        }
+        let width = self.counts.x as usize;
+        let height = self.counts.y as usize;
+        let u = (index % width) as f64;
+        let v = ((index / width) % height) as f64;
+        let w = (index / (width * height)) as f64;
+        Some(self.origin + self.u_step * u + self.v_step * v + self.w_step * w)
+    }
+}
+
+/// A regular lattice over a sphere's bounding cube, plus the sphere itself.
+///
+/// The lattice is evaluated over the whole cube — the same simple
+/// axis-aligned construction as [`GridLattice`] — rather than a
+/// variable-length shape that only carries in-sphere points. A drawer that
+/// wants a spherical silhouette instead of a cubic one uses [`Self::centre`]
+/// and [`Self::radius`] to cull points at display time; the solver evaluates
+/// the same batch either way.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SphereLattice {
+    grid: GridLattice,
+    centre: DVec3,
+    radius: f64,
+}
+
+impl SphereLattice {
+    pub fn new(origin: DVec3, step: DVec3, counts: UVec3, centre: DVec3, radius: f64) -> Self {
+        Self {
+            grid: GridLattice::new(origin, step, counts),
+            centre,
+            radius,
+        }
+    }
+
+    pub const fn counts(self) -> UVec3 {
+        self.grid.counts()
+    }
+
+    /// The bounding-cube lattice itself, for a drawer that wants to
+    /// interpolate the published grid before culling to the sphere.
+    pub const fn grid(self) -> GridLattice {
+        self.grid
+    }
+
+    pub fn len(self) -> usize {
+        self.grid.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        false
+    }
+
+    pub fn position(self, index: usize) -> Option<DVec3> {
+        self.grid.position(index)
+    }
+
+    pub const fn centre(self) -> DVec3 {
+        self.centre
+    }
+
+    pub const fn radius(self) -> f64 {
+        self.radius
+    }
+
+    /// Whether a world point lies inside the sphere this lattice bounds.
+    pub fn contains(self, point: DVec3) -> bool {
+        (point - self.centre).length_squared() <= self.radius * self.radius
+    }
+}
+
 /// Where the values in a batch were sampled.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SampleGeometry {
@@ -170,6 +285,14 @@ pub enum SampleGeometry {
         lattice: PlaneLattice,
     },
     Grid(GridLattice),
+    Box {
+        region: BoxId,
+        lattice: BoxLattice,
+    },
+    Sphere {
+        region: SphereId,
+        lattice: SphereLattice,
+    },
 }
 
 impl SampleGeometry {
@@ -191,6 +314,8 @@ impl SampleGeometry {
             Self::Probes { ids, .. } => ids.len(),
             Self::Plane { lattice, .. } => lattice.len(),
             Self::Grid(lattice) => lattice.len(),
+            Self::Box { lattice, .. } => lattice.len(),
+            Self::Sphere { lattice, .. } => lattice.len(),
         }
     }
 
@@ -203,6 +328,8 @@ impl SampleGeometry {
             Self::Probes { positions, .. } => positions.get(index).copied(),
             Self::Plane { lattice, .. } => lattice.position(index),
             Self::Grid(lattice) => lattice.position(index),
+            Self::Box { lattice, .. } => lattice.position(index),
+            Self::Sphere { lattice, .. } => lattice.position(index),
         }
     }
 
@@ -487,5 +614,81 @@ mod tests {
                 .validity
                 .is_usable()
         );
+    }
+
+    #[test]
+    fn box_lattice_walks_u_before_v_before_w() {
+        let lattice = BoxLattice::new(
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::Z,
+            UVec3::new(3, 2, 2),
+        );
+
+        assert_eq!(lattice.len(), 12);
+        assert_eq!(lattice.position(2).unwrap(), DVec3::new(2.0, 0.0, 0.0));
+        assert_eq!(lattice.position(3).unwrap(), DVec3::new(0.0, 1.0, 0.0));
+        assert_eq!(lattice.position(6).unwrap(), DVec3::new(0.0, 0.0, 1.0));
+        assert!(lattice.position(12).is_none());
+    }
+
+    #[test]
+    fn box_lattice_need_not_be_axis_aligned() {
+        // A lattice whose u/v/w axes are rotated 90 degrees about Z: local X
+        // becomes world Y and local Y becomes world -X.
+        let lattice = BoxLattice::new(
+            DVec3::ZERO,
+            DVec3::Y,
+            DVec3::NEG_X,
+            DVec3::Z,
+            UVec3::splat(2),
+        );
+
+        assert_eq!(lattice.position(1).unwrap(), DVec3::Y);
+        assert_eq!(lattice.position(2).unwrap(), DVec3::NEG_X);
+    }
+
+    #[test]
+    fn sphere_lattice_covers_its_bounding_cube_and_reports_containment() {
+        let lattice = SphereLattice::new(
+            DVec3::splat(-1.0),
+            DVec3::splat(2.0),
+            UVec3::splat(2),
+            DVec3::ZERO,
+            1.0,
+        );
+
+        assert_eq!(lattice.len(), 8);
+        assert_eq!(lattice.centre(), DVec3::ZERO);
+        assert_eq!(lattice.radius(), 1.0);
+        // A cube corner lies outside the inscribed sphere; the centre does not.
+        assert!(!lattice.contains(lattice.position(0).unwrap()));
+        assert!(lattice.contains(DVec3::ZERO));
+    }
+
+    #[test]
+    fn box_and_sphere_sample_geometry_retain_their_authoring_identity() {
+        let region = BoxId::new(3);
+        let box_geometry = SampleGeometry::Box {
+            region,
+            lattice: BoxLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::Z, UVec3::splat(2)),
+        };
+        assert_eq!(box_geometry.len(), 8);
+        assert_eq!(box_geometry.position(0), Some(DVec3::ZERO));
+
+        let sphere = SphereId::new(4);
+        let sphere_geometry = SampleGeometry::Sphere {
+            region: sphere,
+            lattice: SphereLattice::new(
+                DVec3::splat(-1.0),
+                DVec3::splat(2.0),
+                UVec3::splat(2),
+                DVec3::ZERO,
+                1.0,
+            ),
+        };
+        assert_eq!(sphere_geometry.len(), 8);
+        assert_eq!(sphere_geometry.position(0), Some(DVec3::splat(-1.0)));
     }
 }

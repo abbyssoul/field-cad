@@ -6,12 +6,17 @@
 //! about completeness, session identity, and supersession are enforced on one
 //! code path rather than only on the path that happens to be remote.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use fieldcad_core::{
-    ChannelId, FieldSnapshot, PluginId, SimulationMode, TimeStep, WorldCommand, WorldRevision,
-    WorldSnapshot,
+    ChannelId, FieldSnapshot, ObjectId, PluginId, SimulationMode, TimeStep, WorldCommand,
+    WorldRevision, WorldSnapshot,
 };
+use glam::DVec3;
 
 use crate::runtime::{
     EditHistoryStatus, FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus,
@@ -227,6 +232,17 @@ pub trait FieldDataSource: Send {
     /// is a replica, updated when the service acknowledges an edit — the desktop
     /// draws what it has been told, not what it hopes it submitted.
     fn world(&self) -> WorldSnapshot;
+
+    /// The dynamics system's summed force on every body it advanced, as of the
+    /// most recent tick — for an inspector's read-only display. A body with no
+    /// entry covers every reason there is nothing to show for it: no mass,
+    /// pinned, kinematically owned by a solver's own pusher, or no tick yet.
+    /// Empty for a source that does not locally hold this at all (a remote
+    /// session that has not chosen to transmit it). Presentation only, like
+    /// the rest of this trait: nothing reads this to decide a physical result.
+    fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
+        BTreeMap::new()
+    }
 
     /// Accept a transport command. World edits issued while running may return
     /// a queued receipt and become authoritative at the next fixed-tick
@@ -554,6 +570,10 @@ impl FieldDataSource for LocalDataSource {
 
     fn world(&self) -> WorldSnapshot {
         self.core.runtime.world_snapshot()
+    }
+
+    fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
+        self.core.runtime.body_forces()
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {

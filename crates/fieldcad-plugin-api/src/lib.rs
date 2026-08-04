@@ -18,8 +18,9 @@ use fieldcad_core::{
     PropertyBag, PropertySchema, SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic,
     StepContext, TimeStep, Transform, Velocity, WorldSnapshot, validate_properties,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginMetadata {
     pub id: PluginId,
     pub version: PluginVersion,
@@ -68,7 +69,7 @@ impl ChannelHandle {
 }
 
 // Not `Eq`: a property's declared default may carry an `f64` magnitude.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PluginConfigurationSchema {
     pub properties: Vec<PropertySchema>,
 }

@@ -770,6 +770,7 @@ version = "0.1.0"
 dependencies = [
  "fieldcad-core",
  "glam",
+ "serde",
  "thiserror 2.0.19",
 ]
 
@@ -787,6 +788,7 @@ dependencies = [
  "fieldcad-plugin-api",
  "fieldcad-test-field",
  "glam",
+ "serde",
  "thiserror 2.0.19",
 ]
 

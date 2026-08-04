@@ -8,7 +8,8 @@ fieldcad-core = { workspace = true }
 fieldcad-dynamics = { workspace = true }
 fieldcad-mass-sources = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
-glam = { workspace = true }
+glam = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

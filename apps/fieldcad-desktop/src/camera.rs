@@ -382,6 +382,27 @@ impl OrbitCamera {
         (right * pointer_delta.x - up * pointer_delta.y) * world_units_per_point
     }
 
+    /// World units spanned by one screen pixel at `point`'s depth.
+    ///
+    /// The single conversion a screen-space-constant gizmo needs: multiply this
+    /// by a desired pixel size to get a world-space length that will occupy
+    /// exactly that many pixels, however far away `point` is and however the
+    /// scene is scaled. Perspective depth is measured along the view axis (not
+    /// straight-line distance to the eye) so an off-axis point is not
+    /// foreshortened relative to one on it; orthographic is depth-independent,
+    /// like `screen_delta_to_world`.
+    pub fn world_units_per_pixel(&self, point: Vec3, viewport_height: f32) -> f32 {
+        let extent = match self.projection {
+            Projection::Perspective => {
+                let forward = (self.target - self.eye()).normalize_or_zero();
+                let depth = (point - self.eye()).dot(forward).max(self.near);
+                depth * (self.vertical_fov * 0.5).tan()
+            }
+            Projection::Orthographic => self.half_extent_at_target(),
+        };
+        2.0 * extent / viewport_height.max(1.0)
+    }
+
     pub fn dolly(&mut self, scroll_delta: f32) {
         self.distance =
             (self.distance * (-scroll_delta * 0.002).exp()).clamp(MIN_DISTANCE, MAX_DISTANCE);
@@ -655,6 +676,37 @@ mod tests {
 
         assert_eq!(hit.hit_sphere(Vec3::ZERO, 1.0), Some(0.25));
         assert_eq!(miss.hit_sphere(Vec3::ZERO, 1.0), None);
+    }
+
+    /// The whole point of the conversion: a fixed pixel size must map to a
+    /// world length that grows with a *point's own depth* in perspective
+    /// (otherwise a gizmo on a distant object would shrink relative to one on
+    /// a near object at the same camera state), and must be the same for
+    /// every point in orthographic, where there is no foreshortening to
+    /// account for. (The camera's overall zoom/`distance` naturally scales
+    /// both projections together — that is `dolly`, not what this checks.)
+    #[test]
+    fn world_units_per_pixel_accounts_for_perspective_depth_but_not_in_ortho() {
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::ZERO, 1.0);
+        let forward = (camera.target() - camera.eye()).normalize();
+        let near_point = camera.eye() + forward * 2.0;
+        let far_point = camera.eye() + forward * 20.0;
+
+        let near_units = camera.world_units_per_pixel(near_point, 600.0);
+        let far_units = camera.world_units_per_pixel(far_point, 600.0);
+        assert!(
+            far_units > near_units * 9.0,
+            "expected roughly 10x growth with depth: {near_units} near, {far_units} far"
+        );
+
+        camera.set_projection(Projection::Orthographic);
+        let near_ortho = camera.world_units_per_pixel(near_point, 600.0);
+        let far_ortho = camera.world_units_per_pixel(far_point, 600.0);
+        assert!(
+            (near_ortho - far_ortho).abs() < 1.0e-6,
+            "orthographic must not depend on a point's own depth: {near_ortho} vs {far_ortho}"
+        );
     }
 
     #[test]

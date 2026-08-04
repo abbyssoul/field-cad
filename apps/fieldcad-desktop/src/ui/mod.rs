@@ -23,12 +23,15 @@ use viewcontrols::view_controls;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fieldcad_core::{ChannelId, ObjectId, PlaneId, ProbeId, WorldCommand, WorldSnapshot};
+use fieldcad_core::{BoxId, ChannelId, ObjectId, PlaneId, ProbeId, SphereId, WorldCommand, WorldSnapshot};
 use fieldcad_simulation::{CommandPayload, ProbeHistory};
 
 use crate::{
     camera::{AxisView, Projection},
-    scene::{FieldLayerSettings, PlaneLayerSettings, SceneSelection, VectorDisplay},
+    scene::{
+        BoxLayerSettings, FieldLayerSettings, PlaneLayerSettings, SceneSelection,
+        SphereLayerSettings, VectorDisplay,
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +55,8 @@ pub struct ViewOptions {
     pub objects: bool,
     pub probes: bool,
     pub planes: bool,
+    pub boxes: bool,
+    pub spheres: bool,
 }
 
 impl Default for ViewOptions {
@@ -62,6 +67,8 @@ impl Default for ViewOptions {
             objects: true,
             probes: true,
             planes: true,
+            boxes: true,
+            spheres: true,
         }
     }
 }
@@ -78,7 +85,7 @@ pub type ViewToggle = (
 );
 
 impl ViewOptions {
-    pub const ENTRIES: [ViewToggle; 5] = [
+    pub const ENTRIES: [ViewToggle; 7] = [
         ("Grid", "Construction grid on the XY plane", |view| {
             &mut view.grid
         }),
@@ -100,6 +107,16 @@ impl ViewOptions {
             "Field sampling planes and their drawn values",
             |view| &mut view.planes,
         ),
+        (
+            "Field boxes",
+            "Oriented volumes sampling and drawing the field as arrows",
+            |view| &mut view.boxes,
+        ),
+        (
+            "Field spheres",
+            "Spherical volumes sampling and drawing the field as arrows",
+            |view| &mut view.spheres,
+        ),
     ];
 }
 
@@ -118,6 +135,8 @@ pub struct UiModel {
     pub world_selected: bool,
     pub selection: Option<ObjectId>,
     pub plane_selection: Option<PlaneId>,
+    pub box_selection: Option<BoxId>,
+    pub sphere_selection: Option<SphereId>,
     pub probe_selection: Option<ProbeId>,
     /// Non-modal plot windows pinned independently of scene selection.
     pub probe_plots: BTreeMap<ProbeId, ProbePlotWindow>,
@@ -140,6 +159,8 @@ impl UiModel {
             world_selected: true,
             selection: None,
             plane_selection: None,
+            box_selection: None,
+            sphere_selection: None,
             probe_selection: None,
             probe_plots: BTreeMap::new(),
             field_layers: BTreeMap::new(),
@@ -189,12 +210,16 @@ impl UiModel {
         self.selection
             .map(SceneSelection::Object)
             .or_else(|| self.plane_selection.map(SceneSelection::Plane))
+            .or_else(|| self.box_selection.map(SceneSelection::Box))
+            .or_else(|| self.sphere_selection.map(SceneSelection::Sphere))
             .or_else(|| self.probe_selection.map(SceneSelection::Probe))
     }
 
     pub fn set_scene_selection(&mut self, selection: Option<SceneSelection>) {
         self.selection = None;
         self.plane_selection = None;
+        self.box_selection = None;
+        self.sphere_selection = None;
         self.probe_selection = None;
         // Selecting anything in the scene — including nothing — takes the
         // inspector off the world node, so the two can never both look selected.
@@ -202,6 +227,8 @@ impl UiModel {
         match selection {
             Some(SceneSelection::Object(id)) => self.selection = Some(id),
             Some(SceneSelection::Plane(id)) => self.plane_selection = Some(id),
+            Some(SceneSelection::Box(id)) => self.box_selection = Some(id),
+            Some(SceneSelection::Sphere(id)) => self.sphere_selection = Some(id),
             Some(SceneSelection::Probe(id)) => self.probe_selection = Some(id),
             None => {}
         }
@@ -219,6 +246,8 @@ pub struct ChannelLayerSettings {
     pub visible: bool,
     pub whole_domain: FieldLayerSettings,
     pub planes: BTreeMap<PlaneId, PlaneLayerSettings>,
+    pub boxes: BTreeMap<BoxId, BoxLayerSettings>,
+    pub spheres: BTreeMap<SphereId, SphereLayerSettings>,
 }
 
 #[derive(Debug)]
@@ -298,6 +327,45 @@ pub struct FrameContext<'a> {
     /// How the camera is currently mapping the scene to the screen, so the
     /// control that changes it can show which is in force.
     pub projection: Projection,
+}
+
+/// A default-action button with an attached "▾" dropdown listing every named
+/// choice, the default included.
+///
+/// Used wherever "add X" has one obvious default — an empty object, a slice
+/// plane — but also a small catalog of named variants a user reaches for less
+/// often. Clicking the button itself performs the default so the common case
+/// stays one click; opening the dropdown is how a less common choice gets
+/// made without growing the panel into a row of buttons per choice.
+fn split_add_button<T: Clone>(
+    ui: &mut egui::Ui,
+    default_label: &str,
+    default_hover: &str,
+    default: T,
+    choices: &[(&str, T)],
+) -> Option<T> {
+    let mut chosen = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        if ui
+            .button(format!("+  {default_label}"))
+            .on_hover_text(default_hover)
+            .clicked()
+        {
+            chosen = Some(default.clone());
+        }
+        ui.menu_button("▾", |ui| {
+            for (label, value) in choices {
+                if ui.button(*label).clicked() {
+                    chosen = Some(value.clone());
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("More choices");
+    });
+    chosen
 }
 
 /// The controls for drawing a vector field over any region.

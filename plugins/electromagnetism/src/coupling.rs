@@ -6,7 +6,10 @@
 //! positions; every path satisfies the discrete continuity equation exactly,
 //! and their average removes a preferred coordinate ordering.
 
-use fieldcad_core::{Domain, ObjectId, ObjectShape, Transform, Velocity, WorldSnapshot};
+use fieldcad_core::{
+    Domain, ObjectId, ObjectShape, Transform, Velocity, WorldSnapshot, lorentz_factor,
+    relativistic_kinetic_energy,
+};
 use fieldcad_electromagnetic_sources::ChargeSource;
 use fieldcad_particles::{Particle, collect_particles};
 use fieldcad_plugin_api::{ObjectKinematicsUpdate, PluginError, SolverStepOutcome};
@@ -670,14 +673,8 @@ fn centred_fields(
 fn particle_kinetic_energy(particles: &[Particle]) -> f64 {
     particles
         .iter()
-        .map(|particle| {
-            (lorentz_factor(particle.velocity) - 1.0) * particle.mass_kg * SPEED_OF_LIGHT.powi(2)
-        })
+        .map(|particle| relativistic_kinetic_energy(particle.velocity, particle.mass_kg))
         .sum()
-}
-
-fn lorentz_factor(velocity: DVec3) -> f64 {
-    1.0 / (1.0 - velocity.length_squared() / SPEED_OF_LIGHT.powi(2)).sqrt()
 }
 
 fn wrap_position(domain: Domain, position: DVec3) -> DVec3 {

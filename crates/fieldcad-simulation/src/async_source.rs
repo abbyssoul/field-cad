@@ -6,7 +6,7 @@
 //! boundary, not a second implementation of simulation semantics.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,8 +16,9 @@ use std::{
     time::Duration,
 };
 
-use fieldcad_core::{FieldSnapshot, WorldSnapshot};
+use fieldcad_core::{FieldSnapshot, ObjectId, WorldSnapshot};
 use fieldcad_plugin_api::SolverCancellation;
+use glam::DVec3;
 
 use crate::{
     Command, CommandDisposition, CommandId, CommandReceipt, DataSourceStatus, EditHistoryStatus,
@@ -66,6 +67,7 @@ struct SourceState {
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
     snapshot: Option<Arc<FieldSnapshot>>,
+    forces: BTreeMap<ObjectId, DVec3>,
 }
 
 impl SourceState {
@@ -79,6 +81,7 @@ impl SourceState {
             edit_history: source.edit_history(),
             world: source.world(),
             snapshot: source.latest_snapshot(),
+            forces: source.runtime().body_forces(),
         }
     }
 }
@@ -98,6 +101,7 @@ pub struct AsyncLocalDataSource {
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
+    forces: BTreeMap<ObjectId, DVec3>,
     mailbox: SnapshotMailbox,
     poll_in_flight: bool,
     accumulated_elapsed: Duration,
@@ -136,6 +140,7 @@ impl AsyncLocalDataSource {
             field_systems: initial.field_systems,
             edit_history: initial.edit_history,
             world: initial.world,
+            forces: initial.forces,
             mailbox,
             poll_in_flight: false,
             accumulated_elapsed: Duration::ZERO,
@@ -152,6 +157,7 @@ impl AsyncLocalDataSource {
         self.field_systems = state.field_systems;
         self.edit_history = state.edit_history;
         self.world = state.world;
+        self.forces = state.forces;
         match state.snapshot {
             Some(snapshot) => Ok(self.mailbox.offer(snapshot)?),
             None => Ok(false),
@@ -260,6 +266,10 @@ impl FieldDataSource for AsyncLocalDataSource {
 
     fn world(&self) -> WorldSnapshot {
         self.world.clone()
+    }
+
+    fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
+        self.forces.clone()
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {

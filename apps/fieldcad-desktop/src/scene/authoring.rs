@@ -3,10 +3,13 @@
 //! Planes and probes have no rendered body of their own, so they need one to be
 //! visible and selectable — independently of whether any field layer is on.
 
-use fieldcad_core::{SlicePlane, WorldSnapshot};
-use glam::{Vec3, Vec4};
+use fieldcad_core::{FieldBox, FieldSphere, SlicePlane, WorldSnapshot};
+use glam::{Quat, Vec3, Vec4};
 
-use super::{FieldGeometry, SceneSelection, push_line, push_quad, push_quad_outline};
+use super::{
+    FieldGeometry, SceneSelection, push_circle, push_line, push_quad, push_quad_outline,
+    quat_from_dquat,
+};
 
 /// Which classes of thing the viewport is currently drawing.
 ///
@@ -25,6 +28,8 @@ pub struct SceneVisibility {
     pub objects: bool,
     pub probes: bool,
     pub planes: bool,
+    pub boxes: bool,
+    pub spheres: bool,
 }
 
 impl Default for SceneVisibility {
@@ -39,6 +44,8 @@ impl SceneVisibility {
         objects: true,
         probes: true,
         planes: true,
+        boxes: true,
+        spheres: true,
     };
 
     /// Whether a particular selection is currently on screen.
@@ -52,6 +59,8 @@ impl SceneVisibility {
             SceneSelection::Object(_) => self.objects,
             SceneSelection::Probe(_) => self.probes,
             SceneSelection::Plane(_) => self.planes,
+            SceneSelection::Box(_) => self.boxes,
+            SceneSelection::Sphere(_) => self.spheres,
         }
     }
 }
@@ -71,6 +80,24 @@ pub fn append_authoring_geometry(
                 geometry,
                 plane,
                 selection == Some(SceneSelection::Plane(plane.id)),
+            );
+        }
+    }
+    if show.boxes {
+        for field_box in world.boxes().values().filter(|region| region.visible) {
+            append_box_proxy(
+                geometry,
+                field_box,
+                selection == Some(SceneSelection::Box(field_box.id)),
+            );
+        }
+    }
+    if show.spheres {
+        for sphere in world.spheres().values().filter(|sphere| sphere.visible) {
+            append_sphere_proxy(
+                geometry,
+                sphere,
+                selection == Some(SceneSelection::Sphere(sphere.id)),
             );
         }
     }
@@ -140,9 +167,113 @@ fn append_plane_proxy(geometry: &mut FieldGeometry, plane: &SlicePlane, selected
     );
 }
 
+/// The eight world-space corners of a field box, in `±x, ±y, ±z` bit order
+/// (matching [`push_quad`]'s winding expectations per face below).
+fn box_corners(origin: Vec3, rotation: Quat, half_extent: Vec3) -> [Vec3; 8] {
+    let mut corners = [Vec3::ZERO; 8];
+    for (index, corner) in corners.iter_mut().enumerate() {
+        let signs = Vec3::new(
+            if index & 1 == 0 { -1.0 } else { 1.0 },
+            if index & 2 == 0 { -1.0 } else { 1.0 },
+            if index & 4 == 0 { -1.0 } else { 1.0 },
+        );
+        *corner = origin + rotation * (half_extent * signs);
+    }
+    corners
+}
+
+/// A translucent volume with a white outline: the box's rights are the same
+/// as a slice plane's — selectable, draggable, deletable — but its body has
+/// no field-independent purpose beyond marking where it is.
+fn append_box_proxy(geometry: &mut FieldGeometry, field_box: &FieldBox, selected: bool) {
+    let rotation = quat_from_dquat(field_box.rotation);
+    let corners = box_corners(
+        field_box.origin.as_vec3(),
+        rotation,
+        field_box.half_extent.as_vec3(),
+    );
+    let body = if selected {
+        Vec4::new(1.0, 0.48, 0.08, 0.10)
+    } else {
+        Vec4::new(0.9, 0.9, 0.95, 0.05)
+    };
+    let outline = if selected {
+        Vec4::new(1.0, 0.48, 0.08, 1.0)
+    } else {
+        Vec4::new(1.0, 1.0, 1.0, 0.85)
+    };
+    // Corner indices per face, wound so `push_quad`'s two triangles face
+    // outward; index bits are (x, y, z) as in `box_corners`.
+    const FACES: [[usize; 4]; 6] = [
+        [0, 2, 6, 4], // -x
+        [1, 5, 7, 3], // +x
+        [0, 1, 3, 2], // -y
+        [4, 6, 7, 5], // +y
+        [0, 4, 5, 1], // -z
+        [2, 3, 7, 6], // +z
+    ];
+    for face in FACES {
+        let quad = [corners[face[0]], corners[face[1]], corners[face[2]], corners[face[3]]];
+        push_quad(&mut geometry.surface_triangles, quad, body);
+        push_quad_outline(&mut geometry.vector_lines, quad, outline);
+    }
+}
+
+/// A translucent "crystal ball" shell with a white wireframe: three great
+/// circles plus a low-poly latitude/longitude mesh, reusing [`push_circle`]
+/// for the wireframe the same way the selection origin marker does.
+fn append_sphere_proxy(geometry: &mut FieldGeometry, sphere: &FieldSphere, selected: bool) {
+    let origin = sphere.origin.as_vec3();
+    let radius = sphere.radius as f32;
+    let body = if selected {
+        Vec4::new(1.0, 0.48, 0.08, 0.10)
+    } else {
+        Vec4::new(0.6, 0.8, 0.95, 0.06)
+    };
+    let outline = if selected {
+        Vec4::new(1.0, 0.48, 0.08, 1.0)
+    } else {
+        Vec4::new(1.0, 1.0, 1.0, 0.85)
+    };
+
+    for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
+        push_circle(&mut geometry.vector_lines, origin, a, b, radius, outline);
+    }
+
+    const LATITUDES: u32 = 8;
+    const LONGITUDES: u32 = 16;
+    for lat in 0..LATITUDES {
+        let theta0 = std::f32::consts::PI * lat as f32 / LATITUDES as f32;
+        let theta1 = std::f32::consts::PI * (lat + 1) as f32 / LATITUDES as f32;
+        for lon in 0..LONGITUDES {
+            let phi0 = std::f32::consts::TAU * lon as f32 / LONGITUDES as f32;
+            let phi1 = std::f32::consts::TAU * (lon + 1) as f32 / LONGITUDES as f32;
+            let vertex = |theta: f32, phi: f32| {
+                origin
+                    + radius
+                        * Vec3::new(theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos())
+            };
+            push_quad(
+                &mut geometry.surface_triangles,
+                [
+                    vertex(theta0, phi0),
+                    vertex(theta1, phi0),
+                    vertex(theta1, phi1),
+                    vertex(theta0, phi1),
+                ],
+                body,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{ObjectId, PlaneId, ProbeId};
+    use fieldcad_core::{
+        BoxId, FieldBoxSpec, FieldSphereSpec, ObjectId, PlaneId, ProbeId, SphereId, World,
+        WorldCommand,
+    };
+    use glam::DVec3;
 
     use super::*;
 
@@ -154,16 +285,22 @@ mod tests {
             objects: false,
             probes: false,
             planes: true,
+            boxes: false,
+            spheres: false,
         };
 
         assert!(!only_planes.shows(SceneSelection::Object(ObjectId::new(0))));
         assert!(!only_planes.shows(SceneSelection::Probe(ProbeId::new(0))));
         assert!(only_planes.shows(SceneSelection::Plane(PlaneId::new(0))));
+        assert!(!only_planes.shows(SceneSelection::Box(BoxId::new(0))));
+        assert!(!only_planes.shows(SceneSelection::Sphere(SphereId::new(0))));
 
         for selection in [
             SceneSelection::Object(ObjectId::new(1)),
             SceneSelection::Probe(ProbeId::new(1)),
             SceneSelection::Plane(PlaneId::new(1)),
+            SceneSelection::Box(BoxId::new(1)),
+            SceneSelection::Sphere(SphereId::new(1)),
         ] {
             assert!(SceneVisibility::ALL.shows(selection));
         }
@@ -172,5 +309,40 @@ mod tests {
     #[test]
     fn a_session_opens_showing_everything() {
         assert_eq!(SceneVisibility::default(), SceneVisibility::ALL);
+    }
+
+    #[test]
+    fn box_and_sphere_proxies_are_drawn_for_visible_regions() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateBox(
+                    FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(1.0)).unwrap(),
+                ),
+                WorldCommand::CreateSphere(
+                    FieldSphereSpec::new("ball", DVec3::ZERO, 1.0).unwrap(),
+                ),
+            ])
+            .unwrap();
+        let snapshot = world.snapshot();
+
+        let mut geometry = FieldGeometry::default();
+        append_authoring_geometry(&mut geometry, &snapshot, None, SceneVisibility::ALL);
+        assert!(!geometry.surface_triangles.is_empty());
+        assert!(!geometry.vector_lines.is_empty());
+
+        let mut hidden = FieldGeometry::default();
+        append_authoring_geometry(
+            &mut hidden,
+            &snapshot,
+            None,
+            SceneVisibility {
+                boxes: false,
+                spheres: false,
+                ..SceneVisibility::ALL
+            },
+        );
+        assert!(hidden.surface_triangles.is_empty());
+        assert!(hidden.vector_lines.is_empty());
     }
 }

@@ -3,10 +3,10 @@
 //! Rays are cast through the same `Viewport` the frame was rendered with, so a
 //! click lands on the object the user actually sees.
 
-use fieldcad_core::{ObjectId, SlicePlane, WorldSnapshot};
+use fieldcad_core::{FieldBox, ObjectId, SlicePlane, WorldSnapshot};
 use glam::{Vec2, Vec3};
 
-use super::{ObjectMesh, SceneSelection, SceneVisibility, instances};
+use super::{ObjectMesh, SceneSelection, SceneVisibility, instances, quat_from_dquat};
 use crate::camera::{OrbitCamera, Viewport};
 
 /// The nearest visible authoring entity under a pointer.
@@ -34,6 +34,31 @@ pub fn pick_scene(
         }
     }
 
+    for field_box in world
+        .boxes()
+        .values()
+        .filter(|region| region.visible && show.boxes)
+    {
+        let Some(distance) = ray_box_hit(ray, field_box) else {
+            continue;
+        };
+        if nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, SceneSelection::Box(field_box.id)));
+        }
+    }
+
+    for sphere in world
+        .spheres()
+        .values()
+        .filter(|sphere| sphere.visible && show.spheres)
+    {
+        if let Some(distance) = ray.hit_sphere(sphere.origin.as_vec3(), sphere.radius as f32)
+            && nearest.is_none_or(|(best, _)| distance < best)
+        {
+            nearest = Some((distance, SceneSelection::Sphere(sphere.id)));
+        }
+    }
+
     for probe in world
         .probes()
         .values()
@@ -50,6 +75,20 @@ pub fn pick_scene(
     }
 
     nearest.map(|(_, selection)| selection)
+}
+
+fn ray_box_hit(ray: crate::camera::Ray, field_box: &FieldBox) -> Option<f32> {
+    let rotation = quat_from_dquat(field_box.rotation);
+    let inverse_rotation = rotation.inverse();
+    let origin = field_box.origin.as_vec3();
+    let local = crate::camera::Ray {
+        origin: inverse_rotation * (ray.origin - origin),
+        direction: inverse_rotation * ray.direction,
+    };
+    local.hit_aabb(
+        -field_box.half_extent.as_vec3(),
+        field_box.half_extent.as_vec3(),
+    )
 }
 
 /// The nearest visible object proxy under a pointer. This intentionally ignores
@@ -340,6 +379,8 @@ mod tests {
                     probes: false,
                     planes: false,
                     objects: true,
+                    boxes: false,
+                    spheres: false,
                 },
                 &OrbitCamera::default(),
                 viewport,
@@ -479,5 +520,124 @@ mod tests {
         };
 
         assert!(local.hit_aabb(Vec3::NEG_ONE, Vec3::ONE).is_some());
+    }
+
+    #[test]
+    fn hidden_boxes_and_spheres_are_not_selectable() {
+        use fieldcad_core::{FieldBoxSpec, FieldSphereSpec};
+
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateBox(
+                    FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(2.0)).unwrap(),
+                ),
+                WorldCommand::CreateSphere(
+                    FieldSphereSpec::new("ball", DVec3::new(10.0, 0.0, 0.0), 2.0).unwrap(),
+                ),
+            ])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::ZERO, 2.0);
+        camera.set_axis_view(AxisView::PositiveZ);
+        let centre = Vec2::new(400.0, 300.0);
+
+        assert_eq!(
+            pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre),
+            Some(SceneSelection::Box(
+                *snapshot.boxes().keys().next().unwrap()
+            ))
+        );
+        assert_eq!(
+            pick_scene(
+                &snapshot,
+                SceneVisibility {
+                    boxes: false,
+                    ..SceneVisibility::ALL
+                },
+                &camera,
+                viewport,
+                centre
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rotated_box_is_picked_along_its_rotated_extent() {
+        use fieldcad_core::FieldBoxSpec;
+
+        let mut world = World::new();
+        // A long thin slab box, rotated so its long axis lies along X, mirroring
+        // `picking_respects_object_rotation`.
+        world
+            .commit([WorldCommand::CreateBox(
+                FieldBoxSpec::new("slab", DVec3::ZERO, DVec3::new(0.1, 4.0, 0.1))
+                    .unwrap()
+                    .with_rotation(DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2))
+                    .unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::ZERO, 4.0);
+        camera.set_axis_view(AxisView::PositiveZ);
+
+        // A point 3m along world X, at the viewport centre once the camera looks
+        // straight down Z, lands on the rotated slab's long axis.
+        let pointer = project_to_viewport(&camera, viewport, Vec3::new(3.0, 0.0, 0.0)).unwrap();
+
+        assert_eq!(
+            pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, pointer),
+            Some(SceneSelection::Box(
+                *snapshot.boxes().keys().next().unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn visible_sphere_is_selectable_in_the_viewport() {
+        use fieldcad_core::FieldSphereSpec;
+
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateSphere(
+                FieldSphereSpec::new("ball", DVec3::ZERO, 2.0).unwrap(),
+            )])
+            .unwrap();
+        let sphere = *world.snapshot().spheres().keys().next().unwrap();
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let mut camera = OrbitCamera::default();
+        camera.focus(Vec3::ZERO, 2.0);
+        camera.set_axis_view(AxisView::PositiveZ);
+
+        assert_eq!(
+            pick_scene(
+                &world.snapshot(),
+                SceneVisibility::ALL,
+                &camera,
+                viewport,
+                Vec2::new(400.0, 300.0)
+            ),
+            Some(SceneSelection::Sphere(sphere))
+        );
     }
 }

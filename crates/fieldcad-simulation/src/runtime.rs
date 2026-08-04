@@ -21,7 +21,7 @@ use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
     PluginError, PluginMetadata, SolverCancellation, SolverContext,
 };
-use glam::UVec2;
+use glam::{DVec3, UVec2, UVec3};
 
 /// What the runtime should sample when it publishes a snapshot.
 ///
@@ -36,6 +36,11 @@ pub struct Subscription {
     pub planes: Option<UVec2>,
     /// Sample the whole domain on a lattice decimated by this stride.
     pub domain_stride: Option<u32>,
+    /// Sample each visible field box at this many points along u, v, and w.
+    pub boxes: Option<UVec3>,
+    /// Sample each visible field sphere's bounding cube at this many points
+    /// per axis.
+    pub spheres: Option<u32>,
 }
 
 /// Host-owned limit on presentation sampling work requested in one snapshot.
@@ -63,6 +68,8 @@ impl Default for Subscription {
             probes: true,
             planes: None,
             domain_stride: None,
+            boxes: None,
+            spheres: None,
         }
     }
 }
@@ -72,6 +79,8 @@ impl Subscription {
         probes: true,
         planes: None,
         domain_stride: None,
+        boxes: None,
+        spheres: None,
     };
 
     pub fn with_planes(mut self, counts: UVec2) -> Self {
@@ -81,6 +90,16 @@ impl Subscription {
 
     pub fn with_domain_stride(mut self, stride: u32) -> Self {
         self.domain_stride = Some(stride);
+        self
+    }
+
+    pub fn with_boxes(mut self, counts: UVec3) -> Self {
+        self.boxes = Some(counts);
+        self
+    }
+
+    pub fn with_spheres(mut self, counts_per_axis: u32) -> Self {
+        self.spheres = Some(counts_per_axis);
         self
     }
 }
@@ -386,6 +405,17 @@ pub struct SimulationRuntime {
     /// the gesture changed nothing.
     interactive_edit: Option<WorldRevision>,
     history: EditHistory,
+    /// The dynamics system's summed force on every body it advanced at the
+    /// most recent tick.
+    ///
+    /// A byproduct of `apply_tick` that used to be computed and discarded
+    /// immediately after `dynamics::integrate` consumed it; retaining it costs
+    /// nothing extra and is what lets an inspector show "what force is this
+    /// body feeling right now" without a second computation path. Bodies a
+    /// solver kinematically owns (its own pusher, not summed forces — see
+    /// `fieldcad_dynamics`'s module docs) and pinned/carried bodies have no
+    /// entry, because neither has a force this system computed for it.
+    last_forces: BTreeMap<ObjectId, DVec3>,
 }
 
 /// Everything needed to stand up a runtime.
@@ -586,6 +616,7 @@ impl SimulationRuntime {
             latest: Arc::new(empty_snapshot(session, domain)),
             interactive_edit: None,
             history: EditHistory::new(undo_depth),
+            last_forces: BTreeMap::new(),
         };
         runtime.check_single_provider_per_field()?;
         let world_snapshot = runtime.world.snapshot();
@@ -1044,6 +1075,32 @@ impl SimulationRuntime {
                 "domain stride must be non-zero when grid sampling is enabled".to_owned(),
             ));
         }
+        if let Some(counts) = subscription.boxes {
+            if counts.min_element() == 0 {
+                return Err(RuntimeError::InvalidSubscription(
+                    "box counts must be non-zero when box sampling is enabled".to_owned(),
+                ));
+            }
+            if counts.max_element() > self.sampling_budget.max_plane_samples_per_axis {
+                return Err(RuntimeError::InvalidSubscription(format!(
+                    "box counts exceed the per-axis limit of {}",
+                    self.sampling_budget.max_plane_samples_per_axis
+                )));
+            }
+        }
+        if let Some(density) = subscription.spheres {
+            if density == 0 {
+                return Err(RuntimeError::InvalidSubscription(
+                    "sphere density must be non-zero when sphere sampling is enabled".to_owned(),
+                ));
+            }
+            if density > self.sampling_budget.max_plane_samples_per_axis {
+                return Err(RuntimeError::InvalidSubscription(format!(
+                    "sphere density exceeds the per-axis limit of {}",
+                    self.sampling_budget.max_plane_samples_per_axis
+                )));
+            }
+        }
 
         let world = self.world.snapshot();
         let mut requested = 0_u64;
@@ -1074,6 +1131,30 @@ impl SimulationRuntime {
                     requested = requested
                         .saturating_add(self.domain.decimated_lattice(stride).len() as u64);
                 }
+                if let Some(counts) = subscription.boxes {
+                    let boxes = world
+                        .boxes()
+                        .values()
+                        .filter(|region| region.visible)
+                        .count() as u64;
+                    requested = requested.saturating_add(
+                        boxes
+                            .saturating_mul(u64::from(counts.x))
+                            .saturating_mul(u64::from(counts.y))
+                            .saturating_mul(u64::from(counts.z)),
+                    );
+                }
+                if let Some(density) = subscription.spheres {
+                    let per_sphere = u64::from(density)
+                        .saturating_mul(u64::from(density))
+                        .saturating_mul(u64::from(density));
+                    let spheres = world
+                        .spheres()
+                        .values()
+                        .filter(|sphere| sphere.visible)
+                        .count() as u64;
+                    requested = requested.saturating_add(spheres.saturating_mul(per_sphere));
+                }
                 if requested > self.sampling_budget.max_samples_per_snapshot {
                     return Err(RuntimeError::SamplingBudgetExceeded {
                         requested,
@@ -1087,6 +1168,21 @@ impl SimulationRuntime {
 
     pub fn latest_snapshot(&self) -> Arc<fieldcad_core::FieldSnapshot> {
         Arc::clone(&self.latest)
+    }
+
+    /// The dynamics system's summed force on `object` as of the most recent
+    /// tick, if it was one of the bodies that system advanced. `None` for an
+    /// object with no mass, a pinned/carried body, a body a solver moves with
+    /// its own pusher, or before the first tick.
+    pub fn body_force(&self, object: ObjectId) -> Option<DVec3> {
+        self.last_forces.get(&object).copied()
+    }
+
+    /// Every body force from the most recent tick, for a source that captures
+    /// its whole state wholesale (see `async_source::SourceState`) rather than
+    /// querying one object at a time.
+    pub fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
+        self.last_forces.clone()
     }
 
     /// True if any registered solver evolves in time. When false, ticks cannot
@@ -1172,6 +1268,11 @@ impl SimulationRuntime {
             contributions.push(slot.solver().forces(&bodies)?);
         }
         let total_forces = dynamics::accumulate_forces(bodies.len(), &contributions)?;
+        self.last_forces = bodies
+            .iter()
+            .zip(&total_forces)
+            .map(|(body, force)| (body.object, *force))
+            .collect();
 
         let mut kinematics = BTreeMap::new();
         for slot in self.plugins.iter_mut().filter(|slot| slot.enabled) {
@@ -1332,6 +1433,24 @@ impl SimulationRuntime {
 
         if let Some(stride) = self.subscription.domain_stride {
             geometries.push(SampleGeometry::Grid(self.domain.decimated_lattice(stride)));
+        }
+
+        if let Some(counts) = self.subscription.boxes {
+            for region in world.boxes().values().filter(|region| region.visible) {
+                geometries.push(SampleGeometry::Box {
+                    region: region.id,
+                    lattice: region.lattice(counts),
+                });
+            }
+        }
+
+        if let Some(density) = self.subscription.spheres {
+            for sphere in world.spheres().values().filter(|sphere| sphere.visible) {
+                geometries.push(SampleGeometry::Sphere {
+                    region: sphere.id,
+                    lattice: sphere.lattice(density),
+                });
+            }
         }
 
         geometries
@@ -1849,7 +1968,7 @@ mod tests {
         let report = runtime
             .commit_world_commands(vec![WorldCommand::CreateObject(
                 template_particle_spec(
-                    ParticleTemplate::Electron,
+                    ParticleTemplate::Catalog("Electron"),
                     true,
                     DVec3::ZERO,
                     DVec3::X * 1.0e8,
@@ -1931,7 +2050,7 @@ mod tests {
             .commit_world_commands(vec![
                 WorldCommand::CreateObject(
                     template_particle_spec(
-                        ParticleTemplate::Proton,
+                        ParticleTemplate::Catalog("Proton"),
                         false,
                         DVec3::new(-0.25, 0.0, 0.0),
                         DVec3::new(0.0, -1.0e5, 0.0),
@@ -1941,7 +2060,7 @@ mod tests {
                 ),
                 WorldCommand::CreateObject(
                     template_particle_spec(
-                        ParticleTemplate::Electron,
+                        ParticleTemplate::Catalog("Electron"),
                         false,
                         DVec3::new(0.25, 0.0, 0.0),
                         DVec3::new(0.0, 1.0e5, 0.0),
@@ -1962,5 +2081,69 @@ mod tests {
             .find(|diagnostic| diagnostic.code == "particle-coupling-conservation")
             .map(|diagnostic| diagnostic.message.clone())
             .expect("coupled Maxwell solver publishes conservation diagnostics")
+    }
+
+    #[test]
+    fn set_subscription_rejects_invalid_box_and_sphere_counts() {
+        let (mut runtime, _object) = motion_runtime([]);
+
+        assert!(matches!(
+            runtime.set_subscription(Subscription {
+                boxes: Some(UVec3::new(0, 4, 4)),
+                ..runtime.subscription()
+            }),
+            Err(RuntimeError::InvalidSubscription(_))
+        ));
+        assert!(matches!(
+            runtime.set_subscription(Subscription {
+                spheres: Some(0),
+                ..runtime.subscription()
+            }),
+            Err(RuntimeError::InvalidSubscription(_))
+        ));
+    }
+
+    #[test]
+    fn box_and_sphere_subscriptions_publish_their_geometry() {
+        use fieldcad_core::{FieldBoxSpec, FieldSphereSpec};
+
+        let (mut runtime, _object) = motion_runtime([]);
+        let report = runtime
+            .commit_world_commands(vec![
+                WorldCommand::CreateBox(
+                    FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(1.0)).unwrap(),
+                ),
+                WorldCommand::CreateSphere(
+                    FieldSphereSpec::new("ball", DVec3::ZERO, 1.0).unwrap(),
+                ),
+            ])
+            .unwrap();
+        runtime
+            .set_subscription(Subscription {
+                boxes: Some(UVec3::splat(3)),
+                spheres: Some(3),
+                ..runtime.subscription()
+            })
+            .unwrap();
+
+        let channel = ChannelId::new(PluginId::new("test").unwrap(), "unused").unwrap();
+        let world = runtime.world_snapshot();
+        let geometries = runtime.geometries(&world, &channel);
+
+        let box_geometry = geometries
+            .iter()
+            .find(|geometry| {
+                matches!(geometry, SampleGeometry::Box { region, .. } if *region == report.created_boxes[0])
+            })
+            .expect("a visible box publishes its own geometry");
+        assert_eq!(box_geometry.len(), 27);
+
+        let sphere_geometry = geometries
+            .iter()
+            .find(|geometry| {
+                matches!(geometry, SampleGeometry::Sphere { region, .. } if *region == report.created_spheres[0])
+            })
+            .expect("a visible sphere publishes its own geometry");
+        assert_eq!(sphere_geometry.len(), 27);
     }
 }

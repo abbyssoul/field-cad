@@ -19,13 +19,16 @@ pub use authoring::{SceneVisibility, append_authoring_geometry};
 pub use field::field_geometry;
 pub use gizmo::{
     TransformHandle, TransformPreview, append_transform_gizmo, constrained_translation,
-    dragged_plane_normal, pick_transform_handle, plane_normal_label_position, plane_normal_tip,
-    selection_gizmo_length, selection_origin, view_plane_translation,
+    dragged_box_rotation, dragged_plane_normal, dragged_trackball_rotation,
+    dragged_view_rotation, pick_transform_handle, plane_normal_label_position, plane_normal_tip,
+    rotation_gizmo_radius, selection_gizmo_length, selection_origin, view_plane_translation,
 };
 pub use pick::{pick_object, pick_scene};
 
-use fieldcad_core::{ObjectId, ObjectShape, PlaneId, ProbeId, WorldObject, WorldSnapshot};
-use glam::{Mat4, Quat, Vec3, Vec4};
+use fieldcad_core::{
+    BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SphereId, WorldObject, WorldSnapshot,
+};
+use glam::{DQuat, Mat4, Quat, Vec3, Vec4};
 
 /// One world object prepared for drawing.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,6 +89,8 @@ pub enum ObjectMesh {
 pub enum SceneSelection {
     Object(ObjectId),
     Plane(PlaneId),
+    Box(BoxId),
+    Sphere(SphereId),
     Probe(ProbeId),
 }
 
@@ -190,6 +195,42 @@ impl Default for PlaneLayerSettings {
     }
 }
 
+/// How one field box draws one channel.
+///
+/// Arrows only: unlike a plane, a volume's interior has no natural surface to
+/// flatten a magnitude map onto, and there is no in-plane-vs-3D choice to make
+/// when the region is already three-dimensional.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxLayerSettings {
+    pub visible: bool,
+    pub vectors: VectorDisplay,
+}
+
+impl Default for BoxLayerSettings {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            vectors: VectorDisplay::default(),
+        }
+    }
+}
+
+/// How one field sphere draws one channel. See [`BoxLayerSettings`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SphereLayerSettings {
+    pub visible: bool,
+    pub vectors: VectorDisplay,
+}
+
+impl Default for SphereLayerSettings {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            vectors: VectorDisplay::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FieldGeometry {
     pub surface_triangles: Vec<ColoredVertex>,
@@ -246,9 +287,162 @@ fn push_quad(triangles: &mut Vec<ColoredVertex>, corners: [Vec3; 4], color: Vec4
     }
 }
 
+/// The single-precision rotation a render-space consumer needs from a
+/// world-space [`DQuat`]. Shared by the box authoring proxy and its rotation
+/// gizmo, which must agree on which way "up" is drawn.
+pub(crate) fn quat_from_dquat(rotation: DQuat) -> Quat {
+    Quat::from_xyzw(
+        rotation.x as f32,
+        rotation.y as f32,
+        rotation.z as f32,
+        rotation.w as f32,
+    )
+    .normalize()
+}
+
 fn push_quad_outline(lines: &mut Vec<ColoredVertex>, corners: [Vec3; 4], color: Vec4) {
     for (from, to) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
         push_line(lines, corners[from], corners[to], color);
+    }
+}
+
+/// A circle of `origin + (a*cos + b*sin) * radius`, as a closed line loop.
+///
+/// Shared by the selection origin marker's three great circles and the sphere
+/// authoring proxy's wireframe, which draw the same shape at different radii
+/// and colours.
+fn push_circle(lines: &mut Vec<ColoredVertex>, origin: Vec3, a: Vec3, b: Vec3, radius: f32, color: Vec4) {
+    const SEGMENTS: u32 = 32;
+    let mut previous = origin + a * radius;
+    for segment in 1..=SEGMENTS {
+        let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+        let next = origin + (a * angle.cos() + b * angle.sin()) * radius;
+        push_line(lines, previous, next, color);
+        previous = next;
+    }
+}
+
+/// Two vectors perpendicular to `axis` and to each other, used to parametrize
+/// a ring or a cylinder/cone cross-section around that axis.
+fn ring_basis(axis: Vec3) -> (Vec3, Vec3) {
+    let reference = if axis.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+    let a = axis.cross(reference).normalize_or_zero();
+    let b = axis.cross(a).normalize_or_zero();
+    (a, b)
+}
+
+/// A flat-shaded triangle: the facet normal decides how bright `color` reads,
+/// baked straight into the vertex color at generation time.
+///
+/// The renderer has no lighting of its own — `ColoredVertex` is position plus
+/// flat RGBA, and the shared shader's fragment stage just returns the vertex
+/// color — so this is the one place a solid shape gets to look like more than
+/// a flat silhouette: every facet of a cylinder or cone calls this once, and
+/// the varying baked brightness across facets is what reads as curvature.
+fn push_shaded_triangle(
+    triangles: &mut Vec<ColoredVertex>,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    color: Vec4,
+    light_dir: Vec3,
+) {
+    let normal = (b - a).cross(c - a).normalize_or_zero();
+    let intensity = 0.55 + 0.45 * normal.dot(light_dir).max(0.0);
+    let shaded = Vec4::new(color.x * intensity, color.y * intensity, color.z * intensity, color.w);
+    for position in [a, b, c] {
+        triangles.push(ColoredVertex {
+            position,
+            color: shaded,
+        });
+    }
+}
+
+/// A solid cylinder from `base` to `top`, `radius` wide, flat-shaded per facet.
+/// The side wall only — no caps, since every caller so far attaches one end to
+/// another solid shape (a cone head) or to the origin marker, where a cap
+/// would never be seen.
+fn append_cylinder(
+    triangles: &mut Vec<ColoredVertex>,
+    base: Vec3,
+    top: Vec3,
+    radius: f32,
+    color: Vec4,
+    light_dir: Vec3,
+) {
+    let Some(axis) = (top - base).try_normalize() else {
+        return;
+    };
+    const SEGMENTS: u32 = 10;
+    let (a, b) = ring_basis(axis);
+    let ring = |centre: Vec3, segment: u32| {
+        let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+        centre + (a * angle.cos() + b * angle.sin()) * radius
+    };
+    for segment in 0..SEGMENTS {
+        let next = segment + 1;
+        let (base0, base1) = (ring(base, segment), ring(base, next));
+        let (top0, top1) = (ring(top, segment), ring(top, next));
+        push_shaded_triangle(triangles, base0, top0, top1, color, light_dir);
+        push_shaded_triangle(triangles, base0, top1, base1, color, light_dir);
+    }
+}
+
+/// A solid cone from a `base` circle to `tip`, `radius` wide at the base,
+/// flat-shaded per facet, with a base cap (unlike [`append_cylinder`]: a cone
+/// head's wider base is visible past the narrower shaft it sits on).
+fn append_cone(
+    triangles: &mut Vec<ColoredVertex>,
+    base: Vec3,
+    tip: Vec3,
+    radius: f32,
+    color: Vec4,
+    light_dir: Vec3,
+) {
+    let Some(axis) = (tip - base).try_normalize() else {
+        return;
+    };
+    const SEGMENTS: u32 = 12;
+    let (a, b) = ring_basis(axis);
+    let ring = |segment: u32| {
+        let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+        base + (a * angle.cos() + b * angle.sin()) * radius
+    };
+    for segment in 0..SEGMENTS {
+        let next = segment + 1;
+        let (p0, p1) = (ring(segment), ring(next));
+        push_shaded_triangle(triangles, p0, p1, tip, color, light_dir);
+        push_shaded_triangle(triangles, base, p1, p0, color, light_dir);
+    }
+}
+
+/// A flat ribbon around `origin`, perpendicular to `axis`, spanning
+/// `radius - width/2` to `radius + width/2` — the solid-band analogue of
+/// [`push_circle`], used wherever a rotation ring needs to be more than a
+/// single-pixel line to stay legible and easy to grab.
+fn append_ring_band(
+    triangles: &mut Vec<ColoredVertex>,
+    origin: Vec3,
+    axis: Vec3,
+    radius: f32,
+    width: f32,
+    color: Vec4,
+    light_dir: Vec3,
+) {
+    const SEGMENTS: u32 = 48;
+    let (a, b) = ring_basis(axis);
+    let half_width = width * 0.5;
+    let point = |t: f32, r: f32| origin + (a * t.cos() + b * t.sin()) * r;
+    let mut previous_inner = point(0.0, radius - half_width);
+    let mut previous_outer = point(0.0, radius + half_width);
+    for segment in 1..=SEGMENTS {
+        let t = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+        let inner = point(t, radius - half_width);
+        let outer = point(t, radius + half_width);
+        push_shaded_triangle(triangles, previous_inner, previous_outer, outer, color, light_dir);
+        push_shaded_triangle(triangles, previous_inner, outer, inner, color, light_dir);
+        previous_inner = inner;
+        previous_outer = outer;
     }
 }
 

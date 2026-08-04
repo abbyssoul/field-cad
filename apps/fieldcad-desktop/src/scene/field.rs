@@ -7,13 +7,14 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    ChannelId, FieldColumn, FieldSnapshot, GridLattice, PlaneId, SampleGeometry, SampleValidity,
+    BoxId, BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GridLattice, PlaneId,
+    SampleGeometry, SampleValidity, SphereId, SphereLattice,
 };
 use glam::{DVec3, Vec3};
 
 use super::{
-    ColoredVertex, FieldGeometry, FieldLayerSettings, PlaneLayerSettings, PlaneVectorMode,
-    VectorDisplay, append_arrow,
+    BoxLayerSettings, ColoredVertex, FieldGeometry, FieldLayerSettings, PlaneLayerSettings,
+    PlaneVectorMode, SphereLayerSettings, VectorDisplay, append_arrow,
 };
 
 /// Convert one vector channel's batches into generic coloured triangles and
@@ -28,6 +29,8 @@ pub fn field_geometry(
     channel: &ChannelId,
     settings: FieldLayerSettings,
     plane_layers: &BTreeMap<PlaneId, PlaneLayerSettings>,
+    box_layers: &BTreeMap<BoxId, BoxLayerSettings>,
+    sphere_layers: &BTreeMap<SphereId, SphereLayerSettings>,
 ) -> FieldGeometry {
     let Some(channel) = snapshot.channel(channel) else {
         return FieldGeometry::default();
@@ -93,6 +96,40 @@ pub fn field_geometry(
                     &colors,
                     scale,
                     settings.vectors,
+                );
+            }
+            SampleGeometry::Box { region, lattice } => {
+                let box_settings = box_layers.get(region).copied().unwrap_or_default();
+                if !box_settings.visible || !box_settings.vectors.visible {
+                    continue;
+                }
+                let scale = MagnitudeScale::over(values, batch.validity());
+                let colors = scale.colors(values, batch.validity());
+                append_box_vectors(
+                    &mut output.vector_lines,
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    &colors,
+                    scale,
+                    box_settings.vectors,
+                );
+            }
+            SampleGeometry::Sphere { region, lattice } => {
+                let sphere_settings = sphere_layers.get(region).copied().unwrap_or_default();
+                if !sphere_settings.visible || !sphere_settings.vectors.visible {
+                    continue;
+                }
+                let scale = MagnitudeScale::over(values, batch.validity());
+                let colors = scale.colors(values, batch.validity());
+                append_sphere_vectors(
+                    &mut output.vector_lines,
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    &colors,
+                    scale,
+                    sphere_settings.vectors,
                 );
             }
             _ => {}
@@ -244,6 +281,89 @@ fn append_domain_vectors(
     }
 }
 
+/// Sparse glyphs distributed uniformly through an oriented field box, resampled
+/// from the published lattice the same way a plane or the whole domain is.
+fn append_box_vectors(
+    lines: &mut Vec<ColoredVertex>,
+    lattice: BoxLattice,
+    values: &[DVec3],
+    validity: &[SampleValidity],
+    colors: &[Vec3],
+    scale: MagnitudeScale,
+    display: VectorDisplay,
+) {
+    let counts = lattice.counts();
+    let xs = uniform_axis(counts.x, display.density);
+    let ys = uniform_axis(counts.y, display.density);
+    let zs = uniform_axis(counts.z, display.density);
+    let step_length = uniform_box_spacing(lattice, &xs, &ys, &zs);
+    for &z in &zs {
+        for &y in &ys {
+            for &x in &xs {
+                let Some(interpolation) = box_interpolation(lattice, x, y, z) else {
+                    continue;
+                };
+                if !interpolation.is_usable(validity) {
+                    continue;
+                }
+                let vector = interpolation.dvec3(values).as_vec3();
+                append_arrow(
+                    lines,
+                    interpolation.position,
+                    vector,
+                    step_length * scale.glyph_length(vector.length()) * display.scale,
+                    interpolation.vec3(colors).extend(1.0),
+                );
+            }
+        }
+    }
+}
+
+/// Sparse glyphs distributed uniformly through a field sphere, culled to the
+/// inscribed sphere rather than its published bounding cube — the solver
+/// evaluated the whole cube (see [`SphereLattice`]), but only the samples
+/// actually inside the sphere are drawn, which is what makes the arrows fill
+/// a ball rather than a box.
+fn append_sphere_vectors(
+    lines: &mut Vec<ColoredVertex>,
+    lattice: SphereLattice,
+    values: &[DVec3],
+    validity: &[SampleValidity],
+    colors: &[Vec3],
+    scale: MagnitudeScale,
+    display: VectorDisplay,
+) {
+    let grid = lattice.grid();
+    let counts = grid.counts();
+    let xs = uniform_axis(counts.x, display.density);
+    let ys = uniform_axis(counts.y, display.density);
+    let zs = uniform_axis(counts.z, display.density);
+    let step_length = uniform_domain_spacing(grid, &xs, &ys, &zs);
+    for &z in &zs {
+        for &y in &ys {
+            for &x in &xs {
+                let Some(interpolation) = grid_interpolation(grid, x, y, z) else {
+                    continue;
+                };
+                if !lattice.contains(interpolation.position.as_dvec3()) {
+                    continue;
+                }
+                if !interpolation.is_usable(validity) {
+                    continue;
+                }
+                let vector = interpolation.dvec3(values).as_vec3();
+                append_arrow(
+                    lines,
+                    interpolation.position,
+                    vector,
+                    step_length * scale.glyph_length(vector.length()) * display.scale,
+                    interpolation.vec3(colors).extend(1.0),
+                );
+            }
+        }
+    }
+}
+
 /// Trilinear interpolation of the published domain lattice, mirroring
 /// [`PlaneInterpolation`] one dimension up.
 #[derive(Clone, Copy, Debug)]
@@ -335,6 +455,121 @@ fn uniform_domain_spacing(lattice: GridLattice, xs: &[f64], ys: &[f64], zs: &[f6
         spacing(xs, step.x),
         spacing(ys, step.y),
         spacing(zs, step.z),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|spacing| *spacing > f32::EPSILON)
+    .reduce(f32::min)
+    .unwrap_or(0.25)
+}
+
+/// Trilinear interpolation of an oriented [`BoxLattice`], mirroring
+/// [`GridInterpolation`] with a position built from weighted corner samples —
+/// the same technique [`PlaneInterpolation`] uses — since the lattice's u/v/w
+/// steps need not be axis-aligned.
+#[derive(Clone, Copy, Debug)]
+struct BoxInterpolation {
+    position: Vec3,
+    indices: [usize; 8],
+    weights: [f64; 8],
+}
+
+impl BoxInterpolation {
+    fn is_usable(self, validity: &[SampleValidity]) -> bool {
+        self.indices
+            .iter()
+            .all(|&index| validity[index].is_usable())
+    }
+
+    fn dvec3(self, values: &[DVec3]) -> DVec3 {
+        self.indices
+            .into_iter()
+            .zip(self.weights)
+            .map(|(index, weight)| values[index] * weight)
+            .sum()
+    }
+
+    fn vec3(self, values: &[Vec3]) -> Vec3 {
+        self.indices
+            .into_iter()
+            .zip(self.weights)
+            .map(|(index, weight)| values[index] * weight as f32)
+            .sum()
+    }
+}
+
+fn box_interpolation(lattice: BoxLattice, u: f64, v: f64, w: f64) -> Option<BoxInterpolation> {
+    let counts = lattice.counts();
+    let axis = |value: f64, count: u32| {
+        let value = value.clamp(0.0, f64::from(count.saturating_sub(1)));
+        let low = value.floor();
+        (low as usize, value.ceil() as usize, value - low)
+    };
+    let (u0, u1, fu) = axis(u, counts.x);
+    let (v0, v1, fv) = axis(v, counts.y);
+    let (w0, w1, fw) = axis(w, counts.z);
+    let width = counts.x as usize;
+    let height = counts.y as usize;
+    let at = |u: usize, v: usize, w: usize| u + width * (v + height * w);
+    let indices = [
+        at(u0, v0, w0),
+        at(u1, v0, w0),
+        at(u0, v1, w0),
+        at(u1, v1, w0),
+        at(u0, v0, w1),
+        at(u1, v0, w1),
+        at(u0, v1, w1),
+        at(u1, v1, w1),
+    ];
+    let weights = [
+        (1.0 - fu) * (1.0 - fv) * (1.0 - fw),
+        fu * (1.0 - fv) * (1.0 - fw),
+        (1.0 - fu) * fv * (1.0 - fw),
+        fu * fv * (1.0 - fw),
+        (1.0 - fu) * (1.0 - fv) * fw,
+        fu * (1.0 - fv) * fw,
+        (1.0 - fu) * fv * fw,
+        fu * fv * fw,
+    ];
+    if indices.iter().any(|&index| index >= lattice.len()) {
+        return None;
+    }
+    let position = indices
+        .into_iter()
+        .zip(weights)
+        .map(|(index, weight)| lattice.position(index).map(|point| point * weight))
+        .sum::<Option<DVec3>>()?
+        .as_vec3();
+    Some(BoxInterpolation {
+        position,
+        indices,
+        weights,
+    })
+}
+
+/// The physical distance one full lattice-index step covers along each axis,
+/// scaled by the display axes' fractional increment — the oriented analogue
+/// of [`uniform_domain_spacing`], which can read the step directly off an
+/// axis-aligned [`GridLattice`] where this instead reads it off two adjacent
+/// lattice points.
+fn uniform_box_spacing(lattice: BoxLattice, xs: &[f64], ys: &[f64], zs: &[f64]) -> f32 {
+    let counts = lattice.counts();
+    let width = counts.x as usize;
+    let height = counts.y as usize;
+    let Some(origin) = lattice.position(0) else {
+        return 0.25;
+    };
+    let physical_step = |index: usize| lattice.position(index).map(|point| point.distance(origin));
+    let spacing = |axis: &[f64], step_index: usize| {
+        if axis.len() <= 1 {
+            return None;
+        }
+        physical_step(step_index).map(|step| ((axis[1] - axis[0]) * step).abs() as f32)
+    };
+    [
+        spacing(xs, 1),
+        spacing(ys, width),
+        spacing(zs, width * height),
     ]
     .into_iter()
     .flatten()
@@ -734,9 +969,16 @@ mod tests {
     fn a_plane_hides_a_field_without_hiding_it_on_other_planes() {
         let (snapshot, channel, planes) = two_plane_snapshot();
         let arrows = |layers: BTreeMap<PlaneId, PlaneLayerSettings>| {
-            field_geometry(&snapshot, &channel, FieldLayerSettings::default(), &layers)
-                .vector_lines
-                .len()
+            field_geometry(
+                &snapshot,
+                &channel,
+                FieldLayerSettings::default(),
+                &layers,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .vector_lines
+            .len()
         };
 
         let both = arrows(BTreeMap::new());
@@ -897,5 +1139,137 @@ mod tests {
             displayed_plane_vector(value, Vec3::Z, PlaneVectorMode::Full3d),
             value
         );
+    }
+
+    /// A uniform 3×3×3 unrotated box batch of unit +X vectors, spanning -1..1.
+    fn uniform_box(counts: u32) -> (BoxLattice, Vec<DVec3>, Vec<SampleValidity>, Vec<Vec3>) {
+        let lattice = BoxLattice::new(
+            DVec3::splat(-1.0),
+            DVec3::X,
+            DVec3::Y,
+            DVec3::Z,
+            UVec3::splat(counts),
+        );
+        let values = vec![DVec3::X; lattice.len()];
+        let validity = vec![SampleValidity::Exact; lattice.len()];
+        let colors = vec![Vec3::ONE; lattice.len()];
+        (lattice, values, validity, colors)
+    }
+
+    fn box_arrows(display: VectorDisplay) -> Vec<ColoredVertex> {
+        let (lattice, values, validity, colors) = uniform_box(3);
+        let mut lines = Vec::new();
+        append_box_vectors(
+            &mut lines,
+            lattice,
+            &values,
+            &validity,
+            &colors,
+            MagnitudeScale::over(&values, &validity),
+            display,
+        );
+        lines
+    }
+
+    #[test]
+    fn box_density_is_a_display_setting_not_the_published_sample_count() {
+        let sparse = box_arrows(VectorDisplay::new(true, 4));
+        assert_eq!(sparse.len() / 6, 4 * 4 * 4);
+
+        let dense = box_arrows(VectorDisplay::new(true, 5));
+        assert_eq!(dense.len() / 6, 5 * 5 * 5);
+
+        assert!(box_arrows(VectorDisplay::new(true, 0)).is_empty());
+    }
+
+    #[test]
+    fn box_arrows_span_the_published_lattice_uniformly() {
+        let arrows = box_arrows(VectorDisplay::new(true, 3));
+        let origins: Vec<_> = arrows
+            .chunks_exact(6)
+            .map(|arrow| arrow[0].position)
+            .collect();
+
+        assert!((origins[0].x + 1.0).abs() < 1.0e-5);
+        assert!((origins[2].x - 1.0).abs() < 1.0e-5);
+        assert!((origins[0].z + 1.0).abs() < 1.0e-5);
+        assert!((origins[26].z - 1.0).abs() < 1.0e-5);
+        assert!(origins.iter().all(|origin| origin.is_finite()));
+    }
+
+    /// The lattice's u/v/w axes need not be axis-aligned; a rotated box still
+    /// resamples uniformly across its actual (rotated) extent.
+    #[test]
+    fn box_arrows_follow_a_rotated_lattice() {
+        // Local X maps to world Y, local Y maps to world -X: a 90 degree turn
+        // about Z.
+        let lattice = BoxLattice::new(DVec3::ZERO, DVec3::Y, DVec3::NEG_X, DVec3::Z, UVec3::splat(2));
+        let values = vec![DVec3::X; lattice.len()];
+        let validity = vec![SampleValidity::Exact; lattice.len()];
+        let colors = vec![Vec3::ONE; lattice.len()];
+        let mut lines = Vec::new();
+
+        append_box_vectors(
+            &mut lines,
+            lattice,
+            &values,
+            &validity,
+            &colors,
+            MagnitudeScale::over(&values, &validity),
+            VectorDisplay::new(true, 2),
+        );
+
+        let origins: Vec<_> = lines
+            .chunks_exact(6)
+            .map(|arrow| arrow[0].position)
+            .collect();
+        assert!(origins.contains(&Vec3::Y));
+        assert!(origins.contains(&Vec3::NEG_X));
+    }
+
+    fn uniform_sphere(counts_per_axis: u32, radius: f64) -> (SphereLattice, Vec<DVec3>, Vec<SampleValidity>, Vec<Vec3>) {
+        let lattice = SphereLattice::new(
+            DVec3::splat(-radius),
+            DVec3::splat(2.0 * radius / f64::from(counts_per_axis.saturating_sub(1)).max(1.0)),
+            UVec3::splat(counts_per_axis),
+            DVec3::ZERO,
+            radius,
+        );
+        let values = vec![DVec3::X; lattice.len()];
+        let validity = vec![SampleValidity::Exact; lattice.len()];
+        let colors = vec![Vec3::ONE; lattice.len()];
+        (lattice, values, validity, colors)
+    }
+
+    /// Corner samples of the bounding cube lie outside the inscribed sphere
+    /// and must not be drawn, even though the solver evaluated them: this is
+    /// what makes the drawn arrows fill a ball rather than a box.
+    #[test]
+    fn sphere_arrows_are_culled_to_the_inscribed_sphere() {
+        let (lattice, values, validity, colors) = uniform_sphere(5, 2.0);
+        let mut lines = Vec::new();
+        append_sphere_vectors(
+            &mut lines,
+            lattice,
+            &values,
+            &validity,
+            &colors,
+            MagnitudeScale::over(&values, &validity),
+            VectorDisplay::new(true, 5),
+        );
+
+        let origins: Vec<_> = lines
+            .chunks_exact(6)
+            .map(|arrow| arrow[0].position)
+            .collect();
+        assert!(!origins.is_empty());
+        assert!(
+            origins
+                .iter()
+                .all(|origin| origin.distance(Vec3::ZERO) <= 2.0 + 1.0e-4)
+        );
+        // A dense sampling of a 5x5x5 cube has corners outside the sphere, so
+        // strictly fewer arrows are drawn than the cube holds samples.
+        assert!(origins.len() < 5 * 5 * 5);
     }
 }

@@ -140,6 +140,8 @@ macro_rules! entity_id {
 
 entity_id!(ObjectId);
 entity_id!(PlaneId);
+entity_id!(BoxId);
+entity_id!(SphereId);
 entity_id!(ProbeId);
 
 #[derive(

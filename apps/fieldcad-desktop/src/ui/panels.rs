@@ -3,14 +3,16 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    ChannelId, Dimension, FieldValueKind, ObjectId, ObjectShape, ObjectSpec, ProbeId,
-    ProbePosition, ProbeSpec, PropertyBag, PropertyKind, PropertySchema, PropertyValue, Quantity,
-    SimulationMode, SlicePlane, SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform,
-    VectorQuantity, Velocity, WorldCommand, WorldObject, WorldSnapshot,
+    ChannelId, Dimension, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec, FieldValueKind,
+    ObjectId, ObjectShape, ObjectSpec, ProbeId, ProbePosition, ProbeSpec, PropertyBag,
+    PropertyKind, PropertySchema, PropertyValue, Quantity, SimulationMode, SlicePlane,
+    SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform, VectorQuantity, Velocity,
+    WorldCommand, WorldObject, WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
 };
-use fieldcad_mass_sources::inertial_mass_component_id;
+use fieldcad_mass_sources::{inertial_mass_component_id, mass_property_id};
+use fieldcad_particles::{ParticleTemplate, template_particle_spec};
 use fieldcad_simulation::{CommandPayload, PlaybackSpeed, ProbeHistory};
-use glam::{DVec2, DVec3};
+use glam::{DQuat, DVec2, DVec3};
 
 use super::compute::{
     ComputeView, WorkbenchState, format_simulation_time, format_time_step, parse_playback_speed,
@@ -334,19 +336,31 @@ fn object_section(
     // behind it. Otherwise folding one loses the only clue that it has contents.
     let title = format!("Objects ({})", frame.world.objects().len());
     super::section(ui, "scene_objects_section", title, true, |ui| {
-        // One button, because there is only one kind of thing a simulation
-        // models: an object at a position. What it *does* is decided by the
+        // A bare object is the default — what it *does* is decided by the
         // components added to it in the inspector, not by which button created
-        // it.
-        if ui
-            .button("+  Add object")
-            .on_hover_text(
-                "Add an object at the origin.\n\
-                 Give it charge or mass in the inspector to couple it to a field.",
+        // it — but a particle-catalog preset is one click away in the dropdown
+        // for the common case of "just give me an electron".
+        let choices: Vec<(&str, ObjectPreset)> = std::iter::once(("Empty", ObjectPreset::Empty))
+            .chain(
+                ParticleTemplate::all()
+                    .filter(|template| *template != ParticleTemplate::Custom)
+                    .map(|template| (template.label(), ObjectPreset::Particle(template))),
             )
-            .clicked()
-        {
-            output.submit(new_object_command(frame.world));
+            .collect();
+        if let Some(preset) = super::split_add_button(
+            ui,
+            "Add object",
+            "Add an object at the origin.\n\
+             Give it charge or mass in the inspector to couple it to a field.",
+            ObjectPreset::Empty,
+            &choices,
+        ) {
+            output.submit(match preset {
+                ObjectPreset::Empty => new_object_command(frame.world),
+                ObjectPreset::Particle(template) => {
+                    template_object_command(frame.world, template)
+                }
+            });
         }
         ui.add_space(4.0);
 
@@ -394,7 +408,10 @@ fn measurement_section(
     frame: &FrameContext<'_>,
     output: &mut UiFrameOutput,
 ) {
-    let instruments = frame.world.probes().len() + frame.world.planes().len();
+    let instruments = frame.world.probes().len()
+        + frame.world.planes().len()
+        + frame.world.boxes().len()
+        + frame.world.spheres().len();
     let title = format!("Measurement ({instruments})");
     super::section(ui, "scene_measurement_section", title, true, |ui| {
         ui.weak("Not simulated").on_hover_text(
@@ -420,20 +437,18 @@ fn measurement_section(
                     channels,
                 ))]);
             }
-            if ui
-                .button("+ Plane")
-                .on_hover_text("Draw the field across a slice")
-                .clicked()
-            {
-                output.edit(vec![WorldCommand::CreatePlane(
-                    SlicePlaneSpec::new(
-                        format!("XY plane {}", frame.world.planes().len() + 1),
-                        DVec3::ZERO,
-                        DVec3::Z,
-                    )
-                    .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
-                    .expect("static plane parameters are valid"),
-                )]);
+            if let Some(preset) = super::split_add_button(
+                ui,
+                "Plane",
+                "Draw the field across a slice",
+                MeasurementPreset::Plane,
+                &[
+                    ("Plane", MeasurementPreset::Plane),
+                    ("Box", MeasurementPreset::Box),
+                    ("Sphere", MeasurementPreset::Sphere),
+                ],
+            ) {
+                output.edit(vec![measurement_command(frame.world, preset)]);
             }
         });
 
@@ -492,6 +507,66 @@ fn measurement_section(
                 });
             }
         }
+
+        if !frame.world.boxes().is_empty() {
+            ui.add_space(8.0);
+            ui.label("Field boxes");
+            for field_box in frame.world.boxes().values() {
+                ui.horizontal(|ui| {
+                    if visibility_button(ui, field_box.visible).clicked() {
+                        output.edit(vec![WorldCommand::SetBoxVisible {
+                            region: field_box.id,
+                            visible: !field_box.visible,
+                        }]);
+                    }
+                    if ui
+                        .selectable_label(
+                            model.box_selection == Some(field_box.id),
+                            format!("▧  {}", field_box.name),
+                        )
+                        .on_hover_text(&field_box.name)
+                        .clicked()
+                    {
+                        model.set_scene_selection(Some(SceneSelection::Box(field_box.id)));
+                    }
+                    if ui.small_button("×").on_hover_text("Delete box").clicked() {
+                        output.edit(vec![WorldCommand::RemoveBox(field_box.id)]);
+                    }
+                });
+            }
+        }
+
+        if !frame.world.spheres().is_empty() {
+            ui.add_space(8.0);
+            ui.label("Field spheres");
+            for sphere in frame.world.spheres().values() {
+                ui.horizontal(|ui| {
+                    if visibility_button(ui, sphere.visible).clicked() {
+                        output.edit(vec![WorldCommand::SetSphereVisible {
+                            sphere: sphere.id,
+                            visible: !sphere.visible,
+                        }]);
+                    }
+                    if ui
+                        .selectable_label(
+                            model.sphere_selection == Some(sphere.id),
+                            format!("◯  {}", sphere.name),
+                        )
+                        .on_hover_text(&sphere.name)
+                        .clicked()
+                    {
+                        model.set_scene_selection(Some(SceneSelection::Sphere(sphere.id)));
+                    }
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Delete sphere")
+                        .clicked()
+                    {
+                        output.edit(vec![WorldCommand::RemoveSphere(sphere.id)]);
+                    }
+                });
+            }
+        }
     });
 }
 
@@ -539,7 +614,7 @@ pub(super) fn inspector(
                     {
                         ui.heading("Object");
                         ui.separator();
-                        object_properties(ui, frame.world, object, output);
+                        object_properties(ui, frame.world, frame.compute, object, output);
                     } else if let Some(plane) = model
                         .plane_selection
                         .and_then(|id| frame.world.planes().get(&id))
@@ -547,6 +622,19 @@ pub(super) fn inspector(
                         ui.heading("Slice plane");
                         ui.separator();
                         plane_properties(ui, plane, &mut model.field_layers, frame.compute, output);
+                    } else if let Some(field_box) =
+                        model.box_selection.and_then(|id| frame.world.boxes().get(&id))
+                    {
+                        ui.heading("Field box");
+                        ui.separator();
+                        box_properties(ui, field_box, &mut model.field_layers, frame.compute, output);
+                    } else if let Some(sphere) = model
+                        .sphere_selection
+                        .and_then(|id| frame.world.spheres().get(&id))
+                    {
+                        ui.heading("Field sphere");
+                        ui.separator();
+                        sphere_properties(ui, sphere, &mut model.field_layers, frame.compute, output);
                     } else if let Some(probe) =
                         model.probe_selection.and_then(|id| frame.world.probe(id))
                     {
@@ -914,6 +1002,7 @@ fn format_configuration_number(value: f64) -> String {
 fn object_properties(
     ui: &mut egui::Ui,
     world: &WorldSnapshot,
+    compute: &ComputeView,
     object: &WorldObject,
     output: &mut UiFrameOutput,
 ) {
@@ -924,6 +1013,11 @@ fn object_properties(
     super::section(ui, "inspector_components", "Components", true, |ui| {
         object_components(ui, world, object, output);
     });
+    if let Some(mass_kg) = inertial_mass_kg(object) {
+        super::section(ui, "inspector_derived", "Derived values", true, |ui| {
+            derived_values(ui, compute, object, mass_kg);
+        });
+    }
 
     // Outside the sections: these are things to do to the subject rather than a
     // group of its properties, and folding them away would hide the only way to
@@ -1144,6 +1238,72 @@ fn motion_summary(object: &WorldObject) -> &'static str {
     } else {
         "no inertia — add Inertial mass to make it movable"
     }
+}
+
+/// The object's inertial mass, if it has a valid one attached. Reading
+/// straight off the component rather than through
+/// `fieldcad_mass_sources::collect_mass_sources` because the inspector wants
+/// this one object's value, not every massive body in the scene.
+fn inertial_mass_kg(object: &WorldObject) -> Option<f64> {
+    object
+        .components
+        .get(&inertial_mass_component_id())
+        .and_then(|properties| properties.scalar(&mass_property_id()))
+        .filter(|mass| mass.is_finite() && *mass > 0.0)
+}
+
+/// Kinetic energy, momentum, and the force this body feels right now —
+/// read-only context for watching a simulation, not something anything
+/// downstream reads back. Shown only once the object has mass, since none of
+/// the three means anything without it.
+fn derived_values(ui: &mut egui::Ui, compute: &ComputeView, object: &WorldObject, mass_kg: f64) {
+    let velocity = object.velocity.linear;
+    let kinetic_energy = relativistic_kinetic_energy(velocity, mass_kg);
+    let momentum = relativistic_momentum(velocity, mass_kg);
+    let force = compute.body_forces.get(&object.id).copied();
+
+    egui::Grid::new("object_derived_values")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Kinetic energy").on_hover_text(
+                "(γ−1)mc², the relativistic kinetic energy. Reduces to ½mv² well below \
+                 light speed; excludes rest energy, which would otherwise swamp this number \
+                 for anything not moving relativistically.",
+            );
+            ui.label(format!("{} J", format_engineering(kinetic_energy)));
+            ui.end_row();
+
+            ui.label("Momentum")
+                .on_hover_text("p = γmv, the relativistic momentum.");
+            ui.label(format_vector(momentum, "kg·m/s"));
+            ui.end_row();
+
+            ui.label("Force").on_hover_text(
+                "What every active field system's coupling summed onto this body at the most \
+                 recent simulation tick. Only meaningful while the body is one the dynamics \
+                 system advances — pinned, and a solver's own pusher (rather than a summed \
+                 force) both leave this unavailable.",
+            );
+            match force {
+                Some(force) => ui.label(format_vector(force, "N")),
+                None => ui.weak("not available"),
+            };
+            ui.end_row();
+        });
+}
+
+/// The same parenthesized `(x, y, z) unit` shape [`ComputeView`]'s
+/// `format_value` uses for a published field sample, with engineering
+/// notation per component instead of a fixed four decimals — these values can
+/// span far more orders of magnitude than a normalized field reading.
+fn format_vector(vector: DVec3, unit: &str) -> String {
+    format!(
+        "({}, {}, {}) {unit}",
+        format_engineering(vector.x),
+        format_engineering(vector.y),
+        format_engineering(vector.z),
+    )
 }
 
 /// Every component attached to this object, plus the ones it could still gain.
@@ -1578,6 +1738,248 @@ fn plane_field_layers(
     }
 }
 
+fn box_properties(
+    ui: &mut egui::Ui,
+    field_box: &FieldBox,
+    field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
+    compute: &ComputeView,
+    output: &mut UiFrameOutput,
+) {
+    ui.label(&field_box.name);
+    ui.small("Drag the RGB rings to reorient the box; RGB arrows and squares move its origin.");
+    super::section(ui, "inspector_box_geometry", "Geometry", true, |ui| {
+        box_geometry_editors(ui, field_box, output);
+    });
+    super::section(ui, "inspector_box_display", "Field display", true, |ui| {
+        box_field_layers(ui, field_box, field_layers, compute);
+    });
+
+    ui.add_space(10.0);
+    if ui.button("Duplicate box").clicked() {
+        output.edit(vec![WorldCommand::CreateBox(
+            FieldBoxSpec::from_box(field_box).with_name(format!("{} copy", field_box.name)),
+        )]);
+    }
+    if ui.button("Focus selection  [F]").clicked() {
+        output.camera_action = Some(CameraAction::FocusSelection);
+    }
+    if ui.button("Remove box").clicked() {
+        output.edit(vec![WorldCommand::RemoveBox(field_box.id)]);
+    }
+}
+
+/// Where the box sits and how big it is. Orientation is primarily set by
+/// dragging the rotation rings in the viewport; this offers only a reset,
+/// the way the plane's geometry section offers axis-snap buttons alongside
+/// its draggable normal.
+fn box_geometry_editors(ui: &mut egui::Ui, field_box: &FieldBox, output: &mut UiFrameOutput) {
+    let mut origin = field_box.origin;
+    let mut half_extent = field_box.half_extent;
+    let mut changed = false;
+
+    egui::Grid::new("box_properties")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Origin");
+            ui.horizontal(|ui| {
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "x", &mut origin.x, " m", editing);
+                changed |= coordinate_editor(ui, "y", &mut origin.y, " m", editing);
+                changed |= coordinate_editor(ui, "z", &mut origin.z, " m", editing);
+            });
+            ui.end_row();
+
+            ui.label("Half extent");
+            ui.horizontal(|ui| {
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "w", &mut half_extent.x, " m", editing);
+                changed |= coordinate_editor(ui, "h", &mut half_extent.y, " m", editing);
+                changed |= coordinate_editor(ui, "d", &mut half_extent.z, " m", editing);
+            });
+            ui.end_row();
+        });
+
+    if changed
+        && let Ok(spec) = FieldBoxSpec::from_box(field_box)
+            .with_origin(origin)
+            .and_then(|spec| spec.with_half_extent(half_extent))
+    {
+        output.edit(vec![WorldCommand::SetBox {
+            region: field_box.id,
+            spec,
+        }]);
+    }
+
+    if ui
+        .button("Reset orientation")
+        .on_hover_text("Return this box to the world axes")
+        .clicked()
+        && let Ok(spec) = FieldBoxSpec::from_box(field_box).with_rotation(DQuat::IDENTITY)
+    {
+        output.edit(vec![WorldCommand::SetBox {
+            region: field_box.id,
+            spec,
+        }]);
+    }
+}
+
+/// How each published vector channel is drawn inside this box. Arrows only:
+/// a volume's interior has no natural surface for a magnitude map, unlike a
+/// plane. Presentation only: nothing here changes a computed value.
+fn box_field_layers(
+    ui: &mut egui::Ui,
+    field_box: &FieldBox,
+    field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
+    compute: &ComputeView,
+) {
+    for channel in &compute.vector_channels {
+        let name = channel_label(channel, &compute.channel_names);
+        let layer = field_layers.entry(channel.clone()).or_default();
+        let layer_visible = layer.visible;
+        let settings = layer.boxes.entry(field_box.id).or_default();
+        ui.collapsing(name, |ui| {
+            ui.checkbox(&mut settings.visible, "Show in this box").on_hover_text(
+                "Whether this box draws this field. Other boxes, spheres, and planes are \
+                 unaffected.",
+            );
+            if !layer_visible {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "This field is hidden everywhere. Turn its layer on under Fields \
+                             in the View window.",
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 180, 80)),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add_enabled_ui(settings.visible, |ui| {
+                super::vector_display_controls(
+                    ui,
+                    &mut settings.vectors,
+                    "Vector arrows",
+                    "Draw the field as arrows inside this box",
+                );
+            });
+        });
+    }
+}
+
+fn sphere_properties(
+    ui: &mut egui::Ui,
+    sphere: &FieldSphere,
+    field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
+    compute: &ComputeView,
+    output: &mut UiFrameOutput,
+) {
+    ui.label(&sphere.name);
+    ui.small("RGB arrows and squares move its centre; drag the radius below to resize it.");
+    super::section(ui, "inspector_sphere_geometry", "Geometry", true, |ui| {
+        sphere_geometry_editors(ui, sphere, output);
+    });
+    super::section(ui, "inspector_sphere_display", "Field display", true, |ui| {
+        sphere_field_layers(ui, sphere, field_layers, compute);
+    });
+
+    ui.add_space(10.0);
+    if ui.button("Duplicate sphere").clicked() {
+        output.edit(vec![WorldCommand::CreateSphere(
+            FieldSphereSpec::from_sphere(sphere).with_name(format!("{} copy", sphere.name)),
+        )]);
+    }
+    if ui.button("Focus selection  [F]").clicked() {
+        output.camera_action = Some(CameraAction::FocusSelection);
+    }
+    if ui.button("Remove sphere").clicked() {
+        output.edit(vec![WorldCommand::RemoveSphere(sphere.id)]);
+    }
+}
+
+fn sphere_geometry_editors(ui: &mut egui::Ui, sphere: &FieldSphere, output: &mut UiFrameOutput) {
+    let mut origin = sphere.origin;
+    let mut radius = sphere.radius;
+    let mut changed = false;
+
+    egui::Grid::new("sphere_properties")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Origin");
+            ui.horizontal(|ui| {
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "x", &mut origin.x, " m", editing);
+                changed |= coordinate_editor(ui, "y", &mut origin.y, " m", editing);
+                changed |= coordinate_editor(ui, "z", &mut origin.z, " m", editing);
+            });
+            ui.end_row();
+
+            ui.label("Radius");
+            ui.horizontal(|ui| {
+                let editing = &mut output.scene_edit_in_progress;
+                changed |= coordinate_editor(ui, "r", &mut radius, " m", editing);
+            });
+            ui.end_row();
+        });
+
+    if changed
+        && let Ok(spec) = FieldSphereSpec::from_sphere(sphere)
+            .with_origin(origin)
+            .and_then(|spec| spec.with_radius(radius))
+    {
+        output.edit(vec![WorldCommand::SetSphere {
+            sphere: sphere.id,
+            spec,
+        }]);
+    }
+}
+
+/// How each published vector channel is drawn inside this sphere. See
+/// [`box_field_layers`].
+fn sphere_field_layers(
+    ui: &mut egui::Ui,
+    sphere: &FieldSphere,
+    field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
+    compute: &ComputeView,
+) {
+    for channel in &compute.vector_channels {
+        let name = channel_label(channel, &compute.channel_names);
+        let layer = field_layers.entry(channel.clone()).or_default();
+        let layer_visible = layer.visible;
+        let settings = layer.spheres.entry(sphere.id).or_default();
+        ui.collapsing(name, |ui| {
+            ui.checkbox(&mut settings.visible, "Show in this sphere")
+                .on_hover_text(
+                    "Whether this sphere draws this field. Other spheres, boxes, and planes \
+                     are unaffected.",
+                );
+            if !layer_visible {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "This field is hidden everywhere. Turn its layer on under Fields \
+                             in the View window.",
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 180, 80)),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add_enabled_ui(settings.visible, |ui| {
+                super::vector_display_controls(
+                    ui,
+                    &mut settings.vectors,
+                    "Vector arrows",
+                    "Draw the field as arrows inside this sphere",
+                );
+            });
+        });
+    }
+}
+
 fn probe_properties(
     ui: &mut egui::Ui,
     model: &mut UiModel,
@@ -1814,25 +2216,90 @@ fn plane_spec(
     spec.with_half_extent(half_extent)
 }
 
+/// What the "+ Add object" split button offers: a bare object, the default,
+/// or a named particle-catalog preset from the dropdown.
+#[derive(Clone, Copy, PartialEq)]
+enum ObjectPreset {
+    Empty,
+    Particle(ParticleTemplate),
+}
+
+/// Fan successive objects out along x, so a second one is not created hidden
+/// inside the first.
+fn next_object_position(world: &WorldSnapshot) -> DVec3 {
+    let index = world.objects().len();
+    DVec3::new(index as f64 * 0.6, 0.0, 0.6)
+}
+
 /// Add a bare object: a named position in space and nothing else.
 ///
-/// This is the only way the scene panel creates a modelled object. It couples to
-/// no field until a component is attached, which is what makes the inspector's
-/// component list the single place physics enters a scene.
+/// This is the default way the scene panel creates a modelled object. It
+/// couples to no field until a component is attached, which is what makes the
+/// inspector's component list the single place physics enters a scene.
 fn new_object_command(world: &WorldSnapshot) -> CommandPayload {
     let index = world.objects().len() + 1;
-    // Fan successive objects out along x so a second one is not created hidden
-    // inside the first.
-    let x = (index.saturating_sub(1) as f64) * 0.6;
     CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(
         ObjectSpec::new(format!("Object {index}"))
             .with_transform(
-                Transform::at(DVec3::new(x, 0.0, 0.6)).expect("static position is finite"),
+                Transform::at(next_object_position(world)).expect("static position is finite"),
             )
             .with_shape(
                 ObjectShape::point(DEFAULT_AUTHORING_RADIUS).expect("static radius is valid"),
             ),
     )])
+}
+
+/// Add a named particle-catalog preset: mass, charge, and provenance composed
+/// the same way [`fieldcad_particles::template_particle_spec`] does anywhere
+/// else in this application. Dynamic and unpinned by default, so it responds
+/// to whatever field is active rather than sitting still until the user opts
+/// it in.
+fn template_object_command(world: &WorldSnapshot, template: ParticleTemplate) -> CommandPayload {
+    CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(
+        template_particle_spec(
+            template,
+            false,
+            next_object_position(world),
+            DVec3::ZERO,
+            DEFAULT_AUTHORING_RADIUS,
+        )
+        .expect("catalog template parameters are valid"),
+    )])
+}
+
+/// What the "+ Plane" split button offers: a slice plane, the default, or a
+/// field box/sphere from the dropdown.
+#[derive(Clone, Copy, PartialEq)]
+enum MeasurementPreset {
+    Plane,
+    Box,
+    Sphere,
+}
+
+fn measurement_command(world: &WorldSnapshot, preset: MeasurementPreset) -> WorldCommand {
+    match preset {
+        MeasurementPreset::Plane => WorldCommand::CreatePlane(
+            SlicePlaneSpec::new(
+                format!("XY plane {}", world.planes().len() + 1),
+                DVec3::ZERO,
+                DVec3::Z,
+            )
+            .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
+            .expect("static plane parameters are valid"),
+        ),
+        MeasurementPreset::Box => WorldCommand::CreateBox(
+            FieldBoxSpec::new(
+                format!("Box {}", world.boxes().len() + 1),
+                DVec3::ZERO,
+                DVec3::splat(1.0),
+            )
+            .expect("static box parameters are valid"),
+        ),
+        MeasurementPreset::Sphere => WorldCommand::CreateSphere(
+            FieldSphereSpec::new(format!("Sphere {}", world.spheres().len() + 1), DVec3::ZERO, 0.75)
+                .expect("static sphere parameters are valid"),
+        ),
+    }
 }
 
 fn channel_label(id: &ChannelId, names: &BTreeMap<ChannelId, String>) -> String {
@@ -1878,6 +2345,40 @@ fn transport_sampling(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiF
             .on_hover_text("Whole-domain lattice decimation; 0 publishes no 3D grid");
         if response.changed() {
             subscription.domain_stride = (stride > 0).then_some(stride);
+            changed = true;
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let mut boxes = subscription.boxes.map_or(0, |counts| counts.x);
+        ui.label("Box samples");
+        let response = ui
+            .add_enabled(
+                compute.accepts_commands(),
+                egui::DragValue::new(&mut boxes).speed(1.0).range(0..=1_024),
+            )
+            .on_hover_text("Samples per axis the source evaluates in each visible field box");
+        if response.changed() {
+            subscription.boxes = (boxes > 0).then(|| glam::UVec3::splat(boxes));
+            changed = true;
+        }
+    });
+
+    ui.horizontal(|ui| {
+        let mut spheres = subscription.spheres.unwrap_or(0);
+        ui.label("Sphere samples");
+        let response = ui
+            .add_enabled(
+                compute.accepts_commands(),
+                egui::DragValue::new(&mut spheres)
+                    .speed(1.0)
+                    .range(0..=1_024),
+            )
+            .on_hover_text(
+                "Samples per axis the source evaluates over each visible sphere's bounding cube",
+            );
+        if response.changed() {
+            subscription.spheres = (spheres > 0).then_some(spheres);
             changed = true;
         }
     });
@@ -2660,4 +3161,44 @@ mod tests {
         assert!(format_engineering(9.109e-31).contains("e-31"));
         assert!(format_engineering(6.02e23).contains("e23"));
     }
+
+    #[test]
+    fn inertial_mass_kg_reads_a_valid_attached_component_and_nothing_else() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::RegisterComponentSchema(
+                    fieldcad_mass_sources::inertial_mass_component_schema(),
+                ),
+                WorldCommand::CreateObject(ObjectSpec::new("gizmo")),
+            ])
+            .unwrap();
+        let object = ObjectId::new(0);
+
+        let bare = world.snapshot();
+        assert_eq!(inertial_mass_kg(bare.object(object).unwrap()), None);
+
+        world
+            .commit([WorldCommand::AttachComponent {
+                object,
+                component: fieldcad_mass_sources::inertial_mass_component_id(),
+                properties: fieldcad_mass_sources::inertial_mass_properties(3.5).unwrap(),
+            }])
+            .unwrap();
+
+        let massive = world.snapshot();
+        assert_eq!(
+            inertial_mass_kg(massive.object(object).unwrap()),
+            Some(3.5)
+        );
+    }
+
+    #[test]
+    fn format_vector_uses_engineering_notation_per_component() {
+        let formatted = format_vector(DVec3::new(1.5, -2.0e8, 0.0), "N");
+        assert!(formatted.starts_with("(1.5000, "));
+        assert!(formatted.contains("e8"));
+        assert!(formatted.ends_with(") N"));
+    }
+
 }

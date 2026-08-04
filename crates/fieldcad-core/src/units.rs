@@ -11,6 +11,37 @@ use serde::{Deserialize, Serialize};
 /// drifted would put the pusher and the field on different physics.
 pub const SPEED_OF_LIGHT: f64 = 299_792_458.0;
 
+/// The Lorentz factor, `γ = 1 / sqrt(1 − v²/c²)`.
+///
+/// Shared for the same reason [`SPEED_OF_LIGHT`] is: the dynamics integrator's
+/// momentum-form leapfrog, the electromagnetic coupling's energy diagnostic,
+/// and an inspector displaying a body's derived motion all need this to agree,
+/// or "how fast is enough to matter relativistically" would be answered
+/// differently by two consumers reading the same body.
+///
+/// Clamped rather than allowed to divide by zero or go complex: a caller
+/// computing this from a value it does not otherwise control (a UI reading a
+/// possibly-stale snapshot) should get a large finite number rather than
+/// `NaN`.
+pub fn lorentz_factor(velocity: DVec3) -> f64 {
+    let beta_squared = velocity.length_squared() / (SPEED_OF_LIGHT * SPEED_OF_LIGHT);
+    (1.0 - beta_squared).max(f64::MIN_POSITIVE).sqrt().recip()
+}
+
+/// Relativistic momentum, `p = γmv`.
+pub fn relativistic_momentum(velocity: DVec3, mass_kg: f64) -> DVec3 {
+    velocity * (mass_kg * lorentz_factor(velocity))
+}
+
+/// Relativistic kinetic energy, `K = (γ−1)mc²`. Reduces to `½mv²` at low speed,
+/// and excludes rest energy (`mc²`) deliberately: for a body far from
+/// relativistic speeds, rest energy is many orders of magnitude larger than
+/// the kinetic energy actually changing as it moves, and would swamp the one
+/// number a display of "how much energy does this motion have" is for.
+pub fn relativistic_kinetic_energy(velocity: DVec3, mass_kg: f64) -> f64 {
+    (lorentz_factor(velocity) - 1.0) * mass_kg * SPEED_OF_LIGHT * SPEED_OF_LIGHT
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Dimension {
     pub mass: i8,
@@ -207,6 +238,38 @@ mod tests {
         assert_eq!(Dimension::VELOCITY.to_string(), "m s^-1");
         assert_eq!(Dimension::DIMENSIONLESS.to_string(), "1");
         assert_eq!(Dimension::ELECTRIC_FIELD.to_string(), "kg m s^-3 A^-1");
+    }
+
+    #[test]
+    fn lorentz_factor_is_one_at_rest_and_grows_toward_light_speed() {
+        assert_eq!(lorentz_factor(DVec3::ZERO), 1.0);
+        assert!(lorentz_factor(DVec3::X * SPEED_OF_LIGHT * 0.99) > 7.0);
+    }
+
+    #[test]
+    fn relativistic_kinetic_energy_matches_the_classical_limit_at_low_speed() {
+        // A speed low enough for `K ≈ ½mv²` to hold, but not so low that
+        // `(γ−1)` loses all its significant digits to floating-point
+        // cancellation (γ itself rounds to exactly 1.0 well before that).
+        let velocity = DVec3::X * 1.0e6;
+        let mass_kg = 2.0;
+        let classical = 0.5 * mass_kg * velocity.length_squared();
+
+        let relativistic = relativistic_kinetic_energy(velocity, mass_kg);
+        assert!(
+            ((relativistic - classical) / classical).abs() < 1.0e-3,
+            "relativistic {relativistic} vs classical {classical}"
+        );
+    }
+
+    #[test]
+    fn relativistic_momentum_reduces_to_mv_at_low_speed() {
+        let velocity = DVec3::new(3.0, 0.0, 0.0);
+        let mass_kg = 5.0;
+
+        let momentum = relativistic_momentum(velocity, mass_kg);
+
+        assert!((momentum - velocity * mass_kg).length() < 1.0e-9);
     }
 
     #[test]

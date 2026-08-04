@@ -51,56 +51,94 @@ pub fn template_property_id() -> PropertyId {
     PropertyId::new(TEMPLATE_PROPERTY).expect("static property ID is valid")
 }
 
+/// One entry in the particle preset catalog.
+///
+/// This is the single place a new preset is added: a name and its published
+/// mass and charge. Nothing else in this crate, or in a consumer, names a
+/// preset directly — [`ParticleTemplate::Catalog`] carries the name, and every
+/// other question (mass, charge, whether an edit dropped the claim) is
+/// answered by looking the name up here.
+pub struct ParticleTemplateData {
+    pub name: &'static str,
+    pub mass_kg: f64,
+    pub charge_coulombs: f64,
+}
+
+/// The particle preset catalog. Add a preset by adding a line.
+pub const CATALOG: &[ParticleTemplateData] = &[
+    ParticleTemplateData {
+        name: "Electron",
+        mass_kg: ELECTRON_MASS_KG,
+        charge_coulombs: -ELEMENTARY_CHARGE_COULOMBS,
+    },
+    ParticleTemplateData {
+        name: "Positron",
+        mass_kg: ELECTRON_MASS_KG,
+        charge_coulombs: ELEMENTARY_CHARGE_COULOMBS,
+    },
+    ParticleTemplateData {
+        name: "Proton",
+        mass_kg: PROTON_MASS_KG,
+        charge_coulombs: ELEMENTARY_CHARGE_COULOMBS,
+    },
+    ParticleTemplateData {
+        name: "Anti-proton",
+        mass_kg: PROTON_MASS_KG,
+        charge_coulombs: -ELEMENTARY_CHARGE_COULOMBS,
+    },
+    ParticleTemplateData {
+        name: "Neutron",
+        mass_kg: NEUTRON_MASS_KG,
+        charge_coulombs: 0.0,
+    },
+];
+
+fn catalog_entry(name: &str) -> Option<&'static ParticleTemplateData> {
+    CATALOG.iter().find(|entry| entry.name == name)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ParticleTemplate {
     #[default]
     Custom,
-    Electron,
-    Proton,
-    Positron,
-    Neutron,
+    /// A named entry in [`CATALOG`]. Not guaranteed to resolve — a name that
+    /// no longer has a catalog entry behaves like [`Self::Custom`], the same
+    /// way an edited value drops the claim in [`Self::matches`].
+    Catalog(&'static str),
 }
 
 impl ParticleTemplate {
-    pub const ALL: [Self; 5] = [
-        Self::Custom,
-        Self::Electron,
-        Self::Proton,
-        Self::Positron,
-        Self::Neutron,
-    ];
+    /// Every offerable choice, `Custom` first: what a picker (a dropdown, a
+    /// schema's list of choices) should show.
+    pub fn all() -> impl Iterator<Item = Self> {
+        std::iter::once(Self::Custom).chain(CATALOG.iter().map(|entry| Self::Catalog(entry.name)))
+    }
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Custom => "Custom",
-            Self::Electron => "Electron",
-            Self::Proton => "Proton",
-            Self::Positron => "Positron",
-            Self::Neutron => "Neutron",
+            Self::Catalog(name) => name,
         }
     }
 
     pub fn parse(label: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|template| template.label() == label)
+        if label == "Custom" {
+            return Some(Self::Custom);
+        }
+        catalog_entry(label).map(|entry| Self::Catalog(entry.name))
     }
 
-    pub const fn mass_kg(self) -> Option<f64> {
+    pub fn mass_kg(self) -> Option<f64> {
         match self {
             Self::Custom => None,
-            Self::Electron | Self::Positron => Some(ELECTRON_MASS_KG),
-            Self::Proton => Some(PROTON_MASS_KG),
-            Self::Neutron => Some(NEUTRON_MASS_KG),
+            Self::Catalog(name) => catalog_entry(name).map(|entry| entry.mass_kg),
         }
     }
 
-    pub const fn charge_coulombs(self) -> Option<f64> {
+    pub fn charge_coulombs(self) -> Option<f64> {
         match self {
             Self::Custom => None,
-            Self::Electron => Some(-ELEMENTARY_CHARGE_COULOMBS),
-            Self::Proton | Self::Positron => Some(ELEMENTARY_CHARGE_COULOMBS),
-            Self::Neutron => Some(0.0),
+            Self::Catalog(name) => catalog_entry(name).map(|entry| entry.charge_coulombs),
         }
     }
 
@@ -129,8 +167,7 @@ pub fn particle_component_schema() -> ComponentSchema {
             id: template_property_id(),
             display_name: "Catalog template".to_owned(),
             kind: PropertyKind::Choice(
-                ParticleTemplate::ALL
-                    .into_iter()
+                ParticleTemplate::all()
                     .map(|template| template.label().to_owned())
                     .collect(),
             ),
@@ -316,14 +353,11 @@ mod tests {
         world
     }
 
+    /// Every catalog entry, not a hand-picked few: adding a preset to
+    /// `CATALOG` must not require also remembering to list it in a test.
     #[test]
     fn catalog_entries_compose_from_independently_attachable_components() {
-        for template in [
-            ParticleTemplate::Electron,
-            ParticleTemplate::Proton,
-            ParticleTemplate::Positron,
-            ParticleTemplate::Neutron,
-        ] {
+        for template in ParticleTemplate::all().filter(|template| *template != ParticleTemplate::Custom) {
             let spec = template_particle_spec(template, false, DVec3::ZERO, DVec3::X, 0.1).unwrap();
             assert!(spec.components.contains_key(&inertial_mass_component_id()));
             assert!(spec.components.contains_key(&charge_component_id()));
@@ -332,9 +366,24 @@ mod tests {
     }
 
     #[test]
+    fn anti_proton_has_proton_mass_and_opposite_charge() {
+        let anti_proton = ParticleTemplate::Catalog("Anti-proton");
+        assert_eq!(anti_proton.mass_kg(), Some(PROTON_MASS_KG));
+        assert_eq!(anti_proton.charge_coulombs(), Some(-ELEMENTARY_CHARGE_COULOMBS));
+    }
+
+    #[test]
+    fn a_catalog_name_with_no_entry_behaves_like_custom() {
+        let unknown = ParticleTemplate::Catalog("Muon");
+        assert_eq!(unknown.mass_kg(), None);
+        assert_eq!(unknown.charge_coulombs(), None);
+        assert!(!unknown.matches(0.0, 0.0));
+    }
+
+    #[test]
     fn catalog_values_and_provenance_survive_world_authoring() {
         let world = world_with([template_particle_spec(
-            ParticleTemplate::Electron,
+            ParticleTemplate::Catalog("Electron"),
             false,
             DVec3::X,
             DVec3::Y,
@@ -343,7 +392,7 @@ mod tests {
         .unwrap()]);
 
         let particle = collect_particles(&world.snapshot()).unwrap()[0];
-        assert_eq!(particle.template, ParticleTemplate::Electron);
+        assert_eq!(particle.template, ParticleTemplate::Catalog("Electron"));
         assert_eq!(particle.mass_kg, ELECTRON_MASS_KG);
         assert_eq!(particle.charge_coulombs, -ELEMENTARY_CHARGE_COULOMBS);
         assert_eq!(particle.position, DVec3::X);
@@ -357,7 +406,7 @@ mod tests {
         // holds. The generic property editor cannot know to reset the label, so
         // the claim has to fail its own check.
         let mut world = world_with([template_particle_spec(
-            ParticleTemplate::Electron,
+            ParticleTemplate::Catalog("Electron"),
             false,
             DVec3::ZERO,
             DVec3::ZERO,
@@ -367,7 +416,7 @@ mod tests {
         let object = fieldcad_core::ObjectId::new(0);
         assert_eq!(
             collect_particles(&world.snapshot()).unwrap()[0].template,
-            ParticleTemplate::Electron
+            ParticleTemplate::Catalog("Electron")
         );
 
         world

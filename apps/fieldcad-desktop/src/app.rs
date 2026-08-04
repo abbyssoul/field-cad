@@ -4,9 +4,9 @@ use std::{
 };
 
 use fieldcad_core::{
-    BoundaryCondition, BoundaryConditions, Domain, DomainBounds, ObjectShape, ObjectSpec,
-    Precision, ProbePosition, ProbeSpec, Resolution, SessionId, SimulationMode, SlicePlaneSpec,
-    TimeStep, Transform, WorldCommand, WorldSnapshot,
+    BoundaryCondition, BoundaryConditions, Domain, DomainBounds, FieldBoxSpec, FieldSphereSpec,
+    ObjectShape, ObjectSpec, Precision, ProbePosition, ProbeSpec, Resolution, SessionId,
+    SimulationMode, SlicePlaneSpec, TimeStep, Transform, WorldCommand, WorldSnapshot,
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electromagnetism::{
@@ -25,7 +25,7 @@ use fieldcad_simulation::{
     LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig, SimulationRuntime,
     Subscription,
 };
-use glam::{DQuat, DVec2, DVec3, UVec2, Vec2};
+use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -383,9 +383,9 @@ impl WindowState {
             .and_then(|selection| {
                 scene::plane_normal_label_position(
                     &self.world,
-                    selection,
                     &self.camera,
                     self.viewport,
+                    selection,
                     transform_preview,
                 )
             })
@@ -491,8 +491,14 @@ impl WindowState {
                 if !layer.visible || !compute.vector_channels.contains(channel) {
                     continue;
                 }
-                let layer_geometry =
-                    scene::field_geometry(&snapshot, channel, layer.whole_domain, &layer.planes);
+                let layer_geometry = scene::field_geometry(
+                    &snapshot,
+                    channel,
+                    layer.whole_domain,
+                    &layer.planes,
+                    &layer.boxes,
+                    &layer.spheres,
+                );
                 field
                     .surface_triangles
                     .extend(layer_geometry.surface_triangles);
@@ -511,6 +517,8 @@ impl WindowState {
         scene::append_transform_gizmo(
             &mut field,
             &self.world,
+            &self.camera,
+            self.viewport,
             self.visible_selection(),
             self.active_transform
                 .and_then(|drag| drag.constraint.handle()),
@@ -578,6 +586,20 @@ impl WindowState {
         }
         if self
             .ui_model
+            .box_selection
+            .is_some_and(|id| !self.world.boxes().contains_key(&id))
+        {
+            self.ui_model.box_selection = None;
+        }
+        if self
+            .ui_model
+            .sphere_selection
+            .is_some_and(|id| !self.world.spheres().contains_key(&id))
+        {
+            self.ui_model.sphere_selection = None;
+        }
+        if self
+            .ui_model
             .probe_selection
             .is_some_and(|id| self.world.probe(id).is_none())
         {
@@ -587,6 +609,12 @@ impl WindowState {
             layer
                 .planes
                 .retain(|id, _| self.world.planes().contains_key(id));
+            layer
+                .boxes
+                .retain(|id, _| self.world.boxes().contains_key(id));
+            layer
+                .spheres
+                .retain(|id, _| self.world.spheres().contains_key(id));
         }
         // Each series is bounded, but the set of them is not: probe IDs are
         // never reused, so deleted probes would accumulate for the session.
@@ -650,6 +678,13 @@ impl WindowState {
             );
             let constraint = match picked_handle {
                 Some(TransformHandle::PlaneNormal) => Some(ManipulationConstraint::PlaneNormal),
+                Some(
+                    handle @ (TransformHandle::RotateX
+                    | TransformHandle::RotateY
+                    | TransformHandle::RotateZ
+                    | TransformHandle::RotateView
+                    | TransformHandle::RotateFree),
+                ) => Some(ManipulationConstraint::Rotate(handle)),
                 Some(handle) => Some(ManipulationConstraint::Handle(handle)),
                 None if scene::pick_scene(
                     &self.world,
@@ -673,11 +708,20 @@ impl WindowState {
                     }
                     _ => None,
                 };
+                let box_frame = match selection {
+                    scene::SceneSelection::Box(id) => {
+                        self.world.boxes().get(&id).map(|field_box| BoxFrame {
+                            rotation: field_box.rotation,
+                        })
+                    }
+                    _ => None,
+                };
                 self.active_transform = Some(ActiveTransformDrag {
                     target: selection,
                     constraint,
                     origin: origin.as_dvec3(),
                     plane_frame,
+                    box_frame,
                 });
                 // Immediately, not at the end of the frame: the same frame that
                 // starts the drag can already submit its first move.
@@ -692,11 +736,17 @@ impl WindowState {
                 ManipulationConstraint::PlaneNormal => {
                     self.drag_plane_normal(active, pointer)?;
                 }
+                ManipulationConstraint::Rotate(handle) => {
+                    self.drag_box_rotation(active, handle, pointer, pointer_delta)?;
+                }
                 ManipulationConstraint::Handle(handle) => {
-                    let length = scene::selection_gizmo_length(&self.world, active.target)
-                        .ok_or_else(|| {
-                            "selected entity no longer has a transform gizmo".to_owned()
-                        })?;
+                    let length = scene::selection_gizmo_length(
+                        &self.world,
+                        &self.camera,
+                        self.viewport,
+                        active.target,
+                    )
+                    .ok_or_else(|| "selected entity no longer has a transform gizmo".to_owned())?;
                     if let Some(translation) = scene::constrained_translation(
                         handle,
                         &self.camera,
@@ -753,6 +803,8 @@ impl WindowState {
             objects: self.ui_model.view.objects,
             probes: self.ui_model.view.probes,
             planes: self.ui_model.view.planes,
+            boxes: self.ui_model.view.boxes,
+            spheres: self.ui_model.view.spheres,
         }
     }
 
@@ -822,6 +874,32 @@ impl WindowState {
                     position,
                 }
             }
+            scene::SceneSelection::Box(region_id) => {
+                let field_box = self
+                    .world
+                    .boxes()
+                    .get(&region_id)
+                    .ok_or_else(|| format!("field box {region_id} no longer exists"))?;
+                WorldCommand::SetBox {
+                    region: region_id,
+                    spec: FieldBoxSpec::from_box(field_box)
+                        .with_origin(next_origin)
+                        .map_err(|error| error.to_string())?,
+                }
+            }
+            scene::SceneSelection::Sphere(sphere_id) => {
+                let sphere = self
+                    .world
+                    .spheres()
+                    .get(&sphere_id)
+                    .ok_or_else(|| format!("field sphere {sphere_id} no longer exists"))?;
+                WorldCommand::SetSphere {
+                    sphere: sphere_id,
+                    spec: FieldSphereSpec::from_sphere(sphere)
+                        .with_origin(next_origin)
+                        .map_err(|error| error.to_string())?,
+                }
+            }
         };
         if let Some(current) = self.active_transform.as_mut() {
             current.origin = next_origin;
@@ -845,8 +923,14 @@ impl WindowState {
             .planes()
             .get(&plane_id)
             .ok_or_else(|| format!("plane {plane_id} no longer exists"))?;
-        let (_, tip) = scene::plane_normal_tip(&self.world, active.target, Some(active.preview()))
-            .ok_or_else(|| "selected plane no longer has a normal handle".to_owned())?;
+        let (_, tip) = scene::plane_normal_tip(
+            &self.world,
+            &self.camera,
+            self.viewport,
+            active.target,
+            Some(active.preview()),
+        )
+        .ok_or_else(|| "selected plane no longer has a normal handle".to_owned())?;
         let radius = tip.distance(active.origin.as_vec3());
         let Some(normal) = scene::dragged_plane_normal(
             &self.camera,
@@ -878,6 +962,95 @@ impl WindowState {
                 spec,
             },
             "plane rotation",
+        )
+    }
+
+    fn drag_box_rotation(
+        &mut self,
+        active: ActiveTransformDrag,
+        handle: TransformHandle,
+        pointer: Vec2,
+        pointer_delta: Vec2,
+    ) -> Result<(), String> {
+        let scene::SceneSelection::Box(region_id) = active.target else {
+            return Ok(());
+        };
+        let Some(frame) = active.box_frame else {
+            return Ok(());
+        };
+        let field_box = self
+            .world
+            .boxes()
+            .get(&region_id)
+            .ok_or_else(|| format!("field box {region_id} no longer exists"))?;
+        let current_rotation = scene::quat_from_dquat(frame.rotation);
+        let origin = active.origin.as_vec3();
+        let rotated = match handle {
+            TransformHandle::RotateX | TransformHandle::RotateY | TransformHandle::RotateZ => {
+                let Some(local_axis) = handle.rotation_axis() else {
+                    return Ok(());
+                };
+                scene::dragged_box_rotation(
+                    &self.camera,
+                    self.viewport,
+                    pointer,
+                    pointer_delta,
+                    origin,
+                    local_axis,
+                    current_rotation,
+                )
+            }
+            TransformHandle::RotateView => scene::dragged_view_rotation(
+                &self.camera,
+                self.viewport,
+                pointer,
+                pointer_delta,
+                origin,
+                current_rotation,
+            ),
+            TransformHandle::RotateFree => {
+                let Some(radius) = scene::rotation_gizmo_radius(
+                    &self.world,
+                    &self.camera,
+                    self.viewport,
+                    active.target,
+                ) else {
+                    return Ok(());
+                };
+                scene::dragged_trackball_rotation(
+                    &self.camera,
+                    self.viewport,
+                    pointer,
+                    pointer_delta,
+                    origin,
+                    radius,
+                    current_rotation,
+                )
+            }
+            _ => return Ok(()),
+        };
+        let Some(rotation) = rotated else {
+            return Ok(());
+        };
+        let rotation = DQuat::from_xyzw(
+            rotation.x as f64,
+            rotation.y as f64,
+            rotation.z as f64,
+            rotation.w as f64,
+        )
+        .normalize();
+        let spec = FieldBoxSpec::from_box(field_box)
+            .with_rotation(rotation)
+            .map_err(|error| error.to_string())?;
+        if let Some(current) = self.active_transform.as_mut() {
+            current.box_frame = Some(BoxFrame { rotation });
+        }
+        self.submit_world_manipulation(
+            WorldCommand::SetBox {
+                region: region_id,
+                spec,
+            },
+            "box rotation",
         )
     }
 
@@ -957,6 +1130,20 @@ impl WindowState {
                     self.camera.focus(position.as_vec3(), 0.2);
                 }
             }
+            scene::SceneSelection::Box(id) => {
+                let Some(field_box) = self.world.boxes().get(&id) else {
+                    return;
+                };
+                self.camera
+                    .focus(field_box.origin.as_vec3(), field_box.half_extent.length() as f32);
+            }
+            scene::SceneSelection::Sphere(id) => {
+                let Some(sphere) = self.world.spheres().get(&id) else {
+                    return;
+                };
+                self.camera
+                    .focus(sphere.origin.as_vec3(), sphere.radius as f32);
+            }
         };
     }
 }
@@ -1027,6 +1214,7 @@ struct ActiveTransformDrag {
     /// pointer deltas between ticks.
     origin: DVec3,
     plane_frame: Option<PlaneFrame>,
+    box_frame: Option<BoxFrame>,
 }
 
 impl ActiveTransformDrag {
@@ -1034,6 +1222,9 @@ impl ActiveTransformDrag {
         scene::TransformPreview {
             origin: self.origin.as_vec3(),
             plane_normal: self.plane_frame.map(|frame| frame.normal.as_vec3()),
+            rotation: self
+                .box_frame
+                .map(|frame| scene::quat_from_dquat(frame.rotation)),
         }
     }
 }
@@ -1043,12 +1234,16 @@ enum ManipulationConstraint {
     Handle(TransformHandle),
     ViewPlane,
     PlaneNormal,
+    /// Rotates a selected field box about one of its own rings; never
+    /// translates it. Kept apart from `Handle` because `constrained_translation`
+    /// has nothing to do with a rotation handle.
+    Rotate(TransformHandle),
 }
 
 impl ManipulationConstraint {
     const fn handle(self) -> Option<TransformHandle> {
         match self {
-            Self::Handle(handle) => Some(handle),
+            Self::Handle(handle) | Self::Rotate(handle) => Some(handle),
             Self::ViewPlane => None,
             Self::PlaneNormal => Some(TransformHandle::PlaneNormal),
         }
@@ -1064,9 +1259,20 @@ impl ManipulationConstraint {
                 TransformHandle::PlaneYZ => "Constrained move · YZ plane",
                 TransformHandle::PlaneZX => "Constrained move · ZX plane",
                 TransformHandle::PlaneNormal => "Rotate plane · normal N",
+                TransformHandle::RotateX
+                | TransformHandle::RotateY
+                | TransformHandle::RotateZ
+                | TransformHandle::RotateView
+                | TransformHandle::RotateFree => "Rotate box",
             },
             Self::ViewPlane => "Free move · camera plane",
             Self::PlaneNormal => "Rotate plane · normal N",
+            Self::Rotate(TransformHandle::RotateX) => "Rotate box · local X",
+            Self::Rotate(TransformHandle::RotateY) => "Rotate box · local Y",
+            Self::Rotate(TransformHandle::RotateZ) => "Rotate box · local Z",
+            Self::Rotate(TransformHandle::RotateView) => "Rotate box · view axis",
+            Self::Rotate(TransformHandle::RotateFree) => "Rotate box · free",
+            Self::Rotate(_) => "Rotate box",
         }
     }
 }
@@ -1075,6 +1281,13 @@ impl ManipulationConstraint {
 struct PlaneFrame {
     normal: DVec3,
     u_axis: DVec3,
+}
+
+/// A field box's orientation at the last drag step, updated after each
+/// rotation-ring move the same way [`PlaneFrame`] tracks a plane's normal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BoxFrame {
+    rotation: DQuat,
 }
 
 fn create_local_data_source(
@@ -1094,7 +1307,9 @@ fn create_local_data_source(
             .with_subscription(
                 Subscription::PROBES_ONLY
                     .with_planes(UVec2::splat(33))
-                    .with_domain_stride(8),
+                    .with_domain_stride(8)
+                    .with_boxes(UVec3::splat(9))
+                    .with_spheres(9),
             )
             // Two models of one electric field. Both are composed into the
             // scene so either can compute it, and the analytic one is active

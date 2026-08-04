@@ -34,7 +34,10 @@
 //! recorded trade for a coupling interface that no field is privileged in
 //! (see `docs/adr/0022-dynamics-is-a-first-party-system.md`).
 
-use fieldcad_core::{ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError, WorldSnapshot};
+use fieldcad_core::{
+    ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError, WorldSnapshot,
+    relativistic_momentum,
+};
 use fieldcad_mass_sources::{MassSourceError, collect_mass_sources};
 use fieldcad_plugin_api::{DynamicBody, ObjectKinematicsUpdate};
 use glam::DVec3;
@@ -170,13 +173,6 @@ fn advance_body(
     let momentum = relativistic_momentum(body.velocity, mass) + force * seconds;
     let velocity = velocity_from_momentum(momentum, mass);
     kinematics(body.object, body.position + velocity * seconds, velocity)
-}
-
-/// `p = γ m v`.
-fn relativistic_momentum(velocity: DVec3, mass_kg: f64) -> DVec3 {
-    let beta_squared = velocity.length_squared() / (SPEED_OF_LIGHT * SPEED_OF_LIGHT);
-    let lorentz = (1.0 - beta_squared).max(f64::MIN_POSITIVE).sqrt().recip();
-    velocity * (mass_kg * lorentz)
 }
 
 /// The fastest speed this integrator will report, as a fraction of `c`.

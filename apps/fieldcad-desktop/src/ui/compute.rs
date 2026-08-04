@@ -8,12 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, FieldValue,
-    FieldValueKind, PluginId, SampleValidity, SimulationMode, SnapshotFreshness, UndefinedReason,
-    WorldRevision, WorldSnapshot,
+    FieldValueKind, ObjectId, PluginId, SampleValidity, SimulationMode, SnapshotFreshness,
+    UndefinedReason, WorldRevision, WorldSnapshot,
 };
 use fieldcad_simulation::{
     DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, Subscription,
 };
+use glam::DVec3;
 
 /// A per-frame, read-only summary of what the data source is reporting.
 ///
@@ -48,6 +49,9 @@ pub struct ComputeView {
     pub subscription: Subscription,
     pub diagnostics: Vec<String>,
     pub has_errors: bool,
+    /// The dynamics system's summed force on every body it advanced at the
+    /// most recent tick, for the inspector's read-only derived-values display.
+    pub body_forces: BTreeMap<ObjectId, DVec3>,
 }
 
 impl ComputeView {
@@ -170,6 +174,7 @@ impl ComputeView {
             subscription: source.subscription(),
             diagnostics,
             has_errors,
+            body_forces: source.body_forces(),
         }
     }
 

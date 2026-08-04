@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use glam::{DQuat, DVec2, DVec3, UVec2};
+use glam::{DQuat, DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChannelId, ComponentSchema, ComponentTypeId, ObjectId, PlaneId, PlaneLattice, ProbeId,
-    PropertyBag, SchemaError, WorldRevision,
+    BoxId, BoxLattice, ChannelId, ComponentSchema, ComponentTypeId, ObjectId, PlaneId,
+    PlaneLattice, ProbeId, PropertyBag, SchemaError, SphereId, SphereLattice, WorldRevision,
 };
 
 /// A finite, non-degenerate direction. Used for plane normals and in-plane axes.
@@ -394,6 +394,203 @@ impl SlicePlane {
     }
 }
 
+/// A bounded, orientable box in which a field is sampled and drawn as arrows.
+///
+/// Unlike [`SlicePlane`], a box has no colour surface: a 2D magnitude map has
+/// a natural home on a slice, but a volume's interior cannot be flattened onto
+/// one without hiding most of it, so a box only ever draws vectors.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FieldBoxSpec {
+    name: String,
+    origin: DVec3,
+    rotation: DQuat,
+    half_extent: DVec3,
+    visible: bool,
+}
+
+impl FieldBoxSpec {
+    pub fn new(name: impl Into<String>, origin: DVec3, half_extent: DVec3) -> Result<Self, WorldError> {
+        if !origin.is_finite() || !half_extent.is_finite() || half_extent.min_element() <= 0.0 {
+            return Err(WorldError::InvalidBox);
+        }
+        Ok(Self {
+            name: name.into(),
+            origin,
+            rotation: DQuat::IDENTITY,
+            half_extent,
+            visible: true,
+        })
+    }
+
+    pub fn with_half_extent(mut self, half_extent: DVec3) -> Result<Self, WorldError> {
+        if !half_extent.is_finite() || half_extent.min_element() <= 0.0 {
+            return Err(WorldError::InvalidBox);
+        }
+        self.half_extent = half_extent;
+        Ok(self)
+    }
+
+    pub fn with_rotation(mut self, rotation: DQuat) -> Result<Self, WorldError> {
+        if !rotation.is_finite() || rotation.length_squared() == 0.0 {
+            return Err(WorldError::InvalidBox);
+        }
+        self.rotation = rotation.normalize();
+        Ok(self)
+    }
+
+    pub fn with_origin(mut self, origin: DVec3) -> Result<Self, WorldError> {
+        if !origin.is_finite() {
+            return Err(WorldError::InvalidBox);
+        }
+        self.origin = origin;
+        Ok(self)
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn with_visibility(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    pub fn hidden(mut self) -> Self {
+        self.visible = false;
+        self
+    }
+
+    pub fn from_box(field_box: &FieldBox) -> Self {
+        Self {
+            name: field_box.name.clone(),
+            origin: field_box.origin,
+            rotation: field_box.rotation,
+            half_extent: field_box.half_extent,
+            visible: field_box.visible,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FieldBox {
+    pub id: BoxId,
+    pub name: String,
+    pub origin: DVec3,
+    pub rotation: DQuat,
+    pub half_extent: DVec3,
+    pub visible: bool,
+}
+
+impl FieldBox {
+    /// A sampling lattice covering the box's oriented extent at the requested
+    /// counts. Sampling density is a visualization setting, kept out of the
+    /// stored box for the same reason as [`SlicePlane::lattice`].
+    pub fn lattice(&self, counts: UVec3) -> BoxLattice {
+        let counts = counts.max(UVec3::ONE);
+        let u = self.rotation * DVec3::X;
+        let v = self.rotation * DVec3::Y;
+        let w = self.rotation * DVec3::Z;
+        let span = self.half_extent * 2.0;
+        let divisor = (counts.as_dvec3() - DVec3::ONE).max(DVec3::ONE);
+        let u_step = u * (span.x / divisor.x);
+        let v_step = v * (span.y / divisor.y);
+        let w_step = w * (span.z / divisor.z);
+        let origin =
+            self.origin - u * self.half_extent.x - v * self.half_extent.y - w * self.half_extent.z;
+        BoxLattice::new(origin, u_step, v_step, w_step, counts)
+    }
+}
+
+/// A bounded sphere in which a field is sampled and drawn as arrows.
+///
+/// A "crystal ball": position and radius only, no orientation to author.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FieldSphereSpec {
+    name: String,
+    origin: DVec3,
+    radius: f64,
+    visible: bool,
+}
+
+impl FieldSphereSpec {
+    pub fn new(name: impl Into<String>, origin: DVec3, radius: f64) -> Result<Self, WorldError> {
+        if !origin.is_finite() || !radius.is_finite() || radius <= 0.0 {
+            return Err(WorldError::InvalidSphere);
+        }
+        Ok(Self {
+            name: name.into(),
+            origin,
+            radius,
+            visible: true,
+        })
+    }
+
+    pub fn with_radius(mut self, radius: f64) -> Result<Self, WorldError> {
+        if !radius.is_finite() || radius <= 0.0 {
+            return Err(WorldError::InvalidSphere);
+        }
+        self.radius = radius;
+        Ok(self)
+    }
+
+    pub fn with_origin(mut self, origin: DVec3) -> Result<Self, WorldError> {
+        if !origin.is_finite() {
+            return Err(WorldError::InvalidSphere);
+        }
+        self.origin = origin;
+        Ok(self)
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn with_visibility(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    pub fn hidden(mut self) -> Self {
+        self.visible = false;
+        self
+    }
+
+    pub fn from_sphere(sphere: &FieldSphere) -> Self {
+        Self {
+            name: sphere.name.clone(),
+            origin: sphere.origin,
+            radius: sphere.radius,
+            visible: sphere.visible,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FieldSphere {
+    pub id: SphereId,
+    pub name: String,
+    pub origin: DVec3,
+    pub radius: f64,
+    pub visible: bool,
+}
+
+impl FieldSphere {
+    /// A sampling lattice over the sphere's bounding cube at the requested
+    /// per-axis count. Points outside the sphere are still evaluated —
+    /// display culls them, per [`SphereLattice`] — which keeps this the same
+    /// simple axis-aligned construction [`GridLattice`](crate::GridLattice)
+    /// already uses rather than a second, variable-length geometry shape.
+    pub fn lattice(&self, counts_per_axis: u32) -> SphereLattice {
+        let counts_per_axis = counts_per_axis.max(1);
+        let origin = self.origin - DVec3::splat(self.radius);
+        let divisor = f64::from(counts_per_axis.saturating_sub(1)).max(1.0);
+        let step = DVec3::splat(2.0 * self.radius / divisor);
+        SphereLattice::new(origin, step, UVec3::splat(counts_per_axis), self.origin, self.radius)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ProbePosition {
     World(DVec3),
@@ -467,6 +664,8 @@ pub struct WorldState {
     revision: WorldRevision,
     objects: BTreeMap<ObjectId, WorldObject>,
     planes: BTreeMap<PlaneId, SlicePlane>,
+    boxes: BTreeMap<BoxId, FieldBox>,
+    spheres: BTreeMap<SphereId, FieldSphere>,
     probes: BTreeMap<ProbeId, Probe>,
     component_schemas: BTreeMap<ComponentTypeId, ComponentSchema>,
 }
@@ -494,6 +693,22 @@ impl WorldSnapshot {
 
     pub fn planes(&self) -> &BTreeMap<PlaneId, SlicePlane> {
         &self.0.planes
+    }
+
+    pub fn boxes(&self) -> &BTreeMap<BoxId, FieldBox> {
+        &self.0.boxes
+    }
+
+    pub fn field_box(&self, id: BoxId) -> Option<&FieldBox> {
+        self.0.boxes.get(&id)
+    }
+
+    pub fn spheres(&self) -> &BTreeMap<SphereId, FieldSphere> {
+        &self.0.spheres
+    }
+
+    pub fn sphere(&self, id: SphereId) -> Option<&FieldSphere> {
+        self.0.spheres.get(&id)
     }
 
     pub fn probes(&self) -> &BTreeMap<ProbeId, Probe> {
@@ -571,6 +786,8 @@ impl World {
                 revision: WorldRevision::INITIAL,
                 objects: BTreeMap::new(),
                 planes: BTreeMap::new(),
+                boxes: BTreeMap::new(),
+                spheres: BTreeMap::new(),
                 probes: BTreeMap::new(),
                 component_schemas: BTreeMap::new(),
             }),
@@ -699,6 +916,26 @@ pub enum WorldCommand {
         visible: bool,
     },
     RemovePlane(PlaneId),
+    CreateBox(FieldBoxSpec),
+    SetBox {
+        region: BoxId,
+        spec: FieldBoxSpec,
+    },
+    SetBoxVisible {
+        region: BoxId,
+        visible: bool,
+    },
+    RemoveBox(BoxId),
+    CreateSphere(FieldSphereSpec),
+    SetSphere {
+        sphere: SphereId,
+        spec: FieldSphereSpec,
+    },
+    SetSphereVisible {
+        sphere: SphereId,
+        visible: bool,
+    },
+    RemoveSphere(SphereId),
     CreateProbe(ProbeSpec),
     SetProbePosition {
         probe: ProbeId,
@@ -738,6 +975,14 @@ impl WorldCommand {
             Self::SetPlane { .. } => "Move slice plane",
             Self::SetPlaneVisible { .. } => "Show or hide slice plane",
             Self::RemovePlane(_) => "Remove slice plane",
+            Self::CreateBox(_) => "Add field box",
+            Self::SetBox { .. } => "Move field box",
+            Self::SetBoxVisible { .. } => "Show or hide field box",
+            Self::RemoveBox(_) => "Remove field box",
+            Self::CreateSphere(_) => "Add field sphere",
+            Self::SetSphere { .. } => "Move field sphere",
+            Self::SetSphereVisible { .. } => "Show or hide field sphere",
+            Self::RemoveSphere(_) => "Remove field sphere",
             Self::CreateProbe(_) => "Add probe",
             Self::SetProbePosition { .. } => "Move probe",
             Self::SetProbeChannels { .. } => "Change recorded channels",
@@ -764,6 +1009,8 @@ pub struct CommitReport {
     pub revision: WorldRevision,
     pub created_objects: Vec<ObjectId>,
     pub created_planes: Vec<PlaneId>,
+    pub created_boxes: Vec<BoxId>,
+    pub created_spheres: Vec<SphereId>,
     pub created_probes: Vec<ProbeId>,
 }
 
@@ -773,6 +1020,8 @@ impl CommitReport {
             revision,
             created_objects: Vec::new(),
             created_planes: Vec::new(),
+            created_boxes: Vec::new(),
+            created_spheres: Vec::new(),
             created_probes: Vec::new(),
         }
     }
@@ -782,6 +1031,8 @@ impl CommitReport {
 struct Counters {
     object: u64,
     plane: u64,
+    field_box: u64,
+    sphere: u64,
     probe: u64,
 }
 
@@ -795,6 +1046,18 @@ impl Counters {
     fn next_plane(&mut self) -> PlaneId {
         let id = PlaneId::new(self.plane);
         self.plane += 1;
+        id
+    }
+
+    fn next_box(&mut self) -> BoxId {
+        let id = BoxId::new(self.field_box);
+        self.field_box += 1;
+        id
+    }
+
+    fn next_sphere(&mut self) -> SphereId {
+        let id = SphereId::new(self.sphere);
+        self.sphere += 1;
         id
     }
 
@@ -941,6 +1204,88 @@ fn apply_command(
                 return Err(WorldError::PlaneNotFound { id });
             }
         }
+        WorldCommand::CreateBox(spec) => {
+            // `FieldBoxSpec` cannot be constructed unvalidated, so there is no
+            // second copy of the box predicate here.
+            let id = counters.next_box();
+            state.boxes.insert(
+                id,
+                FieldBox {
+                    id,
+                    name: spec.name,
+                    origin: spec.origin,
+                    rotation: spec.rotation,
+                    half_extent: spec.half_extent,
+                    visible: spec.visible,
+                },
+            );
+            report.created_boxes.push(id);
+        }
+        WorldCommand::SetBoxVisible { region, visible } => {
+            state
+                .boxes
+                .get_mut(&region)
+                .ok_or(WorldError::BoxNotFound { id: region })?
+                .visible = visible;
+        }
+        WorldCommand::SetBox { region, spec } => {
+            let current = state
+                .boxes
+                .get_mut(&region)
+                .ok_or(WorldError::BoxNotFound { id: region })?;
+            *current = FieldBox {
+                id: region,
+                name: spec.name,
+                origin: spec.origin,
+                rotation: spec.rotation,
+                half_extent: spec.half_extent,
+                visible: spec.visible,
+            };
+        }
+        WorldCommand::RemoveBox(id) => {
+            if state.boxes.remove(&id).is_none() {
+                return Err(WorldError::BoxNotFound { id });
+            }
+        }
+        WorldCommand::CreateSphere(spec) => {
+            let id = counters.next_sphere();
+            state.spheres.insert(
+                id,
+                FieldSphere {
+                    id,
+                    name: spec.name,
+                    origin: spec.origin,
+                    radius: spec.radius,
+                    visible: spec.visible,
+                },
+            );
+            report.created_spheres.push(id);
+        }
+        WorldCommand::SetSphereVisible { sphere, visible } => {
+            state
+                .spheres
+                .get_mut(&sphere)
+                .ok_or(WorldError::SphereNotFound { id: sphere })?
+                .visible = visible;
+        }
+        WorldCommand::SetSphere { sphere, spec } => {
+            let current = state
+                .spheres
+                .get_mut(&sphere)
+                .ok_or(WorldError::SphereNotFound { id: sphere })?;
+            *current = FieldSphere {
+                id: sphere,
+                name: spec.name,
+                origin: spec.origin,
+                radius: spec.radius,
+                visible: spec.visible,
+            };
+        }
+        WorldCommand::RemoveSphere(id) => {
+            if state.spheres.remove(&id).is_none() {
+                return Err(WorldError::SphereNotFound { id });
+            }
+        }
         WorldCommand::CreateProbe(spec) => {
             validate_probe(state, &spec)?;
             let id = counters.next_probe();
@@ -1035,6 +1380,10 @@ pub enum WorldError {
     InvalidShape,
     #[error("slice plane requires a finite origin, non-zero normal, and positive extent")]
     InvalidPlane,
+    #[error("field box requires a finite origin, unit rotation, and positive half extent")]
+    InvalidBox,
+    #[error("field sphere requires a finite origin and a positive radius")]
+    InvalidSphere,
     #[error("probe position must be finite")]
     InvalidProbe,
     #[error("object {id} does not exist")]
@@ -1043,6 +1392,10 @@ pub enum WorldError {
     ObjectHasAttachedProbe { id: ObjectId },
     #[error("plane {id} does not exist")]
     PlaneNotFound { id: PlaneId },
+    #[error("field box {id} does not exist")]
+    BoxNotFound { id: BoxId },
+    #[error("field sphere {id} does not exist")]
+    SphereNotFound { id: SphereId },
     #[error("probe {id} does not exist")]
     ProbeNotFound { id: ProbeId },
     #[error("component schema '{id}' is not registered")]
@@ -1414,5 +1767,165 @@ mod tests {
         let position = snapshot.resolve_probe_position(probe).unwrap();
 
         assert!((position - DVec3::new(1.0, 1.0, 0.0)).length() < 1.0e-12);
+    }
+
+    #[test]
+    fn box_lattice_covers_the_declared_extent() {
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreateBox(
+                FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(2.0)).unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let field_box = snapshot.boxes().get(&report.created_boxes[0]).unwrap();
+        let lattice = field_box.lattice(UVec3::new(3, 3, 3));
+
+        assert_eq!(lattice.len(), 27);
+        // The centre sample sits on the box origin, and the lattice spans
+        // corner to corner across the declared extent.
+        assert!((lattice.position(13).unwrap() - field_box.origin).length() < 1.0e-12);
+        assert!(
+            (lattice.position(0).unwrap() - DVec3::splat(-2.0)).length() < 1.0e-9,
+            "unrotated box lattice starts at -half_extent"
+        );
+        assert!(
+            (lattice.position(26).unwrap() - DVec3::splat(2.0)).length() < 1.0e-9,
+            "unrotated box lattice ends at +half_extent"
+        );
+    }
+
+    #[test]
+    fn a_box_edit_replaces_its_geometry_at_one_revision() {
+        let mut world = World::new();
+        let created = world
+            .commit([WorldCommand::CreateBox(
+                FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(1.0)).unwrap(),
+            )])
+            .unwrap();
+        let region = created.created_boxes[0];
+        let before = world.revision();
+        let rotation = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        let replacement = FieldBoxSpec::new("tilted", DVec3::new(1.0, 2.0, 3.0), DVec3::new(4.0, 2.0, 1.0))
+            .unwrap()
+            .with_rotation(rotation)
+            .unwrap()
+            .hidden();
+
+        let report = world
+            .commit([WorldCommand::SetBox {
+                region,
+                spec: replacement,
+            }])
+            .unwrap();
+        let edited = world.snapshot().boxes().get(&region).unwrap().clone();
+
+        assert_eq!(report.revision, before.next());
+        assert_eq!(edited.id, region);
+        assert_eq!(edited.name, "tilted");
+        assert_eq!(edited.origin, DVec3::new(1.0, 2.0, 3.0));
+        assert_eq!(edited.rotation, rotation);
+        assert_eq!(edited.half_extent, DVec3::new(4.0, 2.0, 1.0));
+        assert!(!edited.visible);
+    }
+
+    #[test]
+    fn a_failed_box_batch_is_atomic_and_does_not_consume_ids() {
+        let mut world = World::new();
+        let missing = BoxId::new(99);
+        assert!(
+            world
+                .commit([
+                    WorldCommand::CreateBox(
+                        FieldBoxSpec::new("not committed", DVec3::ZERO, DVec3::ONE).unwrap()
+                    ),
+                    WorldCommand::RemoveBox(missing),
+                ])
+                .is_err()
+        );
+        assert_eq!(world.snapshot().revision(), WorldRevision::INITIAL);
+        assert!(world.snapshot().boxes().is_empty());
+
+        let report = world
+            .commit([WorldCommand::CreateBox(
+                FieldBoxSpec::new("first", DVec3::ZERO, DVec3::ONE).unwrap(),
+            )])
+            .unwrap();
+        assert_eq!(report.created_boxes, vec![BoxId::new(0)]);
+    }
+
+    #[test]
+    fn sphere_lattice_covers_the_bounding_cube() {
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreateSphere(
+                FieldSphereSpec::new("ball", DVec3::ZERO, 2.0).unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let sphere = snapshot.spheres().get(&report.created_spheres[0]).unwrap();
+        let lattice = sphere.lattice(3);
+
+        assert_eq!(lattice.len(), 27);
+        assert_eq!(lattice.radius(), 2.0);
+        assert_eq!(lattice.centre(), DVec3::ZERO);
+        assert!((lattice.position(13).unwrap() - sphere.origin).length() < 1.0e-12);
+        assert!((lattice.position(0).unwrap() - DVec3::splat(-2.0)).length() < 1.0e-9);
+        assert!((lattice.position(26).unwrap() - DVec3::splat(2.0)).length() < 1.0e-9);
+    }
+
+    #[test]
+    fn a_sphere_edit_replaces_its_geometry_at_one_revision() {
+        let mut world = World::new();
+        let created = world
+            .commit([WorldCommand::CreateSphere(
+                FieldSphereSpec::new("ball", DVec3::ZERO, 1.0).unwrap(),
+            )])
+            .unwrap();
+        let sphere = created.created_spheres[0];
+        let before = world.revision();
+        let replacement = FieldSphereSpec::new("moved", DVec3::new(1.0, 2.0, 3.0), 4.0)
+            .unwrap()
+            .hidden();
+
+        let report = world
+            .commit([WorldCommand::SetSphere {
+                sphere,
+                spec: replacement,
+            }])
+            .unwrap();
+        let edited = world.snapshot().spheres().get(&sphere).unwrap().clone();
+
+        assert_eq!(report.revision, before.next());
+        assert_eq!(edited.id, sphere);
+        assert_eq!(edited.name, "moved");
+        assert_eq!(edited.origin, DVec3::new(1.0, 2.0, 3.0));
+        assert_eq!(edited.radius, 4.0);
+        assert!(!edited.visible);
+    }
+
+    #[test]
+    fn a_failed_sphere_batch_is_atomic_and_does_not_consume_ids() {
+        let mut world = World::new();
+        let missing = SphereId::new(99);
+        assert!(
+            world
+                .commit([
+                    WorldCommand::CreateSphere(
+                        FieldSphereSpec::new("not committed", DVec3::ZERO, 1.0).unwrap()
+                    ),
+                    WorldCommand::RemoveSphere(missing),
+                ])
+                .is_err()
+        );
+        assert_eq!(world.snapshot().revision(), WorldRevision::INITIAL);
+        assert!(world.snapshot().spheres().is_empty());
+
+        let report = world
+            .commit([WorldCommand::CreateSphere(
+                FieldSphereSpec::new("first", DVec3::ZERO, 1.0).unwrap(),
+            )])
+            .unwrap();
+        assert_eq!(report.created_spheres, vec![SphereId::new(0)]);
     }
 }

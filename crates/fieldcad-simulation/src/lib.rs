@@ -486,6 +486,71 @@ mod tests {
         assert!(moved.velocity.linear.z.abs() < 1.0e-15);
     }
 
+    /// The force an inspector would show for a body is a byproduct of the same
+    /// tick that moved it, not a second computation — so it has to agree with
+    /// the direction the body actually accelerated in, and be absent before
+    /// any tick supplied one.
+    #[test]
+    fn body_force_reflects_the_most_recent_ticks_dynamics() {
+        use fieldcad_mass_sources::{
+            inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+        };
+
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x67))
+                .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+        )
+        .unwrap();
+        let report = runtime
+            .commit_world_commands(
+                mass_component_schemas()
+                    .into_iter()
+                    .map(WorldCommand::RegisterComponentSchema)
+                    .chain([
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("source")
+                                .with_pinned(true)
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("free")
+                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-9).unwrap(),
+                                )
+                                .with_component(
+                                    inertial_mass_component_id(),
+                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                    ])
+                    .collect(),
+            )
+            .unwrap();
+        let free = report.created_objects[1];
+        let source = report.created_objects[0];
+
+        assert_eq!(runtime.body_force(free), None, "no tick has run yet");
+
+        runtime.step_once().unwrap();
+
+        let force = runtime
+            .body_force(free)
+            .expect("a dynamic body advanced by a tick has a force");
+        assert!(force.x > 0.0, "expected repulsion along +x, got {force:?}");
+        assert!(force.y.abs() < 1.0e-15);
+        assert!(force.z.abs() < 1.0e-15);
+        // A pinned body is never a dynamics-system input, so it never gets an
+        // entry — not zero, absent.
+        assert_eq!(runtime.body_force(source), None);
+    }
+
     /// Inertia is the only thing dividing the force, so doubling it must halve
     /// the acceleration — whatever field supplied the force.
     #[test]
@@ -967,6 +1032,74 @@ mod tests {
         remote.reconnect();
         assert_eq!(remote.status(), DataSourceStatus::Ready);
         assert!(remote.execute(command(CommandPayload::Step)).is_ok());
+    }
+
+    /// The same body-force byproduct the runtime test checks directly, this
+    /// time read through the `FieldDataSource` trait a real UI would use —
+    /// the seam most likely to have a wiring bug, since the runtime method
+    /// itself is a one-line map lookup.
+    #[test]
+    fn a_local_source_reports_body_force_through_the_trait_boundary() {
+        use fieldcad_mass_sources::{
+            inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+        };
+
+        let mut source = LocalDataSource::new(
+            SimulationRuntime::new(
+                RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x68))
+                    .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+            )
+            .unwrap(),
+        );
+        source
+            .execute(command(CommandPayload::CommitWorld(
+                mass_component_schemas()
+                    .into_iter()
+                    .map(WorldCommand::RegisterComponentSchema)
+                    .chain([
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("source")
+                                .with_pinned(true)
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("free")
+                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-9).unwrap(),
+                                )
+                                .with_component(
+                                    inertial_mass_component_id(),
+                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                    ])
+                    .collect(),
+            )))
+            .unwrap();
+        let free = *source
+            .world()
+            .objects()
+            .iter()
+            .find(|(_, object)| object.name == "free")
+            .unwrap()
+            .0;
+
+        assert!(source.body_forces().is_empty(), "no tick has run yet");
+
+        source.execute(command(CommandPayload::Step)).unwrap();
+
+        let force = *source
+            .body_forces()
+            .get(&free)
+            .expect("a dynamic body advanced by a tick has a force");
+        assert!(force.x > 0.0, "expected repulsion along +x, got {force:?}");
     }
 
     #[test]

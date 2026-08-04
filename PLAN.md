@@ -604,6 +604,70 @@ the default if no contrary requirement emerges during review.
 
 ## Next implementation increment
 
+### Task — editable local numerical-domain configuration
+
+**Status: planned.** The core `Domain` already supports finite bounds,
+independent `x/y/z` resolution, per-axis boundary conditions, and precision,
+but the desktop currently constructs one fixed `32³` periodic `f32` domain at
+local-runtime startup. The Simulation inspector must let a user define the
+local experiment domain rather than making solver-grid size a source-code
+setting. Transport sampling remains a separate view/subscription concern and
+must not be presented as grid resolution.
+
+Deliverables:
+
+- add an authoritative, revisioned experiment-configuration command for a
+  complete candidate domain (bounds, resolution, boundaries, and precision),
+  rather than allowing individual UI widgets to mutate solver state;
+- expose a staged Domain section in the Simulation inspector with numeric SI
+  bounds and `x/y/z` cell counts, boundary controls, precision, derived cell
+  size/cell count/memory estimate, and the solver-specific stability limit for
+  the proposed configuration;
+- validate the whole candidate before adoption: finite non-degenerate bounds,
+  non-zero resolution, component/plugin domain constraints, resource budget,
+  and the current or proposed `dt` against every active solver (including the
+  Maxwell Courant limit);
+- reconstruct every local solver from the current authored world and accepted
+  domain configuration, then publish a new initial snapshot with explicit
+  configuration and reset provenance; and
+- include the accepted domain configuration in scene persistence and Orishu
+  export, where it must exactly agree with the manifest and initial-state
+  artifact.
+
+#### Running-edit/reset semantics
+
+Changing a numerical domain is not an ordinary world edit. It changes the
+meaning and shape of the solver state, so continuing the old trajectory would
+misrepresent the result. A successful domain reconfiguration therefore:
+
+1. is applied atomically at a fixed tick boundary if submitted while running;
+2. discards all previous numerical state and stale snapshots;
+3. reinitializes the solvers from the current authored world at `t = 0`, tick
+   `0`, using the accepted domain and `dt`;
+4. clears probe/trajectory histories and other run-derived diagnostics, while
+   retaining the authored world; and
+5. leaves the source **Paused** at the new initial state, even if it was running
+   before. The user explicitly presses Play to begin the new experiment.
+
+The inspector should edit a local draft while fields are held/typed, then offer
+one explicit **Apply domain and reset** action. It must not rebuild the solver
+for every keystroke or attempt to resume the previous run automatically. A
+rejected candidate leaves the old configuration, state, time, and snapshots
+untouched and reports a structured reason.
+
+Acceptance criteria:
+
+- users can configure a non-cubic domain and anisotropic resolution without
+  editing source code;
+- changing only transport sampling does not reset time or solver state;
+- applying a valid domain while paused produces a fresh `t = 0` snapshot;
+- applying it while running takes effect at exactly one tick boundary and ends
+  paused at `t = 0`, with no old-domain value rendered as current;
+- an invalid candidate, including a Courant-invalid `dt`, is rejected without
+  changing the live experiment; and
+- tests cover solver reinitialization, snapshot provenance/freshness, history
+  clearing, and CPU/GPU domain/initial-state parity.
+
 Close Milestone 5's performance review gate on named hardware. Profile GPU step
 submission, full-grid readback, snapshot publication, scene extraction, and
 render time separately over representative grid and visualization densities.

@@ -3,16 +3,25 @@
 //! Drawing and picking derive their geometry from the same functions here. When
 //! each computed its own, a change to the drawn gizmo silently moved the
 //! handles away from where they appeared to be.
+//!
+//! Every size in the gizmo — arrow length, ring radius, the origin dot — is a
+//! fixed multiple of one pixel-based length, converted to world units via
+//! [`OrbitCamera::world_units_per_pixel`] at the gizmo's own origin. That is
+//! what keeps the whole gizmo the same number of screen pixels regardless of
+//! camera distance or the scale a scene is authored at, from the metre-scale
+//! default scene down to a nanometre-scale one — unlike sizing it from the
+//! selected entity's own extent, which is what this used to do and which
+//! shrinks to invisible or grows to absurd at either end of that range.
 
-use fieldcad_core::{SlicePlane, WorldObject};
-use glam::{Vec2, Vec3, Vec4};
+use fieldcad_core::WorldSnapshot;
+use glam::{Quat, Vec2, Vec3, Vec4};
 
 use super::pick::{
     point_in_triangle, point_segment_distance, project_to_viewport, ray_plane_point,
 };
 use super::{
-    FieldGeometry, SceneSelection, WorldSnapshot, append_arrow, push_line, push_quad,
-    push_quad_outline,
+    FieldGeometry, SceneSelection, append_cone, append_cylinder, append_ring_band, push_line,
+    push_quad, push_quad_outline, quat_from_dquat, ring_basis,
 };
 use crate::camera::{OrbitCamera, Viewport};
 
@@ -26,6 +35,19 @@ pub enum TransformHandle {
     PlaneZX,
     /// Reorients a selected slice plane; never translates it.
     PlaneNormal,
+    /// Rotates a selected field box about its own local X/Y/Z axis; never
+    /// translates it.
+    RotateX,
+    RotateY,
+    RotateZ,
+    /// Rotates a selected field box about the camera's current view axis;
+    /// never translates it. Unlike `RotateX/Y/Z` this axis has no fixed
+    /// relationship to the box's own orientation — it is recomputed from the
+    /// camera every frame.
+    RotateView,
+    /// Free trackball rotation of a selected field box: dragging inside the
+    /// rotation gizmo's sphere but not on any specific ring. Never translates.
+    RotateFree,
 }
 
 /// Immediate authoring-helper state while the source is acknowledging a drag.
@@ -35,6 +57,9 @@ pub enum TransformHandle {
 pub struct TransformPreview {
     pub origin: Vec3,
     pub plane_normal: Option<Vec3>,
+    /// A field box's live-dragged orientation, distinct from `plane_normal`
+    /// because a box has three independent rotation handles rather than one.
+    pub rotation: Option<Quat>,
 }
 
 impl TransformHandle {
@@ -47,6 +72,11 @@ impl TransformHandle {
             Self::PlaneYZ => "YZ plane",
             Self::PlaneZX => "ZX plane",
             Self::PlaneNormal => "plane normal N",
+            Self::RotateX => "rotate about local X",
+            Self::RotateY => "rotate about local Y",
+            Self::RotateZ => "rotate about local Z",
+            Self::RotateView => "rotate about the view axis",
+            Self::RotateFree => "free rotation",
         }
     }
 
@@ -55,7 +85,15 @@ impl TransformHandle {
             Self::AxisX => Some(Vec3::X),
             Self::AxisY => Some(Vec3::Y),
             Self::AxisZ => Some(Vec3::Z),
-            Self::PlaneXY | Self::PlaneYZ | Self::PlaneZX | Self::PlaneNormal => None,
+            Self::PlaneXY
+            | Self::PlaneYZ
+            | Self::PlaneZX
+            | Self::PlaneNormal
+            | Self::RotateX
+            | Self::RotateY
+            | Self::RotateZ
+            | Self::RotateView
+            | Self::RotateFree => None,
         }
     }
 
@@ -64,14 +102,56 @@ impl TransformHandle {
             Self::PlaneXY => Some(Vec3::Z),
             Self::PlaneYZ => Some(Vec3::X),
             Self::PlaneZX => Some(Vec3::Y),
-            Self::AxisX | Self::AxisY | Self::AxisZ | Self::PlaneNormal => None,
+            Self::AxisX
+            | Self::AxisY
+            | Self::AxisZ
+            | Self::PlaneNormal
+            | Self::RotateX
+            | Self::RotateY
+            | Self::RotateZ
+            | Self::RotateView
+            | Self::RotateFree => None,
+        }
+    }
+
+    /// The box-local axis this handle rotates about, for the three local
+    /// rotation rings. `None` for every translation handle and for the view
+    /// and free-rotation handles, which have no fixed local axis.
+    pub const fn rotation_axis(self) -> Option<Vec3> {
+        match self {
+            Self::RotateX => Some(Vec3::X),
+            Self::RotateY => Some(Vec3::Y),
+            Self::RotateZ => Some(Vec3::Z),
+            Self::AxisX
+            | Self::AxisY
+            | Self::AxisZ
+            | Self::PlaneXY
+            | Self::PlaneYZ
+            | Self::PlaneZX
+            | Self::PlaneNormal
+            | Self::RotateView
+            | Self::RotateFree => None,
         }
     }
 }
 
+/// Screen-space gizmo sizing. Every other size in this file is a fixed
+/// multiple of this one, converted to world units via
+/// [`OrbitCamera::world_units_per_pixel`] at the gizmo's origin.
+const AXIS_LENGTH_PX: f32 = 90.0;
+
+/// A fixed world-space light direction for baked flat shading (see the module
+/// doc on [`super::push_shaded_triangle`]). Not camera-relative, so a solid
+/// shape's shading does not swim as the camera orbits — the same way
+/// Blender's own gizmo shading behaves. Left un-normalized: at this magnitude
+/// (~1.005) the error is negligible for a baked visual cue.
+const GIZMO_LIGHT_DIR: Vec3 = Vec3::new(0.4, -0.6, 0.7);
+
 pub fn append_transform_gizmo(
     geometry: &mut FieldGeometry,
     world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
     selection: Option<SceneSelection>,
     active: Option<TransformHandle>,
     preview: Option<TransformPreview>,
@@ -79,16 +159,12 @@ pub fn append_transform_gizmo(
     let Some(selection) = selection else {
         return;
     };
-    let Some((world_origin, length)) = transform_gizmo(world, selection) else {
+    let Some((world_origin, length)) = transform_gizmo(world, camera, viewport, selection) else {
         return;
     };
     let origin = preview.map_or(world_origin, |preview| preview.origin);
 
-    append_origin_marker(
-        geometry,
-        origin,
-        selection_marker_radius(world, selection, length),
-    );
+    append_origin_marker(geometry, origin, selection_marker_radius(length));
 
     const AXIS_COLORS: [Vec4; 3] = [
         Vec4::new(0.95, 0.15, 0.18, 1.0),
@@ -102,8 +178,8 @@ pub fn append_transform_gizmo(
     ];
 
     for ((handle, direction), color) in GIZMO_AXES.into_iter().zip(AXIS_COLORS) {
-        append_arrow(
-            &mut geometry.vector_lines,
+        append_solid_arrow(
+            geometry,
             origin,
             direction,
             length,
@@ -124,13 +200,29 @@ pub fn append_transform_gizmo(
     {
         append_plane_normal(
             geometry,
-            plane,
             origin,
             preview
                 .and_then(|preview| preview.plane_normal)
                 .unwrap_or(plane.normal.as_vec3()),
             length,
             active == Some(TransformHandle::PlaneNormal),
+        );
+    }
+
+    if let SceneSelection::Box(id) = selection
+        && let Some(field_box) = world.boxes().get(&id)
+    {
+        let rotation = preview
+            .and_then(|preview| preview.rotation)
+            .unwrap_or_else(|| quat_from_dquat(field_box.rotation));
+        append_rotation_rings(
+            geometry,
+            camera,
+            origin,
+            rotation,
+            rotation_ring_radius(length),
+            view_ring_radius(length),
+            active,
         );
     }
 }
@@ -150,51 +242,58 @@ fn handle_color(
     }
 }
 
-fn object_gizmo_length(object: &WorldObject) -> f32 {
-    object
-        .shape
-        .map_or(0.5, |shape| shape.bounding_radius() as f32 * 2.0)
-        .max(0.9)
-}
-
-fn transform_gizmo(world: &WorldSnapshot, selection: SceneSelection) -> Option<(Vec3, f32)> {
+/// Where a selection's gizmo is anchored. Sizing is handled separately by
+/// [`transform_gizmo`]; visibility is checked here — an invisible entity gets
+/// no gizmo and no anchor point at all.
+fn selection_origin_point(world: &WorldSnapshot, selection: SceneSelection) -> Option<Vec3> {
     match selection {
         SceneSelection::Object(id) => {
             let object = world.object(id).filter(|object| object.visible)?;
-            Some((
-                object.transform.translation.as_vec3(),
-                object_gizmo_length(object),
-            ))
+            Some(object.transform.translation.as_vec3())
         }
         SceneSelection::Plane(id) => {
             let plane = world.planes().get(&id).filter(|plane| plane.visible)?;
-            let length = (plane.half_extent.min_element() as f32 * 0.4).clamp(0.9, 1.8);
-            Some((plane.origin.as_vec3(), length))
+            Some(plane.origin.as_vec3())
         }
         SceneSelection::Probe(id) => {
             let probe = world.probe(id).filter(|probe| probe.visible)?;
-            Some((world.resolve_probe_position(probe).ok()?.as_vec3(), 0.9))
+            Some(world.resolve_probe_position(probe).ok()?.as_vec3())
+        }
+        SceneSelection::Box(id) => {
+            let field_box = world.boxes().get(&id).filter(|region| region.visible)?;
+            Some(field_box.origin.as_vec3())
+        }
+        SceneSelection::Sphere(id) => {
+            let sphere = world.spheres().get(&id).filter(|sphere| sphere.visible)?;
+            Some(sphere.origin.as_vec3())
         }
     }
 }
 
-fn selection_marker_radius(
+/// The gizmo's world-space origin and translation-arrow length. `length` is a
+/// fixed screen-pixel size (`AXIS_LENGTH_PX`) converted to world units at
+/// `origin`'s own depth, which is what makes the gizmo the same size on screen
+/// regardless of camera distance or the scale the scene is authored at. Every
+/// other size in this file (`rotation_ring_radius`, `view_ring_radius`,
+/// `plane_normal_length`, `selection_marker_radius`) is a fixed multiple of
+/// this one `length`.
+fn transform_gizmo(
     world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
     selection: SceneSelection,
-    gizmo_length: f32,
-) -> f32 {
-    match selection {
-        SceneSelection::Object(id) => world
-            .object(id)
-            .map_or(0.16, |object| object.bounding_sphere().1 as f32 * 1.12)
-            .max(0.16),
-        SceneSelection::Probe(_) => 0.17,
-        SceneSelection::Plane(_) => (gizmo_length * 0.12).clamp(0.11, 0.22),
-    }
+) -> Option<(Vec3, f32)> {
+    let origin = selection_origin_point(world, selection)?;
+    let scale = camera.world_units_per_pixel(origin, viewport.height as f32);
+    Some((origin, AXIS_LENGTH_PX * scale))
+}
+
+fn selection_marker_radius(length: f32) -> f32 {
+    (length * 0.12).max(1.0e-6)
 }
 
 pub fn selection_origin(world: &WorldSnapshot, selection: SceneSelection) -> Option<Vec3> {
-    transform_gizmo(world, selection).map(|(origin, _)| origin)
+    selection_origin_point(world, selection)
 }
 
 fn append_origin_marker(geometry: &mut FieldGeometry, origin: Vec3, radius: f32) {
@@ -203,13 +302,7 @@ fn append_origin_marker(geometry: &mut FieldGeometry, origin: Vec3, radius: f32)
         (Vec3::Z, Vec3::X, Vec4::new(0.32, 1.0, 0.45, 1.0)),
         (Vec3::X, Vec3::Y, Vec4::new(0.38, 0.62, 1.0, 1.0)),
     ] {
-        let mut previous = origin + a * radius;
-        for segment in 1..=32 {
-            let angle = std::f32::consts::TAU * segment as f32 / 32.0;
-            let next = origin + (a * angle.cos() + b * angle.sin()) * radius;
-            push_line(&mut geometry.vector_lines, previous, next, color);
-            previous = next;
-        }
+        super::push_circle(&mut geometry.vector_lines, origin, a, b, radius, color);
     }
 }
 
@@ -249,9 +342,61 @@ const GIZMO_AXES: [(TransformHandle, Vec3); 3] = [
     (TransformHandle::AxisZ, Vec3::Z),
 ];
 
+/// The three local rotation rings, keyed by the box-local axis each rotates
+/// about.
+const ROTATION_RINGS: [(TransformHandle, Vec3); 3] = [
+    (TransformHandle::RotateX, Vec3::X),
+    (TransformHandle::RotateY, Vec3::Y),
+    (TransformHandle::RotateZ, Vec3::Z),
+];
+
 fn append_gizmo_plane(geometry: &mut FieldGeometry, corners: [Vec3; 4], color: Vec4) {
     push_quad(&mut geometry.surface_triangles, corners, color);
     push_quad_outline(&mut geometry.vector_lines, corners, color.with_w(0.95));
+}
+
+/// A translation-axis arrow drawn as a solid cylinder shaft and cone head,
+/// Blender/Unreal-style, rather than a thin line — reusing the mesh
+/// primitives from `super` and baking their flat shading from
+/// [`GIZMO_LIGHT_DIR`].
+///
+/// Field-vector glyphs keep drawing as thin lines via `super::append_arrow`;
+/// this is deliberately gizmo-only, since a dense field can draw thousands of
+/// glyphs a frame and a solid mesh per glyph would be a different performance
+/// question entirely.
+fn append_solid_arrow(
+    geometry: &mut FieldGeometry,
+    origin: Vec3,
+    direction: Vec3,
+    length: f32,
+    color: Vec4,
+) {
+    if !direction.is_finite() || direction.length_squared() <= f32::EPSILON || length <= 0.0 {
+        return;
+    }
+    let direction = direction.normalize();
+    const HEAD_FRACTION: f32 = 0.32;
+    const SHAFT_RADIUS_FRACTION: f32 = 0.035;
+    const HEAD_RADIUS_FRACTION: f32 = 0.09;
+    let shaft_end = origin + direction * (length * (1.0 - HEAD_FRACTION));
+    let tip = origin + direction * length;
+
+    append_cylinder(
+        &mut geometry.surface_triangles,
+        origin,
+        shaft_end,
+        length * SHAFT_RADIUS_FRACTION,
+        color,
+        GIZMO_LIGHT_DIR,
+    );
+    append_cone(
+        &mut geometry.surface_triangles,
+        shaft_end,
+        tip,
+        length * HEAD_RADIUS_FRACTION,
+        color,
+        GIZMO_LIGHT_DIR,
+    );
 }
 
 pub fn pick_transform_handle(
@@ -261,14 +406,15 @@ pub fn pick_transform_handle(
     viewport: Viewport,
     pointer: Vec2,
 ) -> Option<TransformHandle> {
-    let (origin, length) = transform_gizmo(world, selection)?;
+    let (origin, length) = transform_gizmo(world, camera, viewport, selection)?;
+    let is_box = matches!(selection, SceneSelection::Box(_));
 
     // The outer part of N is reserved for rotation. For the default XY plane
     // it overlaps the world-Z translation axis, so normal picking must win only
     // near its distinct dashed tip rather than steal the whole axis.
     if let SceneSelection::Plane(id) = selection {
         let plane = world.planes().get(&id)?;
-        let normal_length = plane_normal_length(plane, length);
+        let normal_length = plane_normal_length(length);
         let start = origin + plane.normal.as_vec3() * normal_length * 0.68;
         let end = origin + plane.normal.as_vec3() * normal_length;
         if let (Some(start), Some(end)) = (
@@ -283,6 +429,15 @@ pub fn pick_transform_handle(
     // Plane squares overlap the inner part of the axes, so test their filled
     // screen-space quads first. The quads come from the same function that draws
     // them, so a handle is always where it looks.
+    //
+    // This also has to come before the rotation rings below: "inside this
+    // exact quad" is an unambiguous geometric test, while a ring match is a
+    // fuzzy "within a few pixels of this line" one — and a ring viewed
+    // edge-on (or nearly so) projects to a line that can sweep right through
+    // a plane handle's screen position for a wide range of camera angles, not
+    // just a rare coincidence. An exact hit must always win over an
+    // approximate one, or the plane handle becomes unreliable across most of
+    // the camera's orbit.
     for (handle, a, b) in GIZMO_PLANES {
         let Some(screen) = gizmo_plane_corners(origin, a, b, length)
             .into_iter()
@@ -294,6 +449,44 @@ pub fn pick_transform_handle(
         if point_in_triangle(pointer, screen[0], screen[1], screen[2])
             || point_in_triangle(pointer, screen[0], screen[2], screen[3])
         {
+            return Some(handle);
+        }
+    }
+
+    // The rotation rings sit outside the translation axes (see
+    // `rotation_ring_radius`), so they are still checked before the axes
+    // below for the same reason `PlaneNormal` is: an outer handle should win
+    // over a nearer, but far less deliberately targeted, pixel-distance match
+    // on an inner axis. Unlike the plane quads above, an axis's own pick is
+    // also a fuzzy line-proximity test, so there is no exactness mismatch to
+    // resolve here the way there was against the quads.
+    if is_box
+        && let SceneSelection::Box(id) = selection
+        && let Some(field_box) = world.boxes().get(&id)
+    {
+        let rotation = quat_from_dquat(field_box.rotation);
+        let radius = rotation_ring_radius(length);
+        let mut rings: Vec<(TransformHandle, Vec3, f32)> = ROTATION_RINGS
+            .into_iter()
+            .map(|(handle, local_axis)| {
+                (handle, (rotation * local_axis).normalize_or_zero(), radius)
+            })
+            .collect();
+        let view_axis = (camera.target() - camera.eye()).normalize_or_zero();
+        if view_axis.length_squared() > f32::EPSILON {
+            rings.push((TransformHandle::RotateView, view_axis, view_ring_radius(length)));
+        }
+        let mut nearest: Option<(f32, TransformHandle)> = None;
+        for (handle, axis, ring_radius) in rings {
+            let Some(distance) = pick_ring(camera, viewport, pointer, origin, axis, ring_radius)
+            else {
+                continue;
+            };
+            if distance <= 8.0 && nearest.is_none_or(|(best, _)| distance < best) {
+                nearest = Some((distance, handle));
+            }
+        }
+        if let Some((_, handle)) = nearest {
             return Some(handle);
         }
     }
@@ -312,7 +505,50 @@ pub fn pick_transform_handle(
             nearest = Some((distance, handle));
         }
     }
-    nearest.map(|(_, handle)| handle)
+    if let Some((_, handle)) = nearest {
+        return Some(handle);
+    }
+
+    // Nothing specific was under the pointer. For a box, the space inside the
+    // rotation gizmo's sphere but not on any ring is still a deliberate
+    // target — free trackball rotation — so long as it is not one already
+    // claimed by a translation arrow or plane above, which this is only
+    // reached having missed.
+    if is_box {
+        let ray = camera.ray_from_viewport(pointer, viewport)?;
+        if ray.hit_sphere(origin, rotation_ring_radius(length)).is_some() {
+            return Some(TransformHandle::RotateFree);
+        }
+    }
+    None
+}
+
+/// The screen-space distance from `pointer` to the nearest point on a ring of
+/// `radius` centred at `origin`, perpendicular to `axis`. `None` if the ring
+/// cannot be projected (camera edge-on to a segment, or behind the camera).
+fn pick_ring(
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    pointer: Vec2,
+    origin: Vec3,
+    axis: Vec3,
+    radius: f32,
+) -> Option<f32> {
+    const SEGMENTS: u32 = 32;
+    let (a, b) = ring_basis(axis);
+    let point = |segment: u32| {
+        let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+        project_to_viewport(camera, viewport, origin + (a * angle.cos() + b * angle.sin()) * radius)
+    };
+    let mut nearest: Option<f32> = None;
+    let mut previous = point(0)?;
+    for segment in 1..=SEGMENTS {
+        let current = point(segment)?;
+        let distance = point_segment_distance(pointer, previous, current);
+        nearest = Some(nearest.map_or(distance, |best: f32| best.min(distance)));
+        previous = current;
+    }
+    nearest
 }
 
 /// Convert one pointer-frame delta into an exactly constrained world-space
@@ -349,20 +585,37 @@ pub fn constrained_translation(
     Some(current_hit - previous_hit)
 }
 
-pub fn selection_gizmo_length(world: &WorldSnapshot, selection: SceneSelection) -> Option<f32> {
-    transform_gizmo(world, selection).map(|(_, length)| length)
+pub fn selection_gizmo_length(
+    world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    selection: SceneSelection,
+) -> Option<f32> {
+    transform_gizmo(world, camera, viewport, selection).map(|(_, length)| length)
 }
 
-fn plane_normal_length(plane: &SlicePlane, translation_gizmo_length: f32) -> f32 {
-    // The proportional term keeps N useful on large planes; the second term
-    // ensures its labelled tip remains beyond a coincident translation axis.
-    (plane.half_extent.max_element() as f32 * 0.6)
-        .max(translation_gizmo_length * 1.35)
-        .max(0.65)
+/// The rotation gizmo's sphere radius for a box selection — mirrors
+/// [`selection_gizmo_length`], but for the radius the trackball drag needs
+/// rather than the translation length.
+pub fn rotation_gizmo_radius(
+    world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    selection: SceneSelection,
+) -> Option<f32> {
+    transform_gizmo(world, camera, viewport, selection)
+        .map(|(_, length)| rotation_ring_radius(length))
+}
+
+fn plane_normal_length(translation_gizmo_length: f32) -> f32 {
+    // The proportional term keeps N clear of a coincident translation axis.
+    translation_gizmo_length * 1.3
 }
 
 pub fn plane_normal_tip(
     world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
     selection: SceneSelection,
     preview: Option<TransformPreview>,
 ) -> Option<(Vec3, Vec3)> {
@@ -370,36 +623,35 @@ pub fn plane_normal_tip(
         return None;
     };
     let plane = world.planes().get(&id).filter(|plane| plane.visible)?;
-    let (world_origin, gizmo_length) = transform_gizmo(world, selection)?;
+    let (world_origin, gizmo_length) = transform_gizmo(world, camera, viewport, selection)?;
     let origin = preview.map_or(world_origin, |preview| preview.origin);
     let normal = preview
         .and_then(|preview| preview.plane_normal)
         .unwrap_or(plane.normal.as_vec3());
-    let tip = origin + normal * plane_normal_length(plane, gizmo_length);
+    let tip = origin + normal * plane_normal_length(gizmo_length);
     Some((origin, tip))
 }
 
 pub fn plane_normal_label_position(
     world: &WorldSnapshot,
-    selection: SceneSelection,
     camera: &OrbitCamera,
     viewport: Viewport,
+    selection: SceneSelection,
     preview: Option<TransformPreview>,
 ) -> Option<Vec2> {
-    let (_, tip) = plane_normal_tip(world, selection, preview)?;
+    let (_, tip) = plane_normal_tip(world, camera, viewport, selection, preview)?;
     let position = project_to_viewport(camera, viewport, tip)?;
     viewport.contains(position).then_some(position)
 }
 
 fn append_plane_normal(
     geometry: &mut FieldGeometry,
-    plane: &SlicePlane,
     origin: Vec3,
     direction: Vec3,
     translation_gizmo_length: f32,
     active: bool,
 ) {
-    let length = plane_normal_length(plane, translation_gizmo_length);
+    let length = plane_normal_length(translation_gizmo_length);
     let color = if active {
         Vec4::new(1.0, 0.9, 0.18, 1.0)
     } else {
@@ -436,6 +688,97 @@ fn append_plane_normal(
     );
 }
 
+fn rotation_ring_radius(length: f32) -> f32 {
+    length * 1.3
+}
+
+/// Radius of the fourth, screen-space rotation ring: larger than the three
+/// local rings, per the Blender/Unreal convention of an outer ring for
+/// view-axis rotation.
+fn view_ring_radius(length: f32) -> f32 {
+    length * 1.55
+}
+
+fn append_rotation_rings(
+    geometry: &mut FieldGeometry,
+    camera: &OrbitCamera,
+    origin: Vec3,
+    rotation: Quat,
+    radius: f32,
+    view_radius: f32,
+    active: Option<TransformHandle>,
+) {
+    const RING_COLORS: [Vec4; 3] = [
+        Vec4::new(0.95, 0.15, 0.18, 1.0),
+        Vec4::new(0.18, 0.9, 0.3, 1.0),
+        Vec4::new(0.2, 0.45, 1.0, 1.0),
+    ];
+    let width = radius * 0.04;
+    for ((handle, local_axis), color) in ROTATION_RINGS.into_iter().zip(RING_COLORS) {
+        let world_axis = (rotation * local_axis).normalize_or_zero();
+        append_ring_band(
+            &mut geometry.surface_triangles,
+            origin,
+            world_axis,
+            radius,
+            width,
+            handle_color(color, handle, active, 1.0),
+            GIZMO_LIGHT_DIR,
+        );
+    }
+
+    let view_axis = (camera.target() - camera.eye()).normalize_or_zero();
+    if view_axis.length_squared() > f32::EPSILON {
+        const VIEW_RING_COLOR: Vec4 = Vec4::new(0.92, 0.92, 0.95, 1.0);
+        append_ring_band(
+            &mut geometry.surface_triangles,
+            origin,
+            view_axis,
+            view_radius,
+            view_radius * 0.04,
+            handle_color(VIEW_RING_COLOR, TransformHandle::RotateView, active, 1.0),
+            GIZMO_LIGHT_DIR,
+        );
+    }
+}
+
+/// Where the pointer's ray crosses a sphere of `radius` centred at `origin`,
+/// as a unit direction from `origin` — or, for a pointer outside the sphere's
+/// silhouette, the closest point on the ray to `origin`, normalized, which is
+/// what keeps a drag continuous past the visible edge instead of sticking.
+///
+/// `reference` chooses which of two intersections to prefer when the ray
+/// crosses the sphere twice, by taking whichever is closer to it. Every
+/// caller wants continuity with *something* already in hand — the current
+/// normal, or the previous sample in the same drag — rather than an arbitrary
+/// near/far rule, so this is a parameter rather than a fixed policy.
+fn sphere_drag_point(
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    pointer: Vec2,
+    origin: Vec3,
+    radius: f32,
+    reference: Vec3,
+) -> Option<Vec3> {
+    let ray = camera.ray_from_viewport(pointer, viewport)?;
+    let offset = ray.origin - origin;
+    let b = offset.dot(ray.direction);
+    let c = offset.length_squared() - radius * radius;
+    let discriminant = b * b - c;
+    if discriminant >= 0.0 {
+        let root = discriminant.sqrt();
+        let candidates = [-b - root, -b + root]
+            .into_iter()
+            .filter(|distance| *distance >= 0.0)
+            .map(|distance| (ray.origin + ray.direction * distance - origin).normalize_or_zero());
+        return candidates.max_by(|a, b| a.dot(reference).total_cmp(&b.dot(reference)));
+    }
+
+    let distance = (origin - ray.origin).dot(ray.direction).max(0.0);
+    let closest = ray.origin + ray.direction * distance - origin;
+    (closest.length_squared() > f32::EPSILON).then(|| closest.normalize())
+}
+
 /// Arcball direction for dragging the tip of a plane's normal arrow.
 ///
 /// When the pointer ray crosses the virtual sphere, choose the intersection
@@ -450,23 +793,133 @@ pub fn dragged_plane_normal(
     radius: f32,
     current_normal: Vec3,
 ) -> Option<Vec3> {
-    let ray = camera.ray_from_viewport(pointer, viewport)?;
-    let offset = ray.origin - origin;
-    let b = offset.dot(ray.direction);
-    let c = offset.length_squared() - radius * radius;
-    let discriminant = b * b - c;
-    if discriminant >= 0.0 {
-        let root = discriminant.sqrt();
-        let candidates = [-b - root, -b + root]
-            .into_iter()
-            .filter(|distance| *distance >= 0.0)
-            .map(|distance| (ray.origin + ray.direction * distance - origin).normalize_or_zero());
-        return candidates.max_by(|a, b| a.dot(current_normal).total_cmp(&b.dot(current_normal)));
-    }
+    sphere_drag_point(camera, viewport, pointer, origin, radius, current_normal)
+}
 
-    let distance = (origin - ray.origin).dot(ray.direction).max(0.0);
-    let closest = ray.origin + ray.direction * distance - origin;
-    (closest.length_squared() > f32::EPSILON).then(|| closest.normalize())
+/// The new absolute rotation after rotating about a known world-space axis by
+/// one pointer-frame delta — the core every rotation-ring drag shares. Only
+/// *which* axis differs between a box-local ring
+/// ([`dragged_box_rotation`]) and the view-axis ring
+/// ([`dragged_view_rotation`]).
+///
+/// The angle is measured between where the previous and current pointer rays
+/// cross the rotation plane, so the ring tracks the pointer directly rather
+/// than integrating a velocity.
+fn rotate_about_world_axis(
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    pointer: Vec2,
+    pointer_delta: Vec2,
+    origin: Vec3,
+    world_axis: Vec3,
+    current_rotation: Quat,
+) -> Option<Quat> {
+    if world_axis.length_squared() <= f32::EPSILON {
+        return None;
+    }
+    let previous = pointer - pointer_delta;
+    let previous_ray = camera.ray_from_viewport(previous, viewport)?;
+    let current_ray = camera.ray_from_viewport(pointer, viewport)?;
+    let previous_radius = ray_plane_point(previous_ray, origin, world_axis)? - origin;
+    let current_radius = ray_plane_point(current_ray, origin, world_axis)? - origin;
+    if previous_radius.length_squared() <= f32::EPSILON
+        || current_radius.length_squared() <= f32::EPSILON
+    {
+        return None;
+    }
+    let (a, b) = ring_basis(world_axis);
+    let angle_of = |v: Vec3| v.dot(b).atan2(v.dot(a));
+    let mut delta_angle = angle_of(current_radius) - angle_of(previous_radius);
+    delta_angle = ((delta_angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU))
+        - std::f32::consts::PI;
+    let incremental = Quat::from_axis_angle(world_axis, delta_angle);
+    Some((incremental * current_rotation).normalize())
+}
+
+/// Rotate about one of a box's own local axes — the drag behind a local
+/// rotation ring.
+///
+/// Unlike [`dragged_plane_normal`]'s arcball — which can point a normal
+/// anywhere on the sphere in one drag — each local ring is constrained to
+/// rotate about exactly one axis, `ring_local_axis` in the box's own frame.
+/// That constraint is what lets three independent rings compose into a free
+/// orientation without fighting each other: dragging the X ring can never
+/// smuggle in a Y or Z rotation.
+pub fn dragged_box_rotation(
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    pointer: Vec2,
+    pointer_delta: Vec2,
+    origin: Vec3,
+    ring_local_axis: Vec3,
+    current_rotation: Quat,
+) -> Option<Quat> {
+    let world_axis = (current_rotation * ring_local_axis).normalize_or_zero();
+    rotate_about_world_axis(
+        camera,
+        viewport,
+        pointer,
+        pointer_delta,
+        origin,
+        world_axis,
+        current_rotation,
+    )
+}
+
+/// Rotate about the camera's current view axis — the drag behind the
+/// screen-space ring. Recomputed from the live camera every call, since
+/// unlike a local ring this axis has no fixed relationship to the box's own
+/// orientation.
+pub fn dragged_view_rotation(
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    pointer: Vec2,
+    pointer_delta: Vec2,
+    origin: Vec3,
+    current_rotation: Quat,
+) -> Option<Quat> {
+    let world_axis = (camera.target() - camera.eye()).normalize_or_zero();
+    rotate_about_world_axis(
+        camera,
+        viewport,
+        pointer,
+        pointer_delta,
+        origin,
+        world_axis,
+        current_rotation,
+    )
+}
+
+/// Free trackball rotation: the drag behind the space inside the rotation
+/// gizmo's sphere that is not on any specific ring.
+///
+/// Built from two [`sphere_drag_point`] samples — the classic arcball
+/// construction, generalized from `dragged_plane_normal`'s "one point on a
+/// sphere" to "the rotation between two such points": the axis is
+/// perpendicular to both samples, the angle is between them, applied as one
+/// incremental rotation. The current sample prefers continuity with the
+/// previous one (rather than an arbitrary near/far rule), since this is one
+/// drag sampled twice, not two independent picks.
+pub fn dragged_trackball_rotation(
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    pointer: Vec2,
+    pointer_delta: Vec2,
+    origin: Vec3,
+    radius: f32,
+    current_rotation: Quat,
+) -> Option<Quat> {
+    let previous_pointer = pointer - pointer_delta;
+    let camera_ward = (camera.eye() - origin).normalize_or_zero();
+    let previous = sphere_drag_point(camera, viewport, previous_pointer, origin, radius, camera_ward)?;
+    let current = sphere_drag_point(camera, viewport, pointer, origin, radius, previous)?;
+
+    let axis = previous.cross(current);
+    if axis.length_squared() <= f32::EPSILON {
+        return None;
+    }
+    let angle = previous.dot(current).clamp(-1.0, 1.0).acos();
+    Some((Quat::from_axis_angle(axis.normalize(), angle) * current_rotation).normalize())
 }
 
 /// Move parallel to the camera's view plane while retaining the object's depth.
@@ -496,6 +949,13 @@ mod tests {
 
     use super::*;
 
+    const VIEWPORT: Viewport = Viewport {
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 600,
+    };
+
     #[test]
     fn axis_gizmo_pick_and_drag_remain_on_the_selected_axis() {
         let mut world = World::new();
@@ -506,30 +966,24 @@ mod tests {
             .unwrap();
         let snapshot = world.snapshot();
         let object = snapshot.objects().values().next().unwrap();
-        let viewport = Viewport {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        };
         let camera = OrbitCamera::default();
         let origin = object.transform.translation.as_vec3();
         let selection = SceneSelection::Object(object.id);
-        let length = object_gizmo_length(object);
+        let (_, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
         let start =
-            project_to_viewport(&camera, viewport, origin + Vec3::X * length * 0.6).unwrap();
-        let end = project_to_viewport(&camera, viewport, origin + Vec3::X * length * 0.9).unwrap();
+            project_to_viewport(&camera, VIEWPORT, origin + Vec3::X * length * 0.6).unwrap();
+        let end = project_to_viewport(&camera, VIEWPORT, origin + Vec3::X * length * 0.9).unwrap();
         let pointer = start.lerp(end, 0.5);
 
         assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, viewport, pointer),
+            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
             Some(TransformHandle::AxisX)
         );
         let screen_axis = (end - start).normalize();
         let movement = constrained_translation(
             TransformHandle::AxisX,
             &camera,
-            viewport,
+            VIEWPORT,
             pointer + screen_axis * 12.0,
             screen_axis * 12.0,
             origin,
@@ -551,20 +1005,24 @@ mod tests {
             .unwrap();
         let snapshot = world.snapshot();
         let object = snapshot.objects().values().next().unwrap();
-        let viewport = Viewport {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        };
+        let camera = OrbitCamera::default();
+        let origin = object.transform.translation.as_vec3();
+        let (_, length) = transform_gizmo(
+            &snapshot,
+            &camera,
+            VIEWPORT,
+            SceneSelection::Object(object.id),
+        )
+        .unwrap();
+
         let movement = constrained_translation(
             TransformHandle::PlaneXY,
-            &OrbitCamera::default(),
-            viewport,
+            &camera,
+            VIEWPORT,
             Vec2::new(430.0, 320.0),
             Vec2::new(12.0, 8.0),
-            object.transform.translation.as_vec3(),
-            object_gizmo_length(object),
+            origin,
+            length,
         )
         .unwrap();
 
@@ -575,15 +1033,9 @@ mod tests {
     #[test]
     fn free_drag_moves_in_the_camera_plane() {
         let camera = OrbitCamera::default();
-        let viewport = Viewport {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        };
         let movement = view_plane_translation(
             &camera,
-            viewport,
+            VIEWPORT,
             Vec2::new(430.0, 320.0),
             Vec2::new(12.0, 8.0),
             Vec3::new(0.0, 0.0, 0.6),
@@ -605,26 +1057,16 @@ mod tests {
             .unwrap();
         let snapshot = world.snapshot();
         let object = snapshot.objects().values().next().unwrap();
-        let viewport = Viewport {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        };
         let camera = OrbitCamera::default();
         let origin = object.transform.translation.as_vec3();
-        let corners = gizmo_plane_corners(origin, Vec3::X, Vec3::Y, object_gizmo_length(object));
+        let selection = SceneSelection::Object(object.id);
+        let (_, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
+        let corners = gizmo_plane_corners(origin, Vec3::X, Vec3::Y, length);
         let centroid = corners.iter().fold(Vec3::ZERO, |sum, c| sum + *c) / 4.0;
-        let pointer = project_to_viewport(&camera, viewport, centroid).unwrap();
+        let pointer = project_to_viewport(&camera, VIEWPORT, centroid).unwrap();
 
         assert_eq!(
-            pick_transform_handle(
-                &snapshot,
-                SceneSelection::Object(object.id),
-                &camera,
-                viewport,
-                pointer,
-            ),
+            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
             Some(TransformHandle::PlaneXY)
         );
     }
@@ -644,14 +1086,23 @@ mod tests {
             ])
             .unwrap();
         let snapshot = world.snapshot();
+        let camera = OrbitCamera::default();
 
         for selection in [
             SceneSelection::Probe(report.created_probes[0]),
             SceneSelection::Plane(report.created_planes[0]),
         ] {
             let mut geometry = FieldGeometry::default();
-            append_transform_gizmo(&mut geometry, &snapshot, Some(selection), None, None);
-            assert!(geometry.vector_lines.len() > 6 * 32);
+            append_transform_gizmo(
+                &mut geometry,
+                &snapshot,
+                &camera,
+                VIEWPORT,
+                Some(selection),
+                None,
+                None,
+            );
+            assert!(!geometry.vector_lines.is_empty());
             assert_eq!(selection_origin(&snapshot, selection), Some(Vec3::ZERO));
         }
     }
@@ -672,25 +1123,20 @@ mod tests {
             .unwrap();
         let snapshot = world.snapshot();
         let selection = SceneSelection::Plane(report.created_planes[0]);
-        let viewport = Viewport {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        };
         let camera = OrbitCamera::default();
-        let (origin, tip) = plane_normal_tip(&snapshot, selection, None).unwrap();
-        assert!(tip.distance(origin) >= 2.4);
+        let (origin, tip) =
+            plane_normal_tip(&snapshot, &camera, VIEWPORT, selection, None).unwrap();
+        assert!(tip.distance(origin) > 0.0);
 
-        let pointer = project_to_viewport(&camera, viewport, tip * 0.9).unwrap();
+        let pointer = project_to_viewport(&camera, VIEWPORT, tip * 0.9).unwrap();
         assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, viewport, pointer),
+            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
             Some(TransformHandle::PlaneNormal)
         );
 
         let dragged = dragged_plane_normal(
             &camera,
-            viewport,
+            VIEWPORT,
             pointer + Vec2::new(30.0, 15.0),
             origin,
             tip.distance(origin),
@@ -699,5 +1145,296 @@ mod tests {
         .unwrap();
         assert!(dragged.is_normalized());
         assert!(dragged != Vec3::Z);
+    }
+
+    /// The whole point of the redesign: the gizmo's on-screen size must not
+    /// change as the camera dollies, even though the world-space `length`
+    /// absolutely does.
+    #[test]
+    fn the_gizmo_is_the_same_screen_size_at_any_camera_distance() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("source"))])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Object(fieldcad_core::ObjectId::new(0));
+
+        let mut near = OrbitCamera::default();
+        near.focus(Vec3::ZERO, 1.0);
+        let mut far = OrbitCamera::default();
+        far.focus(Vec3::ZERO, 1.0);
+        far.dolly(-2_000.0);
+        assert!(far.distance() > near.distance() * 1.5);
+
+        let (near_origin, near_length) =
+            transform_gizmo(&snapshot, &near, VIEWPORT, selection).unwrap();
+        let (far_origin, far_length) =
+            transform_gizmo(&snapshot, &far, VIEWPORT, selection).unwrap();
+        assert!(
+            far_length > near_length * 1.5,
+            "world-space length must grow with distance: {near_length} near, {far_length} far"
+        );
+
+        let near_tip = project_to_viewport(&near, VIEWPORT, near_origin + Vec3::X * near_length)
+            .unwrap();
+        let near_base = project_to_viewport(&near, VIEWPORT, near_origin).unwrap();
+        let far_tip =
+            project_to_viewport(&far, VIEWPORT, far_origin + Vec3::X * far_length).unwrap();
+        let far_base = project_to_viewport(&far, VIEWPORT, far_origin).unwrap();
+
+        let near_pixels = near_tip.distance(near_base);
+        let far_pixels = far_tip.distance(far_base);
+        assert!(
+            (near_pixels - far_pixels).abs() < 1.0,
+            "expected a constant on-screen arrow length: {near_pixels}px near, {far_pixels}px far"
+        );
+    }
+
+    fn box_world() -> (World, fieldcad_core::BoxId) {
+        use fieldcad_core::FieldBoxSpec;
+        use glam::DVec3;
+
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreateBox(
+                FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(2.0)).unwrap(),
+            )])
+            .unwrap();
+        (world, report.created_boxes[0])
+    }
+
+    /// Regression test for a real precedence bug: a plane-drag handle's own
+    /// centroid failed to pick that handle for roughly half of a sweep of
+    /// camera orbit angles, because the rotation rings were checked first and
+    /// a ring viewed edge-on projects to a line that can sweep right through
+    /// a plane handle's screen position — not a rare coincidence, but a
+    /// systematic conflict across a wide range of angles. "Inside this exact
+    /// quad" is unambiguous and now wins over "within a few pixels of a ring
+    /// line" for the same reason `PlaneNormal` already wins its own overlap
+    /// with the Z axis: an exact, deliberately-shaped target must not lose to
+    /// an approximate one.
+    ///
+    /// This asserts "reliable", not "always": a small number of near-edge-on
+    /// angles are a genuine foreshortening limit no picking-order fix can
+    /// remove — a flat handle viewed edge-on is hard to click in any tool,
+    /// this one included, because it is a hard-to-see sliver on screen, not a
+    /// picking bug.
+    #[test]
+    fn a_plane_handle_is_reliably_pickable_across_a_sweep_of_camera_orbits() {
+        let (world, box_id) = box_world();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Box(box_id);
+
+        let mut total = 0;
+        let mut correct = 0;
+        for yaw_deg in (0..360).step_by(15) {
+            for pitch_deg in (-80..=80).step_by(20) {
+                let mut camera = OrbitCamera::default();
+                let yaw_radians = (yaw_deg as f32).to_radians();
+                let pitch_radians = (pitch_deg as f32).to_radians();
+                camera.orbit(Vec2::new(-yaw_radians / 0.006, pitch_radians / 0.006));
+
+                let Some((origin, length)) =
+                    transform_gizmo(&snapshot, &camera, VIEWPORT, selection)
+                else {
+                    continue;
+                };
+                for (handle, a, b) in GIZMO_PLANES {
+                    let corners = gizmo_plane_corners(origin, a, b, length);
+                    let centroid = corners.iter().fold(Vec3::ZERO, |sum, c| sum + *c) / 4.0;
+                    let Some(pointer) = project_to_viewport(&camera, VIEWPORT, centroid) else {
+                        continue;
+                    };
+                    total += 1;
+                    if pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer)
+                        == Some(handle)
+                    {
+                        correct += 1;
+                    }
+                }
+            }
+        }
+
+        let hit_rate = correct as f32 / total as f32;
+        assert!(
+            hit_rate > 0.85,
+            "expected a plane handle's own centroid to pick it reliably, got {correct}/{total} \
+             ({:.1}%)",
+            hit_rate * 100.0
+        );
+    }
+
+    #[test]
+    fn a_local_rotation_ring_is_picked_where_it_is_drawn_and_rotates_only_about_its_own_axis() {
+        let (world, box_id) = box_world();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Box(box_id);
+        let camera = OrbitCamera::default();
+        let (origin, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
+        let radius = rotation_ring_radius(length);
+
+        // At the box's identity rotation, the Z ring is the circle in the XY
+        // plane. A point on a coordinate axis (e.g. `origin + X * radius`)
+        // would sit on the Z ring *and* the Y ring at once, so this picks a
+        // point at 45 degrees, which belongs to the Z ring alone.
+        let point_on_z_ring = origin + (Vec3::X + Vec3::Y).normalize() * radius;
+        let pointer = project_to_viewport(&camera, VIEWPORT, point_on_z_ring).unwrap();
+
+        assert_eq!(
+            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            Some(TransformHandle::RotateZ)
+        );
+
+        // Two points 30 degrees apart on the same ring, so the screen-space
+        // delta between their projections corresponds to a known angle
+        // regardless of the default camera's particular viewing direction —
+        // `project_to_viewport` and `ray_plane_point` are exact inverses for
+        // two points already on the ring's own plane.
+        let angle_of = |degrees: f32| {
+            let radians = degrees.to_radians();
+            origin + Vec3::new(radians.cos(), radians.sin(), 0.0) * radius
+        };
+        let pointer_before = project_to_viewport(&camera, VIEWPORT, angle_of(45.0)).unwrap();
+        let pointer_after = project_to_viewport(&camera, VIEWPORT, angle_of(75.0)).unwrap();
+        let delta = pointer_after - pointer_before;
+
+        let dragged = dragged_box_rotation(
+            &camera,
+            VIEWPORT,
+            pointer_after,
+            delta,
+            origin,
+            Vec3::Z,
+            Quat::IDENTITY,
+        )
+        .unwrap();
+
+        // A meaningful rotation happened...
+        assert!((dragged * Vec3::X - Vec3::X).length() > 1.0e-4);
+        // ...but only about Z: Z itself is fixed, and X never leaves the XY
+        // plane the way it would if Y or X rotation had leaked in.
+        assert!((dragged * Vec3::Z - Vec3::Z).length() < 1.0e-4);
+        assert!((dragged * Vec3::X).z.abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn the_view_ring_is_picked_and_rotates_about_the_cameras_forward_axis() {
+        let (world, box_id) = box_world();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Box(box_id);
+        let camera = OrbitCamera::default();
+        let (origin, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
+        let radius = view_ring_radius(length);
+        let view_axis = (camera.target() - camera.eye()).normalize();
+        let (a, _) = ring_basis(view_axis);
+
+        let pointer = project_to_viewport(&camera, VIEWPORT, origin + a * radius).unwrap();
+        assert_eq!(
+            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            Some(TransformHandle::RotateView)
+        );
+
+        let delta = Vec2::new(24.0, 6.0);
+        let dragged = dragged_view_rotation(
+            &camera,
+            VIEWPORT,
+            pointer + delta,
+            delta,
+            origin,
+            Quat::IDENTITY,
+        )
+        .unwrap();
+
+        // Rotating about the view axis leaves that axis itself fixed.
+        assert!((dragged * view_axis - view_axis).length() < 1.0e-3);
+        assert!((dragged * Vec3::X - Vec3::X).length() > 1.0e-4);
+    }
+
+    #[test]
+    fn empty_space_inside_the_rotation_sphere_picks_free_rotation_and_rotates_off_axis() {
+        let (world, box_id) = box_world();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Box(box_id);
+        let camera = OrbitCamera::default();
+        let (origin, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
+        let radius = rotation_ring_radius(length);
+
+        // Well inside the sphere (rings sit *at* `radius`, on its surface, so
+        // any point strictly inside is automatically clear of all three), and
+        // along a diagonal direction whose every axis component
+        // (`radius * 0.85 / sqrt(3)`) stays past the translation gizmo's
+        // reach — the axis segments extend only to `length`, the plane quads
+        // only to `length * 0.42` — so it lands off every specific handle.
+        let point = origin + Vec3::new(1.0, 1.0, 1.0).normalize() * radius * 0.85;
+        let pointer = project_to_viewport(&camera, VIEWPORT, point).unwrap();
+
+        assert_eq!(
+            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            Some(TransformHandle::RotateFree)
+        );
+
+        let delta = Vec2::new(20.0, 15.0);
+        let dragged = dragged_trackball_rotation(
+            &camera,
+            VIEWPORT,
+            pointer + delta,
+            delta,
+            origin,
+            radius,
+            Quat::IDENTITY,
+        )
+        .unwrap();
+
+        // A free trackball drag is not confined to a single world axis: at
+        // least two of the three basis vectors must have moved.
+        let moved = [Vec3::X, Vec3::Y, Vec3::Z]
+            .into_iter()
+            .filter(|axis| (dragged * *axis - *axis).length() > 1.0e-3)
+            .count();
+        assert!(moved >= 2, "expected an off-axis rotation, dragged = {dragged:?}");
+    }
+
+    /// The regression this design specifically guards against: a translation
+    /// arrow's tip can sit well inside the rotation gizmo's sphere radius, and
+    /// clicking it must still translate rather than fall through to the
+    /// trackball catch-all.
+    #[test]
+    fn a_translation_arrow_inside_the_rotation_sphere_still_picks_translation() {
+        let (world, box_id) = box_world();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Box(box_id);
+        let camera = OrbitCamera::default();
+        let (origin, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
+        let radius = rotation_ring_radius(length);
+        assert!(length < radius, "the translation arrow must sit inside the rotation sphere");
+
+        // Whichever axis's grabbable segment the default oblique view happens
+        // to keep clear of all four rings' screen-projected silhouettes — an
+        // edge-on ring collapses to a line that can run right along an axis
+        // arrow for some specific views, so this is a property of "some axis,
+        // some point on its segment, for a camera actually looking at the
+        // gizmo" rather than one hand-picked axis and point.
+        let mut hit = None;
+        'search: for axis in [
+            (TransformHandle::AxisX, Vec3::X),
+            (TransformHandle::AxisY, Vec3::Y),
+            (TransformHandle::AxisZ, Vec3::Z),
+        ] {
+            let (start, end) = gizmo_axis_segment(origin, axis.1, length);
+            for t in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+                let pointer = project_to_viewport(&camera, VIEWPORT, start.lerp(end, t)).unwrap();
+                if pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer)
+                    == Some(axis.0)
+                {
+                    hit = Some(());
+                    break 'search;
+                }
+            }
+        }
+        assert!(
+            hit.is_some(),
+            "expected at least one point on some translation axis segment to pick that axis, \
+             not a ring or free rotation"
+        );
     }
 }
