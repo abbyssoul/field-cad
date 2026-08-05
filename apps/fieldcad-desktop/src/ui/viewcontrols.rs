@@ -124,9 +124,66 @@ fn camera_controls(
 
 fn display_toggles(ui: &mut egui::Ui, view: &mut ViewOptions) {
     ui.strong("Show");
-    for (label, hover, field) in ViewOptions::ENTRIES {
+    for (label, hover, field) in ViewOptions::PRIMARY_ENTRIES {
         ui.checkbox(field(view), label).on_hover_text(hover);
     }
+    egui::CollapsingHeader::new("Auxiliary object types")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add_enabled_ui(view.auxiliary_objects, |ui| {
+                for (label, hover, field) in ViewOptions::AUXILIARY_ENTRIES {
+                    ui.checkbox(field(view), label).on_hover_text(hover);
+                }
+            });
+        });
+    egui::CollapsingHeader::new("Compute")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.checkbox(&mut view.compute_bounds, "Bounds")
+                .on_hover_text("The spatial extent of the active computation; this does not change the solver domain");
+        });
+    egui::CollapsingHeader::new("Transform gizmo")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.small("Screen-space size; does not change the selected object.");
+            egui::Grid::new("transform_gizmo_display")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Origin arrows");
+                    ui.horizontal(|ui| {
+                        ui.label("Length");
+                        ui.add(
+                            egui::DragValue::new(&mut view.gizmo_display.axis_length_px)
+                                .range(12.0..=300.0)
+                                .suffix(" px"),
+                        );
+                        ui.label("Thickness");
+                        ui.add(
+                            egui::DragValue::new(&mut view.gizmo_display.axis_thickness_px)
+                                .range(0.5..=24.0)
+                                .suffix(" px"),
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("Rotation rings");
+                    ui.horizontal(|ui| {
+                        ui.label("Diameter");
+                        ui.add(
+                            egui::DragValue::new(&mut view.gizmo_display.rotation_diameter_px)
+                                .range(24.0..=600.0)
+                                .suffix(" px"),
+                        );
+                        ui.label("Thickness");
+                        ui.add(
+                            egui::DragValue::new(&mut view.gizmo_display.rotation_thickness_px)
+                                .range(0.5..=24.0)
+                                .suffix(" px"),
+                        );
+                    });
+                    ui.end_row();
+                });
+        });
 }
 
 /// Which published field channels are drawn.

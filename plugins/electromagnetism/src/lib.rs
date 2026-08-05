@@ -32,8 +32,8 @@ use fieldcad_mass_sources::mass_component_schemas;
 use fieldcad_particles::particle_component_schema;
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
-    PluginError, PluginMetadata, SampledColumn, SolverCancellation, SolverContext, SolverKind,
-    SolverStepOutcome,
+    PluginError, PluginMetadata, ResolvedFieldBrushStroke, SampledColumn, SolverCancellation,
+    SolverContext, SolverKind, SolverStepOutcome,
 };
 use glam::{DVec3, UVec3};
 
@@ -1333,6 +1333,50 @@ impl EquationSystemSolver for MaxwellSolver {
 
     fn kinematic_objects(&self) -> &[fieldcad_core::ObjectId] {
         self.core.kinematic_objects()
+    }
+
+    fn mutable_vector_channels(&self) -> &[ChannelHandle] {
+        &[ELECTRIC_FIELD_HANDLE, MAGNETIC_FIELD_HANDLE]
+    }
+
+    fn apply_field_brush_stroke(
+        &mut self,
+        stroke: &ResolvedFieldBrushStroke,
+    ) -> Result<(), PluginError> {
+        let target = match stroke.stroke.channel {
+            ref channel if channel == &electric_field_channel_id() => &mut self.electric,
+            ref channel if channel == &magnetic_field_channel_id() => &mut self.magnetic,
+            _ => {
+                return Err(PluginError::Solver(
+                    "Maxwell cannot paint this field channel".to_owned(),
+                ));
+            }
+        };
+        let radius_squared = stroke.stroke.radius_metres * stroke.stroke.radius_metres;
+        let amount = stroke.direction * stroke.stroke.strength.si_value();
+        let bounds = self.core.domain().bounds();
+        for z in 0..self.counts.z {
+            for y in 0..self.counts.y {
+                for x in 0..self.counts.x {
+                    let position = bounds.min()
+                        + DVec3::new(
+                            f64::from(x) * self.spacing.x,
+                            f64::from(y) * self.spacing.y,
+                            f64::from(z) * self.spacing.z,
+                        );
+                    let weight = stroke.centres.iter().fold(0.0_f64, |weight, centre| {
+                        let normalized = position.distance_squared(*centre) / radius_squared;
+                        if normalized < 1.0 {
+                            weight.max((1.0 - normalized).powi(2))
+                        } else {
+                            weight
+                        }
+                    });
+                    target[linear_index(self.counts, x, y, z)] += amount * weight;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn step(&mut self, context: StepContext) -> Result<SolverStepOutcome, PluginError> {

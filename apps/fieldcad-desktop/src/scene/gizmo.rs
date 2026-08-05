@@ -138,7 +138,44 @@ impl TransformHandle {
 /// Screen-space gizmo sizing. Every other size in this file is a fixed
 /// multiple of this one, converted to world units via
 /// [`OrbitCamera::world_units_per_pixel`] at the gizmo's origin.
-const AXIS_LENGTH_PX: f32 = 90.0;
+const AXIS_LENGTH_PX: f32 = 120.0;
+
+/// Presentation settings for the scale-independent transform gizmo, expressed
+/// in logical screen pixels. They affect neither authored geometry nor the
+/// transform produced by a drag.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GizmoDisplay {
+    pub axis_length_px: f32,
+    pub axis_thickness_px: f32,
+    pub rotation_diameter_px: f32,
+    pub rotation_thickness_px: f32,
+}
+
+impl Default for GizmoDisplay {
+    fn default() -> Self {
+        Self {
+            axis_length_px: AXIS_LENGTH_PX,
+            axis_thickness_px: 4.0,
+            rotation_diameter_px: 220.0,
+            rotation_thickness_px: 8.0,
+        }
+    }
+}
+
+impl GizmoDisplay {
+    fn axis_length_px(self) -> f32 {
+        self.axis_length_px.max(12.0)
+    }
+    fn axis_thickness_px(self) -> f32 {
+        self.axis_thickness_px.max(0.5)
+    }
+    fn rotation_radius_px(self) -> f32 {
+        (self.rotation_diameter_px * 0.5).max(12.0)
+    }
+    fn rotation_thickness_px(self) -> f32 {
+        self.rotation_thickness_px.max(0.5)
+    }
+}
 
 /// A fixed world-space light direction for baked flat shading (see the module
 /// doc on [`super::push_shaded_triangle`]). Not camera-relative, so a solid
@@ -156,10 +193,34 @@ pub fn append_transform_gizmo(
     active: Option<TransformHandle>,
     preview: Option<TransformPreview>,
 ) {
+    append_transform_gizmo_with_display(
+        geometry,
+        world,
+        camera,
+        viewport,
+        selection,
+        active,
+        preview,
+        GizmoDisplay::default(),
+    );
+}
+
+pub fn append_transform_gizmo_with_display(
+    geometry: &mut FieldGeometry,
+    world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    selection: Option<SceneSelection>,
+    active: Option<TransformHandle>,
+    preview: Option<TransformPreview>,
+    display: GizmoDisplay,
+) {
     let Some(selection) = selection else {
         return;
     };
-    let Some((world_origin, length)) = transform_gizmo(world, camera, viewport, selection) else {
+    let Some((world_origin, length)) =
+        transform_gizmo_with_display(world, camera, viewport, selection, display)
+    else {
         return;
     };
     let origin = preview.map_or(world_origin, |preview| preview.origin);
@@ -183,6 +244,8 @@ pub fn append_transform_gizmo(
             origin,
             direction,
             length,
+            display.axis_thickness_px()
+                * camera.world_units_per_pixel(origin, viewport.height as f32),
             handle_color(color, handle, active, 1.0),
         );
     }
@@ -220,8 +283,12 @@ pub fn append_transform_gizmo(
             camera,
             origin,
             rotation,
-            rotation_ring_radius(length),
-            view_ring_radius(length),
+            display.rotation_radius_px()
+                * camera.world_units_per_pixel(origin, viewport.height as f32),
+            display.rotation_radius_px() * 1.55 / 1.3
+                * camera.world_units_per_pixel(origin, viewport.height as f32),
+            display.rotation_thickness_px()
+                * camera.world_units_per_pixel(origin, viewport.height as f32),
             active,
         );
     }
@@ -283,9 +350,19 @@ fn transform_gizmo(
     viewport: Viewport,
     selection: SceneSelection,
 ) -> Option<(Vec3, f32)> {
+    transform_gizmo_with_display(world, camera, viewport, selection, GizmoDisplay::default())
+}
+
+fn transform_gizmo_with_display(
+    world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    selection: SceneSelection,
+    display: GizmoDisplay,
+) -> Option<(Vec3, f32)> {
     let origin = selection_origin_point(world, selection)?;
     let scale = camera.world_units_per_pixel(origin, viewport.height as f32);
-    Some((origin, AXIS_LENGTH_PX * scale))
+    Some((origin, display.axis_length_px() * scale))
 }
 
 fn selection_marker_radius(length: f32) -> f32 {
@@ -369,6 +446,7 @@ fn append_solid_arrow(
     origin: Vec3,
     direction: Vec3,
     length: f32,
+    shaft_radius: f32,
     color: Vec4,
 ) {
     if !direction.is_finite() || direction.length_squared() <= f32::EPSILON || length <= 0.0 {
@@ -376,8 +454,6 @@ fn append_solid_arrow(
     }
     let direction = direction.normalize();
     const HEAD_FRACTION: f32 = 0.32;
-    const SHAFT_RADIUS_FRACTION: f32 = 0.035;
-    const HEAD_RADIUS_FRACTION: f32 = 0.09;
     let shaft_end = origin + direction * (length * (1.0 - HEAD_FRACTION));
     let tip = origin + direction * length;
 
@@ -385,7 +461,7 @@ fn append_solid_arrow(
         &mut geometry.surface_triangles,
         origin,
         shaft_end,
-        length * SHAFT_RADIUS_FRACTION,
+        shaft_radius,
         color,
         GIZMO_LIGHT_DIR,
     );
@@ -393,7 +469,7 @@ fn append_solid_arrow(
         &mut geometry.surface_triangles,
         shaft_end,
         tip,
-        length * HEAD_RADIUS_FRACTION,
+        shaft_radius * (0.09 / 0.035),
         color,
         GIZMO_LIGHT_DIR,
     );
@@ -406,7 +482,26 @@ pub fn pick_transform_handle(
     viewport: Viewport,
     pointer: Vec2,
 ) -> Option<TransformHandle> {
-    let (origin, length) = transform_gizmo(world, camera, viewport, selection)?;
+    pick_transform_handle_with_display(
+        world,
+        selection,
+        camera,
+        viewport,
+        pointer,
+        GizmoDisplay::default(),
+    )
+}
+
+pub fn pick_transform_handle_with_display(
+    world: &WorldSnapshot,
+    selection: SceneSelection,
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    pointer: Vec2,
+    display: GizmoDisplay,
+) -> Option<TransformHandle> {
+    let (origin, length) =
+        transform_gizmo_with_display(world, camera, viewport, selection, display)?;
     let is_box = matches!(selection, SceneSelection::Box(_));
 
     // The outer part of N is reserved for rotation. For the default XY plane
@@ -465,7 +560,8 @@ pub fn pick_transform_handle(
         && let Some(field_box) = world.boxes().get(&id)
     {
         let rotation = quat_from_dquat(field_box.rotation);
-        let radius = rotation_ring_radius(length);
+        let scale = camera.world_units_per_pixel(origin, viewport.height as f32);
+        let radius = display.rotation_radius_px() * scale;
         let mut rings: Vec<(TransformHandle, Vec3, f32)> = ROTATION_RINGS
             .into_iter()
             .map(|(handle, local_axis)| {
@@ -474,7 +570,7 @@ pub fn pick_transform_handle(
             .collect();
         let view_axis = (camera.target() - camera.eye()).normalize_or_zero();
         if view_axis.length_squared() > f32::EPSILON {
-            rings.push((TransformHandle::RotateView, view_axis, view_ring_radius(length)));
+            rings.push((TransformHandle::RotateView, view_axis, radius * 1.55 / 1.3));
         }
         let mut nearest: Option<(f32, TransformHandle)> = None;
         for (handle, axis, ring_radius) in rings {
@@ -482,7 +578,9 @@ pub fn pick_transform_handle(
             else {
                 continue;
             };
-            if distance <= 8.0 && nearest.is_none_or(|(best, _)| distance < best) {
+            if distance <= display.rotation_thickness_px() * 0.5 + 4.0
+                && nearest.is_none_or(|(best, _)| distance < best)
+            {
                 nearest = Some((distance, handle));
             }
         }
@@ -509,14 +607,13 @@ pub fn pick_transform_handle(
         return Some(handle);
     }
 
-    // Nothing specific was under the pointer. For a box, the space inside the
-    // rotation gizmo's sphere but not on any ring is still a deliberate
-    // target — free trackball rotation — so long as it is not one already
-    // claimed by a translation arrow or plane above, which this is only
-    // reached having missed.
+    // A free trackball drag is the box gizmo's catch-all. Specific translation
+    // handles above still win where the configured rings overlap them.
     if is_box {
         let ray = camera.ray_from_viewport(pointer, viewport)?;
-        if ray.hit_sphere(origin, rotation_ring_radius(length)).is_some() {
+        let radius = display.rotation_radius_px()
+            * camera.world_units_per_pixel(origin, viewport.height as f32);
+        if ray.hit_sphere(origin, radius).is_some() {
             return Some(TransformHandle::RotateFree);
         }
     }
@@ -538,7 +635,11 @@ fn pick_ring(
     let (a, b) = ring_basis(axis);
     let point = |segment: u32| {
         let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
-        project_to_viewport(camera, viewport, origin + (a * angle.cos() + b * angle.sin()) * radius)
+        project_to_viewport(
+            camera,
+            viewport,
+            origin + (a * angle.cos() + b * angle.sin()) * radius,
+        )
     };
     let mut nearest: Option<f32> = None;
     let mut previous = point(0)?;
@@ -591,7 +692,18 @@ pub fn selection_gizmo_length(
     viewport: Viewport,
     selection: SceneSelection,
 ) -> Option<f32> {
-    transform_gizmo(world, camera, viewport, selection).map(|(_, length)| length)
+    selection_gizmo_length_with_display(world, camera, viewport, selection, GizmoDisplay::default())
+}
+
+pub fn selection_gizmo_length_with_display(
+    world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    selection: SceneSelection,
+    display: GizmoDisplay,
+) -> Option<f32> {
+    transform_gizmo_with_display(world, camera, viewport, selection, display)
+        .map(|(_, length)| length)
 }
 
 /// The rotation gizmo's sphere radius for a box selection — mirrors
@@ -603,8 +715,19 @@ pub fn rotation_gizmo_radius(
     viewport: Viewport,
     selection: SceneSelection,
 ) -> Option<f32> {
-    transform_gizmo(world, camera, viewport, selection)
-        .map(|(_, length)| rotation_ring_radius(length))
+    rotation_gizmo_radius_with_display(world, camera, viewport, selection, GizmoDisplay::default())
+}
+
+pub fn rotation_gizmo_radius_with_display(
+    world: &WorldSnapshot,
+    camera: &OrbitCamera,
+    viewport: Viewport,
+    selection: SceneSelection,
+    display: GizmoDisplay,
+) -> Option<f32> {
+    transform_gizmo_with_display(world, camera, viewport, selection, display).map(|(origin, _)| {
+        display.rotation_radius_px() * camera.world_units_per_pixel(origin, viewport.height as f32)
+    })
 }
 
 fn plane_normal_length(translation_gizmo_length: f32) -> f32 {
@@ -688,15 +811,17 @@ fn append_plane_normal(
     );
 }
 
+#[cfg(test)]
 fn rotation_ring_radius(length: f32) -> f32 {
-    length * 1.3
+    length * (110.0 / AXIS_LENGTH_PX)
 }
 
 /// Radius of the fourth, screen-space rotation ring: larger than the three
 /// local rings, per the Blender/Unreal convention of an outer ring for
 /// view-axis rotation.
+#[cfg(test)]
 fn view_ring_radius(length: f32) -> f32 {
-    length * 1.55
+    rotation_ring_radius(length) * 1.55 / 1.3
 }
 
 fn append_rotation_rings(
@@ -706,6 +831,7 @@ fn append_rotation_rings(
     rotation: Quat,
     radius: f32,
     view_radius: f32,
+    thickness: f32,
     active: Option<TransformHandle>,
 ) {
     const RING_COLORS: [Vec4; 3] = [
@@ -713,7 +839,6 @@ fn append_rotation_rings(
         Vec4::new(0.18, 0.9, 0.3, 1.0),
         Vec4::new(0.2, 0.45, 1.0, 1.0),
     ];
-    let width = radius * 0.04;
     for ((handle, local_axis), color) in ROTATION_RINGS.into_iter().zip(RING_COLORS) {
         let world_axis = (rotation * local_axis).normalize_or_zero();
         append_ring_band(
@@ -721,7 +846,7 @@ fn append_rotation_rings(
             origin,
             world_axis,
             radius,
-            width,
+            thickness,
             handle_color(color, handle, active, 1.0),
             GIZMO_LIGHT_DIR,
         );
@@ -735,7 +860,7 @@ fn append_rotation_rings(
             origin,
             view_axis,
             view_radius,
-            view_radius * 0.04,
+            thickness,
             handle_color(VIEW_RING_COLOR, TransformHandle::RotateView, active, 1.0),
             GIZMO_LIGHT_DIR,
         );
@@ -911,7 +1036,14 @@ pub fn dragged_trackball_rotation(
 ) -> Option<Quat> {
     let previous_pointer = pointer - pointer_delta;
     let camera_ward = (camera.eye() - origin).normalize_or_zero();
-    let previous = sphere_drag_point(camera, viewport, previous_pointer, origin, radius, camera_ward)?;
+    let previous = sphere_drag_point(
+        camera,
+        viewport,
+        previous_pointer,
+        origin,
+        radius,
+        camera_ward,
+    )?;
     let current = sphere_drag_point(camera, viewport, pointer, origin, radius, previous)?;
 
     let axis = previous.cross(current);
@@ -1175,8 +1307,8 @@ mod tests {
             "world-space length must grow with distance: {near_length} near, {far_length} far"
         );
 
-        let near_tip = project_to_viewport(&near, VIEWPORT, near_origin + Vec3::X * near_length)
-            .unwrap();
+        let near_tip =
+            project_to_viewport(&near, VIEWPORT, near_origin + Vec3::X * near_length).unwrap();
         let near_base = project_to_viewport(&near, VIEWPORT, near_origin).unwrap();
         let far_tip =
             project_to_viewport(&far, VIEWPORT, far_origin + Vec3::X * far_length).unwrap();
@@ -1187,6 +1319,44 @@ mod tests {
         assert!(
             (near_pixels - far_pixels).abs() < 1.0,
             "expected a constant on-screen arrow length: {near_pixels}px near, {far_pixels}px far"
+        );
+    }
+
+    #[test]
+    fn display_options_control_arrow_length_and_rotation_diameter() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("source"))])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Object(snapshot.objects().values().next().unwrap().id);
+        let camera = OrbitCamera::default();
+        let display = GizmoDisplay {
+            axis_length_px: 140.0,
+            rotation_diameter_px: 320.0,
+            ..GizmoDisplay::default()
+        };
+
+        let (_, length) =
+            transform_gizmo_with_display(&snapshot, &camera, VIEWPORT, selection, display).unwrap();
+        let expected_scale = camera.world_units_per_pixel(Vec3::ZERO, VIEWPORT.height as f32);
+        assert!((length - 140.0 * expected_scale).abs() < 1.0e-5);
+        let radius =
+            rotation_gizmo_radius_with_display(&snapshot, &camera, VIEWPORT, selection, display)
+                .unwrap();
+        assert!((radius - 160.0 * expected_scale).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn gizmo_display_defaults_match_the_workbench_defaults() {
+        assert_eq!(
+            GizmoDisplay::default(),
+            GizmoDisplay {
+                axis_length_px: 120.0,
+                axis_thickness_px: 4.0,
+                rotation_diameter_px: 220.0,
+                rotation_thickness_px: 8.0,
+            }
         );
     }
 
@@ -1359,19 +1529,25 @@ mod tests {
         let (origin, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
         let radius = rotation_ring_radius(length);
 
-        // Well inside the sphere (rings sit *at* `radius`, on its surface, so
-        // any point strictly inside is automatically clear of all three), and
-        // along a diagonal direction whose every axis component
-        // (`radius * 0.85 / sqrt(3)`) stays past the translation gizmo's
-        // reach — the axis segments extend only to `length`, the plane quads
-        // only to `length * 0.42` — so it lands off every specific handle.
-        let point = origin + Vec3::new(1.0, 1.0, 1.0).normalize() * radius * 0.85;
-        let pointer = project_to_viewport(&camera, VIEWPORT, point).unwrap();
-
-        assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
-            Some(TransformHandle::RotateFree)
-        );
+        // A configured rotation sphere may overlap a translation arrow. Find a
+        // visible interior point that is not claimed by one of those more
+        // specific handles, then it must be the free trackball target.
+        let pointer = [
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(-1.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, -1.0),
+        ]
+        .into_iter()
+        .flat_map(|direction| {
+            [0.35, 0.55, 0.75].map(move |fraction| direction.normalize() * radius * fraction)
+        })
+        .filter_map(|offset| project_to_viewport(&camera, VIEWPORT, origin + offset))
+        .find(|pointer| {
+            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, *pointer)
+                == Some(TransformHandle::RotateFree)
+        })
+        .expect("some unclaimed point inside the rotation sphere must start free rotation");
 
         let delta = Vec2::new(20.0, 15.0);
         let dragged = dragged_trackball_rotation(
@@ -1391,22 +1567,27 @@ mod tests {
             .into_iter()
             .filter(|axis| (dragged * *axis - *axis).length() > 1.0e-3)
             .count();
-        assert!(moved >= 2, "expected an off-axis rotation, dragged = {dragged:?}");
+        assert!(
+            moved >= 2,
+            "expected an off-axis rotation, dragged = {dragged:?}"
+        );
     }
 
     /// The regression this design specifically guards against: a translation
-    /// arrow's tip can sit well inside the rotation gizmo's sphere radius, and
-    /// clicking it must still translate rather than fall through to the
-    /// trackball catch-all.
+    /// arrow's tip can extend beyond a deliberately smaller rotation gizmo,
+    /// leaving a direct translation target outside the trackball catch-all.
     #[test]
-    fn a_translation_arrow_inside_the_rotation_sphere_still_picks_translation() {
+    fn a_translation_arrow_outside_the_rotation_sphere_still_picks_translation() {
         let (world, box_id) = box_world();
         let snapshot = world.snapshot();
         let selection = SceneSelection::Box(box_id);
         let camera = OrbitCamera::default();
         let (origin, length) = transform_gizmo(&snapshot, &camera, VIEWPORT, selection).unwrap();
         let radius = rotation_ring_radius(length);
-        assert!(length < radius, "the translation arrow must sit inside the rotation sphere");
+        assert!(
+            length > radius,
+            "the translation arrow must extend beyond the rotation sphere"
+        );
 
         // Whichever axis's grabbable segment the default oblique view happens
         // to keep clear of all four rings' screen-projected silhouettes — an

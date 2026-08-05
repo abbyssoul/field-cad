@@ -218,13 +218,25 @@ impl Domain {
     /// not draw one glyph per solver cell.
     pub fn decimated_lattice(&self, stride: u32) -> GridLattice {
         let stride = stride.max(1);
-        let cell = self.cell_size();
         let counts = (self.resolution.cells() / stride).max(UVec3::ONE);
-        GridLattice::new(
-            self.bounds.min() + cell * 0.5,
-            cell * f64::from(stride),
-            counts,
-        )
+        let bounds = self.bounds;
+        // This lattice is a visualization subscription, not the solver's
+        // cell-centred storage. Its sparse samples must cover the same region
+        // the domain outline represents; retaining every `stride`th cell
+        // centre leaves a conspicuous unrepresented strip at the far faces.
+        // A one-sample axis has no extent to distribute, so it observes the
+        // centre of that axis rather than arbitrarily one face.
+        let axis = |min: f64, max: f64, count: u32| {
+            if count == 1 {
+                ((min + max) * 0.5, 0.0)
+            } else {
+                (min, (max - min) / f64::from(count - 1))
+            }
+        };
+        let (x, dx) = axis(bounds.min.x, bounds.max.x, counts.x);
+        let (y, dy) = axis(bounds.min.y, bounds.max.y, counts.y);
+        let (z, dz) = axis(bounds.min.z, bounds.max.z, counts.z);
+        GridLattice::new(DVec3::new(x, y, z), DVec3::new(dx, dy, dz), counts)
     }
 }
 
@@ -270,5 +282,17 @@ mod tests {
         assert_eq!(domain.decimated_lattice(4).len(), 8);
         assert_eq!(domain.decimated_lattice(1000).len(), 1);
         assert_eq!(domain.resolution().cell_count(), 512);
+    }
+
+    #[test]
+    fn a_decimated_lattice_spans_the_domain_bounds() {
+        let domain = Domain::centred_cube(1.0, 8).unwrap();
+        let lattice = domain.decimated_lattice(4);
+
+        assert_eq!(lattice.position(0).unwrap(), domain.bounds().min());
+        assert_eq!(
+            lattice.position(lattice.len() - 1).unwrap(),
+            domain.bounds().max()
+        );
     }
 }

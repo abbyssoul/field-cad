@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    BoundaryCondition, ChannelId, Dimension, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec, FieldValueKind,
-    ObjectId, ObjectShape, ObjectSpec, ProbeId, ProbePosition, ProbeSpec, PropertyBag,
-    PropertyKind, PropertySchema, PropertyValue, Quantity, SimulationMode, SlicePlane,
-    SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform, VectorQuantity, Velocity,
-    WorldCommand, WorldObject, WorldSnapshot, Precision, relativistic_kinetic_energy, relativistic_momentum,
+    BoundaryCondition, ChannelId, Dimension, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec,
+    FieldValueKind, ObjectId, ObjectShape, ObjectSpec, Precision, ProbeId, ProbePosition,
+    ProbeSpec, PropertyBag, PropertyKind, PropertySchema, PropertyValue, Quantity, SimulationMode,
+    SlicePlane, SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform, VectorQuantity, Velocity,
+    WorldCommand, WorldObject, WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
 };
 use fieldcad_mass_sources::{inertial_mass_component_id, mass_property_id};
 use fieldcad_particles::{ParticleTemplate, template_particle_spec};
@@ -19,7 +19,10 @@ use super::compute::{
     time_step_drag_speed, validity_note,
 };
 use super::plot::probe_history_plots;
-use super::{CameraAction, ChannelLayerSettings, DomainDraft, FrameContext, UiFrameOutput, UiModel};
+use super::{
+    CameraAction, ChannelLayerSettings, DomainDraft, FrameContext, UiFrameOutput, UiModel,
+    ViewportTool,
+};
 use crate::{
     mcp::{self, McpAction, McpSession},
     scene::{PlaneVectorMode, SceneSelection},
@@ -40,6 +43,20 @@ pub(super) fn menu_bar(
             // into the 3D view, which is both where their effect is and what
             // freed the room for these to be labelled and spaced.
             ui.strong("Field CAD");
+            ui.separator();
+
+            ui.label("Tool");
+            for tool in ViewportTool::ALL {
+                let response = ui
+                    .selectable_label(model.viewport_tool == tool, tool.label())
+                    .on_hover_text(tool.description());
+                if response.clicked() {
+                    model.viewport_tool = tool;
+                    if tool == ViewportTool::FieldBrush {
+                        model.field_brush_dialog_open = true;
+                    }
+                }
+            }
             ui.separator();
 
             if ui
@@ -168,6 +185,80 @@ pub(super) fn menu_bar(
             });
         });
     });
+}
+
+/// Configuration kept ready for the numerical field-brush command. Field
+/// snapshots are currently read-only outputs, so this intentionally cannot
+/// submit a faux world edit that an analytic solver would immediately replace.
+pub(super) fn field_brush_dialog(
+    context: &egui::Context,
+    model: &mut UiModel,
+    compute: &ComputeView,
+) {
+    if !model.field_brush_dialog_open {
+        return;
+    }
+    egui::Window::new("Field brush")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut model.field_brush_dialog_open)
+        .show(context, |ui| {
+            ui.label("Paint a disturbance into a selected slice plane.");
+            ui.small("The plane defines the brush orientation.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Radius");
+                ui.add(
+                    egui::DragValue::new(&mut model.field_brush.radius_metres)
+                        .range(f64::from_bits(1)..=f64::MAX)
+                        .suffix(" m"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Strength");
+                ui.add(egui::DragValue::new(&mut model.field_brush.strength));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Field");
+                egui::ComboBox::from_id_salt("field_brush_channel")
+                    .selected_text(
+                        model
+                            .field_brush
+                            .channel
+                            .as_ref()
+                            .map(|channel| {
+                                compute
+                                    .channel_names
+                                    .get(channel)
+                                    .cloned()
+                                    .unwrap_or_else(|| channel.to_string())
+                            })
+                            .unwrap_or_else(|| "Choose a field".to_owned()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for channel in &compute.vector_channels {
+                            let label = compute
+                                .channel_names
+                                .get(channel)
+                                .map_or_else(|| channel.to_string(), Clone::clone);
+                            let writable = compute.mutable_vector_channels.contains(channel);
+                            let response = ui.add_enabled(writable, egui::Button::selectable(
+                                model.field_brush.channel.as_ref() == Some(channel), label,
+                            ));
+                            if response.clicked() { model.field_brush.channel = Some(channel.clone()); }
+                            if !writable { response.on_hover_text("Read-only: the active solver is analytical or does not support painting."); }
+                        }
+                    });
+            });
+            ui.separator();
+            ui.separator();
+            if compute.mode != SimulationMode::Paused {
+                ui.colored_label(egui::Color32::from_rgb(235, 190, 75), "Pause simulation to paint.");
+            } else {
+                ui.small("Select a slice plane, then drag in the viewport. Positive strength follows the plane normal; negative strength reverses it.");
+            }
+            ui.small("Analytical fields remain authoritative. A read-only field will explain why it cannot be painted.");
+        });
 }
 
 fn state_badge(ui: &mut egui::Ui, state: WorkbenchState) {
@@ -364,9 +455,7 @@ fn object_section(
         ) {
             output.submit(match preset {
                 ObjectPreset::Empty => new_object_command(frame.world),
-                ObjectPreset::Particle(template) => {
-                    template_object_command(frame.world, template)
-                }
+                ObjectPreset::Particle(template) => template_object_command(frame.world, template),
             });
         }
         ui.add_space(4.0);
@@ -629,19 +718,32 @@ pub(super) fn inspector(
                         ui.heading("Slice plane");
                         ui.separator();
                         plane_properties(ui, plane, &mut model.field_layers, frame.compute, output);
-                    } else if let Some(field_box) =
-                        model.box_selection.and_then(|id| frame.world.boxes().get(&id))
+                    } else if let Some(field_box) = model
+                        .box_selection
+                        .and_then(|id| frame.world.boxes().get(&id))
                     {
                         ui.heading("Field box");
                         ui.separator();
-                        box_properties(ui, field_box, &mut model.field_layers, frame.compute, output);
+                        box_properties(
+                            ui,
+                            field_box,
+                            &mut model.field_layers,
+                            frame.compute,
+                            output,
+                        );
                     } else if let Some(sphere) = model
                         .sphere_selection
                         .and_then(|id| frame.world.spheres().get(&id))
                     {
                         ui.heading("Field sphere");
                         ui.separator();
-                        sphere_properties(ui, sphere, &mut model.field_layers, frame.compute, output);
+                        sphere_properties(
+                            ui,
+                            sphere,
+                            &mut model.field_layers,
+                            frame.compute,
+                            output,
+                        );
                     } else if let Some(probe) =
                         model.probe_selection.and_then(|id| frame.world.probe(id))
                     {
@@ -706,9 +808,15 @@ fn world_properties(
     edit_in_progress: bool,
     output: &mut UiFrameOutput,
 ) {
-    super::section(ui, "inspector_numerical_domain", "Numerical domain", true, |ui| {
-        numerical_domain_editor(ui, model, compute, edit_in_progress, output);
-    });
+    super::section(
+        ui,
+        "inspector_numerical_domain",
+        "Numerical domain",
+        true,
+        |ui| {
+            numerical_domain_editor(ui, model, compute, edit_in_progress, output);
+        },
+    );
     super::section(ui, "inspector_fields", "Fields", true, |ui| {
         field_controls(ui, compute, output);
     });
@@ -1182,7 +1290,12 @@ fn object_properties(
     object: &WorldObject,
     output: &mut UiFrameOutput,
 ) {
-    ui.label(&object.name);
+    if let Some(name) = name_editor(ui, ("object_name", object.id), &object.name) {
+        output.edit(vec![WorldCommand::SetObjectName {
+            object: object.id,
+            name,
+        }]);
+    }
     super::section(ui, "inspector_placement", "Placement", true, |ui| {
         placement_editors(ui, object, output);
     });
@@ -1747,6 +1860,50 @@ fn format_engineering(value: f64) -> String {
     }
 }
 
+/// An inspector name edit is staged locally until the user explicitly accepts
+/// it. That keeps Escape a genuine cancel even though the inspector is rebuilt
+/// from an immutable world snapshot every frame.
+fn name_editor(
+    ui: &mut egui::Ui,
+    source: impl std::hash::Hash + std::fmt::Debug,
+    name: &str,
+) -> Option<String> {
+    let id = ui.make_persistent_id(source);
+    let mut draft = ui.data_mut(|data| {
+        data.get_temp::<String>(id)
+            .unwrap_or_else(|| name.to_owned())
+    });
+    let response = ui
+        .horizontal(|ui| {
+            ui.label("Name");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft)
+                    .id(id)
+                    .desired_width(f32::INFINITY),
+            )
+        })
+        .inner;
+    let cancel = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let accept = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+    if cancel {
+        ui.data_mut(|data| data.remove::<String>(id));
+        None
+    } else if accept {
+        ui.data_mut(|data| data.remove::<String>(id));
+        (draft != name).then_some(draft)
+    } else if response.has_focus() {
+        // Only an active text edit owns a local draft. Caching an idle value
+        // would let the one old snapshot observed while an async command is in
+        // flight override the new authoritative name forever.
+        ui.data_mut(|data| data.insert_temp(id, draft));
+        None
+    } else {
+        ui.data_mut(|data| data.remove::<String>(id));
+        None
+    }
+}
+
 fn plane_properties(
     ui: &mut egui::Ui,
     plane: &SlicePlane,
@@ -1754,7 +1911,12 @@ fn plane_properties(
     compute: &ComputeView,
     output: &mut UiFrameOutput,
 ) {
-    ui.label(&plane.name);
+    if let Some(name) = name_editor(ui, ("plane_name", plane.id), &plane.name) {
+        output.edit(vec![WorldCommand::SetPlaneName {
+            plane: plane.id,
+            name,
+        }]);
+    }
     ui.small("Drag the dashed purple N arrow to reorient the plane; RGB arrows and squares move its origin.");
     super::section(ui, "inspector_plane_geometry", "Geometry", true, |ui| {
         plane_geometry_editors(ui, plane, output);
@@ -1921,7 +2083,12 @@ fn box_properties(
     compute: &ComputeView,
     output: &mut UiFrameOutput,
 ) {
-    ui.label(&field_box.name);
+    if let Some(name) = name_editor(ui, ("box_name", field_box.id), &field_box.name) {
+        output.edit(vec![WorldCommand::SetBoxName {
+            region: field_box.id,
+            name,
+        }]);
+    }
     ui.small("Drag the RGB rings to reorient the box; RGB arrows and squares move its origin.");
     super::section(ui, "inspector_box_geometry", "Geometry", true, |ui| {
         box_geometry_editors(ui, field_box, output);
@@ -2015,10 +2182,11 @@ fn box_field_layers(
         let layer_visible = layer.visible;
         let settings = layer.boxes.entry(field_box.id).or_default();
         ui.collapsing(name, |ui| {
-            ui.checkbox(&mut settings.visible, "Show in this box").on_hover_text(
-                "Whether this box draws this field. Other boxes, spheres, and planes are \
+            ui.checkbox(&mut settings.visible, "Show in this box")
+                .on_hover_text(
+                    "Whether this box draws this field. Other boxes, spheres, and planes are \
                  unaffected.",
-            );
+                );
             if !layer_visible {
                 ui.add(
                     egui::Label::new(
@@ -2051,14 +2219,25 @@ fn sphere_properties(
     compute: &ComputeView,
     output: &mut UiFrameOutput,
 ) {
-    ui.label(&sphere.name);
+    if let Some(name) = name_editor(ui, ("sphere_name", sphere.id), &sphere.name) {
+        output.edit(vec![WorldCommand::SetSphereName {
+            sphere: sphere.id,
+            name,
+        }]);
+    }
     ui.small("RGB arrows and squares move its centre; drag the radius below to resize it.");
     super::section(ui, "inspector_sphere_geometry", "Geometry", true, |ui| {
         sphere_geometry_editors(ui, sphere, output);
     });
-    super::section(ui, "inspector_sphere_display", "Field display", true, |ui| {
-        sphere_field_layers(ui, sphere, field_layers, compute);
-    });
+    super::section(
+        ui,
+        "inspector_sphere_display",
+        "Field display",
+        true,
+        |ui| {
+            sphere_field_layers(ui, sphere, field_layers, compute);
+        },
+    );
 
     ui.add_space(10.0);
     if ui.button("Duplicate sphere").clicked() {
@@ -2165,7 +2344,12 @@ fn probe_properties(
     history: &ProbeHistory,
     output: &mut UiFrameOutput,
 ) {
-    ui.label(&probe.name);
+    if let Some(name) = name_editor(ui, ("probe_name", probe.id), &probe.name) {
+        output.edit(vec![WorldCommand::SetProbeName {
+            probe: probe.id,
+            name,
+        }]);
+    }
     super::section(ui, "inspector_probe_position", "Position", true, |ui| {
         probe_position_editors(ui, probe, world, output);
     });
@@ -2472,8 +2656,12 @@ fn measurement_command(world: &WorldSnapshot, preset: MeasurementPreset) -> Worl
             .expect("static box parameters are valid"),
         ),
         MeasurementPreset::Sphere => WorldCommand::CreateSphere(
-            FieldSphereSpec::new(format!("Sphere {}", world.spheres().len() + 1), DVec3::ZERO, 0.75)
-                .expect("static sphere parameters are valid"),
+            FieldSphereSpec::new(
+                format!("Sphere {}", world.spheres().len() + 1),
+                DVec3::ZERO,
+                0.75,
+            )
+            .expect("static sphere parameters are valid"),
         ),
     }
 }
@@ -2790,6 +2978,26 @@ mod tests {
     use glam::{DQuat, DVec3};
 
     use super::*;
+
+    #[test]
+    fn an_idle_name_editor_does_not_cache_the_authoritative_name() {
+        let context = egui::Context::default();
+        let source = ("name_editor_test", ObjectId::new(1));
+        let mut id = None;
+        let _ = context.run_ui(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                id = Some(ui.make_persistent_id(source));
+                assert_eq!(name_editor(ui, source, "old name"), None);
+            });
+        });
+
+        assert!(
+            context
+                .data(|data| data.get_temp::<String>(id.unwrap()))
+                .is_none(),
+            "an untouched editor must follow a later authoritative world refresh"
+        );
+    }
 
     fn painted_text(shape: &egui::epaint::Shape, output: &mut String) {
         match shape {
@@ -3451,10 +3659,7 @@ mod tests {
             .unwrap();
 
         let massive = world.snapshot();
-        assert_eq!(
-            inertial_mass_kg(massive.object(object).unwrap()),
-            Some(3.5)
-        );
+        assert_eq!(inertial_mass_kg(massive.object(object).unwrap()), Some(3.5));
     }
 
     #[test]
@@ -3464,5 +3669,4 @@ mod tests {
         assert!(formatted.contains("e8"));
         assert!(formatted.ends_with(") N"));
     }
-
 }

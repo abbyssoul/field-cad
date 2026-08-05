@@ -46,6 +46,8 @@ pub struct ComputeView {
     pub edit_history: EditHistoryStatus,
     /// Channels a generic vector layer can draw, in published order.
     pub vector_channels: Vec<ChannelId>,
+    /// Active vector fields that their owning numerical solver permits painting.
+    pub mutable_vector_channels: Vec<ChannelId>,
     /// What the source has acknowledged it is sampling.
     pub subscription: Subscription,
     pub diagnostics: Vec<String>,
@@ -69,6 +71,11 @@ impl ComputeView {
         let mut total_samples = 0;
         let mut domain_summary = "No data".to_owned();
         let field_systems = source.field_systems();
+        let mutable_vector_channels = field_systems
+            .iter()
+            .filter(|system| system.enabled)
+            .flat_map(|system| system.mutable_vector_channels.iter().cloned())
+            .collect();
         let active_plugins: BTreeSet<_> = field_systems
             .iter()
             .filter(|system| system.enabled)
@@ -174,6 +181,7 @@ impl ComputeView {
             field_systems,
             edit_history: source.edit_history(),
             vector_channels,
+            mutable_vector_channels,
             subscription: source.subscription(),
             diagnostics,
             has_errors,

@@ -17,7 +17,7 @@ mod viewcontrols;
 pub use compute::ComputeView;
 
 use help::help_window;
-use panels::{diagnostics_window, inspector, mcp_window, menu_bar, scene_tree};
+use panels::{diagnostics_window, field_brush_dialog, inspector, mcp_window, menu_bar, scene_tree};
 use plot::floating_probe_plots;
 use viewcontrols::view_controls;
 
@@ -34,7 +34,7 @@ use crate::{
     camera::{AxisView, Projection},
     mcp::{McpAction, McpSession},
     scene::{
-        BoxLayerSettings, FieldLayerSettings, PlaneLayerSettings, SceneSelection,
+        BoxLayerSettings, FieldLayerSettings, GizmoDisplay, PlaneLayerSettings, SceneSelection,
         SphereLayerSettings, VectorDisplay,
     },
 };
@@ -47,17 +47,74 @@ pub enum CameraAction {
     SetProjection(Projection),
 }
 
+/// What a primary-button gesture in the viewport means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewportTool {
+    /// Pick an inspector subject without ever starting a transform gesture.
+    Select,
+    /// Pick and manipulate the selected scene item. This preserves the
+    /// workbench's original viewport behaviour.
+    #[default]
+    Transform,
+    /// Reserved for an authoritative numerical-field disturbance command.
+    FieldBrush,
+}
+
+impl ViewportTool {
+    pub const ALL: [Self; 3] = [Self::Select, Self::Transform, Self::FieldBrush];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Select => "Select",
+            Self::Transform => "Transform",
+            Self::FieldBrush => "Field brush",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Select => "Select objects without moving or rotating them",
+            Self::Transform => "Move or rotate selected objects in the viewport",
+            Self::FieldBrush => "Configure a numerical-field disturbance brush",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldBrushDraft {
+    pub radius_metres: f64,
+    pub strength: f64,
+    pub channel: Option<ChannelId>,
+}
+
+impl Default for FieldBrushDraft {
+    fn default() -> Self {
+        Self {
+            radius_metres: 0.5,
+            strength: 1.0,
+            channel: None,
+        }
+    }
+}
+
 /// What the 3D view draws, as distinct from what the world contains.
 ///
 /// These are presentation filters and nothing else: hiding probes does not stop
 /// them recording, and hiding objects does not stop them sourcing a field. They
 /// live with the view controls in the viewport because that is where their
 /// effect is visible.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewOptions {
     pub grid: bool,
     pub axes: bool,
     pub objects: bool,
+    /// Master visibility for scene helpers that do not participate in the
+    /// simulation: probes and field-sampling regions.
+    pub auxiliary_objects: bool,
+    /// The region the active solver discretizes. This is not an authored scene
+    /// object, so it remains independent of auxiliary-object visibility.
+    pub compute_bounds: bool,
+    pub gizmo_display: GizmoDisplay,
     pub probes: bool,
     pub planes: bool,
     pub boxes: bool,
@@ -70,6 +127,9 @@ impl Default for ViewOptions {
             grid: true,
             axes: true,
             objects: true,
+            auxiliary_objects: true,
+            compute_bounds: false,
+            gizmo_display: GizmoDisplay::default(),
             probes: true,
             planes: true,
             boxes: true,
@@ -90,7 +150,7 @@ pub type ViewToggle = (
 );
 
 impl ViewOptions {
-    pub const ENTRIES: [ViewToggle; 7] = [
+    pub const PRIMARY_ENTRIES: [ViewToggle; 4] = [
         ("Grid", "Construction grid on the XY plane", |view| {
             &mut view.grid
         }),
@@ -102,6 +162,14 @@ impl ViewOptions {
             "Simulated bodies. Hiding them does not remove them from the simulation.",
             |view| &mut view.objects,
         ),
+        (
+            "Auxiliary objects",
+            "Probes and field-sampling regions. Hiding them does not affect simulation or recording.",
+            |view| &mut view.auxiliary_objects,
+        ),
+    ];
+
+    pub const AUXILIARY_ENTRIES: [ViewToggle; 4] = [
         (
             "Probes",
             "Point recorders. Hidden probes keep recording.",
@@ -128,6 +196,9 @@ impl ViewOptions {
 #[derive(Debug, Default)]
 pub struct UiModel {
     pub view: ViewOptions,
+    pub viewport_tool: ViewportTool,
+    pub field_brush_dialog_open: bool,
+    pub field_brush: FieldBrushDraft,
     pub diagnostics_visible: bool,
     /// The getting-started window. Open on a first run, because the composition
     /// model is the part of this application a user cannot guess.
@@ -166,6 +237,9 @@ impl UiModel {
     pub fn new() -> Self {
         Self {
             view: ViewOptions::default(),
+            viewport_tool: ViewportTool::default(),
+            field_brush_dialog_open: false,
+            field_brush: FieldBrushDraft::default(),
             diagnostics_visible: true,
             help_visible: true,
             // A new session opens on the world node, so the inspector explains
@@ -522,6 +596,7 @@ pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -
         output.mcp_action = mcp_window(&context, frame.mcp);
     }
     floating_probe_plots(&context, model, &frame);
+    field_brush_dialog(&context, model, frame.compute);
 
     output
 }
@@ -1238,9 +1313,11 @@ mod tests {
                 "{label} view button is missing: {text}"
             );
         }
-        for (label, _, _) in ViewOptions::ENTRIES {
+        for (label, _, _) in ViewOptions::PRIMARY_ENTRIES {
             assert!(text.contains(label), "{label} toggle is missing: {text}");
         }
+        assert!(text.contains("Auxiliary object types"));
+        assert!(text.contains("Compute"));
         assert!(text.contains("Reset"), "camera reset is missing: {text}");
 
         // And it is positioned inside the 3D view rather than over a panel.
@@ -1489,6 +1566,8 @@ mod tests {
         assert!(model.view.grid);
         assert!(model.view.axes);
         assert!(model.view.objects);
+        assert!(model.view.auxiliary_objects);
+        assert!(!model.view.compute_bounds);
         assert!(model.view.probes);
         assert!(model.view.planes);
     }

@@ -409,7 +409,11 @@ pub struct FieldBoxSpec {
 }
 
 impl FieldBoxSpec {
-    pub fn new(name: impl Into<String>, origin: DVec3, half_extent: DVec3) -> Result<Self, WorldError> {
+    pub fn new(
+        name: impl Into<String>,
+        origin: DVec3,
+        half_extent: DVec3,
+    ) -> Result<Self, WorldError> {
         if !origin.is_finite() || !half_extent.is_finite() || half_extent.min_element() <= 0.0 {
             return Err(WorldError::InvalidBox);
         }
@@ -587,7 +591,13 @@ impl FieldSphere {
         let origin = self.origin - DVec3::splat(self.radius);
         let divisor = f64::from(counts_per_axis.saturating_sub(1)).max(1.0);
         let step = DVec3::splat(2.0 * self.radius / divisor);
-        SphereLattice::new(origin, step, UVec3::splat(counts_per_axis), self.origin, self.radius)
+        SphereLattice::new(
+            origin,
+            step,
+            UVec3::splat(counts_per_axis),
+            self.origin,
+            self.radius,
+        )
     }
 }
 
@@ -876,6 +886,10 @@ pub enum WorldCommand {
     RegisterComponentSchema(ComponentSchema),
     CreateObject(ObjectSpec),
     RemoveObject(ObjectId),
+    SetObjectName {
+        object: ObjectId,
+        name: String,
+    },
     SetTransform {
         object: ObjectId,
         transform: Transform,
@@ -907,6 +921,10 @@ pub enum WorldCommand {
         component: ComponentTypeId,
     },
     CreatePlane(SlicePlaneSpec),
+    SetPlaneName {
+        plane: PlaneId,
+        name: String,
+    },
     SetPlane {
         plane: PlaneId,
         spec: SlicePlaneSpec,
@@ -917,6 +935,10 @@ pub enum WorldCommand {
     },
     RemovePlane(PlaneId),
     CreateBox(FieldBoxSpec),
+    SetBoxName {
+        region: BoxId,
+        name: String,
+    },
     SetBox {
         region: BoxId,
         spec: FieldBoxSpec,
@@ -927,6 +949,10 @@ pub enum WorldCommand {
     },
     RemoveBox(BoxId),
     CreateSphere(FieldSphereSpec),
+    SetSphereName {
+        sphere: SphereId,
+        name: String,
+    },
     SetSphere {
         sphere: SphereId,
         spec: FieldSphereSpec,
@@ -937,6 +963,10 @@ pub enum WorldCommand {
     },
     RemoveSphere(SphereId),
     CreateProbe(ProbeSpec),
+    SetProbeName {
+        probe: ProbeId,
+        name: String,
+    },
     SetProbePosition {
         probe: ProbeId,
         position: ProbePosition,
@@ -964,6 +994,7 @@ impl WorldCommand {
             Self::RegisterComponentSchema(_) => "Register component schema",
             Self::CreateObject(_) => "Add object",
             Self::RemoveObject(_) => "Remove object",
+            Self::SetObjectName { .. } => "Rename object",
             Self::SetTransform { .. } => "Move object",
             Self::SetVelocity { .. } => "Set velocity",
             Self::SetShape { .. } => "Change shape",
@@ -972,18 +1003,22 @@ impl WorldCommand {
             Self::AttachComponent { .. } => "Edit component",
             Self::DetachComponent { .. } => "Remove component",
             Self::CreatePlane(_) => "Add slice plane",
+            Self::SetPlaneName { .. } => "Rename slice plane",
             Self::SetPlane { .. } => "Move slice plane",
             Self::SetPlaneVisible { .. } => "Show or hide slice plane",
             Self::RemovePlane(_) => "Remove slice plane",
             Self::CreateBox(_) => "Add field box",
+            Self::SetBoxName { .. } => "Rename field box",
             Self::SetBox { .. } => "Move field box",
             Self::SetBoxVisible { .. } => "Show or hide field box",
             Self::RemoveBox(_) => "Remove field box",
             Self::CreateSphere(_) => "Add field sphere",
+            Self::SetSphereName { .. } => "Rename field sphere",
             Self::SetSphere { .. } => "Move field sphere",
             Self::SetSphereVisible { .. } => "Show or hide field sphere",
             Self::RemoveSphere(_) => "Remove field sphere",
             Self::CreateProbe(_) => "Add probe",
+            Self::SetProbeName { .. } => "Rename probe",
             Self::SetProbePosition { .. } => "Move probe",
             Self::SetProbeChannels { .. } => "Change recorded channels",
             Self::SetProbeVisible { .. } => "Show or hide probe",
@@ -1118,6 +1153,9 @@ fn apply_command(
             }
             state.objects.remove(&id);
         }
+        WorldCommand::SetObjectName { object, name } => {
+            object_mut(state, object)?.name = name;
+        }
         WorldCommand::SetTransform { object, transform } => {
             transform.validate()?;
             object_mut(state, object)?.transform = transform.normalized();
@@ -1177,6 +1215,13 @@ fn apply_command(
             );
             report.created_planes.push(id);
         }
+        WorldCommand::SetPlaneName { plane, name } => {
+            state
+                .planes
+                .get_mut(&plane)
+                .ok_or(WorldError::PlaneNotFound { id: plane })?
+                .name = name;
+        }
         WorldCommand::SetPlaneVisible { plane, visible } => {
             state
                 .planes
@@ -1221,6 +1266,13 @@ fn apply_command(
             );
             report.created_boxes.push(id);
         }
+        WorldCommand::SetBoxName { region, name } => {
+            state
+                .boxes
+                .get_mut(&region)
+                .ok_or(WorldError::BoxNotFound { id: region })?
+                .name = name;
+        }
         WorldCommand::SetBoxVisible { region, visible } => {
             state
                 .boxes
@@ -1260,6 +1312,13 @@ fn apply_command(
                 },
             );
             report.created_spheres.push(id);
+        }
+        WorldCommand::SetSphereName { sphere, name } => {
+            state
+                .spheres
+                .get_mut(&sphere)
+                .ok_or(WorldError::SphereNotFound { id: sphere })?
+                .name = name;
         }
         WorldCommand::SetSphereVisible { sphere, visible } => {
             state
@@ -1301,6 +1360,13 @@ fn apply_command(
                 },
             );
             report.created_probes.push(id);
+        }
+        WorldCommand::SetProbeName { probe, name } => {
+            state
+                .probes
+                .get_mut(&probe)
+                .ok_or(WorldError::ProbeNotFound { id: probe })?
+                .name = name;
         }
         WorldCommand::SetProbePosition { probe, position } => {
             let probe_spec = ProbeSpec {
@@ -1443,6 +1509,27 @@ mod tests {
         assert_eq!(report.revision.get(), 1);
         assert_eq!(world.snapshot().objects().len(), 1);
         assert_eq!(world.snapshot().probes().len(), 1);
+    }
+
+    #[test]
+    fn renaming_an_object_preserves_its_identity() {
+        let mut world = World::new();
+        let id = world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("before"))])
+            .unwrap()
+            .created_objects[0];
+
+        world
+            .commit([WorldCommand::SetObjectName {
+                object: id,
+                name: "after".to_owned(),
+            }])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let object = snapshot.object(id).unwrap();
+        assert_eq!(object.id, id);
+        assert_eq!(object.name, "after");
     }
 
     #[test]
@@ -1806,11 +1893,15 @@ mod tests {
         let region = created.created_boxes[0];
         let before = world.revision();
         let rotation = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
-        let replacement = FieldBoxSpec::new("tilted", DVec3::new(1.0, 2.0, 3.0), DVec3::new(4.0, 2.0, 1.0))
-            .unwrap()
-            .with_rotation(rotation)
-            .unwrap()
-            .hidden();
+        let replacement = FieldBoxSpec::new(
+            "tilted",
+            DVec3::new(1.0, 2.0, 3.0),
+            DVec3::new(4.0, 2.0, 1.0),
+        )
+        .unwrap()
+        .with_rotation(rotation)
+        .unwrap()
+        .hidden();
 
         let report = world
             .commit([WorldCommand::SetBox {

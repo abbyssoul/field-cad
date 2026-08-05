@@ -18,10 +18,11 @@ use fieldcad_core::{
 };
 use fieldcad_dynamics::{self as dynamics, DynamicsError};
 use fieldcad_plugin_api::{
-    ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
-    PluginError, PluginMetadata, SolverCancellation, SolverContext,
+    ChannelHandle, EquationSystemPlugin, EquationSystemSolver, FieldBrushStroke,
+    PluginConfigurationSchema, PluginError, PluginMetadata, ResolvedFieldBrushStroke,
+    SolverCancellation, SolverContext,
 };
-use glam::{DVec3, UVec2, UVec3};
+use glam::{DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
 /// What the runtime should sample when it publishes a snapshot.
@@ -216,6 +217,8 @@ struct HistoryEntry {
     numerical: Option<NumericalCheckpoint>,
     /// What the edit was, in the user's words, for the control that offers it.
     label: String,
+    /// A direct numerical edit is inverted by reapplying its signed strength.
+    brush: Option<FieldBrushStroke>,
 }
 
 #[derive(Clone, Copy)]
@@ -250,17 +253,14 @@ impl EditHistory {
             checkpoint,
             numerical: None,
             label,
+            brush: None,
         });
         while self.undo.len() > self.depth {
             self.undo.pop_front();
         }
     }
 
-    fn record_domain(
-        &mut self,
-        checkpoint: WorldCheckpoint,
-        numerical: NumericalCheckpoint,
-    ) {
+    fn record_domain(&mut self, checkpoint: WorldCheckpoint, numerical: NumericalCheckpoint) {
         self.gesture_recorded = false;
         self.redo.clear();
         if self.depth == 0 {
@@ -270,6 +270,24 @@ impl EditHistory {
             checkpoint,
             numerical: Some(numerical),
             label: "Change numerical domain".to_owned(),
+            brush: None,
+        });
+        while self.undo.len() > self.depth {
+            self.undo.pop_front();
+        }
+    }
+
+    fn record_brush(&mut self, checkpoint: WorldCheckpoint, stroke: FieldBrushStroke) {
+        self.gesture_recorded = false;
+        self.redo.clear();
+        if self.depth == 0 {
+            return;
+        }
+        self.undo.push_back(HistoryEntry {
+            checkpoint,
+            numerical: None,
+            label: "Paint field".to_owned(),
+            brush: Some(stroke),
         });
         while self.undo.len() > self.depth {
             self.undo.pop_front();
@@ -405,6 +423,9 @@ impl PluginSlot {
 pub struct FieldSystemStatus {
     pub plugin: PluginMetadata,
     pub channels: Vec<ChannelSchema>,
+    /// Vector channels the active numerical solver accepts direct painting for.
+    /// Empty for analytical and inactive systems.
+    pub mutable_vector_channels: Vec<ChannelId>,
     /// The declared settings and their authoritative values. Keeping these in
     /// the source-owned catalog lets both local and future remote scenes report
     /// exactly which numerical scenario is active.
@@ -698,6 +719,19 @@ impl SimulationRuntime {
                     .iter()
                     .map(|channel| channel.as_ref().clone())
                     .collect(),
+                mutable_vector_channels: if slot.enabled {
+                    slot.solver()
+                        .mutable_vector_channels()
+                        .iter()
+                        .filter_map(|handle| {
+                            slot.channels
+                                .get(handle.index())
+                                .map(|schema| schema.id.clone())
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 configuration_schema: slot.configuration_schema.clone(),
                 configuration: slot.configuration.clone(),
                 enabled: slot.enabled,
@@ -768,8 +802,19 @@ impl SimulationRuntime {
                 time_step: self.clock.time_step(),
             }),
             label: entry.label.clone(),
+            brush: entry.brush.clone(),
         };
-        if let Err(error) = self.adopt_history_entry(&entry) {
+        let result = if let Some(stroke) = &entry.brush {
+            let stroke = if direction == HistoryDirection::Undo {
+                Self::inverted_brush(stroke)?
+            } else {
+                stroke.clone()
+            };
+            self.apply_field_brush_stroke_inner(stroke)
+        } else {
+            self.adopt_history_entry(&entry)
+        };
+        if let Err(error) = result {
             match direction {
                 HistoryDirection::Undo => self.history.undo.push_back(entry),
                 HistoryDirection::Redo => self.history.redo.push_back(entry),
@@ -1318,9 +1363,10 @@ impl SimulationRuntime {
             .collect::<Result<_, PluginError>>()?;
 
         let current_step = requested_time_step.unwrap_or(self.clock.time_step());
-        let current_is_valid = replacements.iter().flatten().all(|solver| {
-            solver.validate_time_step(current_step).is_ok()
-        });
+        let current_is_valid = replacements
+            .iter()
+            .flatten()
+            .all(|solver| solver.validate_time_step(current_step).is_ok());
         let time_step = if current_is_valid {
             current_step
         } else {
@@ -1504,6 +1550,91 @@ impl SimulationRuntime {
         }
         self.publish_snapshot(SamplingPolicy::All)?;
         Ok(report)
+    }
+
+    /// Apply one paused, solver-owned numerical field edit.
+    pub fn apply_field_brush_stroke(
+        &mut self,
+        stroke: FieldBrushStroke,
+    ) -> Result<(), RuntimeError> {
+        if self.clock.snapshot().mode == SimulationMode::Running {
+            return Err(RuntimeError::CannotPaintFieldWhileRunning);
+        }
+        let before = self.world.checkpoint();
+        self.apply_field_brush_stroke_inner(stroke.clone())?;
+        self.history.record_brush(before, stroke);
+        self.publish_snapshot(SamplingPolicy::All)
+    }
+
+    fn inverted_brush(stroke: &FieldBrushStroke) -> Result<FieldBrushStroke, RuntimeError> {
+        let strength =
+            fieldcad_core::Quantity::new(-stroke.strength.si_value(), stroke.strength.dimension())
+                .map_err(|error| RuntimeError::InvalidFieldBrush(error.to_string()))?;
+        Ok(FieldBrushStroke {
+            strength,
+            ..stroke.clone()
+        })
+    }
+
+    fn apply_field_brush_stroke_inner(
+        &mut self,
+        stroke: FieldBrushStroke,
+    ) -> Result<(), RuntimeError> {
+        if !stroke.radius_metres.is_finite()
+            || stroke.radius_metres <= 0.0
+            || stroke.samples.is_empty()
+        {
+            return Err(RuntimeError::InvalidFieldBrush(
+                "a stroke needs finite positive radius and at least one sample".to_owned(),
+            ));
+        }
+        let world = self.world.snapshot();
+        let plane = world
+            .planes()
+            .get(&stroke.plane)
+            .ok_or(RuntimeError::UnknownBrushPlane(stroke.plane))?;
+        let slot = self
+            .provider_slot(&stroke.channel)
+            .ok_or_else(|| RuntimeError::UnknownFieldChannel(stroke.channel.clone()))?;
+        let index = self
+            .plugins
+            .iter()
+            .position(|candidate| candidate.metadata.id == slot.metadata.id)
+            .expect("provider slot belongs to plugin list");
+        let handle = self.plugins[index]
+            .handles()
+            .find_map(|(handle, schema)| (&schema.id == &stroke.channel).then_some(handle))
+            .expect("provider declares requested channel");
+        let schema = &self.plugins[index].channels[handle.index()];
+        if !matches!(schema.value_kind, fieldcad_core::FieldValueKind::Vector(_))
+            || schema.dimension() != stroke.strength.dimension()
+        {
+            return Err(RuntimeError::InvalidFieldBrush(
+                "strength must use the selected vector field's native dimension".to_owned(),
+            ));
+        }
+        if !self.plugins[index]
+            .solver()
+            .mutable_vector_channels()
+            .contains(&handle)
+        {
+            return Err(RuntimeError::FieldIsReadOnly(stroke.channel));
+        }
+        let (u, v) = plane.basis();
+        let centres = stroke
+            .samples
+            .iter()
+            .map(|sample: &DVec2| plane.origin + u * sample.x + v * sample.y)
+            .collect();
+        let resolved = ResolvedFieldBrushStroke {
+            stroke,
+            centres,
+            direction: plane.normal,
+        };
+        self.plugins[index]
+            .solver_mut()
+            .apply_field_brush_stroke(&resolved)?;
+        Ok(())
     }
 
     /// Validate and adopt a world edit without choosing a publication policy.
@@ -1816,9 +1947,21 @@ pub enum RuntimeError {
     CannotStepWhileRunning,
     #[error("undo and redo are only valid while the simulation is paused")]
     CannotEditHistoryWhileRunning,
-    #[error("cannot reconfigure the numerical domain while an interactive scene edit is in progress")]
+    #[error("field painting is only valid while the simulation is paused")]
+    CannotPaintFieldWhileRunning,
+    #[error("slice plane '{0}' no longer exists")]
+    UnknownBrushPlane(fieldcad_core::PlaneId),
+    #[error("field '{0}' is read-only; its active solver does not accept numerical painting")]
+    FieldIsReadOnly(ChannelId),
+    #[error("invalid field brush: {0}")]
+    InvalidFieldBrush(String),
+    #[error(
+        "cannot reconfigure the numerical domain while an interactive scene edit is in progress"
+    )]
     CannotReconfigureDomainWhileEditing,
-    #[error("the current time step {current:?} is invalid for the proposed domain and no active solver reported a safe replacement")]
+    #[error(
+        "the current time step {current:?} is invalid for the proposed domain and no active solver reported a safe replacement"
+    )]
     NoSafeTimeStepForDomain { current: TimeStep },
     #[error("invalid sampling budget")]
     InvalidSamplingBudget,
@@ -1850,6 +1993,10 @@ impl RuntimeError {
             Self::TooManyChannels(_) => "too-many-channels",
             Self::CannotStepWhileRunning => "cannot-step-while-running",
             Self::CannotEditHistoryWhileRunning => "cannot-edit-history-while-running",
+            Self::CannotPaintFieldWhileRunning => "cannot-paint-field-while-running",
+            Self::UnknownBrushPlane(_) => "unknown-brush-plane",
+            Self::FieldIsReadOnly(_) => "field-read-only",
+            Self::InvalidFieldBrush(_) => "invalid-field-brush",
             Self::CannotReconfigureDomainWhileEditing => "cannot-reconfigure-domain-while-editing",
             Self::NoSafeTimeStepForDomain { .. } => "no-safe-time-step-for-domain",
             Self::InvalidSamplingBudget => "invalid-sampling-budget",
@@ -2290,9 +2437,7 @@ mod tests {
                 WorldCommand::CreateBox(
                     FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(1.0)).unwrap(),
                 ),
-                WorldCommand::CreateSphere(
-                    FieldSphereSpec::new("ball", DVec3::ZERO, 1.0).unwrap(),
-                ),
+                WorldCommand::CreateSphere(FieldSphereSpec::new("ball", DVec3::ZERO, 1.0).unwrap()),
             ])
             .unwrap();
         runtime

@@ -16,12 +16,13 @@ use fieldcad_core::{
     WorldSnapshot,
 };
 use fieldcad_electromagnetism::{
-    MaxwellCore, MaxwellSolverBackend, MaxwellSolverSetup, YeeFieldState, plugin_id,
-    sample_yee_fields, yee_conservation,
+    ELECTRIC_FIELD_HANDLE, MAGNETIC_FIELD_HANDLE, MaxwellCore, MaxwellSolverBackend,
+    MaxwellSolverSetup, YeeFieldState, electric_field_channel_id, magnetic_field_channel_id,
+    plugin_id, sample_yee_fields, yee_conservation,
 };
 use fieldcad_plugin_api::{
-    ChannelHandle, EquationSystemSolver, PluginError, SampledColumn, SolverCancellation,
-    SolverKind, SolverStepOutcome,
+    ChannelHandle, EquationSystemSolver, PluginError, ResolvedFieldBrushStroke, SampledColumn,
+    SolverCancellation, SolverKind, SolverStepOutcome,
 };
 use glam::DVec3;
 use wgpu::util::DeviceExt;
@@ -356,7 +357,10 @@ impl EquationSystemSolver for GpuMaxwellSolver {
     }
 
     fn time_step_limit(&self) -> Option<TimeStep> {
-        TimeStep::from_seconds(fieldcad_electromagnetism::courant_limit(&self.core.domain())).ok()
+        TimeStep::from_seconds(fieldcad_electromagnetism::courant_limit(
+            &self.core.domain(),
+        ))
+        .ok()
     }
 
     fn validate_world(&self, world: &WorldSnapshot) -> Result<(), PluginError> {
@@ -394,6 +398,70 @@ impl EquationSystemSolver for GpuMaxwellSolver {
 
     fn kinematic_objects(&self) -> &[fieldcad_core::ObjectId] {
         self.core.kinematic_objects()
+    }
+
+    fn mutable_vector_channels(&self) -> &[ChannelHandle] {
+        &[ELECTRIC_FIELD_HANDLE, MAGNETIC_FIELD_HANDLE]
+    }
+
+    fn apply_field_brush_stroke(
+        &mut self,
+        stroke: &ResolvedFieldBrushStroke,
+    ) -> Result<(), PluginError> {
+        let mut state = (*self.field_state()?).clone();
+        let target = match stroke.stroke.channel {
+            ref channel if channel == &electric_field_channel_id() => &mut state.electric,
+            ref channel if channel == &magnetic_field_channel_id() => &mut state.magnetic,
+            _ => {
+                return Err(PluginError::Solver(
+                    "Maxwell cannot paint this field channel".to_owned(),
+                ));
+            }
+        };
+        let domain = self.core.domain();
+        let counts = domain.resolution().cells();
+        let spacing = domain.cell_size();
+        let radius_squared = stroke.stroke.radius_metres * stroke.stroke.radius_metres;
+        let amount = stroke.direction * stroke.stroke.strength.si_value();
+        for z in 0..counts.z {
+            for y in 0..counts.y {
+                for x in 0..counts.x {
+                    let index = (x + counts.x * (y + counts.y * z)) as usize;
+                    let position = domain.bounds().min()
+                        + DVec3::new(
+                            f64::from(x) * spacing.x,
+                            f64::from(y) * spacing.y,
+                            f64::from(z) * spacing.z,
+                        );
+                    let weight = stroke.centres.iter().fold(0.0_f64, |weight, centre| {
+                        let normalized = position.distance_squared(*centre) / radius_squared;
+                        if normalized < 1.0 {
+                            weight.max((1.0 - normalized).powi(2))
+                        } else {
+                            weight
+                        }
+                    });
+                    target[index] += amount * weight;
+                }
+            }
+        }
+        let fields = gpu_fields(target, "painted Maxwell field").map_err(PluginError::Solver)?;
+        if stroke.stroke.channel == electric_field_channel_id() {
+            self.queue.write_buffer(
+                &self.electric[self.current_electric],
+                0,
+                bytemuck::cast_slice(&fields),
+            );
+        } else {
+            self.queue
+                .write_buffer(&self.magnetic[0], 0, bytemuck::cast_slice(&fields));
+        }
+        *self
+            .cached_state
+            .get_mut()
+            .map_err(|_| PluginError::Solver("Maxwell readback cache was poisoned".to_owned()))? =
+            None;
+        Ok(())
     }
 
     fn step(&mut self, context: StepContext) -> Result<SolverStepOutcome, PluginError> {

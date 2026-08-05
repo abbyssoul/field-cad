@@ -20,6 +20,7 @@ use fieldcad_electrostatics::{
     ElectrostaticBatchEvaluator, ElectrostaticsPlugin, electric_field_channel_id,
     electric_potential_channel_id,
 };
+use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
     AsyncLocalDataSource, CommandEvent, CommandPayload, FieldDataSource, LocalDataSource,
@@ -42,7 +43,7 @@ use crate::{
     mcp::{self, McpAction, McpSession},
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
-    ui::{self, CameraAction, ComputeView, UiModel, ViewportGesture},
+    ui::{self, CameraAction, ComputeView, UiModel, ViewportGesture, ViewportTool},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -212,6 +213,7 @@ struct WindowState {
     /// the previous lattice's history.
     run_generation: u64,
     active_transform: Option<ActiveTransformDrag>,
+    active_field_brush: Option<ActiveFieldBrushDrag>,
     /// Set from the last UI frame: an inspector control is being held.
     inspector_editing: bool,
     /// The interactive edit currently in progress, if any.
@@ -285,6 +287,7 @@ impl WindowState {
             probe_history: ProbeHistory::default(),
             run_generation,
             active_transform: None,
+            active_field_brush: None,
             inspector_editing: false,
             edit_gesture: None,
             frame_stats: FrameStats::default(),
@@ -560,6 +563,7 @@ impl WindowState {
                     &layer.planes,
                     &layer.boxes,
                     &layer.spheres,
+                    show,
                 );
                 field
                     .surface_triangles
@@ -573,19 +577,25 @@ impl WindowState {
             self.ui_model.scene_selection(),
             show,
         );
+        if self.ui_model.view.compute_bounds {
+            scene::append_compute_bounds(&mut field, compute.domain.bounds());
+        }
         // The gizmo is drawn only for a selection that is actually on screen.
         // Handles floating over a hidden object would be draggable targets for
         // something the user cannot see.
-        scene::append_transform_gizmo(
-            &mut field,
-            &self.world,
-            &self.camera,
-            self.viewport,
-            self.visible_selection(),
-            self.active_transform
-                .and_then(|drag| drag.constraint.handle()),
-            transform_preview,
-        );
+        if self.ui_model.viewport_tool == ViewportTool::Transform {
+            scene::append_transform_gizmo_with_display(
+                &mut field,
+                &self.world,
+                &self.camera,
+                self.viewport,
+                self.visible_selection(),
+                self.active_transform
+                    .and_then(|drag| drag.constraint.handle()),
+                transform_preview,
+                self.ui_model.view.gizmo_display,
+            );
+        }
 
         let status = self.renderer.render(
             SceneFrame {
@@ -732,18 +742,61 @@ impl WindowState {
         let pointer_delta = drag_delta * pixels_per_point.max(0.01);
         let was_active = self.active_transform.is_some();
 
+        if self.ui_model.viewport_tool == ViewportTool::FieldBrush && mode == SimulationMode::Paused
+        {
+            if gesture.primary_pressed {
+                if let Some((plane, sample)) = self.field_brush_sample(pointer) {
+                    self.active_field_brush = Some(ActiveFieldBrushDrag {
+                        plane,
+                        samples: vec![sample],
+                    });
+                }
+            }
+            if gesture.primary_dragged {
+                if let Some((plane, sample)) = self.field_brush_sample(pointer)
+                    && let Some(active) = self.active_field_brush.as_mut()
+                    && active.plane == plane
+                    && active.samples.last().is_none_or(|last| {
+                        last.distance(sample) >= self.ui_model.field_brush.radius_metres * 0.25
+                    })
+                {
+                    active.samples.push(sample);
+                }
+            }
+            if gesture.primary_released {
+                if let Some(active) = self.active_field_brush.take()
+                    && let Some(channel) = self.ui_model.field_brush.channel.clone()
+                    && let Ok(strength) = self.brush_strength(&channel)
+                {
+                    self.submit(
+                        CommandPayload::ApplyFieldBrushStroke(FieldBrushStroke {
+                            channel,
+                            plane: active.plane,
+                            samples: active.samples,
+                            radius_metres: self.ui_model.field_brush.radius_metres,
+                            strength,
+                            falloff: FieldBrushFalloff::SmoothCompact,
+                        }),
+                        "field painting",
+                    )?;
+                }
+            }
+        }
+
         // `visible_selection` rather than `scene_selection`: a hidden entity
         // has no handles on screen, so it must not start a drag either.
-        if gesture.primary_pressed
+        if self.ui_model.viewport_tool == ViewportTool::Transform
+            && gesture.primary_pressed
             && let (Some(selection), Some(pointer)) = (self.visible_selection(), pointer)
             && let Some(origin) = scene::selection_origin(&self.world, selection)
         {
-            let picked_handle = scene::pick_transform_handle(
+            let picked_handle = scene::pick_transform_handle_with_display(
                 &self.world,
                 selection,
                 &self.camera,
                 self.viewport,
                 pointer,
+                self.ui_model.view.gizmo_display,
             );
             let constraint = match picked_handle {
                 Some(TransformHandle::PlaneNormal) => Some(ManipulationConstraint::PlaneNormal),
@@ -798,7 +851,8 @@ impl WindowState {
             }
         }
 
-        if gesture.primary_dragged
+        if self.ui_model.viewport_tool == ViewportTool::Transform
+            && gesture.primary_dragged
             && let (Some(active), Some(pointer)) = (self.active_transform, pointer)
         {
             match active.constraint {
@@ -809,11 +863,12 @@ impl WindowState {
                     self.drag_box_rotation(active, handle, pointer, pointer_delta)?;
                 }
                 ManipulationConstraint::Handle(handle) => {
-                    let length = scene::selection_gizmo_length(
+                    let length = scene::selection_gizmo_length_with_display(
                         &self.world,
                         &self.camera,
                         self.viewport,
                         active.target,
+                        self.ui_model.view.gizmo_display,
                     )
                     .ok_or_else(|| "selected entity no longer has a transform gizmo".to_owned())?;
                     if let Some(translation) = scene::constrained_translation(
@@ -845,7 +900,8 @@ impl WindowState {
         }
 
         let drag_consumed = was_active || self.active_transform.is_some();
-        if gesture.primary_clicked
+        if self.ui_model.viewport_tool != ViewportTool::FieldBrush
+            && gesture.primary_clicked
             && !drag_consumed
             && let Some(pointer) = pointer
         {
@@ -863,6 +919,41 @@ impl WindowState {
         self.synchronize_edit_gesture(mode)
     }
 
+    fn field_brush_sample(&self, pointer: Option<Vec2>) -> Option<(fieldcad_core::PlaneId, DVec2)> {
+        let scene::SceneSelection::Plane(plane_id) = self.ui_model.scene_selection()? else {
+            return None;
+        };
+        let plane = self.world.planes().get(&plane_id)?;
+        let ray = self.camera.ray_from_viewport(pointer?, self.viewport)?;
+        let normal = plane.normal.as_vec3();
+        let denominator = ray.direction.dot(normal);
+        if denominator.abs() < 1.0e-6 {
+            return None;
+        }
+        let distance = (plane.origin.as_vec3() - ray.origin).dot(normal) / denominator;
+        if distance < 0.0 {
+            return None;
+        }
+        let hit = (ray.origin + ray.direction * distance).as_dvec3() - plane.origin;
+        let (u, v) = plane.basis();
+        Some((plane_id, DVec2::new(hit.dot(u), hit.dot(v))))
+    }
+
+    fn brush_strength(
+        &self,
+        channel: &fieldcad_core::ChannelId,
+    ) -> Result<fieldcad_core::Quantity, String> {
+        let schema = self
+            .model()
+            .field_systems()
+            .into_iter()
+            .flat_map(|system| system.channels)
+            .find(|schema| &schema.id == channel)
+            .ok_or_else(|| "selected field is no longer available".to_owned())?;
+        fieldcad_core::Quantity::new(self.ui_model.field_brush.strength, schema.dimension())
+            .map_err(|error| error.to_string())
+    }
+
     /// What the 3D view is currently drawing, as the scene module sees it.
     ///
     /// One accessor, so drawing, gizmos, and hit-testing cannot be given
@@ -870,10 +961,10 @@ impl WindowState {
     fn scene_visibility(&self) -> scene::SceneVisibility {
         scene::SceneVisibility {
             objects: self.ui_model.view.objects,
-            probes: self.ui_model.view.probes,
-            planes: self.ui_model.view.planes,
-            boxes: self.ui_model.view.boxes,
-            spheres: self.ui_model.view.spheres,
+            probes: self.ui_model.view.auxiliary_objects && self.ui_model.view.probes,
+            planes: self.ui_model.view.auxiliary_objects && self.ui_model.view.planes,
+            boxes: self.ui_model.view.auxiliary_objects && self.ui_model.view.boxes,
+            spheres: self.ui_model.view.auxiliary_objects && self.ui_model.view.spheres,
         }
     }
 
@@ -1078,11 +1169,12 @@ impl WindowState {
                 current_rotation,
             ),
             TransformHandle::RotateFree => {
-                let Some(radius) = scene::rotation_gizmo_radius(
+                let Some(radius) = scene::rotation_gizmo_radius_with_display(
                     &self.world,
                     &self.camera,
                     self.viewport,
                     active.target,
+                    self.ui_model.view.gizmo_display,
                 ) else {
                     return Ok(());
                 };
@@ -1223,8 +1315,10 @@ impl WindowState {
                 let Some(field_box) = self.world.boxes().get(&id) else {
                     return;
                 };
-                self.camera
-                    .focus(field_box.origin.as_vec3(), field_box.half_extent.length() as f32);
+                self.camera.focus(
+                    field_box.origin.as_vec3(),
+                    field_box.half_extent.length() as f32,
+                );
             }
             scene::SceneSelection::Sphere(id) => {
                 let Some(sphere) = self.world.spheres().get(&id) else {
@@ -1304,6 +1398,12 @@ struct ActiveTransformDrag {
     origin: DVec3,
     plane_frame: Option<PlaneFrame>,
     box_frame: Option<BoxFrame>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveFieldBrushDrag {
+    plane: fieldcad_core::PlaneId,
+    samples: Vec<DVec2>,
 }
 
 impl ActiveTransformDrag {

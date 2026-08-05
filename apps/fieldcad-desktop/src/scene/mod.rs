@@ -15,13 +15,15 @@ mod field;
 mod gizmo;
 mod pick;
 
-pub use authoring::{SceneVisibility, append_authoring_geometry};
+pub use authoring::{SceneVisibility, append_authoring_geometry, append_compute_bounds};
 pub use field::field_geometry;
 pub use gizmo::{
-    TransformHandle, TransformPreview, append_transform_gizmo, constrained_translation,
-    dragged_box_rotation, dragged_plane_normal, dragged_trackball_rotation,
-    dragged_view_rotation, pick_transform_handle, plane_normal_label_position, plane_normal_tip,
-    rotation_gizmo_radius, selection_gizmo_length, selection_origin, view_plane_translation,
+    GizmoDisplay, TransformHandle, TransformPreview, append_transform_gizmo,
+    append_transform_gizmo_with_display, constrained_translation, dragged_box_rotation,
+    dragged_plane_normal, dragged_trackball_rotation, dragged_view_rotation, pick_transform_handle,
+    pick_transform_handle_with_display, plane_normal_label_position, plane_normal_tip,
+    rotation_gizmo_radius, rotation_gizmo_radius_with_display, selection_gizmo_length,
+    selection_gizmo_length_with_display, selection_origin, view_plane_translation,
 };
 pub use pick::{pick_object, pick_scene};
 
@@ -311,7 +313,14 @@ fn push_quad_outline(lines: &mut Vec<ColoredVertex>, corners: [Vec3; 4], color: 
 /// Shared by the selection origin marker's three great circles and the sphere
 /// authoring proxy's wireframe, which draw the same shape at different radii
 /// and colours.
-fn push_circle(lines: &mut Vec<ColoredVertex>, origin: Vec3, a: Vec3, b: Vec3, radius: f32, color: Vec4) {
+fn push_circle(
+    lines: &mut Vec<ColoredVertex>,
+    origin: Vec3,
+    a: Vec3,
+    b: Vec3,
+    radius: f32,
+    color: Vec4,
+) {
     const SEGMENTS: u32 = 32;
     let mut previous = origin + a * radius;
     for segment in 1..=SEGMENTS {
@@ -349,7 +358,12 @@ fn push_shaded_triangle(
 ) {
     let normal = (b - a).cross(c - a).normalize_or_zero();
     let intensity = 0.55 + 0.45 * normal.dot(light_dir).max(0.0);
-    let shaded = Vec4::new(color.x * intensity, color.y * intensity, color.z * intensity, color.w);
+    let shaded = Vec4::new(
+        color.x * intensity,
+        color.y * intensity,
+        color.z * intensity,
+        color.w,
+    );
     for position in [a, b, c] {
         triangles.push(ColoredVertex {
             position,
@@ -439,7 +453,14 @@ fn append_ring_band(
         let t = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
         let inner = point(t, radius - half_width);
         let outer = point(t, radius + half_width);
-        push_shaded_triangle(triangles, previous_inner, previous_outer, outer, color, light_dir);
+        push_shaded_triangle(
+            triangles,
+            previous_inner,
+            previous_outer,
+            outer,
+            color,
+            light_dir,
+        );
         push_shaded_triangle(triangles, previous_inner, outer, inner, color, light_dir);
         previous_inner = inner;
         previous_outer = outer;

@@ -16,6 +16,7 @@ use fieldcad_core::{
     ChannelId, Domain, FieldSnapshot, ObjectId, PluginId, SimulationMode, TimeStep, WorldCommand,
     WorldRevision, WorldSnapshot,
 };
+use fieldcad_plugin_api::FieldBrushStroke;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +109,8 @@ pub enum CommandPayload {
     /// behind a tick boundary would open the gesture after the edits it is
     /// supposed to bracket.
     SetInteractiveEdit(bool),
+    /// Add a localized value to a mutable numerical vector field.
+    ApplyFieldBrushStroke(FieldBrushStroke),
     CommitWorld(Vec<WorldCommand>),
     /// Step the scene back to how it stood before the most recent authored edit,
     /// or forward again.
@@ -420,7 +423,8 @@ impl SessionCore {
             }
             CommandPayload::ReconfigureDomain(domain) => {
                 if self.runtime.status().mode() == SimulationMode::Running {
-                    self.pending_mutations.push_back(PendingMutation::Domain(domain));
+                    self.pending_mutations
+                        .push_back(PendingMutation::Domain(domain));
                     return Ok(CommandDisposition::Queued);
                 }
                 self.runtime.reconfigure_domain(domain)?;
@@ -447,9 +451,13 @@ impl SessionCore {
             CommandPayload::SetInteractiveEdit(editing) => {
                 self.runtime.set_interactive_edit(editing)?;
             }
+            CommandPayload::ApplyFieldBrushStroke(stroke) => {
+                self.runtime.apply_field_brush_stroke(stroke)?;
+            }
             CommandPayload::CommitWorld(commands) => {
                 if self.runtime.status().mode() == SimulationMode::Running {
-                    self.pending_mutations.push_back(PendingMutation::World(commands));
+                    self.pending_mutations
+                        .push_back(PendingMutation::World(commands));
                     return Ok(CommandDisposition::Queued);
                 }
                 self.runtime.commit_world_commands(commands)?;

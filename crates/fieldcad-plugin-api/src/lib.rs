@@ -14,10 +14,12 @@ use std::sync::{
 };
 
 use fieldcad_core::{
-    ChannelSchema, ComponentSchema, Domain, FieldColumn, ObjectId, PluginId, PluginVersion,
-    PropertyBag, PropertySchema, SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic,
-    StepContext, TimeStep, Transform, Velocity, WorldSnapshot, validate_properties,
+    ChannelId, ChannelSchema, ComponentSchema, Domain, FieldColumn, ObjectId, PlaneId, PluginId,
+    PluginVersion, PropertyBag, PropertySchema, Quantity, SampleGeometry, SampleValidity,
+    SchemaError, SolverDiagnostic, StepContext, TimeStep, Transform, Velocity, WorldSnapshot,
+    validate_properties,
 };
+use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +113,34 @@ impl SolverCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+}
+
+/// The radial profile used by a numerical field brush.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldBrushFalloff {
+    /// A smooth, compact bump: it reaches zero exactly at the brush radius.
+    #[default]
+    SmoothCompact,
+}
+
+/// Serializable user intent for one field-painting gesture.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FieldBrushStroke {
+    pub channel: ChannelId,
+    pub plane: PlaneId,
+    /// Plane-local `(u, v)` centres, in metres, sampled along one drag.
+    pub samples: Vec<DVec2>,
+    pub radius_metres: f64,
+    pub strength: Quantity,
+    pub falloff: FieldBrushFalloff,
+}
+
+/// A brush stroke resolved against the authoritative plane at execution time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedFieldBrushStroke {
+    pub stroke: FieldBrushStroke,
+    pub centres: Vec<DVec3>,
+    pub direction: DVec3,
 }
 
 /// One channel's values over one geometry, as produced by a solver.
@@ -260,6 +290,23 @@ pub trait EquationSystemSolver: Send {
     /// particular tick, but it may not update an object it did not declare.
     fn kinematic_objects(&self) -> &[ObjectId] {
         &[]
+    }
+
+    /// Vector channels this evolving solver permits direct numerical edits to.
+    /// Analytic solvers deliberately advertise none.
+    fn mutable_vector_channels(&self) -> &[ChannelHandle] {
+        &[]
+    }
+
+    /// Apply one resolved brush stroke. The runtime has already checked that
+    /// the channel belongs to this solver and is a declared mutable channel.
+    fn apply_field_brush_stroke(
+        &mut self,
+        _stroke: &ResolvedFieldBrushStroke,
+    ) -> Result<(), PluginError> {
+        Err(PluginError::Solver(
+            "this solver does not support numerical field painting".to_owned(),
+        ))
     }
 
     /// The total force this system exerts on each dynamic body, in newtons.

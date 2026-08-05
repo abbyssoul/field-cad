@@ -3,7 +3,7 @@
 //! Planes and probes have no rendered body of their own, so they need one to be
 //! visible and selectable — independently of whether any field layer is on.
 
-use fieldcad_core::{FieldBox, FieldSphere, SlicePlane, WorldSnapshot};
+use fieldcad_core::{DomainBounds, FieldBox, FieldSphere, SlicePlane, WorldSnapshot};
 use glam::{Quat, Vec3, Vec4};
 
 use super::{
@@ -186,12 +186,6 @@ fn box_corners(origin: Vec3, rotation: Quat, half_extent: Vec3) -> [Vec3; 8] {
 /// as a slice plane's — selectable, draggable, deletable — but its body has
 /// no field-independent purpose beyond marking where it is.
 fn append_box_proxy(geometry: &mut FieldGeometry, field_box: &FieldBox, selected: bool) {
-    let rotation = quat_from_dquat(field_box.rotation);
-    let corners = box_corners(
-        field_box.origin.as_vec3(),
-        rotation,
-        field_box.half_extent.as_vec3(),
-    );
     let body = if selected {
         Vec4::new(1.0, 0.48, 0.08, 0.10)
     } else {
@@ -202,6 +196,39 @@ fn append_box_proxy(geometry: &mut FieldGeometry, field_box: &FieldBox, selected
     } else {
         Vec4::new(1.0, 1.0, 1.0, 0.85)
     };
+    append_box_visual(
+        geometry,
+        field_box.origin.as_vec3(),
+        quat_from_dquat(field_box.rotation),
+        field_box.half_extent.as_vec3(),
+        body,
+        outline,
+    );
+}
+
+/// Draw the active computation's spatial extent separately from authored field
+/// boxes. The entry point deliberately accepts the domain's bounds rather than
+/// a scene object, leaving room for other domain-shape renderers later.
+pub fn append_compute_bounds(geometry: &mut FieldGeometry, bounds: DomainBounds) {
+    append_box_visual(
+        geometry,
+        bounds.centre().as_vec3(),
+        Quat::IDENTITY,
+        (bounds.size() * 0.5).as_vec3(),
+        Vec4::new(0.25, 0.75, 1.0, 0.035),
+        Vec4::new(0.25, 0.75, 1.0, 0.9),
+    );
+}
+
+fn append_box_visual(
+    geometry: &mut FieldGeometry,
+    origin: Vec3,
+    rotation: Quat,
+    half_extent: Vec3,
+    body: Vec4,
+    outline: Vec4,
+) {
+    let corners = box_corners(origin, rotation, half_extent);
     // Corner indices per face, wound so `push_quad`'s two triangles face
     // outward; index bits are (x, y, z) as in `box_corners`.
     const FACES: [[usize; 4]; 6] = [
@@ -213,7 +240,12 @@ fn append_box_proxy(geometry: &mut FieldGeometry, field_box: &FieldBox, selected
         [2, 3, 7, 6], // +z
     ];
     for face in FACES {
-        let quad = [corners[face[0]], corners[face[1]], corners[face[2]], corners[face[3]]];
+        let quad = [
+            corners[face[0]],
+            corners[face[1]],
+            corners[face[2]],
+            corners[face[3]],
+        ];
         push_quad(&mut geometry.surface_triangles, quad, body);
         push_quad_outline(&mut geometry.vector_lines, quad, outline);
     }
@@ -251,7 +283,11 @@ fn append_sphere_proxy(geometry: &mut FieldGeometry, sphere: &FieldSphere, selec
             let vertex = |theta: f32, phi: f32| {
                 origin
                     + radius
-                        * Vec3::new(theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos())
+                        * Vec3::new(
+                            theta.sin() * phi.cos(),
+                            theta.sin() * phi.sin(),
+                            theta.cos(),
+                        )
             };
             push_quad(
                 &mut geometry.surface_triangles,
@@ -319,9 +355,7 @@ mod tests {
                 WorldCommand::CreateBox(
                     FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(1.0)).unwrap(),
                 ),
-                WorldCommand::CreateSphere(
-                    FieldSphereSpec::new("ball", DVec3::ZERO, 1.0).unwrap(),
-                ),
+                WorldCommand::CreateSphere(FieldSphereSpec::new("ball", DVec3::ZERO, 1.0).unwrap()),
             ])
             .unwrap();
         let snapshot = world.snapshot();
@@ -344,5 +378,17 @@ mod tests {
         );
         assert!(hidden.surface_triangles.is_empty());
         assert!(hidden.vector_lines.is_empty());
+    }
+
+    #[test]
+    fn computation_bounds_are_drawn_without_creating_a_scene_object() {
+        let mut geometry = FieldGeometry::default();
+        append_compute_bounds(
+            &mut geometry,
+            fieldcad_core::DomainBounds::centred_cube(2.0).unwrap(),
+        );
+
+        assert!(!geometry.surface_triangles.is_empty());
+        assert!(!geometry.vector_lines.is_empty());
     }
 }

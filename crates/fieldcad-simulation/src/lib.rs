@@ -13,6 +13,7 @@ pub mod runtime;
 pub mod source;
 
 pub use async_source::{AsyncLocalDataSource, CommandEvent};
+pub use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 pub use history::{ProbeHistory, ProbeReading};
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
 pub use runtime::{

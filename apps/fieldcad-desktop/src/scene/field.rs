@@ -7,14 +7,14 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    BoxId, BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GridLattice, PlaneId,
-    SampleGeometry, SampleValidity, SphereId, SphereLattice,
+    BoxId, BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GridLattice, PlaneId, SampleGeometry,
+    SampleValidity, SphereId, SphereLattice,
 };
 use glam::{DVec3, Vec3};
 
 use super::{
     BoxLayerSettings, ColoredVertex, FieldGeometry, FieldLayerSettings, PlaneLayerSettings,
-    PlaneVectorMode, SphereLayerSettings, VectorDisplay, append_arrow,
+    PlaneVectorMode, SceneVisibility, SphereLayerSettings, VectorDisplay, append_arrow,
 };
 
 /// Convert one vector channel's batches into generic coloured triangles and
@@ -31,6 +31,7 @@ pub fn field_geometry(
     plane_layers: &BTreeMap<PlaneId, PlaneLayerSettings>,
     box_layers: &BTreeMap<BoxId, BoxLayerSettings>,
     sphere_layers: &BTreeMap<SphereId, SphereLayerSettings>,
+    show: SceneVisibility,
 ) -> FieldGeometry {
     let Some(channel) = snapshot.channel(channel) else {
         return FieldGeometry::default();
@@ -43,6 +44,9 @@ pub fn field_geometry(
         };
         match batch.geometry() {
             SampleGeometry::Plane { plane, lattice } => {
+                if !show.planes {
+                    continue;
+                }
                 let plane_settings = plane_layers.get(plane).copied().unwrap_or_default();
                 // Whether this plane draws this field is the plane's own
                 // setting. The channel's visibility is checked by the caller,
@@ -99,6 +103,9 @@ pub fn field_geometry(
                 );
             }
             SampleGeometry::Box { region, lattice } => {
+                if !show.boxes {
+                    continue;
+                }
                 let box_settings = box_layers.get(region).copied().unwrap_or_default();
                 if !box_settings.visible || !box_settings.vectors.visible {
                     continue;
@@ -116,6 +123,9 @@ pub fn field_geometry(
                 );
             }
             SampleGeometry::Sphere { region, lattice } => {
+                if !show.spheres {
+                    continue;
+                }
                 let sphere_settings = sphere_layers.get(region).copied().unwrap_or_default();
                 if !sphere_settings.visible || !sphere_settings.vectors.visible {
                     continue;
@@ -977,6 +987,7 @@ mod tests {
                 &layers,
                 &BTreeMap::new(),
                 &BTreeMap::new(),
+                SceneVisibility::ALL,
             )
             .vector_lines
             .len()
@@ -1003,6 +1014,26 @@ mod tests {
             ])),
             0
         );
+    }
+
+    #[test]
+    fn hiding_planes_hides_their_field_geometry_too() {
+        let (snapshot, channel, _) = two_plane_snapshot();
+        let geometry = field_geometry(
+            &snapshot,
+            &channel,
+            FieldLayerSettings::default(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            SceneVisibility {
+                planes: false,
+                ..SceneVisibility::ALL
+            },
+        );
+
+        assert!(geometry.surface_triangles.is_empty());
+        assert!(geometry.vector_lines.is_empty());
     }
 
     /// A uniform 3×3×3 domain batch of unit +X vectors.
@@ -1204,7 +1235,13 @@ mod tests {
     fn box_arrows_follow_a_rotated_lattice() {
         // Local X maps to world Y, local Y maps to world -X: a 90 degree turn
         // about Z.
-        let lattice = BoxLattice::new(DVec3::ZERO, DVec3::Y, DVec3::NEG_X, DVec3::Z, UVec3::splat(2));
+        let lattice = BoxLattice::new(
+            DVec3::ZERO,
+            DVec3::Y,
+            DVec3::NEG_X,
+            DVec3::Z,
+            UVec3::splat(2),
+        );
         let values = vec![DVec3::X; lattice.len()];
         let validity = vec![SampleValidity::Exact; lattice.len()];
         let colors = vec![Vec3::ONE; lattice.len()];
@@ -1228,7 +1265,10 @@ mod tests {
         assert!(origins.contains(&Vec3::NEG_X));
     }
 
-    fn uniform_sphere(counts_per_axis: u32, radius: f64) -> (SphereLattice, Vec<DVec3>, Vec<SampleValidity>, Vec<Vec3>) {
+    fn uniform_sphere(
+        counts_per_axis: u32,
+        radius: f64,
+    ) -> (SphereLattice, Vec<DVec3>, Vec<SampleValidity>, Vec<Vec3>) {
         let lattice = SphereLattice::new(
             DVec3::splat(-radius),
             DVec3::splat(2.0 * radius / f64::from(counts_per_axis.saturating_sub(1)).max(1.0)),

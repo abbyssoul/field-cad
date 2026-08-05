@@ -369,9 +369,12 @@ Phased plan:
    just another transport" a checked property instead of a claim, exactly
    the way ADR 0001's local-vs-loopback test already is for that boundary.
 
-   **The only phase from the original plan still open.** Next up.
+   **Done (2026-08-05) — see below.** Was the only phase from the original
+   plan still open at the time these research notes were written; the "Done"
+   entry after them records what was actually built and the two corrections
+   discovered along the way.
 
-   **Research notes (paused 2026-08-05, resume here):**
+   **Research notes (paused 2026-08-05, resumed and closed out same day):**
 
    - **The exact ADR 0001 test to mirror**: `local_and_loopback_sources_are_interchangeable_for_consumers`
      (`crates/fieldcad-simulation/src/lib.rs:938`), which asserts
@@ -479,6 +482,71 @@ Phased plan:
      two logs. That equality is what turns "MCP is just another transport"
      from a claim into a checked property, exactly as the docstring above
      says.
+
+   **Done (2026-08-05), with two corrections to the plan above found only by
+   trying to write the test:**
+
+   - **Not `tests/parity.rs`.** Every `#[tool]` method on `McpServer`
+     (`get_world`, `commit_world`, `play`, …) and their `Parameters` structs
+     (`CommitWorldParams`, …) are crate-private, not `pub` — the existing
+     `mod tests` in `src/lib.rs` can call them only because a child module
+     can see its parent's private items, not because they're part of the
+     crate's public API. An external `tests/` file is a separate crate as
+     far as visibility is concerned and cannot call them at all. Rather than
+     widen `McpServer`'s API surface just to make a test file reachable, the
+     new test lives inside `src/lib.rs`'s existing `mod tests`, alongside
+     `server()`/`json_of()` — reusing them directly instead of duplicating
+     them, since duplication was only ever needed for the `tests/` location
+     the visibility problem rules out.
+   - **A fixed-iteration `settle()` (4× zero-duration polls) doesn't work
+     for `HeadlessServer`.** `observed_script`'s `settle` is fine for
+     `LocalDataSource`/`LoopbackDataSource` — both synchronous, no worker
+     thread. `HeadlessServer` wraps `AsyncLocalDataSource`
+     (`crates/fieldcad-simulation/src/async_source.rs`), a real OS thread
+     reached over an `mpsc` channel; a handful of zero-duration polls issued
+     back-to-back with no yield is not a wait at all; on this machine the
+     worker never got scheduled in that window, and the direct-side log
+     never advanced past its very first entry (first run of this test caught
+     it directly: all five log lines identical, frozen at `tick=0`). Fixed
+     with a real quiescence-detecting `settle` — `crates/fieldcad-mcp/src/
+     lib.rs`, `fn settle` — that polls in a loop with `thread::yield_now()`
+     between iterations, watching `PollOutcome` (`snapshot_updated`,
+     `ticks_advanced`, `commands_applied`) and `pending_command_count()`
+     until three consecutive polls report nothing happened, bounded by a
+     2-second deadline. Needed on the direct side after every command (it
+     bypasses `HeadlessServer::submit_and_await` entirely, calling
+     `FieldDataSource::execute`/`poll` straight on the trait object, exactly
+     as `observed_script` does), and on the MCP side only after the one
+     manual `advance(Duration::from_millis(250))` the test issues directly
+     on the shared `Arc<Mutex<HeadlessServer>>` to let `Play` actually
+     produce ticks — no MCP tool exposes wall-clock advance; in production
+     that's the standalone binary's poll loop or the embedded desktop's
+     per-frame pump, neither of which exists in-process here, so the test
+     plays that role itself for this one step. Every other MCP-side step
+     needed no settling, confirming the plan's original asymmetry note:
+     `submit_and_wait` already waits for its own command's
+     `CommandEvent::Completed`, which itself carries an already-adopted
+     `SourceState` (world, simulation status, latest snapshot), so nothing
+     is left in flight once a tool call returns.
+
+   The new test, `mcp_and_direct_sources_are_interchangeable_for_consumers`
+   (`crates/fieldcad-mcp/src/lib.rs`, `mod tests`), builds two independent
+   `default_session()`s, drives one through `direct_script` (raw
+   `FieldDataSource`, manual settling) and the other through `mcp_script`
+   (tool calls only, plus the one manual wall-clock advance above), both
+   projected through the same `parity_log_line` — the probe-history line is
+   dropped, not replaced, per the gap noted above — and asserts the two
+   logs are equal. `cargo test --workspace` (389 passed) and `cargo clippy
+   --workspace --all-targets` (clean; the 3 pre-existing warnings are in
+   unrelated files) confirm this closes the last open item from the
+   original phased plan.
+
+   **This closes phase 7 — the MCP server implementation plan is complete.**
+   What remains is the explicit scope dependency noted below (stories not
+   yet implemented anywhere, not specific to MCP) and the follow-ups called
+   out inline above: a non-loopback bind (phase 5), a typed command DSL for
+   `commit_world` (phase 3), and `watch_session`/resource-subscription push
+   notifications (phase 3).
 
 Note explicit scope dependency: user-stories/README.md marks several
 stories *Required for API/MCP parity* that aren't implemented yet (stable

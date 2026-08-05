@@ -37,8 +37,8 @@ use fieldcad_core::{
 };
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
-    CommandEvent, CommandPayload, CommandReceipt, FieldDataSource, PlaybackSpeed,
-    SimulationStatus, SourceError, Subscription,
+    CommandEvent, CommandPayload, CommandReceipt, FieldDataSource, PlaybackSpeed, SimulationStatus,
+    SourceError, Subscription,
 };
 use rmcp::{
     ErrorData, ServerHandler,
@@ -49,9 +49,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 mod transport;
-pub use transport::{McpConnections, bind_http, bind_unix, generate_token, run_stdio, serve_http};
 #[cfg(unix)]
 pub use transport::serve_unix;
+pub use transport::{McpConnections, bind_http, bind_unix, generate_token, run_stdio, serve_http};
 
 /// How long a tool call waits for its own command to complete before giving
 /// up. Generous: this is a ceiling against something never completing (a
@@ -487,10 +487,11 @@ impl McpServer {
             Ok(domain) => domain,
             Err(error) => return tool_error(error.to_string()),
         };
-        let receipt = match submit_and_wait(&self.model, CommandPayload::ReconfigureDomain(domain)).await {
-            Ok(receipt) => receipt,
-            Err(error) => return tool_error(error.to_string()),
-        };
+        let receipt =
+            match submit_and_wait(&self.model, CommandPayload::ReconfigureDomain(domain)).await {
+                Ok(receipt) => receipt,
+                Err(error) => return tool_error(error.to_string()),
+            };
         let server = lock(&self.model);
         ok_json(&ReconfigureDomainResult {
             receipt,
@@ -660,9 +661,14 @@ impl ServerHandler for McpServer {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{ObjectShape, ObjectSpec, ProbeSpec, Transform, WorldCommand};
+    use fieldcad_core::{
+        FieldSnapshot, ObjectShape, ObjectSpec, ProbeSpec, Transform, WorldCommand, WorldSnapshot,
+    };
     use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
-    use fieldcad_electrostatics::{electric_field_channel_id, plugin_id as electrostatics_plugin_id};
+    use fieldcad_electrostatics::{
+        electric_field_channel_id, plugin_id as electrostatics_plugin_id,
+    };
+    use fieldcad_simulation::{CommandId, CommandSequencer};
     use rmcp::model::ContentBlock;
     use serde_json::Value;
 
@@ -677,9 +683,16 @@ mod tests {
     /// JSON — this pulls it out and parses it, the way a real MCP client
     /// would read a tool result.
     fn json_of(result: &CallToolResult) -> Value {
-        assert_ne!(result.is_error, Some(true), "unexpected tool error: {result:?}");
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "unexpected tool error: {result:?}"
+        );
         let [ContentBlock::Text(text)] = result.content.as_slice() else {
-            panic!("expected exactly one text content block, got {:?}", result.content);
+            panic!(
+                "expected exactly one text content block, got {:?}",
+                result.content
+            );
         };
         serde_json::from_str(&text.text).expect("tool content is valid JSON")
     }
@@ -836,10 +849,220 @@ mod tests {
         );
 
         assert_eq!(result["receipt"]["disposition"], "Applied");
-        assert_eq!(result["domain"]["resolution"]["cells"], serde_json::json!([8, 12, 16]));
+        assert_eq!(
+            result["domain"]["resolution"]["cells"],
+            serde_json::json!([8, 12, 16])
+        );
         assert_eq!(result["domain"]["precision"], "F64");
         assert_eq!(result["simulation"]["clock"]["mode"], "Paused");
         assert_eq!(result["simulation"]["clock"]["step"]["tick"], 0);
         assert_eq!(result["simulation"]["run_generation"], 1);
+    }
+
+    /// The same log line format `fieldcad_simulation`'s own
+    /// `observed_script` uses (ADR 0001's local/loopback parity test) —
+    /// computed from real deserialized types on either side, so the direct
+    /// and MCP scripts below share the exact same formatting logic and
+    /// cannot drift apart from each other.
+    fn parity_log_line(
+        snapshot: Option<&FieldSnapshot>,
+        status: &SimulationStatus,
+        world: &WorldSnapshot,
+    ) -> String {
+        match snapshot {
+            Some(snapshot) => format!(
+                "seq={} rev={} tick={} mode={} samples={} freshness={} objects={} world_rev={}",
+                snapshot.identity.sequence,
+                snapshot.identity.world_revision,
+                snapshot.identity.tick,
+                status.mode().label(),
+                snapshot.total_samples(),
+                snapshot.freshness_against(status.world_revision).label(),
+                world.objects().len(),
+                world.revision(),
+            ),
+            None => "no data".to_owned(),
+        }
+    }
+
+    /// Poll until nothing further arrives from `AsyncLocalDataSource`'s
+    /// background worker thread (ADR 0011). `observed_script`
+    /// (`fieldcad_simulation`'s local/loopback parity test) settles with a
+    /// fixed handful of zero-duration polls, which is enough for
+    /// `LocalDataSource`/`LoopbackDataSource` — both synchronous, no worker
+    /// thread involved. `HeadlessServer` wraps a real worker thread, so a
+    /// fixed count of immediately-back-to-back polls isn't a wait at all: in
+    /// practice the worker never got scheduled in that window and every
+    /// poll below observed the same unfinished state (this was this test's
+    /// first failure — the direct-side log never advanced past its first
+    /// entry). "Settled" has to be detected — quiet for a few consecutive
+    /// polls, with `thread::yield_now()` between them to actually give the
+    /// worker a turn — not assumed after N iterations.
+    fn settle(source: &mut dyn FieldDataSource) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut quiet_polls = 0;
+        loop {
+            let outcome = source.poll(Duration::ZERO).unwrap();
+            let quiet = !outcome.snapshot_updated
+                && outcome.ticks_advanced == 0
+                && outcome.commands_applied == 0
+                && source.pending_command_count() == 0;
+            quiet_polls = if quiet { quiet_polls + 1 } else { 0 };
+            if quiet_polls >= 3 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not settle in time"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Drive a session directly through `FieldDataSource`, mirroring
+    /// `fieldcad_simulation`'s own `observed_script`
+    /// (`local_and_loopback_sources_are_interchangeable_for_consumers`) —
+    /// settling manually between commands, since `AsyncLocalDataSource`
+    /// resolves non-blocking submissions on a background worker thread.
+    /// Adapted from that script: this one drops its final probe-history
+    /// line, since there is no MCP tool for probe history yet (deliberately
+    /// deferred — see this crate's module docs) — dropping the line keeps
+    /// this comparing only what both sides can actually observe, rather
+    /// than adding a probe-history tool just to make the two sides
+    /// comparable.
+    fn direct_script(source: &mut dyn FieldDataSource) -> Vec<String> {
+        let mut sequencer = CommandSequencer::default();
+        let mut log = Vec::new();
+
+        let record = |source: &mut dyn FieldDataSource, log: &mut Vec<String>| {
+            log.push(parity_log_line(
+                source.latest_snapshot().as_deref(),
+                &source.simulation_status(),
+                &source.world(),
+            ));
+        };
+
+        settle(source);
+        record(source, &mut log);
+
+        let receipt = source
+            .execute(sequencer.issue(CommandPayload::Step))
+            .unwrap();
+        assert_eq!(receipt.command, CommandId::new(0));
+        settle(source);
+        record(source, &mut log);
+
+        source
+            .execute(sequencer.issue(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("added")),
+            ])))
+            .unwrap();
+        settle(source);
+        record(source, &mut log);
+
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+        source.poll(Duration::from_millis(250)).unwrap();
+        settle(source);
+        record(source, &mut log);
+
+        source
+            .execute(sequencer.issue(CommandPayload::Pause))
+            .unwrap();
+        settle(source);
+        record(source, &mut log);
+
+        log
+    }
+
+    fn parsed<T: serde::de::DeserializeOwned>(result: &CallToolResult) -> T {
+        serde_json::from_value(json_of(result)).expect("tool content matches the expected type")
+    }
+
+    /// Drive an equivalent session purely through MCP tool calls. Unlike
+    /// `direct_script`, no manual settling is needed between commands: every
+    /// tool call already awaits its own command's completion via
+    /// `submit_and_wait` before returning.
+    ///
+    /// `model` is the same `Arc<Mutex<HeadlessServer>>` `mcp` wraps. Letting
+    /// simulated time actually advance while `Play` is active is not
+    /// something any MCP tool exposes — in production that role belongs to
+    /// the standalone binary's poll loop or the embedded desktop app's
+    /// per-frame pump, and neither exists in this test, so the test plays
+    /// that role directly here, the same way `direct_script`'s
+    /// `source.poll(Duration::from_millis(250))` (plus its trailing
+    /// `settle`) does on the other side.
+    async fn mcp_script(mcp: &McpServer, model: &Arc<Mutex<HeadlessServer>>) -> Vec<String> {
+        let mut log = Vec::new();
+
+        async fn record(mcp: &McpServer, log: &mut Vec<String>) {
+            let snapshot_result = mcp.get_latest_snapshot().await.unwrap();
+            let snapshot: Option<FieldSnapshot> = if snapshot_result.is_error == Some(true) {
+                None
+            } else {
+                Some(parsed(&snapshot_result))
+            };
+            let status: SimulationStatus = parsed(&mcp.get_simulation_status().await.unwrap());
+            let world: WorldSnapshot = parsed(&mcp.get_world().await.unwrap());
+            log.push(parity_log_line(snapshot.as_ref(), &status, &world));
+        }
+
+        record(mcp, &mut log).await;
+
+        let stepped = json_of(&mcp.step().await.unwrap());
+        assert_eq!(stepped["disposition"], "Applied");
+        record(mcp, &mut log).await;
+
+        let authored = json_of(
+            &mcp.commit_world(Parameters(CommitWorldParams {
+                commands: vec![
+                    serde_json::to_value(WorldCommand::CreateObject(ObjectSpec::new("added")))
+                        .unwrap(),
+                ],
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(authored["disposition"], "Applied");
+        record(mcp, &mut log).await;
+
+        mcp.play().await.unwrap();
+        {
+            let mut server = model.lock().unwrap();
+            server.advance(Duration::from_millis(250)).unwrap();
+            settle(&mut *server);
+        }
+        record(mcp, &mut log).await;
+
+        mcp.pause().await.unwrap();
+        record(mcp, &mut log).await;
+
+        log
+    }
+
+    /// Test it the way ADR 0001 tests locality: drive one session entirely
+    /// through the MCP surface and assert the resulting observable state is
+    /// identical to the same script of commands submitted directly through
+    /// `FieldDataSource`. This is what makes "MCP is just another
+    /// transport" a checked property instead of a claim, exactly the way
+    /// ADR 0001's `local_and_loopback_sources_are_interchangeable_for_consumers`
+    /// already is for the local/loopback boundary. See docs/mcp-plan.md
+    /// phase 7.
+    #[tokio::test]
+    async fn mcp_and_direct_sources_are_interchangeable_for_consumers() {
+        let mut direct = HeadlessServer::new(
+            fieldcad_server::default_session().expect("default session builds"),
+        );
+
+        let model = Arc::new(Mutex::new(HeadlessServer::new(
+            fieldcad_server::default_session().expect("default session builds"),
+        )));
+        let mcp = McpServer::new(Arc::clone(&model));
+
+        let direct_log = direct_script(&mut direct);
+        let mcp_log = mcp_script(&mcp, &model).await;
+
+        assert_eq!(direct_log, mcp_log);
     }
 }
