@@ -27,13 +27,15 @@
 //! plain primitives so its schema is exact.
 
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
 use fieldcad_core::{
-    BoundaryCondition, BoundaryConditions, ChannelId, Domain, DomainBounds, PluginId, Precision,
-    Resolution, SnapshotIdentity, SolverDiagnostic, TimeStep, WorldCommand,
+    BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, Domain, DomainBounds,
+    PluginId, PluginProvenance, Precision, Resolution, SnapshotCompleteness, SnapshotIdentity,
+    SolverDiagnostic, TimeStep, WorldCommand,
 };
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
@@ -49,15 +51,30 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 mod transport;
+mod typed_world;
 #[cfg(unix)]
 pub use transport::serve_unix;
 pub use transport::{McpConnections, bind_http, bind_unix, generate_token, run_stdio, serve_http};
+use typed_world::into_world_command;
+pub use typed_world::{ChannelRefParam, EditWorldParams, WorldEditParam};
 
 /// How long a tool call waits for its own command to complete before giving
 /// up. Generous: this is a ceiling against something never completing (a
 /// wedged solver, a lost worker), not a latency budget — a healthy command
 /// resolves in well under a second.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default cap on `get_latest_snapshot`'s total sample count.
+///
+/// A dense subscription (a fine plane/domain/box/sphere sampling) can make
+/// one snapshot read tens of thousands of characters of JSON — large enough
+/// to exceed a typical MCP client's own response-size budget outright, which
+/// surfaces as an opaque transport failure rather than an actionable error.
+/// This default is conservative on purpose (observed: a subscription of one
+/// 33x33 plane plus a coarse whole-domain sample, two channels, already
+/// produced ~117,000 characters, well past this many samples); a caller that
+/// knows its client tolerates more can raise `max_samples` explicitly.
+const DEFAULT_MAX_SNAPSHOT_SAMPLES: usize = 2_000;
 
 /// `std::sync::Mutex` (not `tokio::sync::Mutex`) is what lets this be shared
 /// with a synchronous caller — the embedded desktop app's winit frame loop,
@@ -316,6 +333,36 @@ struct DiagnosticsResult {
     diagnostics: Vec<SolverDiagnostic>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetLatestSnapshotParams {
+    /// Only include these channels' batches. Omit to include every published
+    /// channel, subject to `max_samples`. A requested channel with no
+    /// published data is simply absent from the result, not an error.
+    #[serde(default)]
+    channels: Option<Vec<ChannelRefParam>>,
+    /// Refuse the read and report a per-channel sample-count breakdown
+    /// instead of a giant payload if the (possibly `channels`-filtered)
+    /// result would exceed this many total samples. Omit for the default
+    /// (see `DEFAULT_MAX_SNAPSHOT_SAMPLES`), which is deliberately
+    /// conservative; raise it if your client tolerates a larger tool result.
+    #[serde(default)]
+    max_samples: Option<usize>,
+}
+
+/// `FieldSnapshot`, minus whichever channels a caller's `channels` filter
+/// excluded. A borrowing view rather than a clone of the snapshot: a
+/// dense subscription's batches are the expensive part of this response, and
+/// filtering must not copy what it is about to either serialize or discard.
+#[derive(Serialize)]
+struct SnapshotView<'a> {
+    identity: SnapshotIdentity,
+    completeness: SnapshotCompleteness,
+    domain: Domain,
+    plugins: &'a [PluginProvenance],
+    channels: BTreeMap<ChannelId, &'a ChannelSnapshot>,
+    diagnostics: &'a [SolverDiagnostic],
+}
+
 /// The MCP-facing handle onto one session's model.
 ///
 /// Cloning shares the model: every clone locks the same
@@ -365,19 +412,73 @@ impl McpServer {
         ok_json(&lock(&self.model).edit_history())
     }
 
-    #[tool(description = "What the model currently samples when it publishes a snapshot.")]
+    #[tool(
+        description = "What the model currently samples when it publishes a snapshot. This is what get_latest_snapshot's response size scales with: roughly (probes) + (plane_samples_per_axis^2 x visible planes) + (domain cells / domain_stride^3) + (box_samples_per_axis^3 x visible boxes) + (sphere_samples_per_axis^3 x visible spheres), all multiplied by the number of published channels. Keep these low for routine MCP polling; get_latest_snapshot also accepts its own channels/max_samples to bound one read without changing this durable subscription."
+    )]
     async fn get_subscription(&self) -> Result<CallToolResult, ErrorData> {
         ok_json(&lock(&self.model).subscription())
     }
 
     #[tool(
-        description = "The latest complete field snapshot: channel batches, revision, tick, and diagnostics."
+        description = "The latest complete field snapshot: channel batches, revision, tick, and diagnostics. A dense subscription (see get_subscription/set_subscription) can make the full snapshot very large — large enough to exceed a typical MCP client's own response-size limit, which otherwise surfaces as an opaque transport failure. Pass `channels` to fetch only specific channels; the read is refused with a structured per-channel sample-count breakdown (not a raw size failure) if the result would still exceed `max_samples` (default 2000 total samples)."
     )]
-    async fn get_latest_snapshot(&self) -> Result<CallToolResult, ErrorData> {
-        match lock(&self.model).latest_snapshot() {
-            Some(snapshot) => ok_json(snapshot.as_ref()),
-            None => tool_error("no snapshot has been published yet"),
+    async fn get_latest_snapshot(
+        &self,
+        Parameters(params): Parameters<GetLatestSnapshotParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(snapshot) = lock(&self.model).latest_snapshot() else {
+            return tool_error("no snapshot has been published yet");
+        };
+
+        let wanted: Option<Vec<ChannelId>> = match params.channels {
+            Some(refs) => match refs.into_iter().map(ChannelRefParam::resolve).collect() {
+                Ok(ids) => Some(ids),
+                Err(error) => return tool_error(error),
+            },
+            None => None,
+        };
+
+        let mut channels: BTreeMap<ChannelId, &ChannelSnapshot> = BTreeMap::new();
+        for (id, channel) in &snapshot.channels {
+            if wanted.as_ref().is_none_or(|ids| ids.contains(id)) {
+                channels.insert(id.clone(), channel);
+            }
         }
+
+        let total_samples: usize = channels
+            .values()
+            .map(|channel| channel.sample_count())
+            .sum();
+        let limit = params.max_samples.unwrap_or(DEFAULT_MAX_SNAPSHOT_SAMPLES);
+        if total_samples > limit {
+            let mut breakdown: Vec<(String, usize)> = channels
+                .iter()
+                .map(|(id, channel)| (id.to_string(), channel.sample_count()))
+                .collect();
+            breakdown.sort_by(|left, right| right.1.cmp(&left.1));
+            let listed = breakdown
+                .iter()
+                .map(|(id, count)| format!("{id}: {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return tool_error(format!(
+                "snapshot has {total_samples} total samples across {} channel(s), exceeding \
+                 max_samples={limit}. Largest channels: [{listed}]. Narrow the read with \
+                 `channels`, raise `max_samples`, or call set_subscription with a lower \
+                 plane_samples_per_axis/domain_stride/box_samples_per_axis/sphere_samples_per_axis \
+                 to reduce sampling density.",
+                channels.len()
+            ));
+        }
+
+        ok_json(&SnapshotView {
+            identity: snapshot.identity,
+            completeness: snapshot.completeness,
+            domain: snapshot.domain,
+            plugins: &snapshot.plugins,
+            channels,
+            diagnostics: &snapshot.diagnostics,
+        })
     }
 
     #[tool(
@@ -393,8 +494,10 @@ impl McpServer {
         })
     }
 
+    // Description intentionally mirrors `FieldDataSource::body_forces`'s own
+    // doc comment (fieldcad-simulation/src/source.rs) — keep the two in sync.
     #[tool(
-        description = "Forces the dynamics system produced on its most recent tick, in SI newtons. Bodies without an entry were not force-integrated (for example pinned or solver-owned bodies), or no tick has run yet."
+        description = "Forces the dynamics system produced on its most recent tick, in SI newtons. A body with no entry covers every reason there is nothing to show for it: no mass component attached, pinned (motion is authored, not solver-integrated), kinematically owned by a solver's own pusher rather than the shared dynamics system, or no tick has run yet. Attaching a charge/mass component alone does not guarantee an entry — mass specifically is required for force integration."
     )]
     async fn get_body_forces(
         &self,
@@ -413,7 +516,44 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Apply one atomic, revisioned transaction of world commands (create/edit/remove objects, planes, probes)."
+        description = "Every component schema registered by an active plugin: property IDs, display names, dimensioned kind, required flag, relevance condition, and default value. Discover what an edit_world component attach/AttachComponent payload must contain before authoring one; the same schemas are also inline in get_world's component_schemas."
+    )]
+    async fn list_component_schemas(&self) -> Result<CallToolResult, ErrorData> {
+        let world = lock(&self.model).world();
+        ok_json(&world.component_schemas().values().collect::<Vec<_>>())
+    }
+
+    #[tool(
+        description = "Apply one atomic, revisioned transaction of typed world-mutation commands: create/edit/remove objects, slice planes, field boxes, field spheres, and probes, and attach/detach/edit object components. Entity references are stable numeric IDs (from get_world, or a previous call's receipt.created); component/channel references are {plugin, name} pairs; component-property values are validated against the schema discovered through list_component_schemas before submission, so a mismatched value is rejected with the property's expected kind rather than a raw deserialization error. Prefer this over commit_world, which takes untyped native WorldCommand JSON with no schema discovery and only reports the authority's raw rejection."
+    )]
+    async fn edit_world(
+        &self,
+        Parameters(params): Parameters<EditWorldParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let world = lock(&self.model).world();
+        let schemas = world.component_schemas();
+        let commands: Vec<WorldCommand> = match params
+            .commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| {
+                into_world_command(schemas, command)
+                    .map_err(|error| format!("invalid command at index {index}: {error}"))
+            })
+            .collect()
+        {
+            Ok(commands) => commands,
+            Err(error) => return tool_error(error),
+        };
+        drop(world);
+        match submit_and_wait(&self.model, CommandPayload::CommitWorld(commands)).await {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Apply one atomic, revisioned transaction of raw WorldCommand JSON (create/edit/remove objects, planes, probes). Legacy/compatibility path kept while edit_world's typed coverage settles: edit_world discovers its schema from tool definitions and validates component-property values before submission, which this cannot."
     )]
     async fn commit_world(
         &self,
@@ -515,7 +655,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Change what the model samples when it publishes a snapshot. A presentation setting only; never changes the physics."
+        description = "Change what the model samples when it publishes a snapshot. A presentation setting only; never changes the physics. A denser sampling here makes every future get_latest_snapshot response larger — a fine plane_samples_per_axis, a small domain_stride, or many visible boxes/spheres can each multiply the total sample count. Prefer the lowest density your workflow needs; use get_latest_snapshot's own channels/max_samples for a one-off bounded read instead of changing this durable subscription."
     )]
     async fn set_subscription(
         &self,
@@ -661,6 +801,8 @@ impl ServerHandler for McpServer {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use fieldcad_core::{
         FieldSnapshot, ObjectShape, ObjectSpec, ProbeSpec, Transform, WorldCommand, WorldSnapshot,
     };
@@ -673,6 +815,10 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::typed_world::{
+        ComponentAttachParam, ComponentRefParam, ObjectShapeParam, ProbePositionParam,
+        PropertyValueParam, QuatParam, TransformParam, Vec3Param,
+    };
 
     fn server() -> McpServer {
         let source = fieldcad_server::default_session().expect("default session builds");
@@ -746,8 +892,89 @@ mod tests {
         let status_after = json_of(&server.get_simulation_status().await.unwrap());
         assert_eq!(status_after["clock"]["step"]["tick"], 1);
 
-        let snapshot = json_of(&server.get_latest_snapshot().await.unwrap());
+        let snapshot = json_of(
+            &server
+                .get_latest_snapshot(Parameters(GetLatestSnapshotParams {
+                    channels: None,
+                    max_samples: None,
+                }))
+                .await
+                .unwrap(),
+        );
         assert!(snapshot.get("identity").is_some());
+    }
+
+    async fn scene_with_a_published_snapshot(server: &McpServer) {
+        json_of(
+            &server
+                .commit_world(Parameters(CommitWorldParams {
+                    commands: charge_and_probe_commands(),
+                }))
+                .await
+                .unwrap(),
+        );
+        json_of(&server.step().await.unwrap());
+    }
+
+    fn electric_field_channel_ref() -> ChannelRefParam {
+        ChannelRefParam {
+            plugin: "fieldcad.electromagnetic-field".to_owned(),
+            name: "electric-field".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_latest_snapshot_refuses_an_oversized_read_with_a_structured_breakdown() {
+        let server = server();
+        scene_with_a_published_snapshot(&server).await;
+
+        let result = server
+            .get_latest_snapshot(Parameters(GetLatestSnapshotParams {
+                channels: None,
+                max_samples: Some(0),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one text content block, got {:?}", result.content);
+        };
+        assert!(text.text.contains("max_samples=0"), "{}", text.text);
+        assert!(text.text.contains("electric-field"), "{}", text.text);
+    }
+
+    #[tokio::test]
+    async fn get_latest_snapshot_can_be_narrowed_to_specific_channels() {
+        let server = server();
+        scene_with_a_published_snapshot(&server).await;
+
+        let narrowed = json_of(
+            &server
+                .get_latest_snapshot(Parameters(GetLatestSnapshotParams {
+                    channels: Some(vec![electric_field_channel_ref()]),
+                    max_samples: None,
+                }))
+                .await
+                .unwrap(),
+        );
+        let channels = narrowed["channels"].as_object().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert!(channels.contains_key("fieldcad.electromagnetic-field:electric-field"));
+
+        let empty = json_of(
+            &server
+                .get_latest_snapshot(Parameters(GetLatestSnapshotParams {
+                    channels: Some(vec![ChannelRefParam {
+                        plugin: "fieldcad.nonexistent".to_owned(),
+                        name: "made-up".to_owned(),
+                    }]),
+                    max_samples: None,
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(empty["channels"], serde_json::json!({}));
     }
 
     #[tokio::test]
@@ -760,6 +987,233 @@ mod tests {
             .await
             .expect("the call itself succeeds; the failure is inside the result");
         assert_eq!(result.is_error, Some(true));
+    }
+
+    fn charge_component_ref() -> ComponentRefParam {
+        ComponentRefParam {
+            plugin: "fieldcad.electromagnetic-sources".to_owned(),
+            name: "charge-source".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_world_creates_a_negatively_charged_object_and_reports_its_allocated_id() {
+        let server = server();
+
+        let created = json_of(
+            &server
+                .edit_world(Parameters(EditWorldParams {
+                    commands: vec![WorldEditParam::CreateObject {
+                        name: "Negative point charge".to_owned(),
+                        transform: Some(TransformParam {
+                            translation: Vec3Param {
+                                x: 0.0,
+                                y: 0.0,
+                                z: -0.6,
+                            },
+                            rotation: QuatParam::default(),
+                        }),
+                        velocity: None,
+                        shape: Some(ObjectShapeParam::Point { radius_m: 0.15 }),
+                        visible: true,
+                        pinned: false,
+                        components: vec![ComponentAttachParam {
+                            component: charge_component_ref(),
+                            properties: [(
+                                "charge".to_owned(),
+                                PropertyValueParam::Scalar { si_value: -1.0e-9 },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        }],
+                    }],
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(created["disposition"], "Applied");
+        let object_ids = created["created"]["created_objects"].as_array().unwrap();
+        assert_eq!(object_ids.len(), 1);
+        let object_id = object_ids[0].as_u64().unwrap();
+
+        let world = json_of(&server.get_world().await.unwrap());
+        let object = &world["objects"][object_id.to_string()];
+        assert_eq!(object["name"], "Negative point charge");
+        assert_eq!(
+            object["components"]["fieldcad.electromagnetic-sources:charge-source"]["charge"]["Scalar"]
+                ["si_value"],
+            -1.0e-9
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_world_rejects_a_property_value_of_the_wrong_kind_with_the_expected_kind() {
+        let server = server();
+
+        let result = server
+            .edit_world(Parameters(EditWorldParams {
+                commands: vec![WorldEditParam::CreateObject {
+                    name: "Bad charge".to_owned(),
+                    transform: None,
+                    velocity: None,
+                    shape: None,
+                    visible: true,
+                    pinned: false,
+                    components: vec![ComponentAttachParam {
+                        component: charge_component_ref(),
+                        properties: [(
+                            "charge".to_owned(),
+                            PropertyValueParam::Boolean { value: true },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    }],
+                }],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one text content block, got {:?}", result.content);
+        };
+        assert!(text.text.contains("expected scalar"), "{}", text.text);
+        assert!(text.text.contains("charge"), "{}", text.text);
+    }
+
+    #[tokio::test]
+    async fn edit_world_rejects_an_unregistered_component_and_points_at_discovery() {
+        let server = server();
+
+        let result = server
+            .edit_world(Parameters(EditWorldParams {
+                commands: vec![WorldEditParam::CreateObject {
+                    name: "Unknown component".to_owned(),
+                    transform: None,
+                    velocity: None,
+                    shape: None,
+                    visible: true,
+                    pinned: false,
+                    components: vec![ComponentAttachParam {
+                        component: ComponentRefParam {
+                            plugin: "fieldcad.nonexistent".to_owned(),
+                            name: "made-up".to_owned(),
+                        },
+                        properties: BTreeMap::new(),
+                    }],
+                }],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let [ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected one text content block, got {:?}", result.content);
+        };
+        assert!(
+            text.text.contains("list_component_schemas"),
+            "{}",
+            text.text
+        );
+    }
+
+    #[tokio::test]
+    async fn list_component_schemas_matches_get_world_and_a_typed_transaction_can_reference_a_new_object()
+     {
+        let server = server();
+
+        let schemas = json_of(&server.list_component_schemas().await.unwrap());
+        let schema_ids: Vec<&str> = schemas
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|schema| schema["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            schema_ids.contains(&"fieldcad.electromagnetic-sources:charge-source"),
+            "{schema_ids:?}"
+        );
+
+        // A mixed transaction: create an object, then attach a probe to it by
+        // ID, then move it — exercising object/probe creation and reference
+        // by allocated ID plus an edit, all in the DSL rather than raw JSON.
+        let created = json_of(
+            &server
+                .edit_world(Parameters(EditWorldParams {
+                    commands: vec![
+                        WorldEditParam::CreateObject {
+                            name: "source".to_owned(),
+                            transform: None,
+                            velocity: None,
+                            shape: None,
+                            visible: true,
+                            pinned: false,
+                            components: Vec::new(),
+                        },
+                        WorldEditParam::CreatePlane {
+                            name: "slice".to_owned(),
+                            origin: Vec3Param::default(),
+                            normal: Vec3Param {
+                                x: 0.0,
+                                y: 0.0,
+                                z: 1.0,
+                            },
+                            half_extent: None,
+                            u_axis: None,
+                            visible: true,
+                        },
+                    ],
+                }))
+                .await
+                .unwrap(),
+        );
+        let object_id = created["created"]["created_objects"][0].as_u64().unwrap();
+        let plane_id = created["created"]["created_planes"][0].as_u64().unwrap();
+
+        let follow_up = json_of(
+            &server
+                .edit_world(Parameters(EditWorldParams {
+                    commands: vec![
+                        WorldEditParam::CreateProbe {
+                            name: "attached".to_owned(),
+                            position: ProbePositionParam::Attached {
+                                object: object_id,
+                                offset: Vec3Param::default(),
+                            },
+                            channels: Vec::new(),
+                            visible: true,
+                            history_capacity: None,
+                        },
+                        WorldEditParam::SetTransform {
+                            object: object_id,
+                            transform: TransformParam {
+                                translation: Vec3Param {
+                                    x: 1.0,
+                                    y: 2.0,
+                                    z: 3.0,
+                                },
+                                rotation: QuatParam::default(),
+                            },
+                        },
+                        WorldEditParam::SetPlaneVisible {
+                            plane: plane_id,
+                            visible: false,
+                        },
+                    ],
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(follow_up["disposition"], "Applied");
+
+        let world = json_of(&server.get_world().await.unwrap());
+        let object = &world["objects"][object_id.to_string()];
+        assert_eq!(
+            object["transform"]["translation"],
+            serde_json::json!([1.0, 2.0, 3.0])
+        );
+        assert_eq!(world["planes"][plane_id.to_string()]["visible"], false);
+        assert_eq!(world["probes"].as_object().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -997,7 +1451,13 @@ mod tests {
         let mut log = Vec::new();
 
         async fn record(mcp: &McpServer, log: &mut Vec<String>) {
-            let snapshot_result = mcp.get_latest_snapshot().await.unwrap();
+            let snapshot_result = mcp
+                .get_latest_snapshot(Parameters(GetLatestSnapshotParams {
+                    channels: None,
+                    max_samples: None,
+                }))
+                .await
+                .unwrap();
             let snapshot: Option<FieldSnapshot> = if snapshot_result.is_error == Some(true) {
                 None
             } else {

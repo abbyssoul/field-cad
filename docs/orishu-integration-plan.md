@@ -337,6 +337,30 @@ how a workload declares and receives behaviour at global boundary faces.
    uninterrupted run versus checkpoint/resume/rebalance; and CPU reference
    versus any later accelerator profile.
 
+## Shared Newtonian-gravity kernel
+
+The analytic Newtonian gravity implementation follows the same ownership rule
+as the planned Maxwell extraction. Its canonical point/sphere source law,
+superposition, singularity/exclusion semantics, and SI constants belong in a
+headless `fieldcad-newtonian-gravity` kernel crate — not in the Field CAD plugin
+or a desktop compute backend. The `fieldcad-gravity` plugin is only the local
+runtime adapter; an Orishu gravity workload must call the same kernel directly.
+
+Before gravity is offered as an Orishu workload, add a kernel extraction task
+to the workload delivery:
+
+1. retain the global analytic evaluator as the reference implementation;
+2. define source/field/query DTOs and source-exclusion semantics for force
+   evaluation independently of Field CAD plugin types;
+3. implement the Orishu `wl_init`, `wl_load_partition`, `wl_query_state`, and
+   force-query adapter over that kernel, with no duplicate gravity law; and
+4. prove Field CAD and one-partition Orishu samples/forces match, then define
+   the partition query policy for long-range superposition before scaling out.
+
+Gravity is analytic in the first profile, so it has no Yee state, time-step
+kernel, or halo exchange. A future dynamic gravity model is a separate
+stateful/profiled workload and must not replace this static source-law oracle.
+
 ## Phased delivery plan
 
 ### Phase 0 — agree contracts before code

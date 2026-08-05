@@ -1,0 +1,12 @@
+[package]
+name = "fieldcad-gravity"
+version = "0.1.0"
+edition = "2024"
+description = "Analytic Newtonian gravity equation-system plugin"
+
+[dependencies]
+fieldcad-core = { workspace = true }
+fieldcad-mass-sources = { workspace = true }
+fieldcad-newtonian-gravity = { workspace = true }
+fieldcad-plugin-api = { workspace = true }
+glam = { workspace = true }

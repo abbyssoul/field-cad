@@ -821,6 +821,7 @@ dependencies = [
  "fieldcad-electromagnetic-sources",
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
+ "fieldcad-gravity",
  "fieldcad-mass-sources",
  "fieldcad-mcp",
  "fieldcad-particles",
@@ -884,6 +885,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldcad-gravity"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "fieldcad-mass-sources",
+ "fieldcad-newtonian-gravity",
+ "fieldcad-plugin-api",
+ "glam",
+]
+
+[[package]]
 name = "fieldcad-mass-sources"
 version = "0.1.0"
 dependencies = [
@@ -916,6 +928,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "fieldcad-newtonian-gravity"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "fieldcad-mass-sources",
+ "glam",
 ]
 
 [[package]]

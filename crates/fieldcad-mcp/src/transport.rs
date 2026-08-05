@@ -53,26 +53,34 @@ fn require_bearer_token(router: Router, token: Option<String>) -> Router {
     let Some(token) = token else {
         return router;
     };
-    router.layer(axum::middleware::from_fn(move |request: Request, next: Next| {
-        let token = token.clone();
-        async move {
-            let authorized = request
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
-                .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()));
-            if authorized {
-                next.run(request).await
-            } else {
-                unauthorized()
+    router.layer(axum::middleware::from_fn(
+        move |request: Request, next: Next| {
+            let token = token.clone();
+            async move {
+                let authorized = request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .is_some_and(|provided| {
+                        constant_time_eq(provided.as_bytes(), token.as_bytes())
+                    });
+                if authorized {
+                    next.run(request).await
+                } else {
+                    unauthorized()
+                }
             }
-        }
-    }))
+        },
+    ))
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")]).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+    )
+        .into_response()
 }
 
 /// A queryable handle onto how many MCP sessions a running Streamable HTTP
@@ -103,7 +111,11 @@ impl McpConnections {
     /// answer "do I have any connection at all", which is what this exists
     /// for — deciding whether it's safe to shut the server down.
     pub fn count(&self) -> Option<usize> {
-        self.sessions.sessions.try_read().ok().map(|sessions| sessions.len())
+        self.sessions
+            .sessions
+            .try_read()
+            .ok()
+            .map(|sessions| sessions.len())
     }
 }
 
@@ -113,7 +125,11 @@ fn mcp_service(
     ct: CancellationToken,
 ) -> StreamableHttpService<McpServer, LocalSessionManager> {
     let config = StreamableHttpServerConfig::default().with_cancellation_token(ct);
-    StreamableHttpService::new(move || Ok(server.clone()), connections.sessions.clone(), config)
+    StreamableHttpService::new(
+        move || Ok(server.clone()),
+        connections.sessions.clone(),
+        config,
+    )
 }
 
 pub async fn run_stdio(server: McpServer, ct: CancellationToken) -> Result<(), String> {
@@ -168,8 +184,9 @@ pub async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListene
                 ));
             }
             Err(_) => {
-                std::fs::remove_file(path)
-                    .map_err(|error| format!("removing stale socket {}: {error}", path.display()))?;
+                std::fs::remove_file(path).map_err(|error| {
+                    format!("removing stale socket {}: {error}", path.display())
+                })?;
             }
         }
     }

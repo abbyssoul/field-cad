@@ -1,5 +1,28 @@
 # Task: safe snapshot sizing and force-integration eligibility reporting
 
+## Status: resolved
+
+Both gaps are closed in `crates/fieldcad-mcp/src/lib.rs`:
+
+- `get_latest_snapshot` now takes `channels` (an optional allow-list of
+  `{plugin, name}` refs) and `max_samples` (default 2,000 total samples,
+  `DEFAULT_MAX_SNAPSHOT_SAMPLES`). A read that would exceed the limit is
+  refused with a structured error naming the total, the limit, and a
+  per-channel sample-count breakdown sorted largest-first, instead of
+  serializing an oversized payload. `get_subscription` and `set_subscription`
+  now document the sampling knobs' approximate effect on response size.
+- `get_body_forces`'s description now enumerates every reason a body can be
+  absent — no mass component, pinned, solver-owned, or no tick yet — mirroring
+  `FieldDataSource::body_forces`'s own doc comment
+  (`crates/fieldcad-simulation/src/source.rs`), which already had this right;
+  only the MCP-facing description was out of date.
+
+Left open, as an optional follow-on (was a "consider" in the original
+required behavior, not a hard requirement): a diagnostic-level signal that
+distinguishes "not dynamics-eligible" from "no tick has run yet" for a body
+missing from `get_body_forces`, rather than both presenting as an absent
+entry.
+
 ## Origin
 
 Found during black-box MCP exploration (agent driving `field-cad-server`

@@ -7,6 +7,7 @@ members = [
     "crates/fieldcad-dynamics",
     "crates/fieldcad-electromagnetic-sources",
     "crates/fieldcad-mass-sources",
+    "crates/fieldcad-newtonian-gravity",
     "crates/fieldcad-mcp",
     "crates/fieldcad-particles",
     "crates/fieldcad-plugin-api",
@@ -14,6 +15,7 @@ members = [
     "crates/fieldcad-simulation",
     "plugins/electrostatics",
     "plugins/electromagnetism",
+    "plugins/gravity",
     "plugins/test-field",
 ]
 default-members = ["apps/fieldcad-desktop"]
@@ -65,6 +67,7 @@ fieldcad-core = { path = "crates/fieldcad-core" }
 fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
 fieldcad-mass-sources = { path = "crates/fieldcad-mass-sources" }
+fieldcad-newtonian-gravity = { path = "crates/fieldcad-newtonian-gravity" }
 fieldcad-mcp = { path = "crates/fieldcad-mcp" }
 fieldcad-particles = { path = "crates/fieldcad-particles" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
@@ -72,4 +75,5 @@ fieldcad-server = { path = "crates/fieldcad-server" }
 fieldcad-simulation = { path = "crates/fieldcad-simulation" }
 fieldcad-electrostatics = { path = "plugins/electrostatics" }
 fieldcad-electromagnetism = { path = "plugins/electromagnetism" }
+fieldcad-gravity = { path = "plugins/gravity" }
 fieldcad-test-field = { path = "plugins/test-field" }

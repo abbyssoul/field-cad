@@ -20,6 +20,7 @@ use fieldcad_electrostatics::{
     ElectrostaticBatchEvaluator, ElectrostaticsPlugin, electric_field_channel_id,
     electric_potential_channel_id,
 };
+use fieldcad_gravity::NewtonianGravityPlugin;
 use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
@@ -1507,6 +1508,10 @@ fn create_local_data_source(
             // one control in the inspector's Fields section, and brings the
             // magnetic field with it.
             .with_plugin(Box::new(ElectrostaticsPlugin::with_evaluator(evaluator)))
+            .with_plugin_registration(
+                PluginRegistration::with_default_configuration(Box::new(NewtonianGravityPlugin))
+                    .with_enabled(false),
+            )
             .with_plugin_registration(
                 PluginRegistration::with_default_configuration(Box::new(
                     ElectromagnetismPlugin::with_backend(maxwell),

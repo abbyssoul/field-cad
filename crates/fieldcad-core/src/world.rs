@@ -1039,7 +1039,7 @@ impl WorldCommand {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitReport {
     pub revision: WorldRevision,
     pub created_objects: Vec<ObjectId>,
@@ -1059,6 +1059,16 @@ impl CommitReport {
             created_spheres: Vec::new(),
             created_probes: Vec::new(),
         }
+    }
+
+    /// No creations to report, at a given revision.
+    ///
+    /// Public counterpart of [`Self::unchanged`] for callers outside this
+    /// module that must attach a report to a receipt for a command that
+    /// created nothing (every non-`CommitWorld` command) or has not yet
+    /// applied (a `CommitWorld` queued behind a tick boundary).
+    pub fn empty(revision: WorldRevision) -> Self {
+        Self::unchanged(revision)
     }
 }
 

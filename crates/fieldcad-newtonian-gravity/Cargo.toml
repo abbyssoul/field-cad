@@ -1,0 +1,10 @@
+[package]
+name = "fieldcad-newtonian-gravity"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable analytic Newtonian gravity kernel for Field CAD backends"
+
+[dependencies]
+fieldcad-core = { workspace = true }
+fieldcad-mass-sources = { workspace = true }
+glam = { workspace = true }

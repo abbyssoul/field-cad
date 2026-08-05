@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use fieldcad_core::{Domain, FieldSnapshot, ObjectId, WorldSnapshot};
+use fieldcad_core::{CommitReport, Domain, FieldSnapshot, ObjectId, WorldSnapshot};
 use fieldcad_plugin_api::SolverCancellation;
 use glam::DVec3;
 
@@ -296,6 +296,7 @@ impl FieldDataSource for AsyncLocalDataSource {
             tick: self.simulation.tick(),
             snapshot_sequence: None,
             disposition: CommandDisposition::Submitted,
+            created: CommitReport::empty(self.simulation.world_revision),
         })
     }
 

@@ -13,8 +13,8 @@ use std::{
 };
 
 use fieldcad_core::{
-    ChannelId, Domain, FieldSnapshot, ObjectId, PluginId, SimulationMode, TimeStep, WorldCommand,
-    WorldRevision, WorldSnapshot,
+    ChannelId, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, SimulationMode, TimeStep,
+    WorldCommand, WorldRevision, WorldSnapshot,
 };
 use fieldcad_plugin_api::FieldBrushStroke;
 use glam::DVec3;
@@ -172,7 +172,7 @@ pub enum CommandDisposition {
 }
 
 /// The authoritative side's answer to one command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandReceipt {
     /// Which command this acknowledges.
     pub command: CommandId,
@@ -185,6 +185,16 @@ pub struct CommandReceipt {
     /// produced.
     pub snapshot_sequence: Option<u64>,
     pub disposition: CommandDisposition,
+    /// Entities this command created, if it was a `CommitWorld` transaction
+    /// that has actually applied.
+    ///
+    /// Empty (never `None`) for every other command, and for a `CommitWorld`
+    /// that returned [`CommandDisposition::Queued`] or
+    /// [`CommandDisposition::Submitted`] — the creations it will eventually
+    /// produce are not yet knowable, since the transaction has not applied.
+    /// A caller that needs the IDs from a queued transaction must re-read the
+    /// world after it applies rather than wait on this field.
+    pub created: CommitReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,8 +412,13 @@ impl SessionCore {
         self.pending_mutations.len()
     }
 
-    /// Apply one command to the authoritative side and report how it landed.
-    fn execute(&mut self, payload: CommandPayload) -> Result<CommandDisposition, SourceError> {
+    /// Apply one command to the authoritative side and report how it landed,
+    /// plus what it created if it was an immediately-applied `CommitWorld`.
+    fn execute(
+        &mut self,
+        payload: CommandPayload,
+    ) -> Result<(CommandDisposition, CommitReport), SourceError> {
+        let mut created = None;
         match payload {
             CommandPayload::Play => {
                 self.runtime.play();
@@ -425,7 +440,10 @@ impl SessionCore {
                 if self.runtime.status().mode() == SimulationMode::Running {
                     self.pending_mutations
                         .push_back(PendingMutation::Domain(domain));
-                    return Ok(CommandDisposition::Queued);
+                    return Ok((
+                        CommandDisposition::Queued,
+                        CommitReport::empty(self.runtime.status().world_revision),
+                    ));
                 }
                 self.runtime.reconfigure_domain(domain)?;
                 self.pacer.reset();
@@ -458,9 +476,12 @@ impl SessionCore {
                 if self.runtime.status().mode() == SimulationMode::Running {
                     self.pending_mutations
                         .push_back(PendingMutation::World(commands));
-                    return Ok(CommandDisposition::Queued);
+                    return Ok((
+                        CommandDisposition::Queued,
+                        CommitReport::empty(self.runtime.status().world_revision),
+                    ));
                 }
-                self.runtime.commit_world_commands(commands)?;
+                created = Some(self.runtime.commit_world_commands(commands)?);
             }
             CommandPayload::Undo => {
                 // Never queued. An edit waiting for a tick boundary is an edit
@@ -474,7 +495,8 @@ impl SessionCore {
                 self.runtime.redo()?;
             }
         }
-        Ok(CommandDisposition::Applied)
+        let created = created.unwrap_or_else(|| CommitReport::empty(self.runtime.status().world_revision));
+        Ok((CommandDisposition::Applied, created))
     }
 
     /// Take in wall-clock time and advance whole fixed ticks, applying queued
@@ -507,7 +529,12 @@ impl SessionCore {
         })
     }
 
-    fn receipt(&self, command: CommandId, disposition: CommandDisposition) -> CommandReceipt {
+    fn receipt(
+        &self,
+        command: CommandId,
+        disposition: CommandDisposition,
+        created: CommitReport,
+    ) -> CommandReceipt {
         let status = self.status();
         CommandReceipt {
             command,
@@ -515,6 +542,7 @@ impl SessionCore {
             tick: status.tick(),
             snapshot_sequence: Some(self.latest_snapshot().identity.sequence),
             disposition,
+            created,
         }
     }
 
@@ -617,9 +645,9 @@ impl FieldDataSource for LocalDataSource {
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
-        let disposition = self.core.execute(command.payload)?;
+        let (disposition, created) = self.core.execute(command.payload)?;
         self.publish()?;
-        Ok(self.core.receipt(command.id, disposition))
+        Ok(self.core.receipt(command.id, disposition, created))
     }
 
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
@@ -776,14 +804,14 @@ impl FieldDataSource for LoopbackDataSource {
             return Err(SourceError::Disconnected);
         }
 
-        let disposition = self.core.execute(command.payload)?;
+        let (disposition, created) = self.core.execute(command.payload)?;
         // A queued edit has changed nothing the server can publish or the client
         // can believe yet, so nothing goes on the wire until its boundary.
         if disposition == CommandDisposition::Applied {
             self.transmit();
             self.adopt(self.core.status());
         }
-        Ok(self.core.receipt(command.id, disposition))
+        Ok(self.core.receipt(command.id, disposition, created))
     }
 
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
