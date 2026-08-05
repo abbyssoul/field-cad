@@ -1,0 +1,25 @@
+[package]
+name = "fieldcad-server"
+version = "0.1.0"
+edition = "2024"
+description = "Headless simulation server: owns the model and a command surface with no window/GPU dependency, for any transport to drive"
+
+[[bin]]
+name = "fieldcad-server"
+path = "src/main.rs"
+
+[dependencies]
+fieldcad-core = { workspace = true }
+fieldcad-electromagnetic-sources = { workspace = true }
+fieldcad-electromagnetism = { workspace = true }
+fieldcad-electrostatics = { workspace = true }
+fieldcad-simulation = { workspace = true }
+glam = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+fieldcad-mass-sources = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }

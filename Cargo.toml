@@ -7,8 +7,10 @@ members = [
     "crates/fieldcad-dynamics",
     "crates/fieldcad-electromagnetic-sources",
     "crates/fieldcad-mass-sources",
+    "crates/fieldcad-mcp",
     "crates/fieldcad-particles",
     "crates/fieldcad-plugin-api",
+    "crates/fieldcad-server",
     "crates/fieldcad-simulation",
     "plugins/electrostatics",
     "plugins/electromagnetism",
@@ -30,18 +32,31 @@ default-members = ["apps/fieldcad-desktop"]
 # validates the WGSL in tests, and it is only evidence about what `wgpu` will
 # accept at runtime if it is the version `wgpu` itself parses with.
 [workspace.dependencies]
+# axum/hyper/hyper-util versions match what rmcp 3.1.0 itself pins for its
+# Streamable HTTP transport tests (its dev-dependencies) — not an
+# independent choice, to keep the `http`/`http-body`/tower-service traits
+# both sides implement in lockstep.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 egui = "0.35"
 egui-wgpu = "0.35"
 egui-winit = "0.35"
 glam = "0.33"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 naga = { version = "29", features = ["wgsl-in"] }
 pollster = "1.0"
+rmcp = "3.1.0"
+schemars = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"
+tokio = "1"
+tokio-util = "0.7"
+tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1"
 wgpu = "29"
 winit = "0.30.13"
 
@@ -50,8 +65,10 @@ fieldcad-core = { path = "crates/fieldcad-core" }
 fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
 fieldcad-mass-sources = { path = "crates/fieldcad-mass-sources" }
+fieldcad-mcp = { path = "crates/fieldcad-mcp" }
 fieldcad-particles = { path = "crates/fieldcad-particles" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
+fieldcad-server = { path = "crates/fieldcad-server" }
 fieldcad-simulation = { path = "crates/fieldcad-simulation" }
 fieldcad-electrostatics = { path = "plugins/electrostatics" }
 fieldcad-electromagnetism = { path = "plugins/electromagnetism" }

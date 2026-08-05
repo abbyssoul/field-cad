@@ -13,10 +13,11 @@ use std::{
 };
 
 use fieldcad_core::{
-    ChannelId, FieldSnapshot, ObjectId, PluginId, SimulationMode, TimeStep, WorldCommand,
+    ChannelId, Domain, FieldSnapshot, ObjectId, PluginId, SimulationMode, TimeStep, WorldCommand,
     WorldRevision, WorldSnapshot,
 };
 use glam::DVec3;
+use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
     EditHistoryStatus, FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus,
@@ -27,7 +28,9 @@ use crate::runtime::{
 ///
 /// Play, pause, and step are commands with correlated acknowledgements; they are
 /// never inferred from the timing of incoming frames.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct CommandId(u64);
 
 impl CommandId {
@@ -54,12 +57,15 @@ impl CommandSequencer {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CommandPayload {
     Play,
     Pause,
     Step,
     SetTimeStep(TimeStep),
+    /// Replace the numerical lattice and restart from the initial boundary.
+    /// When submitted during a run, adoption is queued at the next tick boundary.
+    ReconfigureDomain(Domain),
     SetPlaybackSpeed(PlaybackSpeed),
     /// Change what the source samples when it publishes.
     ///
@@ -114,7 +120,7 @@ pub enum CommandPayload {
     Redo,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     pub id: CommandId,
     pub payload: CommandPayload,
@@ -124,7 +130,7 @@ pub struct Command {
 ///
 /// A multiplier of `2.0` asks the source to schedule twice as many unchanged
 /// fixed-size ticks per wall-clock second. It never stretches `dt`.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct PlaybackSpeed(f64);
 
 impl PlaybackSpeed {
@@ -154,7 +160,7 @@ pub struct PlaybackSpeedError {
 
 /// Whether an acknowledgement describes an already-applied command or an edit
 /// accepted for the next fixed-tick boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandDisposition {
     Applied,
     Queued,
@@ -163,7 +169,7 @@ pub enum CommandDisposition {
 }
 
 /// The authoritative side's answer to one command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandReceipt {
     /// Which command this acknowledges.
     pub command: CommandId,
@@ -178,7 +184,7 @@ pub struct CommandReceipt {
     pub disposition: CommandDisposition,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataSourceStatus {
     Connecting,
     Ready,
@@ -215,6 +221,7 @@ pub trait FieldDataSource: Send {
     fn description(&self) -> &str;
     fn status(&self) -> DataSourceStatus;
     fn simulation_status(&self) -> SimulationStatus;
+    fn domain(&self) -> Domain;
     fn playback_speed(&self) -> PlaybackSpeed;
     fn pending_command_count(&self) -> usize;
     /// What the source is currently asked to publish. Acknowledged, not hoped
@@ -347,7 +354,12 @@ struct SessionCore {
     runtime: SimulationRuntime,
     pacer: TickPacer,
     playback_speed: PlaybackSpeed,
-    pending_world_edits: VecDeque<Vec<WorldCommand>>,
+    pending_mutations: VecDeque<PendingMutation>,
+}
+
+enum PendingMutation {
+    World(Vec<WorldCommand>),
+    Domain(Domain),
 }
 
 /// What one wall-clock advance actually did.
@@ -371,7 +383,7 @@ impl SessionCore {
             runtime,
             pacer: TickPacer::default(),
             playback_speed: PlaybackSpeed::default(),
-            pending_world_edits: VecDeque::new(),
+            pending_mutations: VecDeque::new(),
         }
     }
 
@@ -384,7 +396,7 @@ impl SessionCore {
     }
 
     fn pending_count(&self) -> usize {
-        self.pending_world_edits.len()
+        self.pending_mutations.len()
     }
 
     /// Apply one command to the authoritative side and report how it landed.
@@ -395,15 +407,23 @@ impl SessionCore {
                 self.pacer.reset();
             }
             CommandPayload::Pause => {
-                self.flush_pending_world_edits()?;
+                self.flush_pending_mutations()?;
                 self.runtime.pause();
             }
             CommandPayload::Step => {
-                self.flush_pending_world_edits()?;
+                self.flush_pending_mutations()?;
                 self.runtime.step_once()?;
             }
             CommandPayload::SetTimeStep(step) => {
                 self.runtime.set_time_step(step)?;
+                self.pacer.reset();
+            }
+            CommandPayload::ReconfigureDomain(domain) => {
+                if self.runtime.status().mode() == SimulationMode::Running {
+                    self.pending_mutations.push_back(PendingMutation::Domain(domain));
+                    return Ok(CommandDisposition::Queued);
+                }
+                self.runtime.reconfigure_domain(domain)?;
                 self.pacer.reset();
             }
             CommandPayload::SetPlaybackSpeed(speed) => {
@@ -429,7 +449,7 @@ impl SessionCore {
             }
             CommandPayload::CommitWorld(commands) => {
                 if self.runtime.status().mode() == SimulationMode::Running {
-                    self.pending_world_edits.push_back(commands);
+                    self.pending_mutations.push_back(PendingMutation::World(commands));
                     return Ok(CommandDisposition::Queued);
                 }
                 self.runtime.commit_world_commands(commands)?;
@@ -438,11 +458,11 @@ impl SessionCore {
                 // Never queued. An edit waiting for a tick boundary is an edit
                 // the history has not recorded yet, so undoing past it would
                 // step over an edit that is still on its way in.
-                self.flush_pending_world_edits()?;
+                self.flush_pending_mutations()?;
                 self.runtime.undo()?;
             }
             CommandPayload::Redo => {
-                self.flush_pending_world_edits()?;
+                self.flush_pending_mutations()?;
                 self.runtime.redo()?;
             }
         }
@@ -457,7 +477,7 @@ impl SessionCore {
         let demand = self.pacer.ticks_due(elapsed, status.time_step());
 
         let commands_applied = if demand.ticks > 0 && status.mode() == SimulationMode::Running {
-            self.flush_pending_world_edits()?
+            self.flush_pending_mutations()?
         } else {
             0
         };
@@ -490,10 +510,18 @@ impl SessionCore {
         }
     }
 
-    fn flush_pending_world_edits(&mut self) -> Result<u32, SourceError> {
+    fn flush_pending_mutations(&mut self) -> Result<u32, SourceError> {
         let mut applied = 0;
-        while let Some(commands) = self.pending_world_edits.pop_front() {
-            self.runtime.commit_world_commands(commands)?;
+        while let Some(mutation) = self.pending_mutations.pop_front() {
+            match mutation {
+                PendingMutation::World(commands) => {
+                    self.runtime.commit_world_commands(commands)?;
+                }
+                PendingMutation::Domain(domain) => {
+                    self.runtime.reconfigure_domain(domain)?;
+                    self.pacer.reset();
+                }
+            }
             applied += 1;
         }
         Ok(applied)
@@ -546,6 +574,10 @@ impl FieldDataSource for LocalDataSource {
 
     fn simulation_status(&self) -> SimulationStatus {
         self.core.status()
+    }
+
+    fn domain(&self) -> Domain {
+        *self.core.runtime.domain()
     }
 
     fn playback_speed(&self) -> PlaybackSpeed {
@@ -613,6 +645,9 @@ pub struct LoopbackDataSource {
     believed: SimulationStatus,
     /// The client's replica of the authoritative world.
     believed_world: WorldSnapshot,
+    /// The numerical domain acknowledged by the server. Kept alongside the
+    /// world because domain edits, like scene edits, may be queued remotely.
+    believed_domain: Domain,
     believed_field_systems: Vec<FieldSystemStatus>,
     believed_edit_history: EditHistoryStatus,
     connected: bool,
@@ -622,6 +657,7 @@ impl LoopbackDataSource {
     pub fn new(server: SimulationRuntime) -> Self {
         let believed = server.status();
         let believed_world = server.world_snapshot();
+        let believed_domain = *server.domain();
         let believed_field_systems = server.field_systems();
         let believed_edit_history = server.edit_history();
         let mut source = Self {
@@ -630,6 +666,7 @@ impl LoopbackDataSource {
             mailbox: SnapshotMailbox::default(),
             believed,
             believed_world,
+            believed_domain,
             believed_field_systems,
             believed_edit_history,
             connected: true,
@@ -655,6 +692,7 @@ impl LoopbackDataSource {
     fn adopt(&mut self, status: SimulationStatus) {
         self.believed = status;
         self.believed_world = self.core.runtime.world_snapshot();
+        self.believed_domain = *self.core.runtime.domain();
         self.believed_field_systems = self.core.runtime.field_systems();
         self.believed_edit_history = self.core.runtime.edit_history();
     }
@@ -695,6 +733,10 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn simulation_status(&self) -> SimulationStatus {
         self.believed
+    }
+
+    fn domain(&self) -> Domain {
+        self.believed_domain
     }
 
     fn playback_speed(&self) -> PlaybackSpeed {

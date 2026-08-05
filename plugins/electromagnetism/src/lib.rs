@@ -1315,6 +1315,10 @@ impl EquationSystemSolver for MaxwellSolver {
         self.core.validate_time_step(time_step)
     }
 
+    fn time_step_limit(&self) -> Option<TimeStep> {
+        TimeStep::from_seconds(courant_limit(&self.core.domain())).ok()
+    }
+
     fn validate_world(&self, world: &WorldSnapshot) -> Result<(), PluginError> {
         self.core.validate_world(world)
     }

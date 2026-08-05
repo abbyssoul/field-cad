@@ -937,6 +937,7 @@ mod tests {
             identity: SnapshotIdentity {
                 session: SessionId::from_u128(1),
                 sequence: 0,
+                run_generation: 0,
                 world_revision: WorldRevision::INITIAL,
                 tick: 0,
                 time_seconds: 0.0,

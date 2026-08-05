@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcad_core::{
-    BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, FieldValue,
+    BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, Domain, FieldValue,
     FieldValueKind, ObjectId, PluginId, SampleValidity, SimulationMode, SnapshotFreshness,
     UndefinedReason, WorldRevision, WorldSnapshot,
 };
@@ -24,6 +24,7 @@ use glam::DVec3;
 pub struct ComputeView {
     pub description: String,
     pub status: DataSourceStatus,
+    pub domain: Domain,
     pub mode: SimulationMode,
     pub tick: u64,
     pub time_seconds: f64,
@@ -57,6 +58,7 @@ pub struct ComputeView {
 impl ComputeView {
     pub fn build(source: &dyn FieldDataSource, world: &WorldSnapshot) -> Self {
         let simulation = source.simulation_status();
+        let domain = source.domain();
         let snapshot = source.latest_snapshot();
 
         let mut probe_readings = Vec::new();
@@ -152,6 +154,7 @@ impl ComputeView {
         Self {
             description: source.description().to_owned(),
             status: source.status(),
+            domain,
             mode: simulation.mode(),
             tick: simulation.tick(),
             time_seconds: simulation.time_seconds(),

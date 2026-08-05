@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use fieldcad_core::{FieldSnapshot, ObjectId, WorldSnapshot};
+use fieldcad_core::{Domain, FieldSnapshot, ObjectId, WorldSnapshot};
 use fieldcad_plugin_api::SolverCancellation;
 use glam::DVec3;
 
@@ -60,6 +60,7 @@ enum WorkerEvent {
 
 struct SourceState {
     simulation: SimulationStatus,
+    domain: Domain,
     playback_speed: PlaybackSpeed,
     pending_commands: usize,
     subscription: Subscription,
@@ -74,6 +75,7 @@ impl SourceState {
     fn capture(source: &LocalDataSource) -> Self {
         Self {
             simulation: source.simulation_status(),
+            domain: source.domain(),
             playback_speed: source.playback_speed(),
             pending_commands: source.pending_command_count(),
             subscription: source.subscription(),
@@ -94,6 +96,7 @@ pub struct AsyncLocalDataSource {
     cancellation: SolverCancellation,
     worker: Option<JoinHandle<()>>,
     simulation: SimulationStatus,
+    domain: Domain,
     playback_speed: PlaybackSpeed,
     worker_pending_commands: usize,
     submitted_commands: BTreeSet<CommandId>,
@@ -133,6 +136,7 @@ impl AsyncLocalDataSource {
             cancellation,
             worker: Some(worker),
             simulation: initial.simulation,
+            domain: initial.domain,
             playback_speed: initial.playback_speed,
             worker_pending_commands: initial.pending_commands,
             submitted_commands: BTreeSet::new(),
@@ -151,6 +155,7 @@ impl AsyncLocalDataSource {
 
     fn adopt(&mut self, state: SourceState) -> Result<bool, SourceError> {
         self.simulation = state.simulation;
+        self.domain = state.domain;
         self.playback_speed = state.playback_speed;
         self.worker_pending_commands = state.pending_commands;
         self.subscription = state.subscription;
@@ -242,6 +247,10 @@ impl FieldDataSource for AsyncLocalDataSource {
 
     fn simulation_status(&self) -> SimulationStatus {
         self.simulation
+    }
+
+    fn domain(&self) -> Domain {
+        self.domain
     }
 
     fn playback_speed(&self) -> PlaybackSpeed {

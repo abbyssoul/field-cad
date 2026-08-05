@@ -32,6 +32,10 @@ pub enum SnapshotCompleteness {
 pub struct SnapshotIdentity {
     pub session: SessionId,
     pub sequence: u64,
+    /// Monotonic within a session. Increments when authoritative numerical
+    /// state is discarded and rebuilt from initial conditions, so a later
+    /// snapshot at tick zero cannot be confused with an older run's start.
+    pub run_generation: u64,
     pub world_revision: WorldRevision,
     pub tick: u64,
     pub time_seconds: f64,
@@ -189,6 +193,7 @@ mod tests {
         SnapshotIdentity {
             session: SessionId::from_u128(1),
             sequence,
+            run_generation: 0,
             world_revision: revision,
             tick: 2,
             time_seconds: 0.2,

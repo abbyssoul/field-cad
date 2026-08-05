@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    ChannelId, Dimension, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec, FieldValueKind,
+    BoundaryCondition, ChannelId, Dimension, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec, FieldValueKind,
     ObjectId, ObjectShape, ObjectSpec, ProbeId, ProbePosition, ProbeSpec, PropertyBag,
     PropertyKind, PropertySchema, PropertyValue, Quantity, SimulationMode, SlicePlane,
     SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform, VectorQuantity, Velocity,
-    WorldCommand, WorldObject, WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
+    WorldCommand, WorldObject, WorldSnapshot, Precision, relativistic_kinetic_energy, relativistic_momentum,
 };
 use fieldcad_mass_sources::{inertial_mass_component_id, mass_property_id};
 use fieldcad_particles::{ParticleTemplate, template_particle_spec};
@@ -19,8 +19,11 @@ use super::compute::{
     time_step_drag_speed, validity_note,
 };
 use super::plot::probe_history_plots;
-use super::{CameraAction, ChannelLayerSettings, FrameContext, UiFrameOutput, UiModel};
-use crate::scene::{PlaneVectorMode, SceneSelection};
+use super::{CameraAction, ChannelLayerSettings, DomainDraft, FrameContext, UiFrameOutput, UiModel};
+use crate::{
+    mcp::{self, McpAction, McpSession},
+    scene::{PlaneVectorMode, SceneSelection},
+};
 
 pub(super) fn menu_bar(
     root: &mut egui::Ui,
@@ -158,6 +161,10 @@ pub(super) fn menu_bar(
                 }
                 ui.checkbox(&mut model.diagnostics_visible, "Diagnostics")
                     .on_hover_text("Solver diagnostics and session status window");
+                ui.checkbox(&mut model.mcp_panel_open, "MCP")
+                    .on_hover_text(
+                        "Let an external agent drive this session over MCP, with a bearer token",
+                    );
             });
         });
     });
@@ -608,7 +615,7 @@ pub(super) fn inspector(
                     if model.world_selected {
                         ui.heading("Simulation");
                         ui.separator();
-                        world_properties(ui, frame.compute, output);
+                        world_properties(ui, model, frame.compute, frame.edit_in_progress, output);
                     } else if let Some(object) =
                         model.selection.and_then(|id| frame.world.object(id))
                     {
@@ -692,7 +699,16 @@ fn empty_inspector(ui: &mut egui::Ui, model: &mut UiModel) {
 /// it is transported for viewing, then read-only status. The domain summary sits
 /// with the status because it is fixed for a session. Each is foldable, because
 /// a user tuning sampling has no use for the status grid underneath it.
-fn world_properties(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
+fn world_properties(
+    ui: &mut egui::Ui,
+    model: &mut UiModel,
+    compute: &ComputeView,
+    edit_in_progress: bool,
+    output: &mut UiFrameOutput,
+) {
+    super::section(ui, "inspector_numerical_domain", "Numerical domain", true, |ui| {
+        numerical_domain_editor(ui, model, compute, edit_in_progress, output);
+    });
     super::section(ui, "inspector_fields", "Fields", true, |ui| {
         field_controls(ui, compute, output);
     });
@@ -709,6 +725,166 @@ fn world_properties(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFra
     super::section(ui, "inspector_compute", "Compute", true, |ui| {
         compute_panel(ui, compute);
     });
+}
+
+/// Edit the complete numerical lattice as one staged candidate. The individual
+/// widgets deliberately do not submit commands: changing a domain rebuilds
+/// solver state, so that only happens on the explicit apply action below.
+fn numerical_domain_editor(
+    ui: &mut egui::Ui,
+    model: &mut UiModel,
+    compute: &ComputeView,
+    edit_in_progress: bool,
+    output: &mut UiFrameOutput,
+) {
+    let authoritative = DomainDraft::from_domain(compute.domain);
+    let draft = model.domain_draft.get_or_insert(authoritative);
+
+    ui.small(
+        "Changing this lattice resets the local simulation to t = 0 and leaves it paused. \
+         Transport sampling below does not change the solver grid.",
+    );
+    egui::Grid::new("numerical_domain_editor")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Bounds min");
+            ui.horizontal(|ui| {
+                domain_coordinate(ui, "x", &mut draft.min.x);
+                domain_coordinate(ui, "y", &mut draft.min.y);
+                domain_coordinate(ui, "z", &mut draft.min.z);
+            });
+            ui.end_row();
+
+            ui.label("Bounds max");
+            ui.horizontal(|ui| {
+                domain_coordinate(ui, "x", &mut draft.max.x);
+                domain_coordinate(ui, "y", &mut draft.max.y);
+                domain_coordinate(ui, "z", &mut draft.max.z);
+            });
+            ui.end_row();
+
+            ui.label("Cells");
+            ui.horizontal(|ui| {
+                domain_cells(ui, "x", &mut draft.cells.x);
+                domain_cells(ui, "y", &mut draft.cells.y);
+                domain_cells(ui, "z", &mut draft.cells.z);
+            });
+            ui.end_row();
+
+            ui.label("Boundaries");
+            ui.horizontal(|ui| {
+                boundary_picker(ui, "x", &mut draft.boundaries.x);
+                boundary_picker(ui, "y", &mut draft.boundaries.y);
+                boundary_picker(ui, "z", &mut draft.boundaries.z);
+            });
+            ui.end_row();
+
+            ui.label("Precision");
+            egui::ComboBox::from_id_salt("domain_precision")
+                .selected_text(match draft.precision {
+                    Precision::F32 => "f32",
+                    Precision::F64 => "f64",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut draft.precision, Precision::F32, "f32");
+                    ui.selectable_value(&mut draft.precision, Precision::F64, "f64");
+                });
+            ui.end_row();
+        });
+
+    let candidate = draft.build();
+    match candidate {
+        Ok(domain) => {
+            let spacing = domain.cell_size();
+            let cells = domain.resolution().cell_count();
+            let scalar_bytes = match domain.precision() {
+                Precision::F32 => 4_u64,
+                Precision::F64 => 8_u64,
+            };
+            let minimum_field_bytes = cells.saturating_mul(6).saturating_mul(scalar_bytes);
+            ui.small(format!(
+                "cell size {:.4} × {:.4} × {:.4} m · {cells} cells · Maxwell E/B minimum {}",
+                spacing.x,
+                spacing.y,
+                spacing.z,
+                format_bytes(minimum_field_bytes),
+            ));
+            let changed = domain != compute.domain;
+            let response = ui
+                .add_enabled(
+                    compute.accepts_commands() && changed && !edit_in_progress,
+                    egui::Button::new("Apply domain and reset"),
+                )
+                .on_hover_text(
+                    "Validate the whole candidate, rebuild active solvers from the current authored \
+                     world, clear run history, and pause at t = 0. If the current dt is unstable, \
+                     the source selects 80% of the strictest reported limit.",
+                );
+            if response.clicked() {
+                output.submit(CommandPayload::ReconfigureDomain(domain));
+            }
+        }
+        Err(error) => {
+            ui.colored_label(
+                egui::Color32::from_rgb(240, 105, 95),
+                format!("Invalid domain: {error}"),
+            );
+        }
+    }
+    if edit_in_progress {
+        ui.small("Finish the scene edit in progress before applying a domain.");
+    }
+}
+
+fn domain_coordinate(ui: &mut egui::Ui, axis: &str, value: &mut f64) {
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(0.02)
+            .prefix(format!("{axis}: "))
+            .suffix(" m"),
+    );
+}
+
+fn domain_cells(ui: &mut egui::Ui, axis: &str, value: &mut u32) {
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(1.0)
+            .prefix(format!("{axis}: "))
+            .range(0..=u32::MAX),
+    );
+}
+
+fn boundary_picker(ui: &mut egui::Ui, axis: &str, value: &mut BoundaryCondition) {
+    let label = |boundary| match boundary {
+        BoundaryCondition::Periodic => "Periodic",
+        BoundaryCondition::Dirichlet => "Dirichlet",
+        BoundaryCondition::Neumann => "Neumann",
+        BoundaryCondition::Absorbing => "Absorbing",
+        BoundaryCondition::Open => "Open",
+    };
+    egui::ComboBox::from_id_salt(("domain_boundary", axis))
+        .selected_text(format!("{axis}: {}", label(*value)))
+        .show_ui(ui, |ui| {
+            for boundary in [
+                BoundaryCondition::Periodic,
+                BoundaryCondition::Dirichlet,
+                BoundaryCondition::Neumann,
+                BoundaryCondition::Absorbing,
+                BoundaryCondition::Open,
+            ] {
+                ui.selectable_value(value, boundary, label(boundary));
+            }
+        });
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// The fields this scene can have, and which model computes each.
@@ -2520,6 +2696,93 @@ pub(super) fn diagnostics_window(
         });
 }
 
+pub(super) fn mcp_window(context: &egui::Context, mcp: &McpSession) -> Option<McpAction> {
+    let mut action = None;
+    egui::Window::new("MCP")
+        .default_pos(egui::pos2(218.0, 48.0))
+        .resizable(false)
+        .collapsible(true)
+        .show(context, |ui| match mcp {
+            McpSession::Disabled => {
+                ui.label(
+                    "Let an external agent (or another client) drive this exact session over MCP.",
+                );
+                if ui.button("Enable MCP").clicked() {
+                    action = Some(McpAction::Enable);
+                }
+            }
+            McpSession::Running(running) => {
+                ui.horizontal(|ui| {
+                    match mcp::connection_count(running) {
+                        Some(0) => {
+                            ui.colored_label(egui::Color32::GRAY, "●");
+                            ui.label("No client connected");
+                        }
+                        Some(count) => {
+                            ui.colored_label(egui::Color32::from_rgb(95, 200, 110), "●");
+                            ui.label(format!(
+                                "{count} client{} connected",
+                                if count == 1 { "" } else { "s" }
+                            ));
+                        }
+                        // Only while a request happens to be touching the
+                        // session table this exact frame; resolves itself
+                        // next frame.
+                        None => {
+                            ui.colored_label(egui::Color32::GRAY, "●");
+                            ui.label("Checking…");
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "A session persists until a client explicitly disconnects, so this can lag \
+                     behind a client that vanished uncleanly (e.g. was killed).",
+                );
+                ui.label("Pass this token and URL to your agent's MCP client config:");
+                egui::Grid::new("mcp_running")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Token");
+                        ui.horizontal(|ui| {
+                            // A local, per-frame copy: `TextEdit` needs `&mut
+                            // String`, but nothing here should let a user
+                            // "edit" the actual token, so any change is
+                            // simply discarded at the end of the frame.
+                            let mut token = running.token.clone();
+                            ui.add(
+                                egui::TextEdit::singleline(&mut token)
+                                    .password(true)
+                                    .desired_width(220.0),
+                            );
+                            if ui.button("Copy").clicked() {
+                                context.copy_text(running.token.clone());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("URL");
+                        ui.monospace(format!("http://{}/mcp", running.addr));
+                        ui.end_row();
+                    });
+                ui.separator();
+                if ui.button("Disable MCP").clicked() {
+                    action = Some(McpAction::Disable);
+                }
+            }
+            McpSession::Failed(error) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(240, 105, 95),
+                    format!("MCP server failed: {error}"),
+                );
+                if ui.button("Enable MCP").clicked() {
+                    action = Some(McpAction::Enable);
+                }
+            }
+        });
+    action
+}
+
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{ObjectSpec, Transform, World, WorldCommand};
@@ -2657,6 +2920,7 @@ mod tests {
                             paused_for_edit: false,
                             edit_in_progress,
                             projection: crate::camera::Projection::default(),
+                            mcp: &McpSession::Disabled,
                         },
                         &mut output,
                     );

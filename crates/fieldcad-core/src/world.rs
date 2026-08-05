@@ -675,7 +675,7 @@ pub struct WorldState {
 /// Every field a solver can read lives behind this type, so a solver cannot
 /// observe half of an edit, and two views that report the same revision always
 /// describe identical state — including registered schemas.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldSnapshot(Arc<WorldState>);
 
 impl WorldSnapshot {

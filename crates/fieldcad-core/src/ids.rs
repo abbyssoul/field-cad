@@ -58,7 +58,7 @@ string_id!(PropertyId);
 ///
 /// This is deliberately private: `ComponentTypeId` and `ChannelId` name different
 /// kinds of thing and must not be interchangeable at a call site.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct QualifiedName {
     plugin: PluginId,
     name: String,
@@ -75,6 +75,30 @@ impl QualifiedName {
 impl fmt::Display for QualifiedName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}.{}", self.plugin, self.name)
+    }
+}
+
+// Hand-written rather than derived: a struct serializes as a JSON object,
+// which `serde_json` refuses as a map key (`ChannelId`/`ComponentTypeId` key
+// `FieldSnapshot`/`WorldObject` maps). `:` cannot appear in either field
+// (`validate_identifier` only allows ASCII alphanumerics, `-`, `_`, `.`), so
+// it is an unambiguous, round-trippable separator — unlike `.`, which
+// `PluginId` and the name may both already contain, and which `Display`
+// above uses purely for human-readable output.
+impl Serialize for QualifiedName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{}:{}", self.plugin, self.name))
+    }
+}
+
+impl<'de> Deserialize<'de> for QualifiedName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        let (plugin, name) = raw
+            .split_once(':')
+            .ok_or_else(|| serde::de::Error::custom("expected `plugin:name`"))?;
+        let plugin = PluginId::new(plugin).map_err(serde::de::Error::custom)?;
+        Self::new(plugin, name).map_err(serde::de::Error::custom)
     }
 }
 

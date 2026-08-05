@@ -1,0 +1,39 @@
+[package]
+name = "fieldcad-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP transport onto fieldcad-server: exposes the simulation model as MCP tools/resources for remote and agent clients"
+
+[[bin]]
+name = "fieldcad-mcp"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+fieldcad-core = { workspace = true }
+fieldcad-server = { workspace = true }
+fieldcad-simulation = { workspace = true }
+glam = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true }
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "macros",
+] }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "signal", "sync", "time"] }
+tokio-util = { workspace = true }
+tower-service = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+fieldcad-electromagnetic-sources = { workspace = true }
+fieldcad-electrostatics = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }

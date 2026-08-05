@@ -3,6 +3,7 @@ pub mod camera;
 mod electromagnetism_gpu;
 mod electrostatics_gpu;
 pub mod gpu;
+mod mcp;
 mod renderer;
 pub mod scene;
 mod ui;

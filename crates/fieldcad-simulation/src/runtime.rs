@@ -22,13 +22,14 @@ use fieldcad_plugin_api::{
     PluginError, PluginMetadata, SolverCancellation, SolverContext,
 };
 use glam::{DVec3, UVec2, UVec3};
+use serde::{Deserialize, Serialize};
 
 /// What the runtime should sample when it publishes a snapshot.
 ///
 /// This is a visualization concern, not a physical one: changing it changes how
 /// densely a result is observed, never the result itself. Keeping it separate
 /// from [`Domain`] is what makes that invariant checkable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
     /// Sample every probe that requested each channel.
     pub probes: bool,
@@ -210,8 +211,17 @@ struct EditHistory {
 
 struct HistoryEntry {
     checkpoint: WorldCheckpoint,
+    /// Numerical configuration is included only for a domain edit. Ordinary
+    /// scene undo deliberately leaves playback settings alone.
+    numerical: Option<NumericalCheckpoint>,
     /// What the edit was, in the user's words, for the control that offers it.
     label: String,
+}
+
+#[derive(Clone, Copy)]
+struct NumericalCheckpoint {
+    domain: Domain,
+    time_step: TimeStep,
 }
 
 impl EditHistory {
@@ -236,7 +246,31 @@ impl EditHistory {
         if self.depth == 0 {
             return;
         }
-        self.undo.push_back(HistoryEntry { checkpoint, label });
+        self.undo.push_back(HistoryEntry {
+            checkpoint,
+            numerical: None,
+            label,
+        });
+        while self.undo.len() > self.depth {
+            self.undo.pop_front();
+        }
+    }
+
+    fn record_domain(
+        &mut self,
+        checkpoint: WorldCheckpoint,
+        numerical: NumericalCheckpoint,
+    ) {
+        self.gesture_recorded = false;
+        self.redo.clear();
+        if self.depth == 0 {
+            return;
+        }
+        self.undo.push_back(HistoryEntry {
+            checkpoint,
+            numerical: Some(numerical),
+            label: "Change numerical domain".to_owned(),
+        });
         while self.undo.len() > self.depth {
             self.undo.pop_front();
         }
@@ -269,7 +303,7 @@ impl EditHistory {
 }
 
 /// What the edit history currently offers, for a control that presents it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditHistoryStatus {
     /// The next edit undo would reverse, named. `None` when there is none.
     pub undo: Option<String>,
@@ -367,7 +401,7 @@ impl PluginSlot {
 /// inactive system must remain discoverable in the scene inspector even though
 /// it publishes no channels. Component schemas are registered separately on
 /// the world and likewise remain available while the system is inactive.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FieldSystemStatus {
     pub plugin: PluginMetadata,
     pub channels: Vec<ChannelSchema>,
@@ -391,6 +425,9 @@ pub struct SimulationRuntime {
     sampling_budget: SamplingBudget,
     session: SessionId,
     next_sequence: u64,
+    /// Identifies a fresh numerical run within one long-lived source session.
+    /// It changes when solver state is discarded for a domain reconfiguration.
+    run_generation: u64,
     plugins: Vec<PluginSlot>,
     cancellation: SolverCancellation,
     latest: Arc<fieldcad_core::FieldSnapshot>,
@@ -611,6 +648,7 @@ impl SimulationRuntime {
             sampling_budget,
             session,
             next_sequence: 0,
+            run_generation: 0,
             plugins: prepared,
             cancellation,
             latest: Arc::new(empty_snapshot(session, domain)),
@@ -638,6 +676,10 @@ impl SimulationRuntime {
 
     pub const fn domain(&self) -> &Domain {
         &self.domain
+    }
+
+    pub const fn run_generation(&self) -> u64 {
+        self.run_generation
     }
 
     pub const fn subscription(&self) -> Subscription {
@@ -721,9 +763,13 @@ impl SimulationRuntime {
         // exactly as it was.
         let leaving = HistoryEntry {
             checkpoint: self.world.checkpoint(),
+            numerical: entry.numerical.map(|_| NumericalCheckpoint {
+                domain: self.domain,
+                time_step: self.clock.time_step(),
+            }),
             label: entry.label.clone(),
         };
-        if let Err(error) = self.adopt_checkpoint(&entry.checkpoint) {
+        if let Err(error) = self.adopt_history_entry(&entry) {
             match direction {
                 HistoryDirection::Undo => self.history.undo.push_back(entry),
                 HistoryDirection::Redo => self.history.redo.push_back(entry),
@@ -737,6 +783,14 @@ impl SimulationRuntime {
         // Nothing new was authored, so the coalescing window is meaningless now.
         self.history.begin_gesture();
         self.publish_snapshot(SamplingPolicy::All)
+    }
+
+    fn adopt_history_entry(&mut self, entry: &HistoryEntry) -> Result<(), RuntimeError> {
+        self.adopt_checkpoint(&entry.checkpoint)?;
+        if let Some(numerical) = entry.numerical {
+            self.reconfigure_domain_inner(numerical.domain, Some(numerical.time_step))?;
+        }
+        Ok(())
     }
 
     /// Validate and adopt a captured scene, on the same terms as an edit.
@@ -1209,6 +1263,93 @@ impl SimulationRuntime {
         Ok(())
     }
 
+    /// Atomically replace the numerical lattice and rebuild every active solver
+    /// from the current authored world. A changed lattice invalidates all
+    /// evolved state, so the replacement always starts paused at tick/time zero.
+    pub fn reconfigure_domain(&mut self, domain: Domain) -> Result<(), RuntimeError> {
+        let previous_domain = self.domain;
+        let previous_time_step = self.clock.time_step();
+        let before = self.world.checkpoint();
+        self.reconfigure_domain_inner(domain, None)?;
+        if domain != previous_domain {
+            self.history.record_domain(
+                before,
+                NumericalCheckpoint {
+                    domain: previous_domain,
+                    time_step: previous_time_step,
+                },
+            );
+        }
+        self.publish_snapshot(SamplingPolicy::All)
+    }
+
+    fn reconfigure_domain_inner(
+        &mut self,
+        domain: Domain,
+        requested_time_step: Option<TimeStep>,
+    ) -> Result<(), RuntimeError> {
+        if self.is_editing() {
+            return Err(RuntimeError::CannotReconfigureDomainWhileEditing);
+        }
+        if domain == self.domain {
+            return Ok(());
+        }
+
+        let world = self.world.snapshot();
+        let initial_step = SimulationClock::new(self.clock.time_step()).snapshot().step;
+        let mut replacements: Vec<Option<Box<dyn EquationSystemSolver>>> = self
+            .plugins
+            .iter()
+            .map(|slot| {
+                if !slot.enabled {
+                    return Ok(None);
+                }
+                let mut solver = slot.plugin.create_solver(SolverContext {
+                    configuration: &slot.configuration,
+                    domain: &domain,
+                    world: &world,
+                    initial_step,
+                    cancellation: self.cancellation.clone(),
+                })?;
+                solver.validate_world(&world)?;
+                solver.on_world_changed(&world)?;
+                Ok(Some(solver))
+            })
+            .collect::<Result<_, PluginError>>()?;
+
+        let current_step = requested_time_step.unwrap_or(self.clock.time_step());
+        let current_is_valid = replacements.iter().flatten().all(|solver| {
+            solver.validate_time_step(current_step).is_ok()
+        });
+        let time_step = if current_is_valid {
+            current_step
+        } else {
+            let limit = replacements
+                .iter()
+                .flatten()
+                .filter_map(|solver| solver.time_step_limit())
+                .min_by(|left, right| left.partial_cmp(right).expect("finite time steps"))
+                .ok_or_else(|| RuntimeError::NoSafeTimeStepForDomain {
+                    current: current_step,
+                })?;
+            TimeStep::from_seconds(limit.seconds() * 0.8)
+                .expect("a positive finite solver limit has a positive 80% margin")
+        };
+        for solver in replacements.iter().flatten() {
+            solver.validate_time_step(time_step)?;
+        }
+        self.validate_subscription(self.subscription)?;
+
+        self.domain = domain;
+        self.clock.reset(time_step);
+        self.run_generation = self.run_generation.saturating_add(1);
+        self.last_forces.clear();
+        for (slot, replacement) in self.plugins.iter_mut().zip(replacements.drain(..)) {
+            slot.solver = replacement;
+        }
+        Ok(())
+    }
+
     pub fn step_once(&mut self) -> Result<(), RuntimeError> {
         let context = self
             .clock
@@ -1531,6 +1672,7 @@ impl SimulationRuntime {
             identity: SnapshotIdentity {
                 session: self.session,
                 sequence: self.next_sequence,
+                run_generation: self.run_generation,
                 world_revision: world.revision(),
                 tick: clock.tick(),
                 time_seconds: clock.time_seconds(),
@@ -1563,6 +1705,7 @@ fn empty_snapshot(session: SessionId, domain: Domain) -> fieldcad_core::FieldSna
         identity: SnapshotIdentity {
             session,
             sequence: 0,
+            run_generation: 0,
             world_revision: WorldRevision::INITIAL,
             tick: 0,
             time_seconds: 0.0,
@@ -1576,10 +1719,11 @@ fn empty_snapshot(session: SessionId, domain: Domain) -> fieldcad_core::FieldSna
 }
 
 /// Clock and world state as one value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimulationStatus {
     pub clock: ClockSnapshot,
     pub world_revision: WorldRevision,
+    pub run_generation: u64,
 }
 
 impl SimulationStatus {
@@ -1605,6 +1749,7 @@ impl SimulationRuntime {
         SimulationStatus {
             clock: self.clock.snapshot(),
             world_revision: self.world.revision(),
+            run_generation: self.run_generation,
         }
     }
 }
@@ -1671,6 +1816,10 @@ pub enum RuntimeError {
     CannotStepWhileRunning,
     #[error("undo and redo are only valid while the simulation is paused")]
     CannotEditHistoryWhileRunning,
+    #[error("cannot reconfigure the numerical domain while an interactive scene edit is in progress")]
+    CannotReconfigureDomainWhileEditing,
+    #[error("the current time step {current:?} is invalid for the proposed domain and no active solver reported a safe replacement")]
+    NoSafeTimeStepForDomain { current: TimeStep },
     #[error("invalid sampling budget")]
     InvalidSamplingBudget,
     #[error("invalid subscription: {0}")]
@@ -1701,6 +1850,8 @@ impl RuntimeError {
             Self::TooManyChannels(_) => "too-many-channels",
             Self::CannotStepWhileRunning => "cannot-step-while-running",
             Self::CannotEditHistoryWhileRunning => "cannot-edit-history-while-running",
+            Self::CannotReconfigureDomainWhileEditing => "cannot-reconfigure-domain-while-editing",
+            Self::NoSafeTimeStepForDomain { .. } => "no-safe-time-step-for-domain",
             Self::InvalidSamplingBudget => "invalid-sampling-budget",
             Self::InvalidSubscription(_) => "invalid-subscription",
             Self::SamplingBudgetExceeded { .. } => "sampling-budget-exceeded",
@@ -1854,6 +2005,32 @@ mod tests {
 
         // 1000 polls of 25 ms is 25 s, which is exactly 250 ticks of 0.1 s.
         assert_eq!(total, 250);
+    }
+
+    #[test]
+    fn domain_reconfiguration_resets_and_is_undoable() {
+        let (mut runtime, _) = motion_runtime([]);
+        let original = *runtime.domain();
+        let replacement = Domain::centred_cube(3.0, 6).unwrap();
+
+        runtime.reconfigure_domain(replacement).unwrap();
+        let after_change = runtime.status();
+        assert_eq!(*runtime.domain(), replacement);
+        assert_eq!(after_change.tick(), 0);
+        assert_eq!(after_change.mode(), SimulationMode::Paused);
+        assert_eq!(after_change.run_generation, 1);
+        assert!(runtime.edit_history().can_undo());
+
+        runtime.undo().unwrap();
+        let after_undo = runtime.status();
+        assert_eq!(*runtime.domain(), original);
+        assert_eq!(after_undo.tick(), 0);
+        assert_eq!(after_undo.mode(), SimulationMode::Paused);
+        assert_eq!(after_undo.run_generation, 2);
+
+        runtime.redo().unwrap();
+        assert_eq!(*runtime.domain(), replacement);
+        assert_eq!(runtime.status().run_generation, 3);
     }
 
     #[test]

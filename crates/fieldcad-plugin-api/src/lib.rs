@@ -242,6 +242,14 @@ pub trait EquationSystemSolver: Send {
         Ok(())
     }
 
+    /// Largest stable fixed step this solver can recommend for its currently
+    /// configured numerical domain. `None` means the solver has no finite
+    /// domain-derived limit to offer; it still validates candidates through
+    /// [`Self::validate_time_step`].
+    fn time_step_limit(&self) -> Option<TimeStep> {
+        None
+    }
+
     /// Adopt a world that `validate_world` has already accepted.
     fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError>;
 

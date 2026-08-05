@@ -17,17 +17,22 @@ mod viewcontrols;
 pub use compute::ComputeView;
 
 use help::help_window;
-use panels::{diagnostics_window, inspector, menu_bar, scene_tree};
+use panels::{diagnostics_window, inspector, mcp_window, menu_bar, scene_tree};
 use plot::floating_probe_plots;
 use viewcontrols::view_controls;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fieldcad_core::{BoxId, ChannelId, ObjectId, PlaneId, ProbeId, SphereId, WorldCommand, WorldSnapshot};
+use fieldcad_core::{
+    BoundaryConditions, BoxId, ChannelId, Domain, DomainBounds, ObjectId, PlaneId, Precision,
+    ProbeId, Resolution, SphereId, WorldCommand, WorldSnapshot,
+};
 use fieldcad_simulation::{CommandPayload, ProbeHistory};
+use glam::{DVec3, UVec3};
 
 use crate::{
     camera::{AxisView, Projection},
+    mcp::{McpAction, McpSession},
     scene::{
         BoxLayerSettings, FieldLayerSettings, PlaneLayerSettings, SceneSelection,
         SphereLayerSettings, VectorDisplay,
@@ -145,6 +150,16 @@ pub struct UiModel {
     /// Most recent asynchronous command rejection, retained until a later
     /// command succeeds so the user can act on it rather than consult a log.
     pub command_error: Option<String>,
+    /// Staged numerical-domain values. They are intentionally independent of
+    /// the authoritative source until the user applies the whole candidate.
+    pub domain_draft: Option<DomainDraft>,
+    /// Whether the MCP panel is shown. Independent of whether the embedded
+    /// server is actually running (`crate::mcp::McpSession`, read-only from
+    /// here) — this only controls the panel's visibility, the way
+    /// `diagnostics_visible` does for its window. Defaults closed, unlike
+    /// diagnostics: enabling remote control is a deliberate, security-
+    /// relevant opt-in, not something to surface unasked.
+    pub mcp_panel_open: bool,
 }
 
 impl UiModel {
@@ -165,6 +180,8 @@ impl UiModel {
             probe_plots: BTreeMap::new(),
             field_layers: BTreeMap::new(),
             command_error: None,
+            domain_draft: None,
+            mcp_panel_open: false,
         }
     }
 
@@ -235,6 +252,38 @@ impl UiModel {
     }
 }
 
+/// Editable representation of [`Domain`] which can temporarily contain values
+/// that do not make a valid domain (for example while a user is typing max x).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DomainDraft {
+    pub min: DVec3,
+    pub max: DVec3,
+    pub cells: UVec3,
+    pub boundaries: BoundaryConditions,
+    pub precision: Precision,
+}
+
+impl DomainDraft {
+    pub fn from_domain(domain: Domain) -> Self {
+        Self {
+            min: domain.bounds().min(),
+            max: domain.bounds().max(),
+            cells: domain.resolution().cells(),
+            boundaries: domain.boundaries(),
+            precision: domain.precision(),
+        }
+    }
+
+    pub fn build(self) -> Result<Domain, fieldcad_core::DomainError> {
+        Ok(Domain::new(
+            DomainBounds::new(self.min, self.max)?,
+            Resolution::new(self.cells.x, self.cells.y, self.cells.z)?,
+            self.boundaries,
+            self.precision,
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProbePlotWindow {
     /// Channels shown as separate, unit-safe plots in this window.
@@ -268,6 +317,10 @@ pub struct UiFrameOutput {
     /// already atomic — it produces one command and is over — so it has no
     /// duration for the simulation to be held across.
     pub scene_edit_in_progress: bool,
+    /// A one-shot request to start or stop the embedded MCP server —
+    /// app-level infrastructure, not a simulation command, so it travels
+    /// the same way `camera_action` does rather than through `commands`.
+    pub mcp_action: Option<McpAction>,
 }
 
 impl UiFrameOutput {
@@ -289,6 +342,7 @@ impl Default for UiFrameOutput {
             camera_action: None,
             commands: Vec::new(),
             scene_edit_in_progress: false,
+            mcp_action: None,
         }
     }
 }
@@ -327,6 +381,10 @@ pub struct FrameContext<'a> {
     /// How the camera is currently mapping the scene to the screen, so the
     /// control that changes it can show which is in force.
     pub projection: Projection,
+    /// The embedded MCP server's current state, read-only from here — the
+    /// panel renders it and emits an `McpAction` to change it, the way any
+    /// other control emits a command rather than mutating state directly.
+    pub mcp: &'a McpSession,
 }
 
 /// A default-action button with an attached "▾" dropdown listing every named
@@ -459,6 +517,9 @@ pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -
     help_window(&context, model);
     if model.diagnostics_visible {
         diagnostics_window(&context, &frame, model.command_error.as_deref());
+    }
+    if model.mcp_panel_open {
+        output.mcp_action = mcp_window(&context, frame.mcp);
     }
     floating_probe_plots(&context, model, &frame);
 
@@ -653,6 +714,7 @@ mod tests {
                     paused_for_edit,
                     edit_in_progress: false,
                     projection: Projection::default(),
+                    mcp: &McpSession::Disabled,
                 },
             );
         });
@@ -713,6 +775,7 @@ mod tests {
                     paused_for_edit: false,
                     edit_in_progress: false,
                     projection: Projection::default(),
+                    mcp: &McpSession::Disabled,
                 },
             );
         });

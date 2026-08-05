@@ -1,5 +1,5 @@
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -20,10 +20,10 @@ use fieldcad_electrostatics::{
     ElectrostaticBatchEvaluator, ElectrostaticsPlugin, electric_field_channel_id,
     electric_potential_channel_id,
 };
+use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
-    AsyncLocalDataSource, CommandEvent, CommandPayload, CommandSequencer, FieldDataSource,
-    LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig, SimulationRuntime,
-    Subscription,
+    AsyncLocalDataSource, CommandEvent, CommandPayload, FieldDataSource, LocalDataSource,
+    PluginRegistration, ProbeHistory, RuntimeConfig, SimulationRuntime, Subscription,
 };
 use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2};
 use winit::{
@@ -39,6 +39,7 @@ use crate::{
     camera::{AxisView, OrbitCamera, Viewport},
     electromagnetism_gpu::GpuMaxwellBackend,
     electrostatics_gpu::GpuElectrostaticEvaluator,
+    mcp::{self, McpAction, McpSession},
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
     ui::{self, CameraAction, ComputeView, UiModel, ViewportGesture},
@@ -173,6 +174,15 @@ impl ApplicationHandler for DesktopApplication {
     }
 }
 
+/// Lock the shared model. A free function, not a method on `WindowState`: a
+/// `&self` method returning a guard borrowed from it would tie the guard's
+/// lifetime to all of `self`, making every other field of `WindowState`
+/// un-borrowable for as long as the guard is held — the opposite of what a
+/// per-field lock is for.
+fn lock_model(data_source: &Mutex<HeadlessServer>) -> MutexGuard<'_, HeadlessServer> {
+    data_source.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Field order is drop order. `egui_state` and `renderer` both reference the
 /// window, so they are declared before it; `ViewportRenderer` additionally
 /// drains the GPU queue on drop. Dropping the window first tears out the native
@@ -185,12 +195,22 @@ struct WindowState {
     camera: OrbitCamera,
     ui_model: UiModel,
     viewport: Viewport,
-    data_source: Box<dyn FieldDataSource>,
+    /// Shared, not owned outright: an embedded MCP server (see `crate::mcp`)
+    /// locks the same model from its own thread, so an agent drives the
+    /// exact session this window is drawing rather than a separate one.
+    /// `std::sync::Mutex`, not `tokio::sync::Mutex` — this thread never
+    /// awaits it, and it's what lets `crate::mcp`'s tokio thread and this
+    /// synchronous frame loop share one lock without either needing the
+    /// other's runtime.
+    data_source: Arc<Mutex<HeadlessServer>>,
     /// Mirrors the source's world so panels and picking read one consistent
     /// revision for the whole frame.
     world: WorldSnapshot,
     probe_history: ProbeHistory,
-    commands: CommandSequencer,
+    /// The numerical run generation whose recorder data is currently held.
+    /// A domain reset creates a fresh t=0 run and must not join its samples to
+    /// the previous lattice's history.
+    run_generation: u64,
     active_transform: Option<ActiveTransformDrag>,
     /// Set from the last UI frame: an inspector control is being held.
     inspector_editing: bool,
@@ -201,6 +221,9 @@ struct WindowState {
     next_redraw: Instant,
     /// Set from `WindowEvent::Occluded`; suppresses rendering entirely.
     occluded: bool,
+    /// Whether an embedded MCP server is running against `data_source`, and
+    /// its token, if so. Disabled until the user opts in from the MCP panel.
+    mcp: McpSession,
 }
 
 impl WindowState {
@@ -243,6 +266,7 @@ impl WindowState {
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
         let data_source = create_local_data_source(evaluator, maxwell)?;
         let world = data_source.world();
+        let run_generation = data_source.simulation_status().run_generation;
         // Which layer opens visible is `UiModel`'s own rule — it reveals the
         // first field a session sees — so the shell does not also decide it here
         // and leave two places that can disagree.
@@ -256,17 +280,32 @@ impl WindowState {
             camera: OrbitCamera::default(),
             ui_model,
             viewport: Viewport::default(),
-            data_source: Box::new(data_source),
+            data_source: Arc::new(Mutex::new(HeadlessServer::new(data_source))),
             world,
             probe_history: ProbeHistory::default(),
-            commands: CommandSequencer::default(),
+            run_generation,
             active_transform: None,
             inspector_editing: false,
             edit_gesture: None,
             frame_stats: FrameStats::default(),
             next_redraw: Instant::now(),
             occluded: false,
+            mcp: McpSession::default(),
         })
+    }
+
+    /// Lock the shared model, for a call site that doesn't also need to
+    /// mutate another field of `self` while holding the guard (this being a
+    /// `&self` method ties the guard's lifetime to all of `self`, not just
+    /// `data_source` — a site that needs both, like `refresh_world`, calls
+    /// [`lock_model`] directly on the field instead).
+    /// `unwrap_or_else(PoisonError::into_inner)` rather than a bare
+    /// `.unwrap()`: `std::sync::Mutex` (unlike `tokio::sync::Mutex`)
+    /// poisons on a panic-while-held, and a panic reachable from an MCP tool
+    /// call on another thread must not crash this window's next frame on
+    /// its own next lock attempt.
+    fn model(&self) -> MutexGuard<'_, HeadlessServer> {
+        lock_model(&self.data_source)
     }
 
     fn handle_window_event(
@@ -342,25 +381,41 @@ impl WindowState {
         let frame_started = Instant::now();
         let elapsed = self.frame_stats.begin_frame();
 
+        // If an embedded MCP server died after a successful bind (a panic in
+        // a tool handler, the listener erroring out), stop claiming it's
+        // still `Running` with a token nothing answers to.
+        if let McpSession::Running(running) = &self.mcp
+            && let Some(error) = mcp::check_alive(running)
+        {
+            self.mcp = McpSession::Failed(error);
+        }
+
         // Advance the source by real elapsed time, not by one tick per frame.
         // The numerical `dt` is the source's business; a slow frame must not
-        // change it.
-        self.data_source
-            .poll(elapsed)
-            .map_err(|error| format!("simulation update failed: {error}"))?;
-        for event in self.data_source.drain_command_events() {
-            match event {
-                CommandEvent::Completed(receipt) => {
-                    self.ui_model.command_error = None;
-                    tracing::debug!(
-                        command = receipt.command.get(),
-                        disposition = ?receipt.disposition,
-                        "compute command completed"
-                    );
-                }
-                CommandEvent::Failed { command, error } => {
-                    self.ui_model.command_error = Some(error.to_string());
-                    tracing::warn!(command = command.get(), %error, "compute command rejected");
+        // change it. One lock hold: this thread is the only place that
+        // drains completion events for its own commands, but an MCP tool
+        // call sharing this model registers its own waiter and is notified
+        // by whichever side calls `drain_command_events` next — see
+        // `HeadlessServer::drain_events`.
+        {
+            let mut model = lock_model(&self.data_source);
+            model
+                .poll(elapsed)
+                .map_err(|error| format!("simulation update failed: {error}"))?;
+            for event in model.drain_command_events() {
+                match event {
+                    CommandEvent::Completed(receipt) => {
+                        self.ui_model.command_error = None;
+                        tracing::debug!(
+                            command = receipt.command.get(),
+                            disposition = ?receipt.disposition,
+                            "compute command completed"
+                        );
+                    }
+                    CommandEvent::Failed { command, error } => {
+                        self.ui_model.command_error = Some(error.to_string());
+                        tracing::warn!(command = command.get(), %error, "compute command rejected");
+                    }
                 }
             }
         }
@@ -373,7 +428,7 @@ impl WindowState {
             return Ok(());
         }
 
-        let compute = ComputeView::build(self.data_source.as_ref(), &self.world);
+        let compute = ComputeView::build(&*self.model(), &self.world);
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let pixels_per_point_before_frame = self.egui_context.pixels_per_point().max(0.01);
         let transform_preview = self.active_transform.map(ActiveTransformDrag::preview);
@@ -418,6 +473,7 @@ impl WindowState {
                     paused_for_edit: self.edit_gesture.is_some_and(|gesture| gesture.resume),
                     edit_in_progress: self.edit_gesture.is_some(),
                     projection: self.camera.projection(),
+                    mcp: &self.mcp,
                 },
             );
         });
@@ -433,6 +489,9 @@ impl WindowState {
         }
 
         self.apply_camera_action(ui_frame.camera_action);
+        if let Some(action) = ui_frame.mcp_action {
+            self.apply_mcp_action(action);
+        }
         // Before the frame's own commands are dispatched: a held inspector
         // control submits an edit every frame, and the pause has to precede the
         // first of them rather than arrive a frame late.
@@ -441,12 +500,15 @@ impl WindowState {
         self.apply_viewport_gesture(ui_frame.viewport_gesture, pixels_per_point, compute.mode)?;
 
         // In submission order, which is also the order queued edits are applied
-        // in at a tick boundary (ADR 0011).
+        // in at a tick boundary (ADR 0011). Goes through the shared model's
+        // own `submit`, minting from its one `CommandSequencer` — the same
+        // one MCP tool calls use — rather than a private per-window
+        // sequencer, so two transports sharing this model can never mint the
+        // same `CommandId`.
         if !ui_frame.commands.is_empty() {
             for payload in std::mem::take(&mut ui_frame.commands) {
-                let command = self.commands.issue(payload);
-                self.data_source
-                    .execute(command)
+                self.model()
+                    .submit(payload)
                     .map_err(|error| format!("simulation command failed: {error}"))?;
             }
             self.refresh_world();
@@ -461,7 +523,7 @@ impl WindowState {
             .get(&egui::ViewportId::ROOT)
             .map_or(MAX_IDLE_INTERVAL, |viewport| viewport.repaint_delay);
         let next_frame_delay = if compute.mode == fieldcad_core::SimulationMode::Running
-            || self.data_source.pending_command_count() > 0
+            || self.model().pending_command_count() > 0
         {
             RUNNING_FRAME_INTERVAL.min(ui_repaint_delay)
         } else {
@@ -486,7 +548,7 @@ impl WindowState {
         // Every visible layer names a channel declared by the snapshot. Several
         // channels (for example Maxwell E and B) can be drawn independently.
         let mut field = scene::FieldGeometry::default();
-        if let Some(snapshot) = self.data_source.latest_snapshot() {
+        if let Some(snapshot) = self.model().latest_snapshot() {
             for (channel, layer) in &self.ui_model.field_layers {
                 if !layer.visible || !compute.vector_channels.contains(channel) {
                     continue;
@@ -564,10 +626,17 @@ impl WindowState {
 
     /// Pick up the current world and record any new probe samples.
     fn refresh_world(&mut self) {
-        if let Some(snapshot) = self.data_source.latest_snapshot() {
+        let model = lock_model(&self.data_source);
+        let generation = model.simulation_status().run_generation;
+        if generation != self.run_generation {
+            self.probe_history = ProbeHistory::new(self.probe_history.capacity());
+            self.run_generation = generation;
+        }
+        if let Some(snapshot) = model.latest_snapshot() {
             self.probe_history.record(&snapshot);
         }
-        self.world = self.data_source.world();
+        self.world = model.world();
+        drop(model);
 
         // A selection that no longer resolves must not linger in the inspector.
         if self
@@ -1072,11 +1141,31 @@ impl WindowState {
         payload: fieldcad_simulation::CommandPayload,
         operation: &str,
     ) -> Result<(), String> {
-        let command = self.commands.issue(payload);
-        self.data_source
-            .execute(command)
+        self.model()
+            .submit(payload)
             .map_err(|error| format!("{operation} failed: {error}"))?;
         Ok(())
+    }
+
+    /// Enable or disable the embedded MCP server against this window's
+    /// shared model. `Enable` blocks briefly (see `crate::mcp::enable`) —
+    /// acceptable for a rare, explicit button click.
+    fn apply_mcp_action(&mut self, action: McpAction) {
+        match action {
+            McpAction::Enable => {
+                self.mcp = match mcp::enable(self.data_source.clone()) {
+                    Ok(running) => McpSession::Running(running),
+                    Err(error) => McpSession::Failed(error),
+                };
+            }
+            McpAction::Disable => {
+                if let McpSession::Running(running) =
+                    std::mem::replace(&mut self.mcp, McpSession::Disabled)
+                {
+                    mcp::disable(running);
+                }
+            }
+        }
     }
 
     /// Whether anything is currently editing the scene.

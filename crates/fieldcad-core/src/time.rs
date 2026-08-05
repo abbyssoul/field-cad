@@ -185,6 +185,13 @@ impl SimulationClock {
         self.mode = SimulationMode::Paused;
     }
 
+    /// Discard elapsed numerical state and begin a new paused run from its
+    /// initial boundary. Domain reconfiguration uses this rather than changing
+    /// epochs in place: the old state represented a different lattice.
+    pub fn reset(&mut self, time_step: TimeStep) {
+        *self = Self::new(time_step);
+    }
+
     pub fn advance_running(&mut self) -> Option<StepContext> {
         (self.mode == SimulationMode::Running).then(|| self.advance())
     }

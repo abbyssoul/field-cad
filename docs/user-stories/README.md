@@ -1,7 +1,7 @@
 # Field CAD user stories
 
 Status: living product and API inventory.  
-Last reviewed: 2026-08-04.
+Last reviewed: 2026-08-05.
 
 ## Purpose and scope
 
@@ -37,7 +37,7 @@ per-client conveniences, not shared experiment mutations.
 | State class | Owned by | Examples | API/MCP consequence |
 | --- | --- | --- | --- |
 | Authored world | experiment/session | objects, components, planes, probes, their visibility and probe channels | Read and mutate through revisioned world transactions. |
-| Experiment composition | authoritative data source | active field systems, chosen model for each shared field, time step | Read and mutate through correlated session commands. |
+| Experiment composition | authoritative data source | active field systems, chosen model for each shared field, numerical domain, time step | Read and mutate through correlated session commands. |
 | Simulation state | authoritative data source | paused/running mode, tick, time, dynamically integrated pose/velocity | Read as status/snapshots; advance only through run commands. |
 | Observations | data source | field samples, probe histories, trajectories, diagnostics | Return immutable, versioned results; do not make clients reconstruct them. |
 | Client presentation | individual client | selection, camera, panel layout, layer style, floating plots | Keep local unless explicitly saved as a named view. |
@@ -161,23 +161,34 @@ no such components is still a valid, non-simulated scene object.
   electrostatics and Maxwell are alternatives for one electric field rather
   than contradictory duplicate fields.
 
-- **US-23 — Configure a field system and numerical domain** *(Required for
-  API/MCP parity)*  
-  As a modeller, I want to create or change the domain, resolution, boundaries,
-  precision, solver configuration, initial conditions, and coupling parameters
-  that a selected model exposes so that I can define a reproducible numerical
-  experiment.  
-  Acceptance: schemas and domain constraints are discoverable; changes are
-  validated before adoption; an accepted snapshot reports the values that
-  produced it. The present desktop reports these settings but does not yet
-  expose a general editing command.
+- **US-23 — Configure the numerical domain** *(Implemented locally and through
+  MCP)*
+  As a modeller, I want to set domain bounds, grid resolution, boundary
+  condition on each axis, and numerical precision so that I can define the
+  discretisation used by the simulation.
+  Acceptance: the authority validates the complete candidate against active
+  solvers before adoption; it rebuilds solver state from the authored world,
+  clears run-derived history, resets to paused `t = 0`, and publishes a new run
+  generation. If the existing `dt` is unsafe for the new lattice, the authority
+  selects 80% of the strictest active solver limit. The operation is one
+  acknowledged `reconfigure_domain`/`set_domain` command, queued for the next
+  tick boundary if submitted while running.
 
-- **US-24 — Control recomputation during an interactive edit** *(Implemented)*  
+- **US-24 — Configure field-system-specific settings** *(Required for API/MCP
+  parity)*
+  As a modeller, I want to change the solver configuration, initial conditions,
+  and coupling parameters a selected model exposes so that I can define a
+  reproducible numerical experiment.
+  Acceptance: configuration schemas and constraints are discoverable, changes
+  are validated before adoption, and accepted snapshots report the values that
+  produced them.
+
+- **US-25 — Control recomputation during an interactive edit** *(Implemented)*
   As a modeller, I want to choose per field system whether it recomputes for
   intermediate drag/text values or only when I commit so that I can trade
   immediate feedback for responsiveness without changing the final physics.
 
-- **US-25 — Validate a proposed change before committing it** *(Implemented in
+- **US-26 — Validate a proposed change before committing it** *(Implemented in
   authority; Required for API/MCP exposure)*  
   As an automation client, I want a structured validation result for a proposed
   world or experiment transaction so that I can repair invalid input before
@@ -226,8 +237,9 @@ physical sources or alter a solver result.
 
 - **US-40 — Inspect run state and progress** *(Implemented)*  
   As a modeller, I want the authoritative mode, tick, reconstructed simulation
-  time, time step, playback speed, world revision, snapshot sequence/freshness,
-  queued command count, and source state so that I know exactly what has run.
+  time, time step, playback speed, world revision, snapshot sequence, run
+  generation/freshness, queued command count, and source state so that I know
+  exactly what has run.
 
 - **US-41 — Start and pause a run** *(Implemented)*  
   As a modeller, I want to play or pause simulation so that I can control when
@@ -248,11 +260,13 @@ physical sources or alter a solver result.
   As a modeller, I want to set a positive wall-clock speed multiplier so that I
   can watch a run faster or slower without altering fixed `dt` or results.
 
-- **US-45 — Edit safely while simulation is running** *(Implemented)*  
-  As a modeller, I want an authored edit submitted during a run to be applied
-  atomically immediately before a fixed tick, in submission order, so that the
-  result does not depend on GUI frame cadence. The client must receive an
-  initial applied/queued acknowledgement and, for queued work, a final
+- **US-45 — Change scene or numerical configuration safely while simulation is
+  running** *(Implemented)*
+  As a modeller, I want an authored scene or domain edit submitted during a run
+  to be applied atomically immediately before a fixed tick, in submission order,
+  so that the result does not depend on GUI frame cadence. A domain change then
+  resets the simulation and leaves it paused at `t = 0`. The client must receive
+  an initial applied/queued acknowledgement and, for queued work, a final
   applied/rejected outcome at the tick boundary.
 
 - **US-46 — Bracket an interactive edit** *(Implemented)*  
@@ -268,8 +282,9 @@ physical sources or alter a solver result.
   As a modeller, I want to retrieve immutable field snapshot metadata and
   channel batches so that I can inspect a complete result even while the next
   solve is in flight.  
-  Acceptance: snapshot identity includes session, sequence, world revision and
-  simulation time; freshness against the current world is explicit.
+  Acceptance: snapshot identity includes session, sequence, world revision,
+  simulation time, and run generation; freshness against the current world is
+  explicit.
 
 - **US-51 — Request field sampling appropriate to the question** *(Implemented)*  
   As a client, I want to subscribe to channels and request probe points, visible
@@ -303,11 +318,14 @@ physical sources or alter a solver result.
 
 ### 7. History, recording, reproducibility, and exchange
 
-- **US-60 — Undo and redo authored edits** *(Implemented)*  
+- **US-60 — Undo and redo authored scene and domain edits** *(Implemented)*
   As a modeller, I want to restore the preceding or following captured authored
-  scene while paused so that I can correct construction mistakes.  
-  Acceptance: a restore creates a new world revision, preserves stable IDs,
-  validates against active systems, and does not rewind simulation time.
+  scene or numerical domain while paused so that I can correct construction
+  mistakes.
+  Acceptance: scene restoration creates a new world revision, preserves stable
+  IDs, and validates against active systems. Restoring a domain rebuilds solver
+  state and resets the simulation to paused `t = 0`; it does not attempt to
+  restore transient solver state.
 
 - **US-61 — Inspect edit history** *(Implemented status; Required for API/MCP
   exposure)*  
@@ -397,7 +415,7 @@ experiment.
 | Scene lifecycle | `create_scene`, `open_scene`, `save_scene`, `get_scene`, `list_capabilities` |
 | World inventory | `list_objects`, `get_object`, `list_planes`, `list_probes`, `get_world_revision` |
 | World mutation | `commit_world(expected_revision, commands)`, `validate_world_transaction` |
-| Experiment configuration | `list_field_systems`, `set_field_system_enabled`, `set_field_model`, `set_field_system_configuration`, `set_domain` |
+| Experiment configuration | `list_field_systems`, `set_field_system_enabled`, `set_field_model`, `set_field_system_configuration`, `reconfigure_domain` |
 | Simulation control | `get_simulation_status`, `play`, `pause`, `step`, `set_time_step`, `set_playback_speed` |
 | Observation | `set_subscription`, `get_latest_snapshot`, `sample_field`, `get_probe_history`, `get_trajectory`, `get_diagnostics` |
 | Events | `watch_session` for snapshot/status/diagnostic/queued-command-completion events |
