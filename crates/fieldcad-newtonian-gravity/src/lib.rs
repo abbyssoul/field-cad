@@ -60,10 +60,13 @@ pub fn evaluate_sources(sources: &[MassSource], position: DVec3) -> NewtonianSam
 /// force calculation needs the well-defined sources summed regardless of
 /// what a nearby, unrelated one is doing. `None` if the summed acceleration
 /// overflowed to a non-finite value.
-pub fn evaluate_acceleration_excluding(sources: &[MassSource], position: DVec3) -> Option<DVec3> {
+pub fn evaluate_acceleration_excluding<'a>(
+    sources: impl IntoIterator<Item = &'a MassSource>,
+    position: DVec3,
+) -> Option<DVec3> {
     fieldcad_superposition::field_excluding(
         -GRAVITATIONAL_CONSTANT,
-        sources.iter().filter_map(inverse_square_source),
+        sources.into_iter().filter_map(inverse_square_source),
         position,
     )
 }

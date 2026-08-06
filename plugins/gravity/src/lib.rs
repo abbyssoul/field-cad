@@ -148,18 +148,17 @@ impl EquationSystemSolver for NewtonianGravitySolver {
                 if mass == 0.0 {
                     return Ok(DVec3::ZERO);
                 }
-                let sources: Vec<_> = self
-                    .sources
-                    .iter()
-                    .copied()
-                    .filter(|source| source.object != body.object)
-                    .collect();
-                // A nearby, unrelated small body grazing its own exclusion
+                // A nearby, unrelated body grazing its own exclusion
                 // radius must not zero out the force from every other
                 // source too — only that one source's contribution is
                 // skipped, not the whole sample.
-                let acceleration =
-                    evaluate_acceleration_excluding(&sources, body.position).unwrap_or(DVec3::ZERO);
+                let acceleration = evaluate_acceleration_excluding(
+                    self.sources
+                        .iter()
+                        .filter(|source| source.object != body.object),
+                    body.position,
+                )
+                .unwrap_or(DVec3::ZERO);
                 Ok(acceleration * mass)
             })
             .collect()

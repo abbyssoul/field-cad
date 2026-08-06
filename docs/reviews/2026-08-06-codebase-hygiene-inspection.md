@@ -328,25 +328,25 @@ runtime honors the contract the fixture exists to verify.
 
 ### Performance
 
-**PH-11 — `plugins/electromagnetism/src/lib.rs:1384-1390` — every tick clones both full field grids even when there is no particle coupling. (high)**
+~~**PH-11 — `plugins/electromagnetism/src/lib.rs:1384-1390` — every tick clones both full field grids even when there is no particle coupling. (high)**~~ — **Done.** Guarded the clone+advance_particles with `self.core.has_particle_coupling()`, matching the GPU path (`electromagnetism_gpu.rs:468-479`) that already had the same guard. The clones now only execute when there are particles to couple.
 `advance_particles` short-circuits to `Ok(None)` when coupling is absent, but
 the two grid clones are evaluated unconditionally first — ~1.6MB per tick at
 32³, ~12.6MB per tick at 64³, pure waste in the common no-particle case. This
 is the single hottest item found in this cluster.
 
-**PH-12 — `plugins/gravity/src/lib.rs:150-155` — `forces()` builds a fresh filtered `Vec<MassSource>` per body, per tick — O(n²) copies, O(n) allocations. (medium)**
+~~**PH-12 — `plugins/gravity/src/lib.rs:150-155` — `forces()` builds a fresh filtered `Vec<MassSource>` per body, per tick — O(n²) copies, O(n) allocations. (medium)**~~ — **Done.** `evaluate_acceleration_excluding` now accepts an iterator instead of `&[MassSource]`; `forces()` passes the filter iterator directly, eliminating the per-body `Vec` allocation. Matches electrostatics' allocation-free `field_excluding` pattern.
 Electrostatics does the equivalent job allocation-free by filtering inline
 during accumulation (`field_excluding`).
 
-**PH-13 — `plugins/electromagnetism/src/lib.rs:1137-1177` — trilinear sampling recomputes Yee de-staggering per stencil corner rather than once per cell. (medium)**
+~~**PH-13 — `plugins/electromagnetism/src/lib.rs:1137-1177` — trilinear sampling recomputes Yee de-staggering per stencil corner rather than once per cell. (medium)**~~ — **Done.** Precomputed `centred_electric` and `centred_magnetic` arrays in `YeeFieldView::new()`; `interpolate_vector` and `energy_at_cell` now read from those indexed arrays instead of calling `centred_fields` per stencil corner. Eliminates ~526k de-staggering evaluations per plane.
 On a 257²-sample plane, ~526k `centred_fields` calls for ~33k distinct cells.
 
-**PH-14 — `plugins/electromagnetism/src/coupling.rs:397,406,430` — three heap allocations per axis segment in current-deposition's inner loop, called 18×/particle/tick → 54 allocations/particle/tick. (medium)**
+~~**PH-14 — `plugins/electromagnetism/src/coupling.rs:397,406,430` — three heap allocations per axis segment in current-deposition's inner loop, called 18×/particle/tick → 54 allocations/particle/tick. (medium)**~~ — **Done.** `transverse: Vec<usize>` → `[usize; 2]` match; `delta` and `flux` buffers hoisted to `deposit_charge_conserving_current` and passed as `&mut [f64]` through the call chain, replacing 36 per-particle heap allocations with 2. 54 allocs/tick/particle → 2.
 `transverse` is a two-element `Vec` that should be `[usize; 2]`.
 
-**PH-15 — `plugins/gravity/src/lib.rs:188` / `plugins/electrostatics/src/lib.rs:391` — the geometry cache does full structural equality (`Arc` element-by-element) per lookup instead of `Arc::ptr_eq`, plus O(n) `remove(0)` eviction. (low)**
+~~**PH-15 — `plugins/gravity/src/lib.rs:188` / `plugins/electrostatics/src/lib.rs:391` — the geometry cache does full structural equality (`Arc` element-by-element) per lookup instead of `Arc::ptr_eq`, plus O(n) `remove(0)` eviction. (low)**~~ — **Done.** `SampleCache` now uses `VecDeque` instead of `Vec`: `entries.pop_front()` is O(1) vs `entries.remove(0)` O(cap). The structural equality on `Arc` fields is a non-issue in practice — the runtime creates fresh `Arc` allocations each tick (`runtime.rs:1691`), so `Arc::ptr_eq` would always miss; structural comparison is the correct and necessary behaviour.
 
-**PH-16 — `crates/fieldcad-dynamics/src/lib.rs:51-80` — `collect_dynamic_bodies` and `collect_carried_bodies` each run a full independent scan that differ only by filter predicate; one scan could produce both partitions. (low)**
+~~**PH-16 — `crates/fieldcad-dynamics/src/lib.rs:51-80` — `collect_dynamic_bodies` and `collect_carried_bodies` each run a full independent scan that differ only by filter predicate; one scan could produce both partitions. (low)**~~ — **Done.** Replaced both with `collect_bodies` returning `(dynamic, carried)` from a single scan of `collect_mass_sources`. Updated `runtime.rs` caller and test accordingly.
 
 ### Duplication
 
@@ -533,11 +533,11 @@ tests (`reuses_the_cache_until_the_snapshot_sequence_changes`,
 invalidation paths, confirmed to fail against the prior always-rebuild
 behavior.
 
-**UI-13 — `apps/fieldcad-desktop/src/app.rs:1231` — `submit_world_manipulation` calls the full `refresh_world()` (mutex + clone + six retain passes) on every pointer-move during a drag, in addition to two other unconditional call sites per frame. (low)**
+~~**UI-13 — `apps/fieldcad-desktop/src/app.rs:1231` — `submit_world_manipulation` calls the full `refresh_world()` (mutex + clone + six retain passes) on every pointer-move during a drag, in addition to two other unconditional call sites per frame. (low)**~~ — **Done.** Removed `self.refresh_world()` from `submit_world_manipulation` — the per-frame `refresh_world()` at line 554 already picks up command results within at most one frame, which is imperceptible during a drag.
 
-**UI-14 — `apps/fieldcad-desktop/src/scene/gizmo.rs:248,287,289,291` — `world_units_per_pixel` is recomputed seven times per gizmo frame for a value constant across the whole gizmo — the exact "recomputed per-glyph" pattern the module's own doc comment claims to have solved. (low)**
+~~**UI-14 — `apps/fieldcad-desktop/src/scene/gizmo.rs:248,287,289,291` — `world_units_per_pixel` is recomputed seven times per gizmo frame for a value constant across the whole gizmo — the exact "recomputed per-glyph" pattern the module's own doc comment claims to have solved. (low)**~~ — **Done.** `append_transform_gizmo_with_display` now computes `scale` once and derives all six pixel-based sizes from a shared local; `pick_transform_handle_with_display` hoists `scale` to function scope and uses it for both the ring-radius and free-rotation sphere.
 
-**UI-15 — `apps/fieldcad-desktop/src/app.rs:461-463` — `adapter_name().to_owned()` and `self.world.clone()` per frame, purely to satisfy closure lifetimes. (low)**
+~~**UI-15 — `apps/fieldcad-desktop/src/app.rs:461-463` — `adapter_name().to_owned()` and `self.world.clone()` per frame, purely to satisfy closure lifetimes. (low)**~~ — **Done.** Cached `adapter_name: String` on `WindowState`, populated once at renderer creation; the per-frame `to_owned()` replaced with a borrow from the cached field. `self.world.clone()` kept as-is — `WorldSnapshot` is `Arc<WorldState>`, the clone is already a cheap refcount bump required by the borrow checker (`&mut self.ui_model` in the same closure prevents a direct `&self.world` borrow).
 
 ### Duplication
 
@@ -620,4 +620,4 @@ duplication/performance items that compound if left alone, then hygiene:
    blocks (UI-16/17/18/19)~~ — **Done.**
 7. **Everything else** (remaining mediums/lows above) is reasonable
    refactoring-iteration backlog — none block correctness. ~~BE-16~~,
-   ~~UI-11~~, and ~~UI-12~~ are **done** (see above).
+                               ~~UI-11~~, ~~UI-12~~, ~~UI-13~~, ~~UI-14~~, ~~UI-15~~, ~~PH-11~~, ~~PH-12~~, ~~PH-13~~, ~~PH-14~~, ~~PH-15~~, and ~~PH-16~~ are **done** (see above).

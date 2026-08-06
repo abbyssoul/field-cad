@@ -1375,7 +1375,7 @@ impl SimulationRuntime {
                 .flatten()
                 .filter_map(|solver| solver.time_step_limit())
                 .min_by(|left, right| left.partial_cmp(right).expect("finite time steps"))
-                .ok_or_else(|| RuntimeError::NoSafeTimeStepForDomain {
+                .ok_or(RuntimeError::NoSafeTimeStepForDomain {
                     current: current_step,
                 })?;
             TimeStep::from_seconds(limit.seconds() * 0.8)
@@ -1446,7 +1446,8 @@ impl SimulationRuntime {
         // claimed through `kinematic_objects` is excluded: that solver
         // integrates it with a scheme of its own, and two integrators moving one
         // body would each be right about a different trajectory.
-        let bodies: Vec<_> = dynamics::collect_dynamic_bodies(&world)?
+        let (all_dynamic, all_carried) = dynamics::collect_bodies(&world)?;
+        let bodies: Vec<_> = all_dynamic
             .into_iter()
             .filter(|body| !kinematic_owners.contains_key(&body.object))
             .collect();
@@ -1489,7 +1490,7 @@ impl SimulationRuntime {
         }
         // Pinned bodies with an authored velocity are carried at exactly that
         // velocity, integrating nothing.
-        let carried: Vec<_> = dynamics::collect_carried_bodies(&world)?
+        let carried: Vec<_> = all_carried
             .into_iter()
             .filter(|body| !kinematic_owners.contains_key(&body.object))
             .collect();
@@ -1603,7 +1604,7 @@ impl SimulationRuntime {
             .expect("provider slot belongs to plugin list");
         let handle = self.plugins[index]
             .handles()
-            .find_map(|(handle, schema)| (&schema.id == &stroke.channel).then_some(handle))
+            .find_map(|(handle, schema)| (schema.id == stroke.channel).then_some(handle))
             .expect("provider declares requested channel");
         let schema = &self.plugins[index].channels[handle.index()];
         if !matches!(schema.value_kind, fieldcad_core::FieldValueKind::Vector(_))

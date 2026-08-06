@@ -41,41 +41,31 @@ use fieldcad_mass_sources::{MassSourceError, collect_mass_sources};
 use fieldcad_plugin_api::{DynamicBody, ObjectKinematicsUpdate};
 use glam::DVec3;
 
-/// Every body the dynamics system is responsible for moving, in stable
-/// object-ID order.
+/// Every body the dynamics system is responsible for, partitioned into unpinned
+/// (force-integrated) and pinned-moving (carried at authored velocity) bodies.
 ///
-/// A body qualifies by having inertial mass and not being pinned. Pinned bodies
-/// are excluded because their motion is authored: the user, not a force
-/// balance, decides where they go.
-pub fn collect_dynamic_bodies(world: &WorldSnapshot) -> Result<Vec<DynamicBody>, DynamicsError> {
-    Ok(collect_mass_sources(world)?
-        .into_iter()
-        .filter(|source| !source.pinned)
-        .map(|source| DynamicBody {
+/// A single scan of the world's mass sources produces both partitions,
+/// replacing what were two independent scans before (PH-16).
+pub fn collect_bodies(
+    world: &WorldSnapshot,
+) -> Result<(Vec<DynamicBody>, Vec<DynamicBody>), DynamicsError> {
+    let sources = collect_mass_sources(world)?;
+    let mut dynamic = Vec::with_capacity(sources.len());
+    let mut carried = Vec::new();
+    for source in sources {
+        let body = DynamicBody {
             object: source.object,
             inertial_mass_kg: source.inertial_mass_kg,
             position: source.position,
             velocity: source.velocity.linear,
-        })
-        .collect())
-}
-
-/// Bodies whose pose the user authored but which still have to be carried along.
-///
-/// A pinned body with a velocity moves at exactly that velocity, integrating no
-/// force at all. Returning these separately keeps "the user owns this motion"
-/// from being expressed as a force that happens to cancel.
-pub fn collect_carried_bodies(world: &WorldSnapshot) -> Result<Vec<DynamicBody>, DynamicsError> {
-    Ok(collect_mass_sources(world)?
-        .into_iter()
-        .filter(|source| source.pinned && source.velocity.linear != DVec3::ZERO)
-        .map(|source| DynamicBody {
-            object: source.object,
-            inertial_mass_kg: source.inertial_mass_kg,
-            position: source.position,
-            velocity: source.velocity.linear,
-        })
-        .collect())
+        };
+        if !source.pinned {
+            dynamic.push(body);
+        } else if source.velocity.linear != DVec3::ZERO {
+            carried.push(body);
+        }
+    }
+    Ok((dynamic, carried))
 }
 
 /// Sum one force contribution per field system into a total per body.
@@ -378,8 +368,7 @@ mod tests {
         world.commit(commands).unwrap();
         let snapshot = world.snapshot();
 
-        let dynamic = collect_dynamic_bodies(&snapshot).unwrap();
-        let carried = collect_carried_bodies(&snapshot).unwrap();
+        let (dynamic, carried) = collect_bodies(&snapshot).unwrap();
 
         assert_eq!(dynamic.len(), 1, "only the unpinned body is integrated");
         assert_eq!(dynamic[0].object, ObjectId::new(0));

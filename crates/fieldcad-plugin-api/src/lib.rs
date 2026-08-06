@@ -8,9 +8,9 @@
 //! remote host can expose the same schemas and snapshots over a transport
 //! without loading this Rust object into the visualizer process.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
 };
 
 use fieldcad_core::{
@@ -363,14 +363,14 @@ pub trait EquationSystemSolver: Send {
 /// redoes the same evaluation once per channel, every tick.
 pub struct SampleCache<T> {
     capacity: usize,
-    entries: Mutex<Vec<(SampleGeometry, Arc<[T]>)>>,
+    entries: Mutex<VecDeque<(SampleGeometry, Arc<[T]>)>>,
 }
 
 impl<T> SampleCache<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
-            entries: Mutex::new(Vec::new()),
+            entries: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -391,9 +391,9 @@ impl<T> SampleCache<T> {
         }
         let samples: Arc<[T]> = compute()?.into();
         if entries.len() >= self.capacity {
-            entries.remove(0);
+            entries.pop_front();
         }
-        entries.push((geometry.clone(), Arc::clone(&samples)));
+        entries.push_back((geometry.clone(), Arc::clone(&samples)));
         Ok(samples)
     }
 

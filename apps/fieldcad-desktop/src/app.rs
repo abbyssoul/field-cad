@@ -277,6 +277,7 @@ fn compute_field_layer_geometry(
 struct WindowState {
     egui_state: egui_winit::State,
     renderer: ViewportRenderer,
+    adapter_name: String,
     window: Arc<Window>,
     egui_context: egui::Context,
     camera: OrbitCamera,
@@ -341,6 +342,7 @@ impl WindowState {
         );
         let renderer = pollster::block_on(ViewportRenderer::new(window.clone(), gpu_config))
             .map_err(|error| error.to_string())?;
+        let adapter_name = renderer.adapter_name().to_owned();
 
         let egui_context = egui::Context::default();
         egui_context.set_visuals(egui::Visuals::dark());
@@ -370,6 +372,7 @@ impl WindowState {
         Ok(Self {
             egui_state,
             renderer,
+            adapter_name,
             window,
             egui_context,
             camera: OrbitCamera::default(),
@@ -581,7 +584,6 @@ impl WindowState {
                 )
             });
         let mut ui_frame = ui::UiFrameOutput::default();
-        let adapter_name = self.renderer.adapter_name().to_owned();
         let frame_time_ms = self.frame_stats.smoothed_frame_ms;
         let world = self.world.clone();
 
@@ -593,7 +595,7 @@ impl WindowState {
                     compute: &compute,
                     world: &world,
                     probe_history: &self.probe_history,
-                    adapter_name: &adapter_name,
+                    adapter_name: &self.adapter_name,
                     frame_time_ms,
                     active_translation: self.active_transform.map(|drag| drag.constraint.label()),
                     plane_normal_label,
@@ -857,42 +859,40 @@ impl WindowState {
 
         if self.ui_model.viewport_tool == ViewportTool::FieldBrush && mode == SimulationMode::Paused
         {
-            if gesture.primary_pressed {
-                if let Some((plane, sample)) = self.field_brush_sample(pointer) {
-                    self.active_field_brush = Some(ActiveFieldBrushDrag {
-                        plane,
-                        samples: vec![sample],
-                    });
-                }
+            if gesture.primary_pressed
+                && let Some((plane, sample)) = self.field_brush_sample(pointer)
+            {
+                self.active_field_brush = Some(ActiveFieldBrushDrag {
+                    plane,
+                    samples: vec![sample],
+                });
             }
-            if gesture.primary_dragged {
-                if let Some((plane, sample)) = self.field_brush_sample(pointer)
-                    && let Some(active) = self.active_field_brush.as_mut()
-                    && active.plane == plane
-                    && active.samples.last().is_none_or(|last| {
-                        last.distance(sample) >= self.ui_model.field_brush.radius_metres * 0.25
-                    })
-                {
-                    active.samples.push(sample);
-                }
+            if gesture.primary_dragged
+                && let Some((plane, sample)) = self.field_brush_sample(pointer)
+                && let Some(active) = self.active_field_brush.as_mut()
+                && active.plane == plane
+                && active.samples.last().is_none_or(|last| {
+                    last.distance(sample) >= self.ui_model.field_brush.radius_metres * 0.25
+                })
+            {
+                active.samples.push(sample);
             }
-            if gesture.primary_released {
-                if let Some(active) = self.active_field_brush.take()
-                    && let Some(channel) = self.ui_model.field_brush.channel.clone()
-                    && let Ok(strength) = self.brush_strength(&channel)
-                {
-                    self.submit(
-                        CommandPayload::ApplyFieldBrushStroke(FieldBrushStroke {
-                            channel,
-                            plane: active.plane,
-                            samples: active.samples,
-                            radius_metres: self.ui_model.field_brush.radius_metres,
-                            strength,
-                            falloff: FieldBrushFalloff::SmoothCompact,
-                        }),
-                        "field painting",
-                    )?;
-                }
+            if gesture.primary_released
+                && let Some(active) = self.active_field_brush.take()
+                && let Some(channel) = self.ui_model.field_brush.channel.clone()
+                && let Ok(strength) = self.brush_strength(&channel)
+            {
+                self.submit(
+                    CommandPayload::ApplyFieldBrushStroke(FieldBrushStroke {
+                        channel,
+                        plane: active.plane,
+                        samples: active.samples,
+                        radius_metres: self.ui_model.field_brush.radius_metres,
+                        strength,
+                        falloff: FieldBrushFalloff::SmoothCompact,
+                    }),
+                    "field painting",
+                )?;
             }
         }
 
@@ -1337,9 +1337,7 @@ impl WindowState {
         self.submit(
             fieldcad_simulation::CommandPayload::CommitWorld(vec![world_command]),
             operation,
-        )?;
-        self.refresh_world();
-        Ok(())
+        )
     }
 
     fn submit(

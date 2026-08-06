@@ -184,6 +184,7 @@ impl GizmoDisplay {
 /// (~1.005) the error is negligible for a baked visual cue.
 const GIZMO_LIGHT_DIR: Vec3 = Vec3::new(0.4, -0.6, 0.7);
 
+#[allow(clippy::too_many_arguments)]
 pub fn append_transform_gizmo_with_display(
     geometry: &mut FieldGeometry,
     world: &WorldSnapshot,
@@ -203,6 +204,11 @@ pub fn append_transform_gizmo_with_display(
         return;
     };
     let origin = preview.map_or(world_origin, |preview| preview.origin);
+    let scale = camera.world_units_per_pixel(origin, viewport.height as f32);
+    let axis_thickness = display.axis_thickness_px() * scale;
+    let ring_radius = display.rotation_radius_px() * scale;
+    let ring_outer = ring_radius * 1.55 / 1.3;
+    let ring_thickness = display.rotation_thickness_px() * scale;
 
     append_origin_marker(geometry, origin, selection_marker_radius(length));
 
@@ -223,8 +229,7 @@ pub fn append_transform_gizmo_with_display(
             origin,
             direction,
             length,
-            display.axis_thickness_px()
-                * camera.world_units_per_pixel(origin, viewport.height as f32),
+            axis_thickness,
             handle_color(color, handle, active, 1.0),
         );
     }
@@ -262,12 +267,9 @@ pub fn append_transform_gizmo_with_display(
             camera,
             origin,
             rotation,
-            display.rotation_radius_px()
-                * camera.world_units_per_pixel(origin, viewport.height as f32),
-            display.rotation_radius_px() * 1.55 / 1.3
-                * camera.world_units_per_pixel(origin, viewport.height as f32),
-            display.rotation_thickness_px()
-                * camera.world_units_per_pixel(origin, viewport.height as f32),
+            ring_radius,
+            ring_outer,
+            ring_thickness,
             active,
         );
     }
@@ -471,6 +473,7 @@ pub fn pick_transform_handle_with_display(
     let (origin, length) =
         transform_gizmo_with_display(world, camera, viewport, selection, display)?;
     let is_box = matches!(selection, SceneSelection::Box(_));
+    let scale = camera.world_units_per_pixel(origin, viewport.height as f32);
 
     // The outer part of N is reserved for rotation. For the default XY plane
     // it overlaps the world-Z translation axis, so normal picking must win only
@@ -528,7 +531,6 @@ pub fn pick_transform_handle_with_display(
         && let Some(field_box) = world.boxes().get(&id)
     {
         let rotation = quat_from_dquat(field_box.rotation);
-        let scale = camera.world_units_per_pixel(origin, viewport.height as f32);
         let radius = display.rotation_radius_px() * scale;
         let mut rings: Vec<(TransformHandle, Vec3, f32)> = ROTATION_RINGS
             .into_iter()
@@ -579,8 +581,7 @@ pub fn pick_transform_handle_with_display(
     // handles above still win where the configured rings overlap them.
     if is_box {
         let ray = camera.ray_from_viewport(pointer, viewport)?;
-        let radius = display.rotation_radius_px()
-            * camera.world_units_per_pixel(origin, viewport.height as f32);
+        let radius = display.rotation_radius_px() * scale;
         if ray.hit_sphere(origin, radius).is_some() {
             return Some(TransformHandle::RotateFree);
         }
@@ -783,6 +784,7 @@ fn view_ring_radius(length: f32) -> f32 {
     rotation_ring_radius(length) * 1.55 / 1.3
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_rotation_rings(
     geometry: &mut FieldGeometry,
     camera: &OrbitCamera,

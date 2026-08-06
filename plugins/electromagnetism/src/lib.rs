@@ -1022,6 +1022,8 @@ struct YeeFieldView<'a> {
     electric: &'a [DVec3],
     magnetic: &'a [DVec3],
     periodicity: LatticePeriodicity,
+    centred_electric: Vec<DVec3>,
+    centred_magnetic: Vec<DVec3>,
 }
 
 impl<'a> YeeFieldView<'a> {
@@ -1039,13 +1041,27 @@ impl<'a> YeeFieldView<'a> {
                 magnetic.len()
             )));
         }
+        let counts = domain.resolution().cells();
+        let mut centred_electric = Vec::with_capacity(expected);
+        let mut centred_magnetic = Vec::with_capacity(expected);
+        for z in 0..counts.z {
+            for y in 0..counts.y {
+                for x in 0..counts.x {
+                    let (e, m) = centred_fields(counts, electric, magnetic, x, y, z);
+                    centred_electric.push(e);
+                    centred_magnetic.push(m);
+                }
+            }
+        }
         Ok(Self {
             domain,
-            counts: domain.resolution().cells(),
+            counts,
             spacing: domain.cell_size(),
             electric,
             magnetic,
             periodicity,
+            centred_electric,
+            centred_magnetic,
         })
     }
 
@@ -1099,10 +1115,6 @@ impl<'a> YeeFieldView<'a> {
         self.magnetic[linear_index(self.counts, x, y, z)]
     }
 
-    fn centred_fields(&self, x: u32, y: u32, z: u32) -> (DVec3, DVec3) {
-        centred_fields(self.counts, self.electric, self.magnetic, x, y, z)
-    }
-
     fn electric_divergence(&self, x: u32, y: u32, z: u32) -> f64 {
         let here = self.electric_at(x, y, z);
         let xp = self.electric_at(wrap_previous(x, self.counts.x), y, z);
@@ -1137,7 +1149,8 @@ impl<'a> YeeFieldView<'a> {
                         * axis_weight(fraction.y, dy)
                         * axis_weight(fraction.z, dz);
                     let cell = self.wrapped_cell(base.x + dx, base.y + dy, base.z + dz);
-                    result += weight * select(self.centred_fields(cell.x, cell.y, cell.z));
+                    let index = linear_index(self.counts, cell.x, cell.y, cell.z);
+                    result += weight * select((self.centred_electric[index], self.centred_magnetic[index]));
                 }
             }
         }
@@ -1174,9 +1187,9 @@ impl<'a> YeeFieldView<'a> {
     }
 
     fn energy_at_cell(&self, x: u32, y: u32, z: u32) -> f64 {
-        let (electric, magnetic) = self.centred_fields(x, y, z);
-        0.5 * (VACUUM_PERMITTIVITY * electric.length_squared()
-            + magnetic.length_squared() / VACUUM_PERMEABILITY)
+        let index = linear_index(self.counts, x, y, z);
+        0.5 * (VACUUM_PERMITTIVITY * self.centred_electric[index].length_squared()
+            + self.centred_magnetic[index].length_squared() / VACUUM_PERMEABILITY)
     }
 }
 
@@ -1364,13 +1377,17 @@ impl EquationSystemSolver for MaxwellSolver {
 
     fn step(&mut self, context: StepContext) -> Result<SolverStepOutcome, PluginError> {
         self.core.accept_tick(context)?;
-        let coupled = self.core.advance_particles(
-            &YeeFieldState {
-                electric: self.electric.clone(),
-                magnetic: self.magnetic.clone(),
-            },
-            context.time_step.seconds(),
-        )?;
+        let coupled = if self.core.has_particle_coupling() {
+            self.core.advance_particles(
+                &YeeFieldState {
+                    electric: self.electric.clone(),
+                    magnetic: self.magnetic.clone(),
+                },
+                context.time_step.seconds(),
+            )?
+        } else {
+            None
+        };
         let half_step = 0.5 * context.time_step.seconds();
         self.advance_magnetic(half_step);
         self.advance_electric(

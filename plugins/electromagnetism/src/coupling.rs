@@ -358,6 +358,11 @@ pub fn deposit_charge_conserving_current(
         ));
     }
 
+    let counts = domain.resolution().cells();
+    let axis_count = counts.max_element() as usize;
+    let mut delta = vec![0.0; axis_count];
+    let mut flux = vec![0.0; axis_count];
+
     for order in AXIS_ORDERS {
         let mut start = old_position;
         for axis in order {
@@ -371,6 +376,8 @@ pub fn deposit_charge_conserving_current(
                 axis,
                 seconds,
                 current_density,
+                &mut delta,
+                &mut flux,
             );
             start = end;
         }
@@ -378,6 +385,7 @@ pub fn deposit_charge_conserving_current(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deposit_axis_segment(
     domain: Domain,
     charge: f64,
@@ -386,6 +394,8 @@ fn deposit_axis_segment(
     axis: usize,
     seconds: f64,
     current: &mut [DVec3],
+    delta: &mut [f64],
+    flux: &mut [f64],
 ) {
     if start[axis] == end[axis] || charge == 0.0 {
         return;
@@ -394,17 +404,21 @@ fn deposit_axis_segment(
     let spacing = domain.cell_size();
     let old_shape = cic_shape(domain, start);
     let new_shape = cic_shape(domain, end);
-    let axis_count = counts[axis] as usize;
-    let mut delta = vec![0.0; axis_count];
+    delta.fill(0.0);
     for corner in 0..2 {
         delta[old_shape.indices[axis][corner] as usize] -= old_shape.weights[axis][corner];
         delta[new_shape.indices[axis][corner] as usize] += new_shape.weights[axis][corner];
     }
-    let flux = one_dimensional_flux(
-        &delta,
+    one_dimensional_flux(
+        delta,
         -charge * spacing[axis] / (cell_volume(domain) * seconds),
+        flux,
     );
-    let transverse: Vec<_> = (0..3).filter(|candidate| *candidate != axis).collect();
+    let transverse = match axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
     for first_corner in 0..2 {
         for second_corner in 0..2 {
             let weight = old_shape.weights[transverse[0]][first_corner]
@@ -423,12 +437,12 @@ fn deposit_axis_segment(
     }
 }
 
-fn one_dimensional_flux(delta: &[f64], scale: f64) -> Vec<f64> {
+fn one_dimensional_flux(delta: &[f64], scale: f64, flux: &mut [f64]) {
     let count = delta.len();
+    flux.fill(0.0);
     let cut = (0..count)
         .find(|&index| delta[index].abs() <= f64::EPSILON)
         .unwrap_or(0);
-    let mut flux = vec![0.0; count];
     let mut accumulated = 0.0;
     for offset in 0..count {
         let index = (cut + offset) % count;
@@ -439,7 +453,6 @@ fn one_dimensional_flux(delta: &[f64], scale: f64) -> Vec<f64> {
     if accumulated.abs() <= 64.0 * f64::EPSILON * scale.abs().max(1.0) {
         flux[(cut + count - 1) % count] = 0.0;
     }
-    flux
 }
 
 pub fn continuity_residual(
