@@ -27,7 +27,7 @@
 //! plain primitives so its schema is exact.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
@@ -37,16 +37,22 @@ use fieldcad_core::{
     PluginId, PluginProvenance, Precision, Resolution, SnapshotCompleteness, SnapshotIdentity,
     SolverDiagnostic, TimeStep, WorldCommand,
 };
-use fieldcad_server::HeadlessServer;
+use fieldcad_server::{HeadlessServer, SessionEvent, WatchEvent};
 use fieldcad_simulation::{
-    CommandEvent, CommandPayload, CommandReceipt, FieldDataSource, PlaybackSpeed, SimulationStatus,
-    SourceError, Subscription,
+    CommandEvent, CommandId, CommandPayload, CommandReceipt, DataSourceStatus, FieldDataSource,
+    PlaybackSpeed, QueueStatus, SimulationStatus, SourceError, Subscription,
 };
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        CallToolResult, ContentBlock, ListResourcesResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, ServerCapabilities, ServerInfo, SubscriptionFilter,
+    },
+    schemars,
+    service::{RequestContext, SubscriptionContext},
+    tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -114,11 +120,22 @@ fn tool_error(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
 /// instance), whichever caller drains first would otherwise remove the
 /// event before this call ever saw it — a hang, since nothing here timed
 /// out before that fix, or worse, a different in-flight command's receipt
-/// mistaken for this one's. The periodic `tick` below exists only for a
-/// *standalone* `fieldcad-mcp` with no other transport attached: nothing
-/// else would ever call `advance`/`drain_events` to let a worker's result
-/// become visible at all. When embedded, the desktop's own per-frame pump
-/// usually resolves the waiter first and the tick is a harmless no-op.
+/// mistaken for this one's.
+///
+/// The periodic `tick` below exists only to notice a worker reply that
+/// arrived while nobody was otherwise pumping the model — it is *not* this
+/// call's wall-clock driver. That driver is always someone else: the
+/// embedded desktop app's per-frame pump, or (for a standalone
+/// `fieldcad-mcp`) the session-driving task `main.rs` spawns alongside its
+/// transports (`docs/mcp-plan.md`). Feeding the tick's own real interval
+/// into `advance` here, as an earlier version of this function did, fed a
+/// *second* stream of real elapsed time into the same shared `TickPacer`
+/// whenever that other driver was also running concurrently — a session
+/// under a pending tool call ticked at roughly twice wall-clock speed. Using
+/// `Duration::ZERO` costs nothing (a queued mutation's own completion still
+/// arrives from `AsyncLocalDataSource`'s worker thread the moment it
+/// finishes, independent of `advance`'s elapsed argument) and never competes
+/// with the session's one real clock.
 async fn submit_and_wait(
     model: &Arc<Mutex<HeadlessServer>>,
     payload: CommandPayload,
@@ -137,6 +154,13 @@ async fn submit_and_wait(
                 return match result {
                     Ok(CommandEvent::Completed(completed)) => Ok(completed),
                     Ok(CommandEvent::Failed { error, .. }) => Err(error),
+                    // Cancelled by a `cancel_queued_command` call from
+                    // elsewhere while this tool call's own command was still
+                    // queued -- a legitimate outcome, not a transport error.
+                    Ok(CommandEvent::Cancelled(command)) => Err(SourceError::Solver {
+                        code: "command-cancelled".to_owned(),
+                        message: format!("command {command:?} was cancelled before it applied"),
+                    }),
                     Err(_dropped) => Err(SourceError::Disconnected),
                 };
             }
@@ -150,11 +174,31 @@ async fn submit_and_wait(
                 });
             }
             _ = tick.tick() => {
-                let mut server = lock(model);
-                server.advance(Duration::ZERO)?;
-                server.drain_events();
+                // `Duration::ZERO`, not this tick's own interval: see the
+                // doc comment above. And no `drain_events()` here — that
+                // buffer is shared with every other transport observing
+                // this session (the desktop UI's own per-frame drain,
+                // notably), and this loop has nothing to do with its
+                // contents; `publish()`, called inside `advance` itself,
+                // already resolves this call's own waiter independently of
+                // whether anyone ever drains the shared buffer.
+                lock(model).advance(Duration::ZERO)?;
             }
         }
+    }
+}
+
+/// Submit an already-parsed batch as one atomic `CommitWorld` transaction
+/// and report the outcome — the tail `edit_world` and `commit_world` share;
+/// the two tools differ only in how each turns its own request shape into
+/// `Vec<WorldCommand>` before reaching here.
+async fn submit_world_commands(
+    model: &Arc<Mutex<HeadlessServer>>,
+    commands: Vec<WorldCommand>,
+) -> Result<CallToolResult, ErrorData> {
+    match submit_and_wait(model, CommandPayload::CommitWorld(commands)).await {
+        Ok(receipt) => ok_json(&receipt),
+        Err(error) => tool_error(error.to_string()),
     }
 }
 
@@ -334,6 +378,82 @@ struct DiagnosticsResult {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CancelQueuedCommandParams {
+    /// The command id to cancel, as reported by get_queue's pending list or
+    /// a prior tool call's receipt.
+    command_id: u64,
+}
+
+/// The two status categories not already covered by their own resource
+/// (`fieldcad://session/snapshot`, `fieldcad://session/diagnostics`).
+#[derive(Serialize)]
+struct SessionStatusResource {
+    source: DataSourceStatus,
+    simulation: SimulationStatus,
+}
+
+const SESSION_STATUS_URI: &str = "fieldcad://session/status";
+const SESSION_SNAPSHOT_URI: &str = "fieldcad://session/snapshot";
+const SESSION_DIAGNOSTICS_URI: &str = "fieldcad://session/diagnostics";
+const SESSION_QUEUE_URI: &str = "fieldcad://session/queue";
+
+const SESSION_RESOURCE_URIS: [&str; 4] = [
+    SESSION_STATUS_URI,
+    SESSION_SNAPSHOT_URI,
+    SESSION_DIAGNOSTICS_URI,
+    SESSION_QUEUE_URI,
+];
+
+fn session_resources() -> Vec<Resource> {
+    vec![
+        Resource::new(SESSION_STATUS_URI, "session-status").with_description(
+            "Authoritative source/simulation status: connecting/ready/disconnected/failed, and \
+             run mode/tick/time/time-step/world-revision.",
+        ),
+        Resource::new(SESSION_SNAPSHOT_URI, "session-snapshot").with_description(
+            "The latest complete field snapshot, unfiltered: every published channel, revision, \
+             tick, and diagnostics. Prefer get_latest_snapshot for a channel/max_samples-bounded read.",
+        ),
+        Resource::new(SESSION_DIAGNOSTICS_URI, "session-diagnostics").with_description(
+            "Structured diagnostics produced for the latest complete snapshot.",
+        ),
+        Resource::new(SESSION_QUEUE_URI, "session-queue").with_description(
+            "Authoritative queue state: paused flag, ordered pending commands, and recent \
+             terminal history (capped at 256).",
+        ),
+    ]
+}
+
+/// Every event notification is an invalidation/summary signal, never the
+/// payload itself — a subscriber re-reads the named resource for the full
+/// authoritative value.
+fn resource_text(
+    uri: impl Into<String>,
+    value: &impl Serialize,
+) -> Result<ReadResourceResponse, ErrorData> {
+    let text = serde_json::to_string(value)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+    Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+        vec![ResourceContents::text(text, uri)],
+    )))
+}
+
+/// Which resources a session event invalidates.
+fn affected_resource_uris(event: &WatchEvent) -> &'static [&'static str] {
+    match event {
+        WatchEvent::Lagged => &SESSION_RESOURCE_URIS,
+        WatchEvent::Session(SessionEvent::SnapshotUpdated(_)) => &[SESSION_SNAPSHOT_URI],
+        WatchEvent::Session(SessionEvent::DiagnosticsUpdated(_)) => &[SESSION_DIAGNOSTICS_URI],
+        WatchEvent::Session(
+            SessionEvent::StatusUpdated(_) | SessionEvent::SourceStatusUpdated(_),
+        ) => &[SESSION_STATUS_URI],
+        WatchEvent::Session(SessionEvent::QueueUpdated(_) | SessionEvent::CommandTerminal(_)) => {
+            &[SESSION_QUEUE_URI]
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetLatestSnapshotParams {
     /// Only include these channels' batches. Omit to include every published
     /// channel, subject to `max_samples`. A requested channel with no
@@ -430,7 +550,9 @@ impl McpServer {
             return tool_error("no snapshot has been published yet");
         };
 
-        let wanted: Option<Vec<ChannelId>> = match params.channels {
+        // A set, not a `Vec`: `contains` below runs once per published
+        // channel, and a linear scan there is O(channels x requested).
+        let wanted: Option<BTreeSet<ChannelId>> = match params.channels {
             Some(refs) => match refs.into_iter().map(ChannelRefParam::resolve).collect() {
                 Ok(ids) => Some(ids),
                 Err(error) => return tool_error(error),
@@ -546,10 +668,7 @@ impl McpServer {
             Err(error) => return tool_error(error),
         };
         drop(world);
-        match submit_and_wait(&self.model, CommandPayload::CommitWorld(commands)).await {
-            Ok(receipt) => ok_json(&receipt),
-            Err(error) => tool_error(error.to_string()),
-        }
+        submit_world_commands(&self.model, commands).await
     }
 
     #[tool(
@@ -572,10 +691,7 @@ impl McpServer {
             Ok(commands) => commands,
             Err(error) => return tool_error(error),
         };
-        match submit_and_wait(&self.model, CommandPayload::CommitWorld(commands)).await {
-            Ok(receipt) => ok_json(&receipt),
-            Err(error) => tool_error(error.to_string()),
-        }
+        submit_world_commands(&self.model, commands).await
     }
 
     #[tool(description = "Start the run: fixed simulation ticks advance until paused.")]
@@ -786,16 +902,173 @@ impl McpServer {
             Err(error) => tool_error(error.to_string()),
         }
     }
+
+    #[tool(
+        description = "Authoritative queue state: paused flag, ordered pending commands, and recent terminal history (capped at 256). The same data as the fieldcad://session/queue resource."
+    )]
+    async fn get_queue(&self) -> Result<CallToolResult, ErrorData> {
+        ok_json(&lock(&self.model).get_queue())
+    }
+
+    #[tool(
+        description = "Pause the mutation queue: queued scene/domain edits are held at their tick boundary until resumed. Simulation ticks continue; new eligible mutations are still accepted and appended. Idempotent."
+    )]
+    async fn pause_queue(&self) -> Result<CallToolResult, ErrorData> {
+        match submit_and_wait(&self.model, CommandPayload::PauseQueue).await {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Resume a paused mutation queue: held mutations apply at the next eligible tick boundary, in submission order. Idempotent."
+    )]
+    async fn resume_queue(&self) -> Result<CallToolResult, ErrorData> {
+        match submit_and_wait(&self.model, CommandPayload::ResumeQueue).await {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Cancel one command still waiting for a tick boundary. Only a command that has not yet applied is cancellable; an already-applied, rejected, cancelled, or unknown id is refused."
+    )]
+    async fn cancel_queued_command(
+        &self,
+        Parameters(params): Parameters<CancelQueuedCommandParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let target = CommandId::new(params.command_id);
+        match submit_and_wait(&self.model, CommandPayload::CancelQueuedCommand(target)).await {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+}
+
+impl McpServer {
+    /// The dispatch behind [`ServerHandler::read_resource`], factored out as
+    /// a plain synchronous method — nothing here needs the request context,
+    /// and this shape is directly callable from a test without fabricating
+    /// one.
+    fn read_resource_content(&self, uri: &str) -> Result<ReadResourceResponse, ErrorData> {
+        match uri {
+            SESSION_STATUS_URI => {
+                let server = lock(&self.model);
+                let resource = SessionStatusResource {
+                    source: server.status(),
+                    simulation: server.simulation_status(),
+                };
+                drop(server);
+                resource_text(uri, &resource)
+            }
+            SESSION_SNAPSHOT_URI => match lock(&self.model).latest_snapshot() {
+                Some(snapshot) => resource_text(
+                    uri,
+                    &SnapshotView {
+                        identity: snapshot.identity,
+                        completeness: snapshot.completeness,
+                        domain: snapshot.domain,
+                        plugins: &snapshot.plugins,
+                        channels: snapshot
+                            .channels
+                            .iter()
+                            .map(|(id, channel)| (id.clone(), channel))
+                            .collect(),
+                        diagnostics: &snapshot.diagnostics,
+                    },
+                ),
+                None => resource_text(uri, &Option::<()>::None),
+            },
+            SESSION_DIAGNOSTICS_URI => match lock(&self.model).latest_snapshot() {
+                Some(snapshot) => resource_text(
+                    uri,
+                    &DiagnosticsResult {
+                        snapshot: snapshot.identity,
+                        diagnostics: snapshot.diagnostics.as_ref().to_vec(),
+                    },
+                ),
+                None => resource_text(uri, &Option::<()>::None),
+            },
+            SESSION_QUEUE_URI => {
+                let queue: QueueStatus = lock(&self.model).get_queue();
+                resource_text(uri, &queue)
+            }
+            other => Err(ErrorData::resource_not_found(
+                format!("unknown resource: {other}"),
+                None,
+            )),
+        }
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .build(),
+        )
+        .with_instructions(
             "Field CAD simulation model. Tools mirror the desktop app's own command surface: \
              read the world/status/field-systems/snapshot, author the scene through commit_world, \
-             and control the run through play/pause/step/set_time_step/undo/redo.",
+             and control the run through play/pause/step/set_time_step/undo/redo/pause_queue/ \
+             resume_queue/cancel_queued_command. Resources fieldcad://session/{status,snapshot,\
+             diagnostics,queue} mirror those reads; subscribe via subscriptions/listen for \
+             notifications/resources/updated push notifications rather than polling.",
         )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(session_resources()))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        self.read_resource_content(&request.uri)
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        // The SDK intersects this with both `requested` and this server's own
+        // declared capabilities (`enable_resources_subscribe`) before
+        // acknowledging, so accepting everything requested here is safe: a
+        // client asking for a URI we don't know about simply never receives
+        // a notification for it (see `affected_resource_uris`).
+        Some(requested.clone())
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let mut watcher = lock(&self.model).subscribe_events();
+        loop {
+            tokio::select! {
+                () = context.cancelled() => return Ok(()),
+                event = watcher.recv() => {
+                    let Some(event) = event else { return Ok(()) };
+                    for &uri in affected_resource_uris(&event) {
+                        let accepted = context
+                            .accepted()
+                            .resource_subscriptions
+                            .as_ref()
+                            .is_some_and(|uris| uris.iter().any(|accepted| accepted == uri));
+                        if accepted {
+                            let _ = context.sink().notify_resource_updated(uri).await;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -810,7 +1083,7 @@ mod tests {
     use fieldcad_electrostatics::{
         electric_field_channel_id, plugin_id as electrostatics_plugin_id,
     };
-    use fieldcad_simulation::{CommandId, CommandSequencer};
+    use fieldcad_simulation::{CommandId, CommandSequencer, QueueSummary};
     use rmcp::model::ContentBlock;
     use serde_json::Value;
 
@@ -823,6 +1096,29 @@ mod tests {
     fn server() -> McpServer {
         let source = fieldcad_server::default_session().expect("default session builds");
         McpServer::new(Arc::new(Mutex::new(HeadlessServer::new(source))))
+    }
+
+    /// A tool call that submits a running edit (`commit_world` while
+    /// `Play`-ing) always awaits its own *terminal* completion, per this
+    /// file's `submit_and_wait` — a `Queued` disposition is never returned to
+    /// a synchronous MCP caller, only observable meanwhile through
+    /// `get_queue()` from a second, concurrent caller. Every queue-control
+    /// test below therefore spawns the edit concurrently rather than
+    /// awaiting it inline, and polls `get_queue()` until the edit is visibly
+    /// pending before acting on it.
+    async fn wait_for_one_pending_command_id(server: &McpServer) -> u64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let queue = json_of(&server.get_queue().await.unwrap());
+            if let Some(record) = queue["pending"].as_array().unwrap().first() {
+                return record["command"].as_u64().expect("command id is a number");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the edit never reached the queue"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Every tool here answers with exactly one text content block containing
@@ -902,6 +1198,49 @@ mod tests {
                 .unwrap(),
         );
         assert!(snapshot.get("identity").is_some());
+    }
+
+    /// BE-3 regression: `submit_and_wait`'s own tick loop must never call
+    /// `HeadlessServer::drain_events` — that buffer is shared with every
+    /// other transport observing this session (the embedded desktop UI's
+    /// own per-frame drain, notably), and an MCP tool call awaiting its own
+    /// command has no business discarding a completely unrelated command's
+    /// completion out from under whoever else was going to read it.
+    #[tokio::test]
+    async fn submit_and_wait_never_drains_the_shared_events_buffer_other_transports_read() {
+        let model = Arc::new(Mutex::new(HeadlessServer::new(
+            fieldcad_server::default_session().unwrap(),
+        )));
+
+        // A second, independent transport (the desktop UI, say) submits its
+        // own command directly on the shared model and registers no waiter
+        // for it — its only record of completion is the shared,
+        // passively-observed events log every transport reads via
+        // `drain_events`.
+        let other_receipt = {
+            let mut server = model.lock().unwrap();
+            server.submit(CommandPayload::Play).unwrap()
+        };
+
+        // An MCP tool call for a *different* command, dispatched to the same
+        // worker thread strictly after the one above: by the time this
+        // call's own waiter resolves, the worker has already replied to
+        // both, in submission order.
+        submit_and_wait(
+            &model,
+            CommandPayload::SetPlaybackSpeed(PlaybackSpeed::from_multiplier(2.0).unwrap()),
+        )
+        .await
+        .expect("the MCP call's own command must succeed");
+
+        let events = model.lock().unwrap().drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.command_id() == other_receipt.command),
+            "the other transport's own completion was lost from the shared \
+             events buffer: {events:?}"
+        );
     }
 
     async fn scene_with_a_published_snapshot(server: &McpServer) {
@@ -1266,6 +1605,214 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(forces, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn queue_tools_pause_hold_and_resume_a_running_edit() {
+        let server = server();
+        // Pausing before submitting the edit (rather than racing to pause
+        // after) is what makes this deterministic: nothing can flush a
+        // command appended to an already-paused queue, no matter how many
+        // real ticks a concurrent `submit_and_wait` pump advances meanwhile.
+        server.pause_queue().await.unwrap();
+        server.play().await.unwrap();
+
+        let commit_server = server.clone();
+        let commit = tokio::spawn(async move {
+            commit_server
+                .commit_world(Parameters(CommitWorldParams {
+                    commands: charge_and_probe_commands(),
+                }))
+                .await
+        });
+        wait_for_one_pending_command_id(&server).await;
+
+        let queue = json_of(&server.get_queue().await.unwrap());
+        assert_eq!(queue["paused"], true);
+        assert_eq!(queue["pending"].as_array().unwrap().len(), 1);
+        assert!(!commit.is_finished(), "a paused queue must hold the edit");
+
+        let resumed = json_of(&server.resume_queue().await.unwrap());
+        assert_eq!(resumed["disposition"], "Applied");
+
+        // `Pause` flushes the queue unconditionally once it's not paused --
+        // `Step` would do the same, but only while already paused, and this
+        // session is still `Play`-ing.
+        let paused_run = json_of(&server.pause().await.unwrap());
+        assert_eq!(paused_run["disposition"], "Applied");
+
+        let committed = json_of(&commit.await.unwrap().unwrap());
+        assert_eq!(committed["disposition"], "Applied");
+
+        let queue_after = json_of(&server.get_queue().await.unwrap());
+        assert!(queue_after["pending"].as_array().unwrap().is_empty());
+        assert_eq!(queue_after["history"].as_array().unwrap().len(), 1);
+
+        let world = json_of(&server.get_world().await.unwrap());
+        assert_eq!(world["objects"].as_object().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_command_prevents_its_application() {
+        let server = server();
+        server.pause_queue().await.unwrap();
+        server.play().await.unwrap();
+
+        let commit_server = server.clone();
+        let commit = tokio::spawn(async move {
+            commit_server
+                .commit_world(Parameters(CommitWorldParams {
+                    commands: charge_and_probe_commands(),
+                }))
+                .await
+        });
+        let queued_command_id = wait_for_one_pending_command_id(&server).await;
+
+        let cancelled = json_of(
+            &server
+                .cancel_queued_command(Parameters(CancelQueuedCommandParams {
+                    command_id: queued_command_id,
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(cancelled["disposition"], "Applied");
+
+        // The cancelled command's own waiter resolves with a rejection, not
+        // a hang.
+        let commit_result = commit.await.unwrap().unwrap();
+        assert_eq!(commit_result.is_error, Some(true));
+        let [ContentBlock::Text(text)] = commit_result.content.as_slice() else {
+            panic!(
+                "expected one text content block, got {:?}",
+                commit_result.content
+            );
+        };
+        assert!(
+            text.text.contains("cancelled"),
+            "the cancelled command's own waiter should report cancellation: {}",
+            text.text
+        );
+
+        let queue = json_of(&server.get_queue().await.unwrap());
+        assert!(queue["pending"].as_array().unwrap().is_empty());
+        let history = queue["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["state"], "cancelled");
+
+        // Nothing left to flush: resuming and forcing a boundary must not
+        // resurrect the cancelled edit.
+        server.resume_queue().await.unwrap();
+        server.pause().await.unwrap();
+        let world = json_of(&server.get_world().await.unwrap());
+        assert!(world["objects"].as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pause_step_undo_redo_are_refused_while_the_queue_is_paused_with_pending_work() {
+        for tool in ["pause", "step", "undo", "redo"] {
+            let server = server();
+            server.pause_queue().await.unwrap();
+            server.play().await.unwrap();
+
+            let commit_server = server.clone();
+            let commit = tokio::spawn(async move {
+                commit_server
+                    .commit_world(Parameters(CommitWorldParams {
+                        commands: charge_and_probe_commands(),
+                    }))
+                    .await
+            });
+            wait_for_one_pending_command_id(&server).await;
+
+            let result = match tool {
+                "pause" => server.pause().await.unwrap(),
+                "step" => server.step().await.unwrap(),
+                "undo" => server.undo().await.unwrap(),
+                "redo" => server.redo().await.unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{tool} should be refused: {result:?}"
+            );
+            let [ContentBlock::Text(text)] = result.content.as_slice() else {
+                panic!("expected one text content block, got {:?}", result.content);
+            };
+            assert!(
+                text.text.contains("queue is paused"),
+                "{tool}'s rejection should name the paused queue: {}",
+                text.text
+            );
+
+            // Still hanging on its own never-to-arrive terminal completion:
+            // nothing in this iteration resumes or cancels it.
+            commit.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_resources_lists_exactly_the_four_stable_uris() {
+        let resources = session_resources();
+        let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(
+            uris,
+            vec![
+                "fieldcad://session/status",
+                "fieldcad://session/snapshot",
+                "fieldcad://session/diagnostics",
+                "fieldcad://session/queue",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_resource_matches_the_equivalent_tool_reads() {
+        let server = server();
+
+        let ReadResourceResponse::Complete(status) =
+            server.read_resource_content(SESSION_STATUS_URI).unwrap()
+        else {
+            panic!("expected a complete resource read");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &status.contents[0] else {
+            panic!("expected text resource contents");
+        };
+        let status_json: Value = serde_json::from_str(text).unwrap();
+        assert!(status_json["simulation"]["clock"].is_object());
+
+        let ReadResourceResponse::Complete(queue) =
+            server.read_resource_content(SESSION_QUEUE_URI).unwrap()
+        else {
+            panic!("expected a complete resource read");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &queue.contents[0] else {
+            panic!("expected text resource contents");
+        };
+        let queue_json: Value = serde_json::from_str(text).unwrap();
+        let tool_queue = json_of(&server.get_queue().await.unwrap());
+        assert_eq!(queue_json, tool_queue);
+
+        let unknown = server.read_resource_content("fieldcad://session/nonexistent");
+        assert!(unknown.is_err(), "an unknown resource URI must be refused");
+    }
+
+    #[test]
+    fn a_lag_marker_invalidates_every_stable_resource() {
+        let affected = affected_resource_uris(&WatchEvent::Lagged);
+        assert_eq!(affected, SESSION_RESOURCE_URIS);
+    }
+
+    #[test]
+    fn a_queue_event_invalidates_only_the_queue_resource() {
+        let event = WatchEvent::Session(SessionEvent::QueueUpdated(QueueSummary {
+            paused: false,
+            pending_len: 0,
+            history_len: 0,
+            newest_history: None,
+        }));
+        assert_eq!(affected_resource_uris(&event), &[SESSION_QUEUE_URI]);
     }
 
     #[tokio::test]

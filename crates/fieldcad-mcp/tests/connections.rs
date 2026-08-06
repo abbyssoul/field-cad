@@ -29,17 +29,13 @@ async fn connections_reflects_a_real_client_session() {
     let ct = CancellationToken::new();
     let serve_ct = ct.clone();
     let serve_connections = connections.clone();
-    let serve_handle =
-        tokio::spawn(
-            async move { serve_http(listener, server, None, serve_connections, serve_ct).await },
-        );
+    let serve_handle = tokio::spawn(async move {
+        serve_http(listener, server, None, serve_connections, serve_ct).await
+    });
 
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        connect_with_retry(addr),
-    )
-    .await
-    .expect("the listener accepts within 2s");
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), connect_with_retry(addr))
+        .await
+        .expect("the listener accepts within 2s");
 
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"connections-test","version":"0"}}}"#;
     let request = format!(

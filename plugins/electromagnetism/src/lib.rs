@@ -35,7 +35,7 @@ use fieldcad_plugin_api::{
     PluginError, PluginMetadata, ResolvedFieldBrushStroke, SampledColumn, SolverCancellation,
     SolverContext, SolverKind, SolverStepOutcome,
 };
-use glam::{DVec3, UVec3};
+use glam::{DVec3, IVec3, UVec3};
 
 use coupling::{ParticleCoupling, collect_coupled_particles, coupling_is_requested};
 
@@ -594,6 +594,12 @@ pub fn static_charge_initial_state(
 pub fn static_charge_state_from_sources(domain: Domain, sources: &[ChargeSource]) -> YeeFieldState {
     let counts = domain.resolution().cells();
     let spacing = domain.cell_size();
+    // `ChargeDistribution::Point { exclusion_radius: 0.0 }` is a valid, reachable
+    // input (`ObjectShape::point(0.0)`), but a zero-radius interior region can
+    // never contain a sample, so a lattice node sitting exactly on the charge
+    // divides by zero. Floor it at half a cell: below the grid's own resolution,
+    // "point" and "half a cell wide" are indistinguishable anyway.
+    let minimum_radius = 0.5 * spacing.min_element();
     let mut potential = vec![0.0; domain.resolution().cell_count() as usize];
     for z in 0..counts.z {
         for y in 0..counts.y {
@@ -604,7 +610,8 @@ pub fn static_charge_state_from_sources(domain: Domain, sources: &[ChargeSource]
                         f64::from(y) * spacing.y,
                         f64::from(z) * spacing.z,
                     );
-                potential[linear_index(counts, x, y, z)] = regularized_potential(sources, position);
+                potential[linear_index(counts, x, y, z)] =
+                    regularized_potential(sources, position, minimum_radius);
             }
         }
     }
@@ -630,15 +637,22 @@ pub fn static_charge_state_from_sources(domain: Domain, sources: &[ChargeSource]
     YeeFieldState { electric, magnetic }
 }
 
-fn regularized_potential(sources: &[ChargeSource], position: DVec3) -> f64 {
+fn regularized_potential(sources: &[ChargeSource], position: DVec3, minimum_radius: f64) -> f64 {
     sources
         .iter()
         .filter(|source| source.charge_coulombs != 0.0)
         .map(|source| {
             let distance_squared = (position - source.position).length_squared();
-            let radius = match source.distribution {
+            let declared_radius = match source.distribution {
                 ChargeDistribution::Point { exclusion_radius } => exclusion_radius,
                 ChargeDistribution::UniformSphere { radius } => radius,
+            };
+            // Only the degenerate (zero-radius) case is floored — a legitimately
+            // small but positive radius keeps its own exact interior/exterior split.
+            let radius = if declared_radius > 0.0 {
+                declared_radius
+            } else {
+                minimum_radius
             };
             if distance_squared < radius * radius {
                 COULOMB_CONSTANT * source.charge_coulombs / (2.0 * radius)
@@ -1086,32 +1100,7 @@ impl<'a> YeeFieldView<'a> {
     }
 
     fn centred_fields(&self, x: u32, y: u32, z: u32) -> (DVec3, DVec3) {
-        let xn = wrap_next(x, self.counts.x);
-        let yn = wrap_next(y, self.counts.y);
-        let zn = wrap_next(z, self.counts.z);
-        let e000 = self.electric_at(x, y, z);
-        let electric = DVec3::new(
-            0.25 * (e000.x
-                + self.electric_at(x, yn, z).x
-                + self.electric_at(x, y, zn).x
-                + self.electric_at(x, yn, zn).x),
-            0.25 * (e000.y
-                + self.electric_at(xn, y, z).y
-                + self.electric_at(x, y, zn).y
-                + self.electric_at(xn, y, zn).y),
-            0.25 * (e000.z
-                + self.electric_at(xn, y, z).z
-                + self.electric_at(x, yn, z).z
-                + self.electric_at(xn, yn, z).z),
-        );
-
-        let b000 = self.magnetic_at(x, y, z);
-        let magnetic = DVec3::new(
-            0.5 * (b000.x + self.magnetic_at(xn, y, z).x),
-            0.5 * (b000.y + self.magnetic_at(x, yn, z).y),
-            0.5 * (b000.z + self.magnetic_at(x, y, zn).z),
-        );
-        (electric, magnetic)
+        centred_fields(self.counts, self.electric, self.magnetic, x, y, z)
     }
 
     fn electric_divergence(&self, x: u32, y: u32, z: u32) -> f64 {
@@ -1176,18 +1165,12 @@ impl<'a> YeeFieldView<'a> {
         result
     }
 
-    fn interpolation_cell(&self, position: DVec3) -> (glam::IVec3, DVec3) {
-        let grid = (position - self.domain.bounds().min()) / self.spacing - DVec3::splat(0.5);
-        let floor = grid.floor();
-        (floor.as_ivec3(), grid - floor)
+    fn interpolation_cell(&self, position: DVec3) -> (IVec3, DVec3) {
+        interpolation_cell(self.domain, position)
     }
 
     fn wrapped_cell(&self, x: i32, y: i32, z: i32) -> UVec3 {
-        UVec3::new(
-            x.rem_euclid(self.counts.x as i32) as u32,
-            y.rem_euclid(self.counts.y as i32) as u32,
-            z.rem_euclid(self.counts.z as i32) as u32,
-        )
+        wrapped_cell(self.counts, x, y, z)
     }
 
     fn energy_at_cell(&self, x: u32, y: u32, z: u32) -> f64 {
@@ -1445,6 +1428,87 @@ fn axis_weight(fraction: f64, corner: i32) -> f64 {
     } else {
         fraction
     }
+}
+
+/// De-staggers the Yee lattice's `E`/`B` storage onto one shared cell-centred
+/// point. The single implementation both `YeeFieldView::centred_fields`
+/// (sampling for display) and `coupling::interpolate_particle_fields`
+/// (the particle pusher) build their trilinear reconstruction from — this
+/// used to be a character-for-character duplicate of itself across the two
+/// modules (PH-17), with no mechanism to keep them agreeing after a change
+/// to one.
+fn centred_fields(
+    counts: UVec3,
+    electric: &[DVec3],
+    magnetic: &[DVec3],
+    x: u32,
+    y: u32,
+    z: u32,
+) -> (DVec3, DVec3) {
+    let xn = wrap_next(x, counts.x);
+    let yn = wrap_next(y, counts.y);
+    let zn = wrap_next(z, counts.z);
+    let at = |values: &[DVec3], x, y, z| values[linear_index(counts, x, y, z)];
+    let e000 = at(electric, x, y, z);
+    let electric = DVec3::new(
+        0.25 * (e000.x
+            + at(electric, x, yn, z).x
+            + at(electric, x, y, zn).x
+            + at(electric, x, yn, zn).x),
+        0.25 * (e000.y
+            + at(electric, xn, y, z).y
+            + at(electric, x, y, zn).y
+            + at(electric, xn, y, zn).y),
+        0.25 * (e000.z
+            + at(electric, xn, y, z).z
+            + at(electric, x, yn, z).z
+            + at(electric, xn, yn, z).z),
+    );
+    let b000 = at(magnetic, x, y, z);
+    let magnetic = DVec3::new(
+        0.5 * (b000.x + at(magnetic, xn, y, z).x),
+        0.5 * (b000.y + at(magnetic, x, yn, z).y),
+        0.5 * (b000.z + at(magnetic, x, y, zn).z),
+    );
+    (electric, magnetic)
+}
+
+/// A trilinear stencil corner's raw offset, wrapped to a valid lattice index.
+fn wrapped_cell(counts: UVec3, x: i32, y: i32, z: i32) -> UVec3 {
+    UVec3::new(
+        x.rem_euclid(counts.x as i32) as u32,
+        y.rem_euclid(counts.y as i32) as u32,
+        z.rem_euclid(counts.z as i32) as u32,
+    )
+}
+
+/// `position` folded into `[domain.bounds().min(), domain.bounds().min() +
+/// domain.bounds().size())` along every axis. A particle's own tracked
+/// position is never itself reset at a periodic crossing — only read
+/// through this wrap — so callers that source positions from moving bodies
+/// (unlike a fixed sample geometry, which is always authored inside the
+/// domain) need it before turning a position into lattice coordinates.
+fn wrap_position(domain: Domain, position: DVec3) -> DVec3 {
+    let min = domain.bounds().min();
+    let size = domain.bounds().size();
+    min + (position - min).rem_euclid(size)
+}
+
+/// The stencil base cell and fractional offset for trilinear interpolation
+/// at `position` on the dual (cell-centred) Yee lattice, the single
+/// implementation shared by the display sampling path and the particle
+/// pusher (PH-17). Always wraps `position` into the domain first: a sample
+/// geometry is already authored inside the domain, so this is a no-op
+/// there, but a particle that has drifted past a periodic boundary without
+/// its own position being reset is not, and would otherwise resolve to the
+/// wrong stencil (or, before this was unified, silently *did* — the two
+/// call sites disagreed on exactly this).
+fn interpolation_cell(domain: Domain, position: DVec3) -> (IVec3, DVec3) {
+    let spacing = domain.cell_size();
+    let grid =
+        (wrap_position(domain, position) - domain.bounds().min()) / spacing - DVec3::splat(0.5);
+    let floor = grid.floor();
+    (floor.as_ivec3(), grid - floor)
 }
 
 #[cfg(test)]
@@ -1811,6 +1875,28 @@ mod tests {
         }
     }
 
+    /// PH-17 regression: `interpolation_cell` is the single implementation
+    /// both the display sampling path here and `coupling::interpolate_particle_fields`
+    /// build their trilinear reconstruction from. It must resolve a position
+    /// and that same position shifted by exactly one periodic domain width
+    /// to the identical stencil — before the two call sites shared one
+    /// function, only the particle-pusher's copy wrapped position first, so
+    /// they silently disagreed on exactly this for any position outside
+    /// `[bounds.min(), bounds.min() + bounds.size())`.
+    #[test]
+    fn interpolation_cell_agrees_for_a_position_and_its_periodic_wrap() {
+        let domain = periodic_domain(8);
+        let bounds = domain.bounds();
+        let inside = bounds.min() + bounds.size() * 0.37;
+        let outside = inside + bounds.size();
+
+        let (inside_base, inside_fraction) = interpolation_cell(domain, inside);
+        let (outside_base, outside_fraction) = interpolation_cell(domain, outside);
+
+        assert_eq!(inside_base, outside_base);
+        assert!((inside_fraction - outside_fraction).length() < 1.0e-9);
+    }
+
     /// The interior is what the desktop's default plane shows, and it is the
     /// reason the seam is marked undefined rather than the whole construction
     /// being replaced by a periodic Poisson solve: a Poisson solution is
@@ -1845,6 +1931,38 @@ mod tests {
             worst = worst.max((*actual - expected).length() / expected.length());
         }
         assert!(worst < 0.2, "worst interior relative error was {worst:e}");
+    }
+
+    /// `ObjectShape::point(0.0)` is valid and reachable via MCP. A zero-radius
+    /// point charge sitting exactly on a lattice node used to divide by zero
+    /// in `regularized_potential`'s exterior branch, poisoning the whole grid
+    /// with `NaN` within a few curl evaluations.
+    #[test]
+    fn a_zero_radius_point_charge_on_a_lattice_node_does_not_poison_the_grid() {
+        use fieldcad_core::{ObjectShape, ObjectSpec, Transform, WorldCommand};
+        use fieldcad_electromagnetic_sources::charge_properties;
+
+        let domain = desktop_domain();
+        // 32 cells over [-5, 5] puts a lattice node exactly at the origin.
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::RegisterComponentSchema(charge_component_schema()),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("degenerate point charge")
+                        .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                        .with_shape(ObjectShape::point(0.0).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                ),
+            ])
+            .unwrap();
+
+        let state = static_charge_initial_state(domain, &world.snapshot()).unwrap();
+
+        assert!(
+            state.electric.iter().all(|value| value.is_finite()),
+            "a zero-radius point charge on a lattice node produced a non-finite electric field"
+        );
     }
 
     #[test]

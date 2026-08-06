@@ -16,7 +16,8 @@ use fieldcad_plugin_api::{ObjectKinematicsUpdate, PluginError, SolverStepOutcome
 use glam::{DVec3, UVec3};
 
 use super::{
-    SPEED_OF_LIGHT, VACUUM_PERMITTIVITY, YeeFieldState, linear_index, wrap_next, wrap_previous,
+    SPEED_OF_LIGHT, VACUUM_PERMITTIVITY, YeeFieldState, axis_weight, centred_fields,
+    interpolation_cell, linear_index, wrap_next, wrap_position, wrap_previous, wrapped_cell,
 };
 
 const AXIS_ORDERS: [[usize; 3]; 6] = [
@@ -483,25 +484,24 @@ pub fn interpolate_particle_fields(
         ));
     }
     let counts = domain.resolution().cells();
-    let spacing = domain.cell_size();
-    let grid =
-        (wrap_position(domain, position) - domain.bounds().min()) / spacing - DVec3::splat(0.5);
-    let floor = grid.floor();
-    let base = floor.as_ivec3();
-    let fraction = grid - floor;
+    let (base, fraction) = interpolation_cell(domain, position);
     let mut electric = DVec3::ZERO;
     let mut magnetic = DVec3::ZERO;
     for dz in 0..=1 {
         for dy in 0..=1 {
             for dx in 0..=1 {
-                let weight = corner_weight(fraction.x, dx)
-                    * corner_weight(fraction.y, dy)
-                    * corner_weight(fraction.z, dz);
-                let x = (base.x + dx).rem_euclid(counts.x as i32) as u32;
-                let y = (base.y + dy).rem_euclid(counts.y as i32) as u32;
-                let z = (base.z + dz).rem_euclid(counts.z as i32) as u32;
-                let (cell_e, cell_b) =
-                    centred_fields(counts, &fields.electric, &fields.magnetic, x, y, z);
+                let weight = axis_weight(fraction.x, dx)
+                    * axis_weight(fraction.y, dy)
+                    * axis_weight(fraction.z, dz);
+                let cell = wrapped_cell(counts, base.x + dx, base.y + dy, base.z + dz);
+                let (cell_e, cell_b) = centred_fields(
+                    counts,
+                    &fields.electric,
+                    &fields.magnetic,
+                    cell.x,
+                    cell.y,
+                    cell.z,
+                );
                 electric += weight * cell_e;
                 magnetic += weight * cell_b;
             }
@@ -634,53 +634,11 @@ fn negative_laplacian(domain: Domain, values: &[f64]) -> Vec<f64> {
     result
 }
 
-fn centred_fields(
-    counts: UVec3,
-    electric: &[DVec3],
-    magnetic: &[DVec3],
-    x: u32,
-    y: u32,
-    z: u32,
-) -> (DVec3, DVec3) {
-    let xn = wrap_next(x, counts.x);
-    let yn = wrap_next(y, counts.y);
-    let zn = wrap_next(z, counts.z);
-    let at = |values: &[DVec3], x, y, z| values[linear_index(counts, x, y, z)];
-    let e000 = at(electric, x, y, z);
-    let electric = DVec3::new(
-        0.25 * (e000.x
-            + at(electric, x, yn, z).x
-            + at(electric, x, y, zn).x
-            + at(electric, x, yn, zn).x),
-        0.25 * (e000.y
-            + at(electric, xn, y, z).y
-            + at(electric, x, y, zn).y
-            + at(electric, xn, y, zn).y),
-        0.25 * (e000.z
-            + at(electric, xn, y, z).z
-            + at(electric, x, yn, z).z
-            + at(electric, xn, yn, z).z),
-    );
-    let b000 = at(magnetic, x, y, z);
-    let magnetic = DVec3::new(
-        0.5 * (b000.x + at(magnetic, xn, y, z).x),
-        0.5 * (b000.y + at(magnetic, x, yn, z).y),
-        0.5 * (b000.z + at(magnetic, x, y, zn).z),
-    );
-    (electric, magnetic)
-}
-
 fn particle_kinetic_energy(particles: &[Particle]) -> f64 {
     particles
         .iter()
         .map(|particle| relativistic_kinetic_energy(particle.velocity, particle.mass_kg))
         .sum()
-}
-
-fn wrap_position(domain: Domain, position: DVec3) -> DVec3 {
-    let min = domain.bounds().min();
-    let size = domain.bounds().size();
-    min + (position - min).rem_euclid(size)
 }
 
 #[derive(Clone, Copy)]
@@ -708,14 +666,6 @@ fn cic_shape(domain: Domain, position: DVec3) -> CicShape {
         weights[axis] = [1.0 - fraction_array[axis], fraction_array[axis]];
     }
     CicShape { indices, weights }
-}
-
-fn corner_weight(fraction: f64, corner: i32) -> f64 {
-    if corner == 0 {
-        1.0 - fraction
-    } else {
-        fraction
-    }
 }
 
 fn zero_scalar_grid(domain: Domain) -> Vec<f64> {
@@ -806,6 +756,35 @@ mod tests {
             residual <= 5.0e-13 * scale,
             "residual {residual:e}, scale {scale:e}"
         );
+    }
+
+    /// PH-17 regression: the fields a particle sees must not depend on
+    /// which periodic image of its own position happens to be stored —
+    /// `interpolate_particle_fields` shares its stencil/wrap logic with the
+    /// display sampling path in `lib.rs` now, but this exercises the public
+    /// function's own observable behaviour directly.
+    #[test]
+    fn interpolate_particle_fields_agrees_for_a_position_and_its_periodic_wrap() {
+        let domain = domain();
+        let counts = domain.resolution().cell_count() as usize;
+        // Non-trivial and non-symmetric, so the interpolated value actually
+        // depends on which stencil gets chosen.
+        let electric: Vec<DVec3> = (0..counts)
+            .map(|index| DVec3::splat(index as f64 * 0.01))
+            .collect();
+        let magnetic: Vec<DVec3> = (0..counts)
+            .map(|index| DVec3::splat(-(index as f64) * 0.02))
+            .collect();
+        let fields = YeeFieldState { electric, magnetic };
+
+        let inside = DVec3::new(0.83, 1.41, 0.27);
+        let outside = inside + domain.bounds().size();
+
+        let (e_inside, b_inside) = interpolate_particle_fields(domain, &fields, inside).unwrap();
+        let (e_outside, b_outside) = interpolate_particle_fields(domain, &fields, outside).unwrap();
+
+        assert!((e_inside - e_outside).length() < 1.0e-12);
+        assert!((b_inside - b_outside).length() < 1.0e-12);
     }
 
     #[test]

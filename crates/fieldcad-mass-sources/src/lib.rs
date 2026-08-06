@@ -22,9 +22,9 @@
 //! model, a catalog identity, or a charge.
 
 use fieldcad_core::{
-    ComponentSchema, ComponentTypeId, Dimension, ObjectId, ObjectShape, PluginId, PropertyBag,
-    PropertyCondition, PropertyId, PropertyKind, PropertySchema, PropertyValue, Quantity,
-    QuantityError, Velocity, WorldObject, WorldSnapshot,
+    ComponentSchema, ComponentTypeId, Dimension, ObjectId, PluginId, PointOrSphere,
+    PointOrSphereError, PropertyBag, PropertyCondition, PropertyId, PropertyKind, PropertySchema,
+    PropertyValue, Quantity, QuantityError, Velocity, WorldObject, WorldSnapshot,
 };
 use glam::DVec3;
 
@@ -182,12 +182,31 @@ pub fn independent_gravitational_mass_properties(
 /// a point.
 ///
 /// The variants mirror [`fieldcad_electromagnetic_sources::ChargeDistribution`]
-/// because the geometry question is the same one; the quantity being spread over
-/// that geometry is what differs.
+/// because the geometry question is the same one — [`PointOrSphere`] answers
+/// it once, shared by both — the quantity being spread over that geometry is
+/// what differs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MassDistribution {
     Point { exclusion_radius: f64 },
     UniformSphere { radius: f64 },
+}
+
+impl From<PointOrSphere> for MassDistribution {
+    fn from(value: PointOrSphere) -> Self {
+        match value {
+            PointOrSphere::Point { exclusion_radius } => Self::Point { exclusion_radius },
+            PointOrSphere::UniformSphere { radius } => Self::UniformSphere { radius },
+        }
+    }
+}
+
+impl From<MassDistribution> for PointOrSphere {
+    fn from(value: MassDistribution) -> Self {
+        match value {
+            MassDistribution::Point { exclusion_radius } => Self::Point { exclusion_radius },
+            MassDistribution::UniformSphere { radius } => Self::UniformSphere { radius },
+        }
+    }
 }
 
 /// One authored massive body, in solver-neutral terms.
@@ -290,27 +309,16 @@ fn source_from_object(
     object: &WorldObject,
     _properties: &PropertyBag,
 ) -> Result<MassSource, MassSourceError> {
-    let distribution = match object.shape {
-        Some(ObjectShape::Point { radius }) => MassDistribution::Point {
-            exclusion_radius: radius,
-        },
-        Some(ObjectShape::Sphere { radius }) if radius > 0.0 => {
-            MassDistribution::UniformSphere { radius }
-        }
-        Some(ObjectShape::Sphere { .. }) => {
-            return Err(MassSourceError::NonPositiveSphere {
+    let distribution = PointOrSphere::from_shape(object.shape, DEFAULT_POINT_RADIUS)
+        .map_err(|error| match error {
+            PointOrSphereError::NonPositiveSphere => MassSourceError::NonPositiveSphere {
                 object: object.name.clone(),
-            });
-        }
-        None => MassDistribution::Point {
-            exclusion_radius: DEFAULT_POINT_RADIUS,
-        },
-        Some(ObjectShape::Box { .. }) => {
-            return Err(MassSourceError::UnsupportedShape {
+            },
+            PointOrSphereError::UnsupportedShape => MassSourceError::UnsupportedShape {
                 object: object.name.clone(),
-            });
-        }
-    };
+            },
+        })?
+        .into();
     Ok(MassSource {
         object: object.id,
         position: object.transform.translation,

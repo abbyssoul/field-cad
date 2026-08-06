@@ -11,7 +11,9 @@ use fieldcad_core::{
 };
 use fieldcad_mass_sources::{inertial_mass_component_id, mass_property_id};
 use fieldcad_particles::{ParticleTemplate, template_particle_spec};
-use fieldcad_simulation::{CommandPayload, PlaybackSpeed, ProbeHistory};
+use fieldcad_simulation::{
+    CommandLifecycle, CommandPayload, CommandRecord, PlaybackSpeed, ProbeHistory,
+};
 use glam::{DQuat, DVec2, DVec3};
 
 use super::compute::{
@@ -182,6 +184,10 @@ pub(super) fn menu_bar(
                     .on_hover_text(
                         "Let an external agent drive this session over MCP, with a bearer token",
                     );
+                ui.checkbox(&mut model.queue_panel_open, "Queue").on_hover_text(
+                    "Inspect pending mutations, pause or resume the queue, and cancel a \
+                     still-queued command",
+                );
             });
         });
     });
@@ -464,31 +470,28 @@ fn object_section(
             ui.weak("No objects yet.");
         }
         for object in frame.world.objects().values() {
-            ui.horizontal(|ui| {
-                if visibility_button(ui, object.visible).clicked() {
+            match entity_row(
+                ui,
+                "▣",
+                &object.name,
+                object.visible,
+                model.selection == Some(object.id),
+                "Delete object",
+            ) {
+                Some(EntityRowAction::ToggleVisibility) => {
                     output.edit(vec![WorldCommand::SetObjectVisible {
                         object: object.id,
                         visible: !object.visible,
                     }]);
                 }
-                if ui
-                    .selectable_label(
-                        model.selection == Some(object.id),
-                        format!("▣  {}", object.name),
-                    )
-                    .on_hover_text(&object.name)
-                    .clicked()
-                {
+                Some(EntityRowAction::Select) => {
                     model.set_scene_selection(Some(SceneSelection::Object(object.id)));
                 }
-                if ui
-                    .small_button("×")
-                    .on_hover_text("Delete object")
-                    .clicked()
-                {
+                Some(EntityRowAction::Delete) => {
                     output.edit(vec![WorldCommand::RemoveObject(object.id)]);
                 }
-            });
+                None => {}
+            }
         }
     });
     ui.add_space(6.0);
@@ -552,27 +555,28 @@ fn measurement_section(
             ui.add_space(8.0);
             ui.label("Probes");
             for probe in frame.world.probes().values() {
-                ui.horizontal(|ui| {
-                    if visibility_button(ui, probe.visible).clicked() {
+                match entity_row(
+                    ui,
+                    "◉",
+                    &probe.name,
+                    probe.visible,
+                    model.probe_selection == Some(probe.id),
+                    "Delete probe",
+                ) {
+                    Some(EntityRowAction::ToggleVisibility) => {
                         output.edit(vec![WorldCommand::SetProbeVisible {
                             probe: probe.id,
                             visible: !probe.visible,
                         }]);
                     }
-                    if ui
-                        .selectable_label(
-                            model.probe_selection == Some(probe.id),
-                            format!("◉  {}", probe.name),
-                        )
-                        .on_hover_text(&probe.name)
-                        .clicked()
-                    {
+                    Some(EntityRowAction::Select) => {
                         model.set_scene_selection(Some(SceneSelection::Probe(probe.id)));
                     }
-                    if ui.small_button("×").on_hover_text("Delete probe").clicked() {
+                    Some(EntityRowAction::Delete) => {
                         output.edit(vec![WorldCommand::RemoveProbe(probe.id)]);
                     }
-                });
+                    None => {}
+                }
             }
         }
 
@@ -580,27 +584,28 @@ fn measurement_section(
             ui.add_space(8.0);
             ui.label("Slice planes");
             for plane in frame.world.planes().values() {
-                ui.horizontal(|ui| {
-                    if visibility_button(ui, plane.visible).clicked() {
+                match entity_row(
+                    ui,
+                    "▦",
+                    &plane.name,
+                    plane.visible,
+                    model.plane_selection == Some(plane.id),
+                    "Delete plane",
+                ) {
+                    Some(EntityRowAction::ToggleVisibility) => {
                         output.edit(vec![WorldCommand::SetPlaneVisible {
                             plane: plane.id,
                             visible: !plane.visible,
                         }]);
                     }
-                    if ui
-                        .selectable_label(
-                            model.plane_selection == Some(plane.id),
-                            format!("▦  {}", plane.name),
-                        )
-                        .on_hover_text(&plane.name)
-                        .clicked()
-                    {
+                    Some(EntityRowAction::Select) => {
                         model.set_scene_selection(Some(SceneSelection::Plane(plane.id)));
                     }
-                    if ui.small_button("×").on_hover_text("Delete plane").clicked() {
+                    Some(EntityRowAction::Delete) => {
                         output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
                     }
-                });
+                    None => {}
+                }
             }
         }
 
@@ -608,27 +613,28 @@ fn measurement_section(
             ui.add_space(8.0);
             ui.label("Field boxes");
             for field_box in frame.world.boxes().values() {
-                ui.horizontal(|ui| {
-                    if visibility_button(ui, field_box.visible).clicked() {
+                match entity_row(
+                    ui,
+                    "▧",
+                    &field_box.name,
+                    field_box.visible,
+                    model.box_selection == Some(field_box.id),
+                    "Delete box",
+                ) {
+                    Some(EntityRowAction::ToggleVisibility) => {
                         output.edit(vec![WorldCommand::SetBoxVisible {
                             region: field_box.id,
                             visible: !field_box.visible,
                         }]);
                     }
-                    if ui
-                        .selectable_label(
-                            model.box_selection == Some(field_box.id),
-                            format!("▧  {}", field_box.name),
-                        )
-                        .on_hover_text(&field_box.name)
-                        .clicked()
-                    {
+                    Some(EntityRowAction::Select) => {
                         model.set_scene_selection(Some(SceneSelection::Box(field_box.id)));
                     }
-                    if ui.small_button("×").on_hover_text("Delete box").clicked() {
+                    Some(EntityRowAction::Delete) => {
                         output.edit(vec![WorldCommand::RemoveBox(field_box.id)]);
                     }
-                });
+                    None => {}
+                }
             }
         }
 
@@ -636,31 +642,28 @@ fn measurement_section(
             ui.add_space(8.0);
             ui.label("Field spheres");
             for sphere in frame.world.spheres().values() {
-                ui.horizontal(|ui| {
-                    if visibility_button(ui, sphere.visible).clicked() {
+                match entity_row(
+                    ui,
+                    "◯",
+                    &sphere.name,
+                    sphere.visible,
+                    model.sphere_selection == Some(sphere.id),
+                    "Delete sphere",
+                ) {
+                    Some(EntityRowAction::ToggleVisibility) => {
                         output.edit(vec![WorldCommand::SetSphereVisible {
                             sphere: sphere.id,
                             visible: !sphere.visible,
                         }]);
                     }
-                    if ui
-                        .selectable_label(
-                            model.sphere_selection == Some(sphere.id),
-                            format!("◯  {}", sphere.name),
-                        )
-                        .on_hover_text(&sphere.name)
-                        .clicked()
-                    {
+                    Some(EntityRowAction::Select) => {
                         model.set_scene_selection(Some(SceneSelection::Sphere(sphere.id)));
                     }
-                    if ui
-                        .small_button("×")
-                        .on_hover_text("Delete sphere")
-                        .clicked()
-                    {
+                    Some(EntityRowAction::Delete) => {
                         output.edit(vec![WorldCommand::RemoveSphere(sphere.id)]);
                     }
-                });
+                    None => {}
+                }
             }
         }
     });
@@ -673,6 +676,69 @@ fn visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
         } else {
             "Show in viewport"
         })
+}
+
+/// The "visibility toggle, select, delete" row shape every scene entity
+/// list (objects, probes, planes, boxes, spheres) shares. Drawing is the
+/// only thing shared — each entity kind's own `WorldCommand` variants and
+/// `SceneSelection` case differ enough that building the actual command
+/// stays with the caller, which already has the id in scope from its own
+/// loop.
+enum EntityRowAction {
+    ToggleVisibility,
+    Select,
+    Delete,
+}
+
+fn entity_row(
+    ui: &mut egui::Ui,
+    icon: &str,
+    name: &str,
+    visible: bool,
+    selected: bool,
+    delete_hover: &str,
+) -> Option<EntityRowAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if visibility_button(ui, visible).clicked() {
+            action = Some(EntityRowAction::ToggleVisibility);
+        }
+        if ui
+            .selectable_label(selected, format!("{icon}  {name}"))
+            .on_hover_text(name)
+            .clicked()
+        {
+            action = Some(EntityRowAction::Select);
+        }
+        if ui.small_button("×").on_hover_text(delete_hover).clicked() {
+            action = Some(EntityRowAction::Delete);
+        }
+    });
+    action
+}
+
+/// The trailing "duplicate, focus, remove" actions every shape inspector
+/// (plane, box, sphere) ends with — the shared shape is real, but each
+/// shape's own `WorldCommand` variant and spec type differ enough (and the
+/// `Focus selection` button needs nothing from the caller at all) that
+/// building the two commands stays with the caller.
+fn entity_actions(
+    ui: &mut egui::Ui,
+    output: &mut UiFrameOutput,
+    kind: &str,
+    duplicate: impl FnOnce() -> WorldCommand,
+    remove: impl FnOnce() -> WorldCommand,
+) {
+    ui.add_space(10.0);
+    if ui.button(format!("Duplicate {kind}")).clicked() {
+        output.edit(vec![duplicate()]);
+    }
+    if ui.button("Focus selection  [F]").clicked() {
+        output.camera_action = Some(CameraAction::FocusSelection);
+    }
+    if ui.button(format!("Remove {kind}")).clicked() {
+        output.edit(vec![remove()]);
+    }
 }
 
 pub(super) fn inspector(
@@ -1925,18 +1991,17 @@ fn plane_properties(
         plane_field_layers(ui, plane, field_layers, compute);
     });
 
-    ui.add_space(10.0);
-    if ui.button("Duplicate plane").clicked() {
-        output.edit(vec![WorldCommand::CreatePlane(
-            SlicePlaneSpec::from_plane(plane).with_name(format!("{} copy", plane.name)),
-        )]);
-    }
-    if ui.button("Focus selection  [F]").clicked() {
-        output.camera_action = Some(CameraAction::FocusSelection);
-    }
-    if ui.button("Remove plane").clicked() {
-        output.edit(vec![WorldCommand::RemovePlane(plane.id)]);
-    }
+    entity_actions(
+        ui,
+        output,
+        "plane",
+        || {
+            WorldCommand::CreatePlane(
+                SlicePlaneSpec::from_plane(plane).with_name(format!("{} copy", plane.name)),
+            )
+        },
+        || WorldCommand::RemovePlane(plane.id),
+    );
 }
 
 /// Where the plane sits and how far it reaches, including the three standard
@@ -2005,6 +2070,96 @@ fn plane_geometry_editors(ui: &mut egui::Ui, plane: &SlicePlane, output: &mut Ui
     });
 }
 
+/// Warns that a channel's own visibility layer is off, so no per-entity
+/// setting here will actually draw anything until it is turned on under
+/// Fields in the View window. Byte-identical across every field-layers
+/// panel (plane, box, sphere) before this was shared.
+fn hidden_everywhere_warning(ui: &mut egui::Ui) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "This field is hidden everywhere. Turn its layer on under Fields \
+                 in the View window.",
+            )
+            .small()
+            .color(egui::Color32::from_rgb(230, 180, 80)),
+        )
+        .wrap(),
+    );
+}
+
+/// The fields every per-entity field-layer settings type has in common —
+/// `BoxLayerSettings` and `SphereLayerSettings` are otherwise identical
+/// structs by different names; `PlaneLayerSettings` has these plus its own
+/// extra magnitude/vector-mode controls, which is why only box and sphere
+/// share [`volume_field_layers`] below.
+trait VectorLayerSettings {
+    fn visible_mut(&mut self) -> &mut bool;
+    fn vectors_mut(&mut self) -> &mut crate::scene::VectorDisplay;
+}
+
+impl VectorLayerSettings for crate::scene::BoxLayerSettings {
+    fn visible_mut(&mut self) -> &mut bool {
+        &mut self.visible
+    }
+    fn vectors_mut(&mut self) -> &mut crate::scene::VectorDisplay {
+        &mut self.vectors
+    }
+}
+
+impl VectorLayerSettings for crate::scene::SphereLayerSettings {
+    fn visible_mut(&mut self) -> &mut bool {
+        &mut self.visible
+    }
+    fn vectors_mut(&mut self) -> &mut crate::scene::VectorDisplay {
+        &mut self.vectors
+    }
+}
+
+/// The display text a [`volume_field_layers`] caller supplies, since it's
+/// the only thing that actually differs between a box and a sphere.
+struct VolumeFieldLayerText<'a> {
+    checkbox_label: &'a str,
+    checkbox_hover: &'a str,
+    arrow_hover: &'a str,
+}
+
+/// How each published vector channel is drawn inside a box or sphere —
+/// arrows only, since neither has a natural surface to flatten a magnitude
+/// map onto the way a plane does. `box_field_layers`/`sphere_field_layers`
+/// are thin, differing only in which per-entity settings map they read and
+/// their own display text.
+fn volume_field_layers<Id: Ord + Copy, S: VectorLayerSettings + Default>(
+    ui: &mut egui::Ui,
+    id: Id,
+    field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
+    compute: &ComputeView,
+    layer_map: impl Fn(&mut ChannelLayerSettings) -> &mut BTreeMap<Id, S>,
+    text: VolumeFieldLayerText<'_>,
+) {
+    for channel in &compute.vector_channels {
+        let name = channel_label(channel, &compute.channel_names);
+        let layer = field_layers.entry(channel.clone()).or_default();
+        let layer_visible = layer.visible;
+        let settings = layer_map(layer).entry(id).or_default();
+        ui.collapsing(name, |ui| {
+            ui.checkbox(settings.visible_mut(), text.checkbox_label)
+                .on_hover_text(text.checkbox_hover);
+            if !layer_visible {
+                hidden_everywhere_warning(ui);
+            }
+            ui.add_enabled_ui(*settings.visible_mut(), |ui| {
+                super::vector_display_controls(
+                    ui,
+                    settings.vectors_mut(),
+                    "Vector arrows",
+                    text.arrow_hover,
+                );
+            });
+        });
+    }
+}
+
 /// How each published vector channel is drawn on this plane. Presentation only:
 /// nothing here changes a computed value.
 fn plane_field_layers(
@@ -2029,17 +2184,7 @@ fn plane_field_layers(
                      whole-domain arrows are unaffected.",
                 );
             if !layer_visible {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "This field is hidden everywhere. Turn its layer on under Fields \
-                             in the View window.",
-                        )
-                        .small()
-                        .color(egui::Color32::from_rgb(230, 180, 80)),
-                    )
-                    .wrap(),
-                );
+                hidden_everywhere_warning(ui);
             }
 
             ui.add_enabled_ui(settings.visible, |ui| {
@@ -2097,18 +2242,17 @@ fn box_properties(
         box_field_layers(ui, field_box, field_layers, compute);
     });
 
-    ui.add_space(10.0);
-    if ui.button("Duplicate box").clicked() {
-        output.edit(vec![WorldCommand::CreateBox(
-            FieldBoxSpec::from_box(field_box).with_name(format!("{} copy", field_box.name)),
-        )]);
-    }
-    if ui.button("Focus selection  [F]").clicked() {
-        output.camera_action = Some(CameraAction::FocusSelection);
-    }
-    if ui.button("Remove box").clicked() {
-        output.edit(vec![WorldCommand::RemoveBox(field_box.id)]);
-    }
+    entity_actions(
+        ui,
+        output,
+        "box",
+        || {
+            WorldCommand::CreateBox(
+                FieldBoxSpec::from_box(field_box).with_name(format!("{} copy", field_box.name)),
+            )
+        },
+        || WorldCommand::RemoveBox(field_box.id),
+    );
 }
 
 /// Where the box sits and how big it is. Orientation is primarily set by
@@ -2176,40 +2320,19 @@ fn box_field_layers(
     field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
     compute: &ComputeView,
 ) {
-    for channel in &compute.vector_channels {
-        let name = channel_label(channel, &compute.channel_names);
-        let layer = field_layers.entry(channel.clone()).or_default();
-        let layer_visible = layer.visible;
-        let settings = layer.boxes.entry(field_box.id).or_default();
-        ui.collapsing(name, |ui| {
-            ui.checkbox(&mut settings.visible, "Show in this box")
-                .on_hover_text(
-                    "Whether this box draws this field. Other boxes, spheres, and planes are \
-                 unaffected.",
-                );
-            if !layer_visible {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "This field is hidden everywhere. Turn its layer on under Fields \
-                             in the View window.",
-                        )
-                        .small()
-                        .color(egui::Color32::from_rgb(230, 180, 80)),
-                    )
-                    .wrap(),
-                );
-            }
-            ui.add_enabled_ui(settings.visible, |ui| {
-                super::vector_display_controls(
-                    ui,
-                    &mut settings.vectors,
-                    "Vector arrows",
-                    "Draw the field as arrows inside this box",
-                );
-            });
-        });
-    }
+    volume_field_layers(
+        ui,
+        field_box.id,
+        field_layers,
+        compute,
+        |layer| &mut layer.boxes,
+        VolumeFieldLayerText {
+            checkbox_label: "Show in this box",
+            checkbox_hover: "Whether this box draws this field. Other boxes, spheres, and \
+                              planes are unaffected.",
+            arrow_hover: "Draw the field as arrows inside this box",
+        },
+    );
 }
 
 fn sphere_properties(
@@ -2239,18 +2362,17 @@ fn sphere_properties(
         },
     );
 
-    ui.add_space(10.0);
-    if ui.button("Duplicate sphere").clicked() {
-        output.edit(vec![WorldCommand::CreateSphere(
-            FieldSphereSpec::from_sphere(sphere).with_name(format!("{} copy", sphere.name)),
-        )]);
-    }
-    if ui.button("Focus selection  [F]").clicked() {
-        output.camera_action = Some(CameraAction::FocusSelection);
-    }
-    if ui.button("Remove sphere").clicked() {
-        output.edit(vec![WorldCommand::RemoveSphere(sphere.id)]);
-    }
+    entity_actions(
+        ui,
+        output,
+        "sphere",
+        || {
+            WorldCommand::CreateSphere(
+                FieldSphereSpec::from_sphere(sphere).with_name(format!("{} copy", sphere.name)),
+            )
+        },
+        || WorldCommand::RemoveSphere(sphere.id),
+    );
 }
 
 fn sphere_geometry_editors(ui: &mut egui::Ui, sphere: &FieldSphere, output: &mut UiFrameOutput) {
@@ -2299,40 +2421,19 @@ fn sphere_field_layers(
     field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
     compute: &ComputeView,
 ) {
-    for channel in &compute.vector_channels {
-        let name = channel_label(channel, &compute.channel_names);
-        let layer = field_layers.entry(channel.clone()).or_default();
-        let layer_visible = layer.visible;
-        let settings = layer.spheres.entry(sphere.id).or_default();
-        ui.collapsing(name, |ui| {
-            ui.checkbox(&mut settings.visible, "Show in this sphere")
-                .on_hover_text(
-                    "Whether this sphere draws this field. Other spheres, boxes, and planes \
-                     are unaffected.",
-                );
-            if !layer_visible {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "This field is hidden everywhere. Turn its layer on under Fields \
-                             in the View window.",
-                        )
-                        .small()
-                        .color(egui::Color32::from_rgb(230, 180, 80)),
-                    )
-                    .wrap(),
-                );
-            }
-            ui.add_enabled_ui(settings.visible, |ui| {
-                super::vector_display_controls(
-                    ui,
-                    &mut settings.vectors,
-                    "Vector arrows",
-                    "Draw the field as arrows inside this sphere",
-                );
-            });
-        });
-    }
+    volume_field_layers(
+        ui,
+        sphere.id,
+        field_layers,
+        compute,
+        |layer| &mut layer.spheres,
+        VolumeFieldLayerText {
+            checkbox_label: "Show in this sphere",
+            checkbox_hover: "Whether this sphere draws this field. Other spheres, boxes, and \
+                              planes are unaffected.",
+            arrow_hover: "Draw the field as arrows inside this sphere",
+        },
+    );
 }
 
 fn probe_properties(
@@ -2680,76 +2781,88 @@ fn channel_label(id: &ChannelId, names: &BTreeMap<ChannelId, String>) -> String 
 fn transport_sampling(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
     let mut subscription = compute.subscription;
     let mut changed = false;
+    let enabled = compute.accepts_commands();
 
-    ui.horizontal(|ui| {
-        let mut planes = subscription.planes.map_or(0, |counts| counts.x);
-        ui.label("Plane samples");
-        changed |= ui
-            .add_enabled(
-                compute.accepts_commands(),
-                egui::DragValue::new(&mut planes)
-                    .speed(1.0)
-                    .range(0..=1_024),
-            )
-            .on_hover_text("Samples per axis the source evaluates on each visible plane")
-            .changed();
-        if changed {
-            subscription.planes = (planes > 0).then(|| glam::UVec2::splat(planes));
-        }
-    });
+    if let Some(planes) = density_field(
+        ui,
+        "Plane samples",
+        "Samples per axis the source evaluates on each visible plane",
+        enabled,
+        0..=1_024,
+        subscription.planes.map_or(0, |counts| counts.x),
+    ) {
+        subscription.planes = (planes > 0).then(|| glam::UVec2::splat(planes));
+        changed = true;
+    }
 
-    ui.horizontal(|ui| {
-        let mut stride = subscription.domain_stride.unwrap_or(0);
-        ui.label("Domain stride");
-        let response = ui
-            .add_enabled(
-                compute.accepts_commands(),
-                egui::DragValue::new(&mut stride).speed(1.0).range(0..=256),
-            )
-            .on_hover_text("Whole-domain lattice decimation; 0 publishes no 3D grid");
-        if response.changed() {
-            subscription.domain_stride = (stride > 0).then_some(stride);
-            changed = true;
-        }
-    });
+    if let Some(stride) = density_field(
+        ui,
+        "Domain stride",
+        "Whole-domain lattice decimation; 0 publishes no 3D grid",
+        enabled,
+        0..=256,
+        subscription.domain_stride.unwrap_or(0),
+    ) {
+        subscription.domain_stride = (stride > 0).then_some(stride);
+        changed = true;
+    }
 
-    ui.horizontal(|ui| {
-        let mut boxes = subscription.boxes.map_or(0, |counts| counts.x);
-        ui.label("Box samples");
-        let response = ui
-            .add_enabled(
-                compute.accepts_commands(),
-                egui::DragValue::new(&mut boxes).speed(1.0).range(0..=1_024),
-            )
-            .on_hover_text("Samples per axis the source evaluates in each visible field box");
-        if response.changed() {
-            subscription.boxes = (boxes > 0).then(|| glam::UVec3::splat(boxes));
-            changed = true;
-        }
-    });
+    if let Some(boxes) = density_field(
+        ui,
+        "Box samples",
+        "Samples per axis the source evaluates in each visible field box",
+        enabled,
+        0..=1_024,
+        subscription.boxes.map_or(0, |counts| counts.x),
+    ) {
+        subscription.boxes = (boxes > 0).then(|| glam::UVec3::splat(boxes));
+        changed = true;
+    }
 
-    ui.horizontal(|ui| {
-        let mut spheres = subscription.spheres.unwrap_or(0);
-        ui.label("Sphere samples");
-        let response = ui
-            .add_enabled(
-                compute.accepts_commands(),
-                egui::DragValue::new(&mut spheres)
-                    .speed(1.0)
-                    .range(0..=1_024),
-            )
-            .on_hover_text(
-                "Samples per axis the source evaluates over each visible sphere's bounding cube",
-            );
-        if response.changed() {
-            subscription.spheres = (spheres > 0).then_some(spheres);
-            changed = true;
-        }
-    });
+    if let Some(spheres) = density_field(
+        ui,
+        "Sphere samples",
+        "Samples per axis the source evaluates over each visible sphere's bounding cube",
+        enabled,
+        0..=1_024,
+        subscription.spheres.unwrap_or(0),
+    ) {
+        subscription.spheres = (spheres > 0).then_some(spheres);
+        changed = true;
+    }
 
     if changed && subscription != compute.subscription {
         output.submit(CommandPayload::SetSubscription(subscription));
     }
+}
+
+/// One transport-density drag value, gated on *its own* widget response —
+/// never on whether some other field on the form changed, which would let
+/// this one rewrite itself from a stale read whenever it happened to run
+/// after a sibling that did (the bug this shape exists to make impossible
+/// to reintroduce: reordering these calls must never matter).
+fn density_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    hover: &str,
+    enabled: bool,
+    range: std::ops::RangeInclusive<u32>,
+    mut count: u32,
+) -> Option<u32> {
+    let mut result = None;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui
+            .add_enabled(
+                enabled,
+                egui::DragValue::new(&mut count).speed(1.0).range(range),
+            )
+            .on_hover_text(hover);
+        if response.changed() {
+            result = Some(count);
+        }
+    });
+    result
 }
 
 fn compute_panel(ui: &mut egui::Ui, compute: &ComputeView) {
@@ -2971,6 +3084,102 @@ pub(super) fn mcp_window(context: &egui::Context, mcp: &McpSession) -> Option<Mc
     action
 }
 
+/// A short, human-facing label for one queue entry's lifecycle state — the
+/// UI's own presentation, distinct from the wire-format `snake_case` used by
+/// `CommandLifecycle`'s `Serialize` impl.
+fn lifecycle_label(state: CommandLifecycle) -> &'static str {
+    match state {
+        CommandLifecycle::Submitted => "Submitted",
+        CommandLifecycle::Queued => "Queued",
+        CommandLifecycle::Applied => "Applied",
+        CommandLifecycle::Rejected => "Rejected",
+        CommandLifecycle::Cancelled => "Cancelled",
+    }
+}
+
+/// One row in the pending or history list: the command's kind, id, and
+/// lifecycle state, plus — for a still-queued record — a Cancel button.
+fn queue_record_row(ui: &mut egui::Ui, record: &CommandRecord, output: &mut UiFrameOutput) {
+    ui.horizontal(|ui| {
+        ui.monospace(format!("#{}", record.command.get()));
+        ui.label(record.kind.label());
+        ui.label(lifecycle_label(record.state));
+        if record.state == CommandLifecycle::Rejected
+            && let Some(error) = &record.error
+        {
+            ui.colored_label(egui::Color32::from_rgb(240, 105, 95), "⚠")
+                .on_hover_text(error);
+        }
+        if record.state == CommandLifecycle::Queued && ui.button("Cancel").clicked() {
+            output.submit(CommandPayload::CancelQueuedCommand(record.command));
+        }
+    });
+}
+
+/// Inspect pending mutations, pause/resume the queue, and cancel a
+/// still-queued command — the desktop follow-on to
+/// `docs/tasks/session-events-and-queue-control.md`'s server-side queue
+/// surface. Non-modal, like `diagnostics_window`/`mcp_window`: a user can
+/// keep editing the scene while this stays open.
+pub(super) fn queue_window(
+    context: &egui::Context,
+    frame: &FrameContext<'_>,
+    output: &mut UiFrameOutput,
+) {
+    let queue = &frame.compute.queue;
+    egui::Window::new("Queue")
+        .default_pos(egui::pos2(218.0, 48.0))
+        .resizable(false)
+        .collapsible(true)
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                if queue.paused {
+                    ui.colored_label(egui::Color32::from_rgb(235, 190, 75), "⏸ paused");
+                    if ui
+                        .button("Resume queue")
+                        .on_hover_text(
+                            "Held mutations apply at the next eligible tick boundary, in \
+                             submission order",
+                        )
+                        .clicked()
+                    {
+                        output.submit(CommandPayload::ResumeQueue);
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(95, 200, 110), "● running");
+                    if ui
+                        .button("Pause queue")
+                        .on_hover_text(
+                            "Hold queued scene/domain mutations at their tick boundary; \
+                             simulation ticks continue and new mutations are still accepted",
+                        )
+                        .clicked()
+                    {
+                        output.submit(CommandPayload::PauseQueue);
+                    }
+                }
+            });
+
+            ui.separator();
+            if queue.pending.is_empty() {
+                ui.label("Nothing pending.");
+            } else {
+                for record in &queue.pending {
+                    queue_record_row(ui, record, output);
+                }
+            }
+
+            if !queue.history.is_empty() {
+                ui.separator();
+                ui.collapsing("History", |ui| {
+                    for record in queue.history.iter().rev() {
+                        queue_record_row(ui, record, output);
+                    }
+                });
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{ObjectSpec, Transform, World, WorldCommand};
@@ -3018,7 +3227,7 @@ mod tests {
     fn field_system_details_are_collapsed_by_default_in_the_narrow_inspector() {
         let world = super::super::tests::seeded_world();
         let source = super::super::tests::source();
-        let compute = ComputeView::build(&source, &world.snapshot());
+        let compute = ComputeView::build(&source, &world.snapshot(), None);
         let context = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -3042,6 +3251,32 @@ mod tests {
         );
     }
 
+    /// UI-19 regression: `transport_sampling` used to gate its first field's
+    /// write on the *shared* `changed` accumulator rather than that field's
+    /// own widget response — correct only because that field happened to be
+    /// first, so nothing had set the accumulator yet. `density_field` now
+    /// gates every field on its own response with no shared accumulator to
+    /// leak from, so rendering the panel with nothing dragged must never
+    /// submit a subscription change, regardless of field order.
+    #[test]
+    fn transport_sampling_does_not_submit_when_nothing_was_dragged() {
+        let world = super::super::tests::seeded_world();
+        let source = super::super::tests::source();
+        let compute = ComputeView::build(&source, &world.snapshot(), None);
+        let context = egui::Context::default();
+        let mut output = UiFrameOutput::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            transport_sampling(ui, &compute, &mut output);
+        });
+
+        assert!(
+            output.commands.is_empty(),
+            "rendering the transport-density fields without touching any of \
+             them must not submit a subscription change: {:?}",
+            output.commands
+        );
+    }
+
     /// Undo names the edit it would reverse, rather than offering an unlabelled
     /// arrow the user has to press to find out what it does.
     #[test]
@@ -3049,6 +3284,7 @@ mod tests {
         let mut compute = ComputeView::build(
             &super::super::tests::source(),
             &super::super::tests::seeded_world().snapshot(),
+            None,
         );
         compute.edit_history = fieldcad_simulation::EditHistoryStatus {
             undo: Some("Move object".to_owned()),
@@ -3080,6 +3316,7 @@ mod tests {
         let compute = ComputeView::build(
             &super::super::tests::source(),
             &super::super::tests::seeded_world().snapshot(),
+            None,
         );
         assert!(!compute.edit_history.can_undo());
 
@@ -3170,7 +3407,7 @@ mod tests {
             .unwrap();
         let snapshot = world.snapshot();
         let plane = snapshot.planes().values().next().unwrap();
-        let mut compute = ComputeView::build(&super::super::tests::source(), &snapshot);
+        let mut compute = ComputeView::build(&super::super::tests::source(), &snapshot, None);
         let channel = fieldcad_test_field::vector_channel_id();
         compute.vector_channels = vec![channel.clone()];
 
@@ -3261,7 +3498,7 @@ mod tests {
             .unwrap();
         let snapshot = world.snapshot();
         let plane = snapshot.planes().values().next().unwrap();
-        let compute = ComputeView::build(&super::super::tests::source(), &snapshot);
+        let compute = ComputeView::build(&super::super::tests::source(), &snapshot, None);
         let mut layers = BTreeMap::new();
 
         let context = egui::Context::default();
@@ -3353,7 +3590,7 @@ mod tests {
     fn realtime_update_is_offered_per_field_system_and_submitted_as_a_command() {
         let world = super::super::tests::seeded_world();
         let source = super::super::tests::source();
-        let compute = ComputeView::build(&source, &world.snapshot());
+        let compute = ComputeView::build(&source, &world.snapshot(), None);
         let system = compute.field_systems[0].clone();
         assert!(system.realtime, "a scene starts fully live");
 

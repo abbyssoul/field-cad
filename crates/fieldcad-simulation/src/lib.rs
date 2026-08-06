@@ -22,9 +22,10 @@ pub use runtime::{
     TickPacer,
 };
 pub use source::{
-    Command, CommandDisposition, CommandId, CommandPayload, CommandReceipt, CommandSequencer,
-    DataSourceStatus, FieldDataSource, LocalDataSource, LoopbackDataSource, PlaybackSpeed,
-    PlaybackSpeedError, PollOutcome, SnapshotMailbox, SnapshotRejection, SourceError,
+    Command, CommandDisposition, CommandId, CommandKind, CommandLifecycle, CommandPayload,
+    CommandReceipt, CommandRecord, CommandSequencer, DataSourceStatus, FieldDataSource,
+    LocalDataSource, LoopbackDataSource, PlaybackSpeed, PlaybackSpeedError, PollOutcome,
+    QueueStatus, QueueSummary, SnapshotMailbox, SnapshotRejection, SourceError,
 };
 
 #[cfg(test)]
@@ -186,6 +187,196 @@ mod tests {
             } if code == "plugin"
         ));
         assert_eq!(source.simulation_status().time_step(), before);
+    }
+
+    #[test]
+    fn a_queued_command_reports_completion_only_after_its_tick_boundary() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        source.execute(command(CommandPayload::Play)).unwrap();
+        // Wait for the worker to acknowledge Play (always `Applied`, never
+        // queued) and discard its completion event -- irrelevant here.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            source.poll(Duration::ZERO).unwrap();
+            if !source.drain_command_events().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never applied Play"
+            );
+            std::thread::yield_now();
+        }
+
+        let queued = source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+            ])))
+            .unwrap();
+        assert_eq!(queued.disposition, CommandDisposition::Submitted);
+
+        // Let the worker acknowledge both requests without crossing a tick
+        // boundary (elapsed = ZERO every poll). Once the edit is visibly
+        // queued, this alone must have produced no terminal event yet --
+        // the exact bug this task fixes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            source.poll(Duration::ZERO).unwrap();
+            if source.get_queue().pending.iter().any(|record| {
+                record.kind == CommandKind::CommitWorld && record.state == CommandLifecycle::Queued
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never queued the running edit"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            source.drain_command_events().is_empty(),
+            "a queued acknowledgement must not be reported as terminal completion"
+        );
+
+        // Now cross a tick boundary; only now must the terminal event appear.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let event = loop {
+            source.poll(Duration::from_millis(100)).unwrap();
+            if let Some(event) = source.drain_command_events().into_iter().next() {
+                break event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued edit never completed at a tick boundary"
+            );
+            std::thread::yield_now();
+        };
+        assert!(matches!(
+            event,
+            CommandEvent::Completed(ref receipt) if receipt.disposition == CommandDisposition::Applied
+        ));
+    }
+
+    /// BE-16 regression: `queue_summary` must always agree with what
+    /// `get_queue` would report, since it exists specifically to answer the
+    /// same four questions (paused, pending/history counts, newest history
+    /// id) without cloning `pending`/`history` to get them.
+    #[test]
+    fn queue_summary_agrees_with_get_queue() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        source.execute(command(CommandPayload::Play)).unwrap();
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+            ])))
+            .unwrap();
+
+        // Cross a tick boundary so the queued edit goes terminal, giving
+        // `history` something too — not just `pending`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            source.poll(Duration::from_millis(100)).unwrap();
+            if !source.get_queue().history.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued edit never went terminal"
+            );
+            std::thread::yield_now();
+        }
+
+        let queue = source.get_queue();
+        let summary = source.queue_summary();
+        assert_eq!(summary.paused, queue.paused);
+        assert_eq!(summary.pending_len, queue.pending.len());
+        assert_eq!(summary.history_len, queue.history.len());
+        assert_eq!(
+            summary.newest_history,
+            queue.history.last().map(|record| record.command)
+        );
+    }
+
+    /// A command that flushes another, already-queued command as its own
+    /// side effect (`pause` flushing a running edit) must report that other
+    /// command's completion without requiring a subsequent `Poll` request —
+    /// regression test for a bug where only `Poll`'s worker-side handling
+    /// drained buffered terminal events, so a side-effect flush produced
+    /// during `Execute` sat invisible on the worker thread until some
+    /// *unrelated*, later, non-zero-elapsed poll happened to run.
+    #[test]
+    fn a_side_effect_flush_reports_completion_without_a_subsequent_poll() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        source.execute(command(CommandPayload::Play)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            source.poll(Duration::ZERO).unwrap();
+            if !source.drain_command_events().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never applied Play"
+            );
+            std::thread::yield_now();
+        }
+
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+            ])))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            source.poll(Duration::ZERO).unwrap();
+            if source.get_queue().pending.iter().any(|record| {
+                record.kind == CommandKind::CommitWorld && record.state == CommandLifecycle::Queued
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never queued the running edit"
+            );
+            std::thread::yield_now();
+        }
+
+        source.execute(command(CommandPayload::Pause)).unwrap();
+
+        // Only zero-elapsed polls from here on: nothing may cross a real
+        // tick boundary. `Pause`'s own flush already applied the queued
+        // edit synchronously, on the worker thread, inside its own
+        // `execute` call — a later, non-zero-elapsed poll must not be
+        // necessary to observe it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut events = Vec::new();
+        loop {
+            source.poll(Duration::ZERO).unwrap();
+            events.extend(source.drain_command_events());
+            if events.len() >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the side-effect-flushed edit's completion never surfaced without a real tick"
+            );
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly the flushed edit's completion and pause's own: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                CommandEvent::Completed(receipt) if receipt.disposition == CommandDisposition::Applied
+            )),
+            "expected both the flushed edit and pause itself to have applied cleanly: {events:?}"
+        );
+        assert_eq!(source.simulation_status().mode(), SimulationMode::Paused);
+        assert!(source.get_queue().pending.is_empty());
     }
 
     #[test]
@@ -1295,6 +1486,258 @@ mod tests {
         assert_eq!(source.world().objects().len(), 1);
         assert_eq!(source.simulation_status().tick(), 0);
         assert_eq!(source.simulation_status().mode(), SimulationMode::Paused);
+    }
+
+    #[test]
+    fn pausing_the_queue_holds_a_running_edit_across_tick_boundaries() {
+        let mut source = LocalDataSource::new(runtime());
+        source.execute(command(CommandPayload::Play)).unwrap();
+
+        let receipt = source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+            ])))
+            .unwrap();
+        assert_eq!(receipt.disposition, CommandDisposition::Queued);
+
+        let pause_receipt = source.execute(command(CommandPayload::PauseQueue)).unwrap();
+        assert_eq!(pause_receipt.disposition, CommandDisposition::Applied);
+        assert!(source.get_queue().paused);
+
+        for _ in 0..5 {
+            let outcome = source.poll(Duration::from_millis(100)).unwrap();
+            assert_eq!(outcome.commands_applied, 0);
+        }
+        assert!(source.world().objects().is_empty());
+        assert_eq!(source.get_queue().pending.len(), 1);
+
+        let resume_receipt = source
+            .execute(command(CommandPayload::ResumeQueue))
+            .unwrap();
+        assert_eq!(resume_receipt.disposition, CommandDisposition::Applied);
+        assert!(!source.get_queue().paused);
+
+        let outcome = source.poll(Duration::from_millis(100)).unwrap();
+        assert_eq!(outcome.commands_applied, 1);
+        assert_eq!(source.world().objects().len(), 1);
+        assert!(source.get_queue().pending.is_empty());
+    }
+
+    #[test]
+    fn resuming_a_paused_queue_applies_pending_edits_in_submission_order() {
+        let mut source = LocalDataSource::new(runtime());
+        source.execute(command(CommandPayload::Play)).unwrap();
+
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("first")),
+            ])))
+            .unwrap();
+        source.execute(command(CommandPayload::PauseQueue)).unwrap();
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("second")),
+            ])))
+            .unwrap();
+        assert_eq!(source.get_queue().pending.len(), 2);
+
+        source
+            .execute(command(CommandPayload::ResumeQueue))
+            .unwrap();
+        source.poll(Duration::from_millis(100)).unwrap();
+
+        assert!(source.get_queue().pending.is_empty());
+        assert_eq!(source.world().objects().len(), 2);
+
+        let history = source.get_queue().history;
+        let commit_history: Vec<_> = history
+            .iter()
+            .filter(|record| record.kind == CommandKind::CommitWorld)
+            .collect();
+        assert_eq!(commit_history.len(), 2);
+        assert!(commit_history[0].sequence < commit_history[1].sequence);
+        assert_eq!(commit_history[0].state, CommandLifecycle::Applied);
+        assert_eq!(commit_history[1].state, CommandLifecycle::Applied);
+    }
+
+    #[test]
+    fn cancelling_a_queued_command_prevents_its_application() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        let queued = sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+        ]));
+        let queued_id = queued.id;
+        let receipt = source.execute(queued).unwrap();
+        assert_eq!(receipt.disposition, CommandDisposition::Queued);
+
+        let cancel_receipt = source
+            .execute(sequencer.issue(CommandPayload::CancelQueuedCommand(queued_id)))
+            .unwrap();
+        assert_eq!(cancel_receipt.disposition, CommandDisposition::Applied);
+
+        let queue = source.get_queue();
+        assert!(queue.pending.is_empty());
+        let cancelled = queue
+            .history
+            .iter()
+            .find(|record| record.command == queued_id)
+            .expect("the cancelled command is retained in terminal history");
+        assert_eq!(cancelled.state, CommandLifecycle::Cancelled);
+
+        source.poll(Duration::from_millis(100)).unwrap();
+        assert!(source.world().objects().is_empty());
+    }
+
+    #[test]
+    fn cancelling_an_unknown_or_already_applied_command_is_refused() {
+        let mut source = LocalDataSource::new(runtime());
+        let result = source.execute(command(CommandPayload::CancelQueuedCommand(
+            CommandId::new(999),
+        )));
+        assert!(matches!(result, Err(SourceError::CommandNotQueued(_))));
+    }
+
+    fn queue_paused_conflict(payload: CommandPayload) -> Result<CommandReceipt, SourceError> {
+        let mut source = LocalDataSource::new(runtime());
+        source.execute(command(CommandPayload::Play)).unwrap();
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+            ])))
+            .unwrap();
+        source.execute(command(CommandPayload::PauseQueue)).unwrap();
+        source.execute(command(payload))
+    }
+
+    #[test]
+    fn pause_step_undo_redo_are_refused_while_the_queue_is_paused_with_pending_work() {
+        for payload in [
+            CommandPayload::Pause,
+            CommandPayload::Step,
+            CommandPayload::Undo,
+            CommandPayload::Redo,
+        ] {
+            let result = queue_paused_conflict(payload);
+            assert!(
+                matches!(result, Err(SourceError::QueuePaused { .. })),
+                "expected a queue-paused conflict, got {result:?}"
+            );
+        }
+    }
+
+    fn flush_rejected_conflict(
+        payload: CommandPayload,
+    ) -> (
+        LocalDataSource,
+        CommandId,
+        Result<CommandReceipt, SourceError>,
+    ) {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        let invalid = sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::RemoveObject(ObjectId::new(500)),
+        ]));
+        assert_eq!(
+            source.execute(invalid).unwrap().disposition,
+            CommandDisposition::Queued
+        );
+
+        let valid = sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+        ]));
+        let valid_id = valid.id;
+        assert_eq!(
+            source.execute(valid).unwrap().disposition,
+            CommandDisposition::Queued
+        );
+
+        let result = source.execute(sequencer.issue(payload));
+        (source, valid_id, result)
+    }
+
+    /// `Pause`/`Step`/`Undo`/`Redo` all flush the pending queue before doing
+    /// anything else. If that flush rejects a mutation, the command must not
+    /// proceed on top of a boundary whose preceding queued edit never
+    /// actually landed — regression test for a flush that was briefly
+    /// infallible and silently ignored at these four call sites.
+    #[test]
+    fn pause_step_undo_redo_are_refused_when_their_own_flush_rejects_a_mutation() {
+        for payload in [
+            CommandPayload::Pause,
+            CommandPayload::Step,
+            CommandPayload::Undo,
+            CommandPayload::Redo,
+        ] {
+            let (source, valid_id, result) = flush_rejected_conflict(payload);
+            assert!(
+                matches!(result, Err(SourceError::FlushRejected { .. })),
+                "expected a flush-rejected conflict, got {result:?}"
+            );
+            // The mode must be left unchanged so the still-queued valid
+            // mutation gets another flush attempt on the next tick, instead
+            // of being stranded by a state change to non-`Running`.
+            assert_eq!(source.simulation_status().mode(), SimulationMode::Running);
+            let queue = source.get_queue();
+            assert_eq!(queue.pending.len(), 1);
+            assert_eq!(queue.pending[0].command, valid_id);
+        }
+    }
+
+    #[test]
+    fn pause_step_undo_redo_proceed_normally_when_the_queue_is_paused_but_empty() {
+        for payload in [
+            CommandPayload::Pause,
+            CommandPayload::Step,
+            CommandPayload::Undo,
+            CommandPayload::Redo,
+        ] {
+            let mut source = LocalDataSource::new(runtime());
+            source.execute(command(CommandPayload::PauseQueue)).unwrap();
+            let result = source.execute(command(payload));
+            assert!(
+                !matches!(result, Err(SourceError::QueuePaused { .. })),
+                "an idle paused queue must not block commands, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_history_evicts_its_oldest_entry_past_256_records() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for index in 0..300 {
+            let queued = sequencer.issue(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new(format!("object {index}"))),
+            ]));
+            ids.push(queued.id);
+            let receipt = source.execute(queued).unwrap();
+            assert_eq!(receipt.disposition, CommandDisposition::Queued);
+        }
+        // A single flush (triggered here by `Pause`, which is never itself
+        // queued) applies every one of the 300 queued mutations in one pass.
+        source
+            .execute(sequencer.issue(CommandPayload::Pause))
+            .unwrap();
+
+        let queue = source.get_queue();
+        assert!(queue.pending.is_empty());
+        assert_eq!(queue.history.len(), 256);
+        assert_eq!(queue.history.first().unwrap().command, ids[300 - 256]);
+        assert_eq!(queue.history.last().unwrap().command, *ids.last().unwrap());
     }
 
     fn milestone_four_recording() -> SessionRecording {

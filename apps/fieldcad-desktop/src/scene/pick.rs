@@ -94,7 +94,14 @@ fn ray_box_hit(ray: crate::camera::Ray, field_box: &FieldBox) -> Option<f32> {
 /// The nearest visible object proxy under a pointer. This intentionally ignores
 /// plane/probe authoring geometry so an already-selected object's own visible
 /// body remains a reliable free-drag target.
-pub fn pick_object(
+///
+/// Not `pub`, and only compiled for tests: no production caller reaches for
+/// this directly today — `pick_scene` above calls `nearest_object_hit`
+/// itself instead. Re-exporting an unused-but-tempting function anyway is
+/// exactly the kind of surface that let UI-1 happen elsewhere in this
+/// module tree.
+#[cfg(test)]
+fn pick_object(
     world: &WorldSnapshot,
     show: SceneVisibility,
     camera: &OrbitCamera,

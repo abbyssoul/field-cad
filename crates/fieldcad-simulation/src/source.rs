@@ -20,10 +20,15 @@ use fieldcad_plugin_api::FieldBrushStroke;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
+use crate::async_source::CommandEvent;
 use crate::runtime::{
     EditHistoryStatus, FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus,
     Subscription, TickPacer,
 };
+
+/// Retained terminal command records per session, per
+/// `docs/tasks/session-events-and-queue-control.md`.
+const MAX_TERMINAL_HISTORY: usize = 256;
 
 /// Client-issued identity for one command, echoed in its acknowledgement.
 ///
@@ -121,12 +126,215 @@ pub enum CommandPayload {
     /// would be guessing.
     Undo,
     Redo,
+    /// Hold queued scene/domain mutations at their tick boundary until
+    /// resumed. Simulation ticks continue; new eligible mutations are still
+    /// accepted and appended. Never itself queued, and idempotent.
+    PauseQueue,
+    /// Resume a paused queue: held mutations apply at the next eligible tick
+    /// boundary, in submission order. Idempotent.
+    ResumeQueue,
+    /// Cancel one command still waiting for a tick boundary. Only a command
+    /// that has not yet applied is cancellable — there is no per-command
+    /// cancellation of in-flight solver work here; `SolverCancellation`
+    /// remains session-level.
+    CancelQueuedCommand(CommandId),
+}
+
+impl CommandPayload {
+    /// The stable, payload-free label carried by this command's
+    /// [`CommandRecord`] while it is queued or after it goes terminal.
+    pub fn kind(&self) -> CommandKind {
+        match self {
+            Self::Play => CommandKind::Play,
+            Self::Pause => CommandKind::Pause,
+            Self::Step => CommandKind::Step,
+            Self::SetTimeStep(_) => CommandKind::SetTimeStep,
+            Self::ReconfigureDomain(_) => CommandKind::ReconfigureDomain,
+            Self::SetPlaybackSpeed(_) => CommandKind::SetPlaybackSpeed,
+            Self::SetSubscription(_) => CommandKind::SetSubscription,
+            Self::SetFieldSystemEnabled { .. } => CommandKind::SetFieldSystemEnabled,
+            Self::SetFieldSystemRealtime { .. } => CommandKind::SetFieldSystemRealtime,
+            Self::SetFieldModel { .. } => CommandKind::SetFieldModel,
+            Self::SetInteractiveEdit(_) => CommandKind::SetInteractiveEdit,
+            Self::ApplyFieldBrushStroke(_) => CommandKind::ApplyFieldBrushStroke,
+            Self::CommitWorld(_) => CommandKind::CommitWorld,
+            Self::Undo => CommandKind::Undo,
+            Self::Redo => CommandKind::Redo,
+            Self::PauseQueue => CommandKind::PauseQueue,
+            Self::ResumeQueue => CommandKind::ResumeQueue,
+            Self::CancelQueuedCommand(_) => CommandKind::CancelQueuedCommand,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     pub id: CommandId,
     pub payload: CommandPayload,
+}
+
+/// The payload-free shape of one [`CommandPayload`] variant, retained in a
+/// [`CommandRecord`] after the payload itself is discarded (queued only, or
+/// never serialized at all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    Play,
+    Pause,
+    Step,
+    SetTimeStep,
+    ReconfigureDomain,
+    SetPlaybackSpeed,
+    SetSubscription,
+    SetFieldSystemEnabled,
+    SetFieldSystemRealtime,
+    SetFieldModel,
+    SetInteractiveEdit,
+    ApplyFieldBrushStroke,
+    CommitWorld,
+    Undo,
+    Redo,
+    PauseQueue,
+    ResumeQueue,
+    CancelQueuedCommand,
+}
+
+impl CommandKind {
+    /// A short, human-facing label — for a queue inspector, not the wire
+    /// format (which uses the `snake_case` `Serialize` form above).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Play => "Play",
+            Self::Pause => "Pause",
+            Self::Step => "Step",
+            Self::SetTimeStep => "Set time step",
+            Self::ReconfigureDomain => "Reconfigure domain",
+            Self::SetPlaybackSpeed => "Set playback speed",
+            Self::SetSubscription => "Set subscription",
+            Self::SetFieldSystemEnabled => "Set field system enabled",
+            Self::SetFieldSystemRealtime => "Set field system realtime",
+            Self::SetFieldModel => "Set field model",
+            Self::SetInteractiveEdit => "Set interactive edit",
+            Self::ApplyFieldBrushStroke => "Field brush stroke",
+            Self::CommitWorld => "Commit world",
+            Self::Undo => "Undo",
+            Self::Redo => "Redo",
+            Self::PauseQueue => "Pause queue",
+            Self::ResumeQueue => "Resume queue",
+            Self::CancelQueuedCommand => "Cancel queued command",
+        }
+    }
+}
+
+/// Where one command currently stands in the mutation queue's lifecycle.
+///
+/// A `Submitted` record is never produced by [`SessionCore`] itself — it
+/// exists only for [`crate::async_source::AsyncLocalDataSource`] to
+/// synthesize a display entry for a command already sent to its worker
+/// thread but not yet executed there (see
+/// [`CommandRecord::submitted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandLifecycle {
+    Submitted,
+    Queued,
+    Applied,
+    Rejected,
+    Cancelled,
+}
+
+/// The mutation a queued [`CommandRecord`] will apply at the next eligible
+/// tick boundary. Cleared the instant a record goes terminal, and never
+/// serialized — an MCP client never needs to see or reconstruct it, and a
+/// `CommitWorld` payload can be arbitrarily large.
+#[derive(Clone, Debug, PartialEq)]
+enum PendingPayload {
+    World(Vec<WorldCommand>),
+    Domain(Domain),
+}
+
+/// One command's identity, order, and lifecycle — replaces a payload-only
+/// pending mutation so identity survives worker submission and tick-boundary
+/// application, and so a terminal command remains inspectable afterward.
+///
+/// Derives `Serialize` only: like every other outward-only wire type in this
+/// crate, nothing ever reconstructs one from JSON.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CommandRecord {
+    pub command: CommandId,
+    pub kind: CommandKind,
+    /// Submission order. Assigned by `SessionCore`'s own monotonic counter —
+    /// a wall-clock timestamp isn't needed for "submission order" and this
+    /// keeps the type deterministic and dependency-free. Meaningless (always
+    /// `0`) for a `Submitted` record synthesized before it reaches the queue.
+    pub sequence: u64,
+    pub state: CommandLifecycle,
+    /// Set once `state` is `Applied`.
+    pub receipt: Option<CommandReceipt>,
+    /// Set once `state` is `Rejected`.
+    pub error: Option<String>,
+    #[serde(skip)]
+    payload: Option<PendingPayload>,
+}
+
+impl CommandRecord {
+    fn queued(
+        command: CommandId,
+        kind: CommandKind,
+        sequence: u64,
+        payload: PendingPayload,
+    ) -> Self {
+        Self {
+            command,
+            kind,
+            sequence,
+            state: CommandLifecycle::Queued,
+            receipt: None,
+            error: None,
+            payload: Some(payload),
+        }
+    }
+
+    /// A display-only record for a command already sent to a worker thread
+    /// but not yet executed there. See [`CommandLifecycle::Submitted`].
+    pub fn submitted(command: CommandId, kind: CommandKind) -> Self {
+        Self {
+            command,
+            kind,
+            sequence: 0,
+            state: CommandLifecycle::Submitted,
+            receipt: None,
+            error: None,
+            payload: None,
+        }
+    }
+}
+
+/// Authoritative queue state: whether it is paused, the ordered commands
+/// still waiting for a tick boundary, and recent terminal history (capped at
+/// [`MAX_TERMINAL_HISTORY`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct QueueStatus {
+    pub paused: bool,
+    /// Oldest first: index `0` applies next when eligible.
+    pub pending: Vec<CommandRecord>,
+    /// Oldest first.
+    pub history: Vec<CommandRecord>,
+}
+
+/// The shape of a [`QueueStatus`] without its contents: whether it is
+/// paused, how many pending/history records it holds, and the newest
+/// history entry's id. A change-detecting caller (a publish/broadcast loop
+/// that only needs to notice "the queue moved," not read what moved) can
+/// build one of these from `pending.len()`/`history.len()`/`history.last()`
+/// — none of which need `pending` or `history` themselves cloned, unlike
+/// building a whole [`QueueStatus`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueSummary {
+    pub paused: bool,
+    pub pending_len: usize,
+    pub history_len: usize,
+    pub newest_history: Option<CommandId>,
 }
 
 /// Wall-clock playback rate, kept separate from the numerical time step.
@@ -237,6 +445,25 @@ pub trait FieldDataSource: Send {
     fn domain(&self) -> Domain;
     fn playback_speed(&self) -> PlaybackSpeed;
     fn pending_command_count(&self) -> usize;
+    /// Authoritative queue state: paused flag, ordered pending commands, and
+    /// recent terminal history. See `docs/tasks/session-events-and-queue-control.md`.
+    fn get_queue(&self) -> QueueStatus;
+    /// The queue's shape without its contents — for a caller (a change
+    /// detector, a per-frame view builder deciding whether to keep last
+    /// frame's `get_queue()` result) that only needs to know whether the
+    /// queue moved, not read what moved. The default falls back to
+    /// `get_queue()` itself, so it is always correct; override it wherever a
+    /// cheaper path exists — nothing overriding this should ever need to
+    /// clone `pending`/`history` to answer it.
+    fn queue_summary(&self) -> QueueSummary {
+        let queue = self.get_queue();
+        QueueSummary {
+            paused: queue.paused,
+            pending_len: queue.pending.len(),
+            history_len: queue.history.len(),
+            newest_history: queue.history.last().map(|record| record.command),
+        }
+    }
     /// What the source is currently asked to publish. Acknowledged, not hoped
     /// for: it reflects the last accepted [`CommandPayload::SetSubscription`].
     fn subscription(&self) -> Subscription;
@@ -344,6 +571,18 @@ pub enum SourceError {
     Disconnected,
     #[error("solver reported '{code}': {message}")]
     Solver { code: String, message: String },
+    #[error(
+        "the mutation queue is paused; '{command}' cannot proceed until the queue resumes or its blocking work is cancelled"
+    )]
+    QueuePaused { command: &'static str },
+    #[error(
+        "no queued command with id {0:?} to cancel (already applied, rejected, cancelled, or unknown)"
+    )]
+    CommandNotQueued(CommandId),
+    #[error(
+        "'{command}' cannot proceed: a queued mutation was rejected while flushing the pending queue"
+    )]
+    FlushRejected { command: &'static str },
 }
 
 impl From<RuntimeError> for SourceError {
@@ -367,12 +606,23 @@ struct SessionCore {
     runtime: SimulationRuntime,
     pacer: TickPacer,
     playback_speed: PlaybackSpeed,
-    pending_mutations: VecDeque<PendingMutation>,
-}
-
-enum PendingMutation {
-    World(Vec<WorldCommand>),
-    Domain(Domain),
+    pending_mutations: VecDeque<CommandRecord>,
+    /// Capped at [`MAX_TERMINAL_HISTORY`], oldest evicted first.
+    terminal_history: VecDeque<CommandRecord>,
+    /// Holds queued scene/domain mutations at their tick boundary. Distinct
+    /// from `SimulationMode`: simulation ticks continue while this is set.
+    queue_paused: bool,
+    next_sequence: u64,
+    /// Terminal [`CommandEvent`]s produced by something other than the
+    /// current call's own direct return (a flushed mutation, a
+    /// cancellation), accumulated across calls until [`Self::take_emitted`]
+    /// is called — the one buffer both `LocalDataSource` and
+    /// `LoopbackDataSource` used to keep a second, separately-drained copy
+    /// of, forwarding through their own `command_events` field and
+    /// `drain_command_events` on every `execute`/`poll`. Living here once
+    /// removes that duplication: a wrapper's own `drain_command_events` is
+    /// just `self.core.take_emitted()`.
+    emitted: Vec<CommandEvent>,
 }
 
 /// What one wall-clock advance actually did.
@@ -397,6 +647,10 @@ impl SessionCore {
             pacer: TickPacer::default(),
             playback_speed: PlaybackSpeed::default(),
             pending_mutations: VecDeque::new(),
+            terminal_history: VecDeque::new(),
+            queue_paused: false,
+            next_sequence: 0,
+            emitted: Vec::new(),
         }
     }
 
@@ -412,24 +666,65 @@ impl SessionCore {
         self.pending_mutations.len()
     }
 
-    /// Apply one command to the authoritative side and report how it landed,
-    /// plus what it created if it was an immediately-applied `CommitWorld`.
-    fn execute(
-        &mut self,
-        payload: CommandPayload,
-    ) -> Result<(CommandDisposition, CommitReport), SourceError> {
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
+    }
+
+    fn queue_status(&self) -> QueueStatus {
+        QueueStatus {
+            paused: self.queue_paused,
+            pending: self.pending_mutations.iter().cloned().collect(),
+            history: self.terminal_history.iter().cloned().collect(),
+        }
+    }
+
+    fn queue_summary(&self) -> QueueSummary {
+        QueueSummary {
+            paused: self.queue_paused,
+            pending_len: self.pending_mutations.len(),
+            history_len: self.terminal_history.len(),
+            newest_history: self.terminal_history.back().map(|record| record.command),
+        }
+    }
+
+    /// Drains every terminal event accumulated since the last drain — a
+    /// flushed mutation, a cancellation, or an ordinary `execute`/`advance`
+    /// completion. The wrapping source's own `drain_command_events` is
+    /// exactly this call.
+    fn take_emitted(&mut self) -> Vec<CommandEvent> {
+        std::mem::take(&mut self.emitted)
+    }
+
+    /// Clears the record's payload (a terminal record needs no payload to
+    /// replay, only its outcome) and appends it to the capped history ring.
+    fn record_terminal(&mut self, mut record: CommandRecord) {
+        record.payload = None;
+        self.terminal_history.push_back(record);
+        while self.terminal_history.len() > MAX_TERMINAL_HISTORY {
+            self.terminal_history.pop_front();
+        }
+    }
+
+    /// Apply one command to the authoritative side and report how it landed.
+    fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
+        let id = command.id;
+        let kind = command.payload.kind();
         let mut created = None;
-        match payload {
+        match command.payload {
             CommandPayload::Play => {
                 self.runtime.play();
                 self.pacer.reset();
             }
             CommandPayload::Pause => {
-                self.flush_pending_mutations()?;
+                self.reject_if_queue_paused("pause")?;
+                self.flush_and_check("pause")?;
                 self.runtime.pause();
             }
             CommandPayload::Step => {
-                self.flush_pending_mutations()?;
+                self.reject_if_queue_paused("step")?;
+                self.flush_and_check("step")?;
                 self.runtime.step_once()?;
             }
             CommandPayload::SetTimeStep(step) => {
@@ -438,9 +733,15 @@ impl SessionCore {
             }
             CommandPayload::ReconfigureDomain(domain) => {
                 if self.runtime.status().mode() == SimulationMode::Running {
-                    self.pending_mutations
-                        .push_back(PendingMutation::Domain(domain));
-                    return Ok((
+                    let record = CommandRecord::queued(
+                        id,
+                        kind,
+                        self.next_sequence(),
+                        PendingPayload::Domain(domain),
+                    );
+                    self.pending_mutations.push_back(record);
+                    return Ok(self.receipt(
+                        id,
                         CommandDisposition::Queued,
                         CommitReport::empty(self.runtime.status().world_revision),
                     ));
@@ -474,9 +775,15 @@ impl SessionCore {
             }
             CommandPayload::CommitWorld(commands) => {
                 if self.runtime.status().mode() == SimulationMode::Running {
-                    self.pending_mutations
-                        .push_back(PendingMutation::World(commands));
-                    return Ok((
+                    let record = CommandRecord::queued(
+                        id,
+                        kind,
+                        self.next_sequence(),
+                        PendingPayload::World(commands),
+                    );
+                    self.pending_mutations.push_back(record);
+                    return Ok(self.receipt(
+                        id,
                         CommandDisposition::Queued,
                         CommitReport::empty(self.runtime.status().world_revision),
                     ));
@@ -487,43 +794,100 @@ impl SessionCore {
                 // Never queued. An edit waiting for a tick boundary is an edit
                 // the history has not recorded yet, so undoing past it would
                 // step over an edit that is still on its way in.
-                self.flush_pending_mutations()?;
+                self.reject_if_queue_paused("undo")?;
+                self.flush_and_check("undo")?;
                 self.runtime.undo()?;
             }
             CommandPayload::Redo => {
-                self.flush_pending_mutations()?;
+                self.reject_if_queue_paused("redo")?;
+                self.flush_and_check("redo")?;
                 self.runtime.redo()?;
             }
+            CommandPayload::PauseQueue => {
+                self.queue_paused = true;
+            }
+            CommandPayload::ResumeQueue => {
+                self.queue_paused = false;
+            }
+            CommandPayload::CancelQueuedCommand(target) => {
+                let Some(index) = self
+                    .pending_mutations
+                    .iter()
+                    .position(|record| record.command == target)
+                else {
+                    return Err(SourceError::CommandNotQueued(target));
+                };
+                let mut record = self
+                    .pending_mutations
+                    .remove(index)
+                    .expect("index was just found in this deque");
+                record.state = CommandLifecycle::Cancelled;
+                self.record_terminal(record);
+                self.emitted.push(CommandEvent::Cancelled(target));
+            }
         }
-        let created = created.unwrap_or_else(|| CommitReport::empty(self.runtime.status().world_revision));
-        Ok((CommandDisposition::Applied, created))
+        let created =
+            created.unwrap_or_else(|| CommitReport::empty(self.runtime.status().world_revision));
+        Ok(self.receipt(id, CommandDisposition::Applied, created))
+    }
+
+    /// `Pause`/`Step`/`Undo`/`Redo` must not silently flush a paused queue.
+    /// Fires only when there is something a flush would actually hold back —
+    /// pausing an idle queue must not block these commands.
+    fn reject_if_queue_paused(&self, command: &'static str) -> Result<(), SourceError> {
+        if self.queue_paused && !self.pending_mutations.is_empty() {
+            return Err(SourceError::QueuePaused { command });
+        }
+        Ok(())
+    }
+
+    /// Flushes the pending queue and aborts `command` if the flush rejected
+    /// a mutation. `Pause`/`Step`/`Undo`/`Redo` all move the runtime past a
+    /// tick boundary, so they must not proceed on top of a boundary whose
+    /// preceding queued edit never actually landed — the mode is left
+    /// unchanged so the rejected mutation's still-queued successors get
+    /// another flush attempt on the next `advance` rather than being
+    /// stranded by a state change to non-`Running` (see `advance`).
+    fn flush_and_check(&mut self, command: &'static str) -> Result<(), SourceError> {
+        let summary = self.flush_pending_mutations();
+        if summary.rejected {
+            return Err(SourceError::FlushRejected { command });
+        }
+        Ok(())
     }
 
     /// Take in wall-clock time and advance whole fixed ticks, applying queued
-    /// edits immediately before the first of them.
+    /// edits immediately before the first of them, unless the queue is
+    /// paused — a paused queue holds its mutations across ticks.
     fn advance(&mut self, elapsed: Duration) -> Result<TickProgress, SourceError> {
         let status = self.runtime.status();
         let elapsed = scale_elapsed(elapsed, self.playback_speed);
         let demand = self.pacer.ticks_due(elapsed, status.time_step());
 
-        let commands_applied = if demand.ticks > 0 && status.mode() == SimulationMode::Running {
-            self.flush_pending_mutations()?
-        } else {
-            0
-        };
+        let summary =
+            if demand.ticks > 0 && status.mode() == SimulationMode::Running && !self.queue_paused {
+                self.flush_pending_mutations()
+            } else {
+                FlushSummary::default()
+            };
         let status_after_flush = self.runtime.status();
 
+        // A rejected flush stops this cycle's ticks rather than advancing
+        // past a boundary whose mutation just failed; the tick resumes
+        // normally on the next `advance` call.
         let mut ticks_advanced = 0;
-        for _ in 0..demand.ticks {
-            if !self.runtime.advance_running()? {
-                break;
+        if !summary.rejected {
+            for _ in 0..demand.ticks {
+                if !self.runtime.advance_running()? {
+                    break;
+                }
+                ticks_advanced += 1;
             }
-            ticks_advanced += 1;
         }
 
         Ok(TickProgress {
             ticks_advanced,
-            commands_applied,
+            commands_applied: summary.applied,
             fell_behind: demand.fell_behind && ticks_advanced > 0,
             status_after_flush,
         })
@@ -546,22 +910,60 @@ impl SessionCore {
         }
     }
 
-    fn flush_pending_mutations(&mut self) -> Result<u32, SourceError> {
-        let mut applied = 0;
-        while let Some(mutation) = self.pending_mutations.pop_front() {
-            match mutation {
-                PendingMutation::World(commands) => {
-                    self.runtime.commit_world_commands(commands)?;
+    /// Applies every still-queued mutation in submission order. Infallible:
+    /// a rejected mutation becomes its own terminal `Rejected` record
+    /// (observable through `get_queue()`'s history) rather than failing the
+    /// whole tick boundary or command that triggered the flush.
+    fn flush_pending_mutations(&mut self) -> FlushSummary {
+        let mut summary = FlushSummary::default();
+        while let Some(mut record) = self.pending_mutations.pop_front() {
+            let command_id = record.command;
+            let payload = record
+                .payload
+                .take()
+                .expect("a queued record always carries its payload");
+            let result: Result<CommitReport, RuntimeError> = match payload {
+                PendingPayload::World(commands) => self.runtime.commit_world_commands(commands),
+                PendingPayload::Domain(domain) => {
+                    let outcome = self.runtime.reconfigure_domain(domain);
+                    if outcome.is_ok() {
+                        self.pacer.reset();
+                    }
+                    outcome.map(|()| CommitReport::empty(self.runtime.status().world_revision))
                 }
-                PendingMutation::Domain(domain) => {
-                    self.runtime.reconfigure_domain(domain)?;
-                    self.pacer.reset();
+            };
+            match result {
+                Ok(created) => {
+                    let receipt = self.receipt(command_id, CommandDisposition::Applied, created);
+                    record.state = CommandLifecycle::Applied;
+                    record.receipt = Some(receipt.clone());
+                    self.record_terminal(record);
+                    self.emitted.push(CommandEvent::Completed(receipt));
+                    summary.applied += 1;
+                }
+                Err(error) => {
+                    let error: SourceError = error.into();
+                    record.state = CommandLifecycle::Rejected;
+                    record.error = Some(error.to_string());
+                    self.record_terminal(record);
+                    self.emitted.push(CommandEvent::Failed {
+                        command: command_id,
+                        error,
+                    });
+                    summary.rejected = true;
+                    break;
                 }
             }
-            applied += 1;
         }
-        Ok(applied)
+        summary
     }
+}
+
+/// What one call to [`SessionCore::flush_pending_mutations`] did.
+#[derive(Default)]
+struct FlushSummary {
+    applied: u32,
+    rejected: bool,
 }
 
 /// Wraps an in-process runtime.
@@ -624,6 +1026,14 @@ impl FieldDataSource for LocalDataSource {
         self.core.pending_count()
     }
 
+    fn get_queue(&self) -> QueueStatus {
+        self.core.queue_status()
+    }
+
+    fn queue_summary(&self) -> QueueSummary {
+        self.core.queue_summary()
+    }
+
     fn subscription(&self) -> Subscription {
         self.core.runtime.subscription()
     }
@@ -645,9 +1055,14 @@ impl FieldDataSource for LocalDataSource {
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
-        let (disposition, created) = self.core.execute(command.payload)?;
+        // `core.emitted` accumulates regardless of the outcome below, so a
+        // side-effect flush's events are never lost even when the command
+        // that triggered them is itself rejected — nothing here needs to
+        // drain it before propagating `?`, unlike when each wrapper kept a
+        // second, separately-drained copy of this buffer.
+        let receipt = self.core.execute(command)?;
         self.publish()?;
-        Ok(self.core.receipt(command.id, disposition, created))
+        Ok(receipt)
     }
 
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
@@ -662,6 +1077,10 @@ impl FieldDataSource for LocalDataSource {
 
     fn latest_snapshot(&self) -> Option<Arc<FieldSnapshot>> {
         self.mailbox.latest()
+    }
+
+    fn drain_command_events(&mut self) -> Vec<CommandEvent> {
+        self.core.take_emitted()
     }
 }
 
@@ -783,6 +1202,17 @@ impl FieldDataSource for LoopbackDataSource {
         self.core.pending_count()
     }
 
+    fn get_queue(&self) -> QueueStatus {
+        // Unfiltered by `believed_*`: the queue itself, unlike a snapshot, is
+        // already known synchronously in this stand-in, matching the
+        // existing precedent set by `pending_command_count` above.
+        self.core.queue_status()
+    }
+
+    fn queue_summary(&self) -> QueueSummary {
+        self.core.queue_summary()
+    }
+
     fn subscription(&self) -> Subscription {
         self.core.runtime.subscription()
     }
@@ -804,14 +1234,16 @@ impl FieldDataSource for LoopbackDataSource {
             return Err(SourceError::Disconnected);
         }
 
-        let (disposition, created) = self.core.execute(command.payload)?;
+        // `core.emitted` accumulates regardless of the outcome below — see
+        // `LocalDataSource::execute`.
+        let receipt = self.core.execute(command)?;
         // A queued edit has changed nothing the server can publish or the client
         // can believe yet, so nothing goes on the wire until its boundary.
-        if disposition == CommandDisposition::Applied {
+        if receipt.disposition == CommandDisposition::Applied {
             self.transmit();
             self.adopt(self.core.status());
         }
-        Ok(self.core.receipt(command.id, disposition, created))
+        Ok(receipt)
     }
 
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
@@ -847,6 +1279,10 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn latest_snapshot(&self) -> Option<Arc<FieldSnapshot>> {
         self.mailbox.latest()
+    }
+
+    fn drain_command_events(&mut self) -> Vec<CommandEvent> {
+        self.core.take_emitted()
     }
 }
 

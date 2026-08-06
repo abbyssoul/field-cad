@@ -15,8 +15,8 @@
 
 use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, ComponentTypeId, Dimension, FieldValueKind,
-    ObjectId, ObjectShape, PluginId, PropertyBag, PropertyId, PropertyKind, PropertySchema,
-    PropertyValue, Quantity, QuantityError, Velocity, WorldObject, WorldSnapshot,
+    ObjectId, PluginId, PointOrSphere, PointOrSphereError, PropertyBag, PropertyId, PropertyKind,
+    PropertySchema, PropertyValue, Quantity, QuantityError, Velocity, WorldObject, WorldSnapshot,
 };
 use glam::DVec3;
 
@@ -117,10 +117,32 @@ pub fn charge_properties(coulombs: f64) -> Result<PropertyBag, QuantityError> {
     .collect())
 }
 
+/// The variants mirror [`fieldcad_mass_sources::MassDistribution`] because
+/// the geometry question is the same one — [`PointOrSphere`] answers it
+/// once, shared by both — the quantity spread over that geometry is what
+/// differs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ChargeDistribution {
     Point { exclusion_radius: f64 },
     UniformSphere { radius: f64 },
+}
+
+impl From<PointOrSphere> for ChargeDistribution {
+    fn from(value: PointOrSphere) -> Self {
+        match value {
+            PointOrSphere::Point { exclusion_radius } => Self::Point { exclusion_radius },
+            PointOrSphere::UniformSphere { radius } => Self::UniformSphere { radius },
+        }
+    }
+}
+
+impl From<ChargeDistribution> for PointOrSphere {
+    fn from(value: ChargeDistribution) -> Self {
+        match value {
+            ChargeDistribution::Point { exclusion_radius } => Self::Point { exclusion_radius },
+            ChargeDistribution::UniformSphere { radius } => Self::UniformSphere { radius },
+        }
+    }
 }
 
 /// The exclusion radius given to a charged object with no authored shape.
@@ -155,30 +177,16 @@ fn source_from_object(
             object: object.name.clone(),
         }
     })?;
-    let distribution = match object.shape {
-        Some(ObjectShape::Point { radius }) => ChargeDistribution::Point {
-            exclusion_radius: radius,
-        },
-        Some(ObjectShape::Sphere { radius }) if radius > 0.0 => {
-            ChargeDistribution::UniformSphere { radius }
-        }
-        Some(ObjectShape::Sphere { .. }) => {
-            return Err(ChargeSourceError::NonPositiveSphere {
+    let distribution = PointOrSphere::from_shape(object.shape, DEFAULT_POINT_RADIUS)
+        .map_err(|error| match error {
+            PointOrSphereError::NonPositiveSphere => ChargeSourceError::NonPositiveSphere {
                 object: object.name.clone(),
-            });
-        }
-        // A shapeless object is a point in space, and a point in space carrying
-        // charge is a point charge. Rejecting it would break the composition
-        // flow, where an object is created bare and given charge afterwards.
-        None => ChargeDistribution::Point {
-            exclusion_radius: DEFAULT_POINT_RADIUS,
-        },
-        Some(ObjectShape::Box { .. }) => {
-            return Err(ChargeSourceError::UnsupportedShape {
+            },
+            PointOrSphereError::UnsupportedShape => ChargeSourceError::UnsupportedShape {
                 object: object.name.clone(),
-            });
-        }
-    };
+            },
+        })?
+        .into();
     Ok(ChargeSource {
         object: object.id,
         position: object.transform.translation,
@@ -200,7 +208,7 @@ pub enum ChargeSourceError {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{ObjectSpec, Transform, World, WorldCommand};
+    use fieldcad_core::{ObjectShape, ObjectSpec, Transform, World, WorldCommand};
 
     use super::*;
 

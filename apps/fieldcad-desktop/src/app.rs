@@ -1,12 +1,13 @@
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
 use fieldcad_core::{
-    BoundaryCondition, BoundaryConditions, Domain, DomainBounds, FieldBoxSpec, FieldSphereSpec,
-    ObjectShape, ObjectSpec, Precision, ProbePosition, ProbeSpec, Resolution, SessionId,
-    SimulationMode, SlicePlaneSpec, TimeStep, Transform, WorldCommand, WorldSnapshot,
+    BoundaryCondition, BoundaryConditions, ChannelId, Domain, DomainBounds, FieldBoxSpec,
+    FieldSphereSpec, ObjectShape, ObjectSpec, Precision, ProbePosition, ProbeSpec, Resolution,
+    SessionId, SimulationMode, SlicePlaneSpec, TimeStep, Transform, WorldCommand, WorldSnapshot,
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electromagnetism::{
@@ -24,8 +25,9 @@ use fieldcad_gravity::NewtonianGravityPlugin;
 use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
-    AsyncLocalDataSource, CommandEvent, CommandPayload, FieldDataSource, LocalDataSource,
-    PluginRegistration, ProbeHistory, RuntimeConfig, SimulationRuntime, Subscription,
+    AsyncLocalDataSource, CommandEvent, CommandId, CommandPayload, FieldDataSource,
+    LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig, SimulationRuntime,
+    Subscription,
 };
 use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2};
 use winit::{
@@ -185,6 +187,89 @@ fn lock_model(data_source: &Mutex<HeadlessServer>) -> MutexGuard<'_, HeadlessSer
     data_source.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// [`WindowState::field_layer_geometry`]'s memoized result, plus the inputs
+/// it was computed from.
+struct FieldGeometryCache {
+    key: FieldGeometryKey,
+    geometry: scene::FieldGeometry,
+}
+
+#[derive(PartialEq)]
+struct FieldGeometryKey {
+    /// `None` when there is no snapshot yet to draw from — distinct from any
+    /// real `(session, sequence)` pair, so an empty scene is never mistaken
+    /// for a match against one that has since published its first snapshot.
+    snapshot: Option<(SessionId, u64)>,
+    field_layers: BTreeMap<ChannelId, ui::ChannelLayerSettings>,
+    show: scene::SceneVisibility,
+}
+
+/// A vector layer's triangles and arrows are pure functions of the snapshot
+/// it reads, the layer settings that shaped it, and which scene classes are
+/// visible — see [`scene::field_geometry`]. None of that changes between two
+/// frames of a paused, static scene, yet the interpolation this drives
+/// (trilinear per glyph, both surface and vector passes) is the most
+/// expensive thing this module does per frame. `field_snapshot` is compared
+/// by `(session, sequence)` rather than by value for the same reason
+/// [`ComputeView::build`] does: every path that changes a channel's
+/// published batches publishes a new sequence.
+///
+/// Returns the geometry to draw this frame, and, only on a cache miss, the
+/// cache entry to replace it with — `None` on a hit means the existing cache
+/// is still current and the caller need not touch it (in particular, need
+/// not clone `field_layers` again).
+///
+/// Free rather than a `WindowState` method so the caching decision is
+/// testable without a window or a GPU device.
+fn compute_field_layer_geometry(
+    cache: Option<&FieldGeometryCache>,
+    field_snapshot: Option<&fieldcad_core::FieldSnapshot>,
+    field_layers: &BTreeMap<ChannelId, ui::ChannelLayerSettings>,
+    show: scene::SceneVisibility,
+    vector_channels: &[ChannelId],
+) -> (scene::FieldGeometry, Option<FieldGeometryCache>) {
+    let snapshot_identity =
+        field_snapshot.map(|snapshot| (snapshot.identity.session, snapshot.identity.sequence));
+    if let Some(cache) = cache
+        && cache.key.snapshot == snapshot_identity
+        && cache.key.show == show
+        && cache.key.field_layers == *field_layers
+    {
+        return (cache.geometry.clone(), None);
+    }
+
+    let mut geometry = scene::FieldGeometry::default();
+    if let Some(field_snapshot) = field_snapshot {
+        for (channel, layer) in field_layers {
+            if !layer.visible || !vector_channels.contains(channel) {
+                continue;
+            }
+            let layer_geometry = scene::field_geometry(
+                field_snapshot,
+                channel,
+                layer.whole_domain,
+                &layer.planes,
+                &layer.boxes,
+                &layer.spheres,
+                show,
+            );
+            geometry
+                .surface_triangles
+                .extend(layer_geometry.surface_triangles);
+            geometry.vector_lines.extend(layer_geometry.vector_lines);
+        }
+    }
+    let new_cache = FieldGeometryCache {
+        key: FieldGeometryKey {
+            snapshot: snapshot_identity,
+            field_layers: field_layers.clone(),
+            show,
+        },
+        geometry: geometry.clone(),
+    };
+    (geometry, Some(new_cache))
+}
+
 /// Field order is drop order. `egui_state` and `renderer` both reference the
 /// window, so they are declared before it; `ViewportRenderer` additionally
 /// drains the GPU queue on drop. Dropping the window first tears out the native
@@ -208,6 +293,13 @@ struct WindowState {
     /// Mirrors the source's world so panels and picking read one consistent
     /// revision for the whole frame.
     world: WorldSnapshot,
+    /// Last frame's [`ComputeView`], reused where its snapshot- and
+    /// queue-derived fields still match the source — see
+    /// [`ComputeView::build`].
+    compute: Option<ComputeView>,
+    /// The channel-layer loop's last output, plus the inputs it was built
+    /// from — see [`WindowState::field_layer_geometry`].
+    field_geometry_cache: Option<FieldGeometryCache>,
     probe_history: ProbeHistory,
     /// The numerical run generation whose recorder data is currently held.
     /// A domain reset creates a fresh t=0 run and must not join its samples to
@@ -285,6 +377,8 @@ impl WindowState {
             viewport: Viewport::default(),
             data_source: Arc::new(Mutex::new(HeadlessServer::new(data_source))),
             world,
+            compute: None,
+            field_geometry_cache: None,
             probe_history: ProbeHistory::default(),
             run_generation,
             active_transform: None,
@@ -310,6 +404,31 @@ impl WindowState {
     /// its own next lock attempt.
     fn model(&self) -> MutexGuard<'_, HeadlessServer> {
         lock_model(&self.data_source)
+    }
+
+    /// The channel-layer loop's contribution to the scene, alone (authoring
+    /// proxies, compute bounds, and the gizmo are appended separately, since
+    /// they depend on live drag/selection state that changes far more often
+    /// than a snapshot). Thin wrapper around [`compute_field_layer_geometry`]
+    /// that owns the cache across frames — split out so the caching decision
+    /// itself is testable without a window or a GPU device.
+    fn field_layer_geometry(
+        &mut self,
+        field_snapshot: Option<&fieldcad_core::FieldSnapshot>,
+        show: scene::SceneVisibility,
+        vector_channels: &[ChannelId],
+    ) -> scene::FieldGeometry {
+        let (geometry, new_cache) = compute_field_layer_geometry(
+            self.field_geometry_cache.as_ref(),
+            field_snapshot,
+            &self.ui_model.field_layers,
+            show,
+            vector_channels,
+        );
+        if let Some(new_cache) = new_cache {
+            self.field_geometry_cache = Some(new_cache);
+        }
+        geometry
     }
 
     fn handle_window_event(
@@ -419,6 +538,12 @@ impl WindowState {
                     CommandEvent::Failed { command, error } => {
                         self.ui_model.command_error = Some(error.to_string());
                         tracing::warn!(command = command.get(), %error, "compute command rejected");
+                        if let Some(gesture) = &mut self.edit_gesture {
+                            gesture.pause_rejected(command);
+                        }
+                    }
+                    CommandEvent::Cancelled(command) => {
+                        tracing::debug!(command = command.get(), "queued command cancelled");
                     }
                 }
             }
@@ -432,7 +557,7 @@ impl WindowState {
             return Ok(());
         }
 
-        let compute = ComputeView::build(&*self.model(), &self.world);
+        let compute = ComputeView::build(&*self.model(), &self.world, self.compute.as_ref());
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let pixels_per_point_before_frame = self.egui_context.pixels_per_point().max(0.01);
         let transform_preview = self.active_transform.map(ActiveTransformDrag::preview);
@@ -446,6 +571,7 @@ impl WindowState {
                     self.viewport,
                     selection,
                     transform_preview,
+                    self.ui_model.view.gizmo_display,
                 )
             })
             .map(|position| {
@@ -551,27 +677,9 @@ impl WindowState {
         let instances = scene::instances(&self.world, self.ui_model.selection, show);
         // Every visible layer names a channel declared by the snapshot. Several
         // channels (for example Maxwell E and B) can be drawn independently.
-        let mut field = scene::FieldGeometry::default();
-        if let Some(snapshot) = self.model().latest_snapshot() {
-            for (channel, layer) in &self.ui_model.field_layers {
-                if !layer.visible || !compute.vector_channels.contains(channel) {
-                    continue;
-                }
-                let layer_geometry = scene::field_geometry(
-                    &snapshot,
-                    channel,
-                    layer.whole_domain,
-                    &layer.planes,
-                    &layer.boxes,
-                    &layer.spheres,
-                    show,
-                );
-                field
-                    .surface_triangles
-                    .extend(layer_geometry.surface_triangles);
-                field.vector_lines.extend(layer_geometry.vector_lines);
-            }
-        }
+        let field_snapshot = self.model().latest_snapshot();
+        let mut field =
+            self.field_layer_geometry(field_snapshot.as_deref(), show, &compute.vector_channels);
         scene::append_authoring_geometry(
             &mut field,
             &self.world,
@@ -581,6 +689,10 @@ impl WindowState {
         if self.ui_model.view.compute_bounds {
             scene::append_compute_bounds(&mut field, compute.domain.bounds());
         }
+        // Kept for next frame's `ComputeView::build` to reuse whatever is
+        // still current — every other use of `compute` above is a borrow, so
+        // nothing here is left dangling.
+        self.compute = Some(compute);
         // The gizmo is drawn only for a selection that is actually on screen.
         // Handles floating over a hidden object would be draggable targets for
         // something the user cannot see.
@@ -1090,6 +1202,7 @@ impl WindowState {
             self.viewport,
             active.target,
             Some(active.preview()),
+            self.ui_model.view.gizmo_display,
         )
         .ok_or_else(|| "selected plane no longer has a normal handle".to_owned())?;
         let radius = tip.distance(active.origin.as_vec3());
@@ -1276,12 +1389,25 @@ impl WindowState {
     /// must land before the first edit it brackets and the resume after the
     /// last.
     fn synchronize_edit_gesture(&mut self, mode: SimulationMode) -> Result<(), String> {
-        let (next, commands) =
+        let (mut next, commands) =
             EditGesture::transition(self.edit_gesture, self.scene_is_being_edited(), mode);
-        self.edit_gesture = next;
         for payload in commands {
-            self.submit(payload, "scene edit")?;
+            // `AsyncLocalDataSource` never blocks: this always reports
+            // `Submitted`, whatever the command's eventual outcome. A
+            // `Pause` can still be rejected later (a paused mutation queue
+            // with work held back) — record its id so the gesture can tell
+            // whether it actually took once that rejection, if any, arrives
+            // as an ordinary `CommandEvent::Failed`.
+            let is_pause = matches!(payload, CommandPayload::Pause);
+            let receipt = self
+                .model()
+                .submit(payload)
+                .map_err(|error| format!("scene edit failed: {error}"))?;
+            if is_pause && let Some(gesture) = &mut next {
+                gesture.pause_command = Some(receipt.command);
+            }
         }
+        self.edit_gesture = next;
         Ok(())
     }
 
@@ -1347,9 +1473,21 @@ impl WindowState {
 /// correlated commands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EditGesture {
-    /// The simulation was advancing when this gesture began, and so is resumed
-    /// when it commits. A run the user had already paused stays paused.
+    /// The simulation was advancing when this gesture began, and so is
+    /// resumed when it commits — *provided* the `Pause` that opened it is
+    /// confirmed to have actually applied; see `pause_command`. A run the
+    /// user had already paused stays paused.
     resume: bool,
+    /// The id of this gesture's own `Pause` submission, while its outcome is
+    /// still unknown. Submission through `AsyncLocalDataSource` never
+    /// blocks — it always reports `Submitted` immediately — so a rejection
+    /// (`reject_if_queue_paused`, when the mutation queue is paused with
+    /// work still held back) is only discovered later, as an ordinary
+    /// `CommandEvent::Failed`. `pause_rejected` clears `resume` when that
+    /// happens, so a `Pause` that never took does not get an unconditional
+    /// `Play` on commit — the sim was never actually stopped, so there is
+    /// nothing to resume.
+    pause_command: Option<CommandId>,
 }
 
 impl EditGesture {
@@ -1359,7 +1497,9 @@ impl EditGesture {
     /// Pure, because the ordering here is the whole contract and it is not worth
     /// standing up a window to check: the pause precedes the edits it brackets,
     /// the commit precedes the resume, and a run the user had already paused is
-    /// given back exactly as it was found.
+    /// given back exactly as it was found. `pause_command` is left unset here —
+    /// the caller fills it in from the `Pause` submission's own receipt, since
+    /// this function has no source to submit through.
     fn transition(
         current: Option<Self>,
         editing: bool,
@@ -1373,7 +1513,13 @@ impl EditGesture {
                     commands.push(CommandPayload::Pause);
                 }
                 commands.push(CommandPayload::SetInteractiveEdit(true));
-                (Some(Self { resume }), commands)
+                (
+                    Some(Self {
+                        resume,
+                        pause_command: None,
+                    }),
+                    commands,
+                )
             }
             (false, Some(gesture)) => {
                 let mut commands = vec![CommandPayload::SetInteractiveEdit(false)];
@@ -1384,6 +1530,16 @@ impl EditGesture {
             }
             (true, Some(gesture)) => (Some(gesture), Vec::new()),
             (false, None) => (None, Vec::new()),
+        }
+    }
+
+    /// This gesture's own `Pause` was rejected: the run it meant to bracket
+    /// never actually stopped, so closing the gesture must not submit an
+    /// unconditional, unneeded `Play` on top of it.
+    fn pause_rejected(&mut self, command: CommandId) {
+        if self.pause_command == Some(command) {
+            self.resume = false;
+            self.pause_command = None;
         }
     }
 }
@@ -1600,7 +1756,7 @@ impl FrameStats {
 mod tests {
     use super::{EditGesture, FrameStats};
     use fieldcad_core::SimulationMode;
-    use fieldcad_simulation::CommandPayload;
+    use fieldcad_simulation::{CommandId, CommandPayload};
     use std::time::Duration;
 
     /// The order is the point: the pause has to arrive before the first edit of
@@ -1636,6 +1792,56 @@ mod tests {
         );
     }
 
+    /// UI-2 regression: `Pause` can be rejected after a gesture has already
+    /// provisionally started on the assumption it would take —
+    /// `reject_if_queue_paused` fires whenever the mutation queue is paused
+    /// with work still held back, and `AsyncLocalDataSource` never blocks a
+    /// submission to report that synchronously. Once the rejection arrives,
+    /// closing the gesture must not submit an unconditional `Play`: the run
+    /// it meant to bracket was never actually stopped.
+    #[test]
+    fn a_rejected_pause_does_not_resume_a_run_that_never_stopped() {
+        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Running);
+        assert_eq!(
+            commands,
+            vec![
+                CommandPayload::Pause,
+                CommandPayload::SetInteractiveEdit(true)
+            ]
+        );
+        let mut opened = opened.unwrap();
+        let pause_command = CommandId::new(7);
+        opened.pause_command = Some(pause_command);
+
+        opened.pause_rejected(pause_command);
+        assert!(!opened.resume);
+
+        // Held across frames exactly as an accepted pause would be.
+        let (held, commands) = EditGesture::transition(Some(opened), true, SimulationMode::Running);
+        assert_eq!(held, Some(opened));
+        assert!(commands.is_empty());
+
+        // Closing it asks only to leave interactive-edit mode — never `Play`,
+        // since the run underneath was never actually paused.
+        let (closed, commands) = EditGesture::transition(held, false, SimulationMode::Running);
+        assert_eq!(closed, None);
+        assert_eq!(commands, vec![CommandPayload::SetInteractiveEdit(false)]);
+    }
+
+    /// A rejection for some unrelated command must not disturb a gesture's
+    /// own, still-pending or already-accepted pause.
+    #[test]
+    fn pause_rejected_ignores_an_unrelated_command_id() {
+        let (opened, _) = EditGesture::transition(None, true, SimulationMode::Running);
+        let mut opened = opened.unwrap();
+        opened.pause_command = Some(CommandId::new(1));
+
+        opened.pause_rejected(CommandId::new(2));
+
+        assert!(opened.resume);
+        assert_eq!(opened.pause_command, Some(CommandId::new(1)));
+    }
+
     /// The gesture hands the transport back as it found it. Resuming a run the
     /// user had deliberately paused would make dragging a body start the
     /// simulation.
@@ -1667,5 +1873,199 @@ mod tests {
         stats.finish_frame(Duration::from_millis(2));
 
         assert!((stats.smoothed_frame_ms - 9.2).abs() < 1.0e-6);
+    }
+
+    mod field_layer_geometry_cache {
+        use std::{collections::BTreeMap, sync::Arc};
+
+        use fieldcad_core::{
+            ChannelId, ChannelSchema, ChannelSnapshot, Dimension, Domain, FieldBatch, FieldColumn,
+            FieldSnapshot, FieldValueKind, PlaneLattice, PluginId, SampleGeometry, SampleValidity,
+            SessionId, SnapshotCompleteness, SnapshotIdentity, WorldRevision,
+        };
+        use glam::{DVec3, UVec2};
+
+        use super::super::compute_field_layer_geometry;
+        use crate::{scene, ui};
+
+        /// One vector channel publishing a single plane batch — just enough
+        /// for [`scene::field_geometry`] to produce non-empty arrows.
+        fn make_snapshot(sequence: u64) -> (FieldSnapshot, ChannelId) {
+            let plugin = PluginId::new("test").unwrap();
+            let channel = ChannelId::new(plugin.clone(), "vector").unwrap();
+            let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(2));
+            let batch = FieldBatch::new(
+                SampleGeometry::Plane {
+                    plane: fieldcad_core::PlaneId::new(0),
+                    lattice,
+                },
+                FieldColumn::vectors(vec![DVec3::X; 4]),
+                vec![SampleValidity::Exact; 4],
+            )
+            .unwrap();
+            let snapshot = FieldSnapshot {
+                identity: SnapshotIdentity {
+                    session: SessionId::from_u128(1),
+                    sequence,
+                    run_generation: 0,
+                    world_revision: WorldRevision::INITIAL,
+                    tick: 0,
+                    time_seconds: 0.0,
+                },
+                completeness: SnapshotCompleteness::Complete,
+                domain: Domain::centred_cube(4.0, 4).unwrap(),
+                plugins: Arc::from([]),
+                channels: BTreeMap::from([(
+                    channel.clone(),
+                    ChannelSnapshot {
+                        schema: Arc::new(ChannelSchema {
+                            id: channel.clone(),
+                            display_name: "Vector".to_owned(),
+                            value_kind: FieldValueKind::Vector(Dimension::ELECTRIC_FIELD),
+                        }),
+                        provider: plugin,
+                        batches: vec![batch].into(),
+                    },
+                )]),
+                diagnostics: Arc::from([]),
+            };
+            (snapshot, channel)
+        }
+
+        fn visible_layers(channel: &ChannelId) -> BTreeMap<ChannelId, ui::ChannelLayerSettings> {
+            BTreeMap::from([(
+                channel.clone(),
+                ui::ChannelLayerSettings {
+                    visible: true,
+                    ..ui::ChannelLayerSettings::default()
+                },
+            )])
+        }
+
+        /// The regression this guards: recomputing the same layer geometry
+        /// every frame regardless of whether the snapshot or its settings
+        /// changed (UI-12). Poisoning the cached geometry with a vertex a
+        /// real computation would never produce, then asserting it either
+        /// survives or is discarded, tells reuse and invalidation apart in a
+        /// way comparing two honest rebuilds never could — those always
+        /// agree.
+        #[test]
+        fn reuses_the_cache_until_the_snapshot_sequence_changes() {
+            let (snapshot, channel) = make_snapshot(0);
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+
+            let (baseline, new_cache) = compute_field_layer_geometry(
+                None,
+                Some(&snapshot),
+                &layers,
+                show,
+                &[channel.clone()],
+            );
+            assert!(
+                !baseline.vector_lines.is_empty(),
+                "test setup: expected arrows"
+            );
+            let mut cache = new_cache.expect("first call always misses");
+
+            cache.geometry.vector_lines.push(scene::ColoredVertex {
+                position: glam::Vec3::splat(9_999.0),
+                color: glam::Vec4::ZERO,
+            });
+            let poisoned_len = cache.geometry.vector_lines.len();
+
+            // Nothing about the snapshot or settings changed: the poisoned
+            // geometry must come back verbatim, and the cache must not be
+            // rebuilt.
+            let (reused, new_cache) = compute_field_layer_geometry(
+                Some(&cache),
+                Some(&snapshot),
+                &layers,
+                show,
+                &[channel.clone()],
+            );
+            assert_eq!(reused.vector_lines.len(), poisoned_len);
+            assert!(
+                new_cache.is_none(),
+                "an unchanged input must not rebuild the cache"
+            );
+
+            // A new snapshot sequence must discard the stale cache and
+            // recompute rather than propagate it.
+            let (next_snapshot, _) = make_snapshot(1);
+            let (rebuilt, new_cache) = compute_field_layer_geometry(
+                Some(&cache),
+                Some(&next_snapshot),
+                &layers,
+                show,
+                &[channel.clone()],
+            );
+            assert_eq!(
+                rebuilt.vector_lines.len(),
+                baseline.vector_lines.len(),
+                "a changed snapshot must discard the stale cache and recompute"
+            );
+            assert!(
+                new_cache.is_some(),
+                "a changed input must rebuild the cache"
+            );
+        }
+
+        /// Mirrors the snapshot-sequence case above for the layer settings:
+        /// hiding a layer changes what is drawn without publishing a new
+        /// snapshot, so it must invalidate the cache on its own.
+        #[test]
+        fn reuses_the_cache_until_the_layer_settings_change() {
+            let (snapshot, channel) = make_snapshot(0);
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+
+            let (_, new_cache) = compute_field_layer_geometry(
+                None,
+                Some(&snapshot),
+                &layers,
+                show,
+                &[channel.clone()],
+            );
+            let mut cache = new_cache.unwrap();
+            cache.geometry.vector_lines.push(scene::ColoredVertex {
+                position: glam::Vec3::splat(9_999.0),
+                color: glam::Vec4::ZERO,
+            });
+
+            let hidden_layers = BTreeMap::from([(
+                channel.clone(),
+                ui::ChannelLayerSettings {
+                    visible: false,
+                    ..ui::ChannelLayerSettings::default()
+                },
+            )]);
+            let (rebuilt, new_cache) = compute_field_layer_geometry(
+                Some(&cache),
+                Some(&snapshot),
+                &hidden_layers,
+                show,
+                &[channel.clone()],
+            );
+            assert!(
+                rebuilt.vector_lines.is_empty(),
+                "a hidden layer must discard the stale cache and draw nothing"
+            );
+            assert!(new_cache.is_some());
+        }
+
+        #[test]
+        fn no_snapshot_and_no_cache_produces_empty_geometry_without_panicking() {
+            let (geometry, new_cache) = compute_field_layer_geometry(
+                None,
+                None,
+                &BTreeMap::new(),
+                scene::SceneVisibility::ALL,
+                &[],
+            );
+            assert!(geometry.surface_triangles.is_empty());
+            assert!(geometry.vector_lines.is_empty());
+            assert!(new_cache.is_some());
+        }
     }
 }

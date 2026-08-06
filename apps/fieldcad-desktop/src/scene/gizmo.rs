@@ -184,27 +184,6 @@ impl GizmoDisplay {
 /// (~1.005) the error is negligible for a baked visual cue.
 const GIZMO_LIGHT_DIR: Vec3 = Vec3::new(0.4, -0.6, 0.7);
 
-pub fn append_transform_gizmo(
-    geometry: &mut FieldGeometry,
-    world: &WorldSnapshot,
-    camera: &OrbitCamera,
-    viewport: Viewport,
-    selection: Option<SceneSelection>,
-    active: Option<TransformHandle>,
-    preview: Option<TransformPreview>,
-) {
-    append_transform_gizmo_with_display(
-        geometry,
-        world,
-        camera,
-        viewport,
-        selection,
-        active,
-        preview,
-        GizmoDisplay::default(),
-    );
-}
-
 pub fn append_transform_gizmo_with_display(
     geometry: &mut FieldGeometry,
     world: &WorldSnapshot,
@@ -344,6 +323,12 @@ fn selection_origin_point(world: &WorldSnapshot, selection: SceneSelection) -> O
 /// other size in this file (`rotation_ring_radius`, `view_ring_radius`,
 /// `plane_normal_length`, `selection_marker_radius`) is a fixed multiple of
 /// this one `length`.
+///
+/// Only this module's own tests call the bare (default-display) form now;
+/// production code always threads a real [`GizmoDisplay`] through
+/// [`transform_gizmo_with_display`] instead — the same fix applied to
+/// `plane_normal_tip` for UI-1.
+#[cfg(test)]
 fn transform_gizmo(
     world: &WorldSnapshot,
     camera: &OrbitCamera,
@@ -473,23 +458,6 @@ fn append_solid_arrow(
         color,
         GIZMO_LIGHT_DIR,
     );
-}
-
-pub fn pick_transform_handle(
-    world: &WorldSnapshot,
-    selection: SceneSelection,
-    camera: &OrbitCamera,
-    viewport: Viewport,
-    pointer: Vec2,
-) -> Option<TransformHandle> {
-    pick_transform_handle_with_display(
-        world,
-        selection,
-        camera,
-        viewport,
-        pointer,
-        GizmoDisplay::default(),
-    )
 }
 
 pub fn pick_transform_handle_with_display(
@@ -686,15 +654,6 @@ pub fn constrained_translation(
     Some(current_hit - previous_hit)
 }
 
-pub fn selection_gizmo_length(
-    world: &WorldSnapshot,
-    camera: &OrbitCamera,
-    viewport: Viewport,
-    selection: SceneSelection,
-) -> Option<f32> {
-    selection_gizmo_length_with_display(world, camera, viewport, selection, GizmoDisplay::default())
-}
-
 pub fn selection_gizmo_length_with_display(
     world: &WorldSnapshot,
     camera: &OrbitCamera,
@@ -707,17 +666,8 @@ pub fn selection_gizmo_length_with_display(
 }
 
 /// The rotation gizmo's sphere radius for a box selection — mirrors
-/// [`selection_gizmo_length`], but for the radius the trackball drag needs
-/// rather than the translation length.
-pub fn rotation_gizmo_radius(
-    world: &WorldSnapshot,
-    camera: &OrbitCamera,
-    viewport: Viewport,
-    selection: SceneSelection,
-) -> Option<f32> {
-    rotation_gizmo_radius_with_display(world, camera, viewport, selection, GizmoDisplay::default())
-}
-
+/// [`selection_gizmo_length_with_display`], but for the radius the trackball
+/// drag needs rather than the translation length.
 pub fn rotation_gizmo_radius_with_display(
     world: &WorldSnapshot,
     camera: &OrbitCamera,
@@ -735,18 +685,26 @@ fn plane_normal_length(translation_gizmo_length: f32) -> f32 {
     translation_gizmo_length * 1.3
 }
 
+/// The plane-normal handle's world-space origin and tip, sized from
+/// `display` — the caller's configured [`GizmoDisplay`], not a default one.
+/// Both this handle's drawn length and its drag-arcball radius derive from
+/// the tip this returns, so the two must agree with what
+/// [`append_transform_gizmo_with_display`] actually draws for the same
+/// `display`.
 pub fn plane_normal_tip(
     world: &WorldSnapshot,
     camera: &OrbitCamera,
     viewport: Viewport,
     selection: SceneSelection,
     preview: Option<TransformPreview>,
+    display: GizmoDisplay,
 ) -> Option<(Vec3, Vec3)> {
     let SceneSelection::Plane(id) = selection else {
         return None;
     };
     let plane = world.planes().get(&id).filter(|plane| plane.visible)?;
-    let (world_origin, gizmo_length) = transform_gizmo(world, camera, viewport, selection)?;
+    let (world_origin, gizmo_length) =
+        transform_gizmo_with_display(world, camera, viewport, selection, display)?;
     let origin = preview.map_or(world_origin, |preview| preview.origin);
     let normal = preview
         .and_then(|preview| preview.plane_normal)
@@ -761,8 +719,9 @@ pub fn plane_normal_label_position(
     viewport: Viewport,
     selection: SceneSelection,
     preview: Option<TransformPreview>,
+    display: GizmoDisplay,
 ) -> Option<Vec2> {
-    let (_, tip) = plane_normal_tip(world, camera, viewport, selection, preview)?;
+    let (_, tip) = plane_normal_tip(world, camera, viewport, selection, preview, display)?;
     let position = project_to_viewport(camera, viewport, tip)?;
     viewport.contains(position).then_some(position)
 }
@@ -1108,7 +1067,14 @@ mod tests {
         let pointer = start.lerp(end, 0.5);
 
         assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            pick_transform_handle_with_display(
+                &snapshot,
+                selection,
+                &camera,
+                VIEWPORT,
+                pointer,
+                GizmoDisplay::default(),
+            ),
             Some(TransformHandle::AxisX)
         );
         let screen_axis = (end - start).normalize();
@@ -1198,7 +1164,14 @@ mod tests {
         let pointer = project_to_viewport(&camera, VIEWPORT, centroid).unwrap();
 
         assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            pick_transform_handle_with_display(
+                &snapshot,
+                selection,
+                &camera,
+                VIEWPORT,
+                pointer,
+                GizmoDisplay::default(),
+            ),
             Some(TransformHandle::PlaneXY)
         );
     }
@@ -1225,7 +1198,7 @@ mod tests {
             SceneSelection::Plane(report.created_planes[0]),
         ] {
             let mut geometry = FieldGeometry::default();
-            append_transform_gizmo(
+            append_transform_gizmo_with_display(
                 &mut geometry,
                 &snapshot,
                 &camera,
@@ -1233,6 +1206,7 @@ mod tests {
                 Some(selection),
                 None,
                 None,
+                GizmoDisplay::default(),
             );
             assert!(!geometry.vector_lines.is_empty());
             assert_eq!(selection_origin(&snapshot, selection), Some(Vec3::ZERO));
@@ -1256,13 +1230,27 @@ mod tests {
         let snapshot = world.snapshot();
         let selection = SceneSelection::Plane(report.created_planes[0]);
         let camera = OrbitCamera::default();
-        let (origin, tip) =
-            plane_normal_tip(&snapshot, &camera, VIEWPORT, selection, None).unwrap();
+        let (origin, tip) = plane_normal_tip(
+            &snapshot,
+            &camera,
+            VIEWPORT,
+            selection,
+            None,
+            GizmoDisplay::default(),
+        )
+        .unwrap();
         assert!(tip.distance(origin) > 0.0);
 
         let pointer = project_to_viewport(&camera, VIEWPORT, tip * 0.9).unwrap();
         assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            pick_transform_handle_with_display(
+                &snapshot,
+                selection,
+                &camera,
+                VIEWPORT,
+                pointer,
+                GizmoDisplay::default(),
+            ),
             Some(TransformHandle::PlaneNormal)
         );
 
@@ -1277,6 +1265,66 @@ mod tests {
         .unwrap();
         assert!(dragged.is_normalized());
         assert!(dragged != Vec3::Z);
+    }
+
+    /// UI-1 regression: the plane-normal handle must be sized from the
+    /// caller's configured `GizmoDisplay`, not a hardcoded default —
+    /// `plane_normal_tip` used to call the bare (default-display)
+    /// `transform_gizmo` regardless of what `append_transform_gizmo_with_display`
+    /// actually drew, so the N handle rendered at one size while its label
+    /// and drag radius were computed at another.
+    #[test]
+    fn plane_normal_tip_scales_with_the_configured_display() {
+        use fieldcad_core::SlicePlaneSpec;
+        use glam::{DVec2, DVec3};
+
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreatePlane(
+                SlicePlaneSpec::new("plane", DVec3::ZERO, DVec3::Z)
+                    .unwrap()
+                    .with_half_extent(DVec2::splat(4.0))
+                    .unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Plane(report.created_planes[0]);
+        let camera = OrbitCamera::default();
+
+        let default_display = GizmoDisplay::default();
+        let configured_display = GizmoDisplay {
+            axis_length_px: default_display.axis_length_px * 2.5,
+            ..default_display
+        };
+
+        let (default_origin, default_tip) = plane_normal_tip(
+            &snapshot,
+            &camera,
+            VIEWPORT,
+            selection,
+            None,
+            default_display,
+        )
+        .unwrap();
+        let (configured_origin, configured_tip) = plane_normal_tip(
+            &snapshot,
+            &camera,
+            VIEWPORT,
+            selection,
+            None,
+            configured_display,
+        )
+        .unwrap();
+
+        assert_eq!(default_origin, configured_origin);
+        let default_length = default_tip.distance(default_origin);
+        let configured_length = configured_tip.distance(configured_origin);
+        assert!(
+            (configured_length / default_length - 2.5).abs() < 1.0e-4,
+            "the normal handle's tip must scale with axis_length_px like every \
+             other gizmo handle does: default {default_length}, configured \
+             (2.5x) {configured_length}"
+        );
     }
 
     /// The whole point of the redesign: the gizmo's on-screen size must not
@@ -1416,8 +1464,14 @@ mod tests {
                         continue;
                     };
                     total += 1;
-                    if pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer)
-                        == Some(handle)
+                    if pick_transform_handle_with_display(
+                        &snapshot,
+                        selection,
+                        &camera,
+                        VIEWPORT,
+                        pointer,
+                        GizmoDisplay::default(),
+                    ) == Some(handle)
                     {
                         correct += 1;
                     }
@@ -1451,7 +1505,14 @@ mod tests {
         let pointer = project_to_viewport(&camera, VIEWPORT, point_on_z_ring).unwrap();
 
         assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            pick_transform_handle_with_display(
+                &snapshot,
+                selection,
+                &camera,
+                VIEWPORT,
+                pointer,
+                GizmoDisplay::default(),
+            ),
             Some(TransformHandle::RotateZ)
         );
 
@@ -1500,7 +1561,14 @@ mod tests {
 
         let pointer = project_to_viewport(&camera, VIEWPORT, origin + a * radius).unwrap();
         assert_eq!(
-            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer),
+            pick_transform_handle_with_display(
+                &snapshot,
+                selection,
+                &camera,
+                VIEWPORT,
+                pointer,
+                GizmoDisplay::default(),
+            ),
             Some(TransformHandle::RotateView)
         );
 
@@ -1544,8 +1612,14 @@ mod tests {
         })
         .filter_map(|offset| project_to_viewport(&camera, VIEWPORT, origin + offset))
         .find(|pointer| {
-            pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, *pointer)
-                == Some(TransformHandle::RotateFree)
+            pick_transform_handle_with_display(
+                &snapshot,
+                selection,
+                &camera,
+                VIEWPORT,
+                *pointer,
+                GizmoDisplay::default(),
+            ) == Some(TransformHandle::RotateFree)
         })
         .expect("some unclaimed point inside the rotation sphere must start free rotation");
 
@@ -1604,8 +1678,14 @@ mod tests {
             let (start, end) = gizmo_axis_segment(origin, axis.1, length);
             for t in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
                 let pointer = project_to_viewport(&camera, VIEWPORT, start.lerp(end, t)).unwrap();
-                if pick_transform_handle(&snapshot, selection, &camera, VIEWPORT, pointer)
-                    == Some(axis.0)
+                if pick_transform_handle_with_display(
+                    &snapshot,
+                    selection,
+                    &camera,
+                    VIEWPORT,
+                    pointer,
+                    GizmoDisplay::default(),
+                ) == Some(axis.0)
                 {
                     hit = Some(());
                     break 'search;

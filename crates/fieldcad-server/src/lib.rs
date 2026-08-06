@@ -5,13 +5,14 @@
 //! crate is where that boundary stops being desktop-shaped. [`HeadlessServer`]
 //! owns the model — a [`SimulationRuntime`] behind an [`AsyncLocalDataSource`]
 //! — with no window, no GPU device, nothing that requires a display. Any
-//! transport (an embedded UI, and later MCP or another network surface) drives
-//! it through the same [`fieldcad_simulation::FieldDataSource`] contract ADR
+//! transport (an embedded UI, MCP, or another network surface) drives it
+//! through the same [`fieldcad_simulation::FieldDataSource`] contract ADR
 //! 0001 already defines, so "remote and local sources behave identically" is a
 //! property of this crate rather than a promise a transport has to keep.
 //!
-//! No transport is wired up yet — see `docs/mcp-plan.md` phase 3 onward. This
-//! crate proves the model can run detached from the desktop app first.
+//! `fieldcad-mcp` is a working transport built on this crate, both as its
+//! own standalone binary and embedded inside the desktop app, sharing one
+//! session with the desktop UI's own commands.
 
 use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration};
 
@@ -24,10 +25,14 @@ use fieldcad_simulation::{
     AsyncLocalDataSource, Command, CommandDisposition, CommandEvent, CommandId, CommandPayload,
     CommandReceipt, CommandSequencer, DataSourceStatus, EditHistoryStatus, FieldDataSource,
     FieldSystemStatus, LocalDataSource, PlaybackSpeed, PluginRegistration, PollOutcome,
-    RuntimeConfig, RuntimeError, SimulationRuntime, SimulationStatus, SourceError, Subscription,
+    QueueStatus, QueueSummary, RuntimeConfig, RuntimeError, SimulationRuntime, SimulationStatus,
+    SourceError, Subscription,
 };
 use glam::DVec3;
 use tokio::sync::oneshot;
+
+mod event_hub;
+pub use event_hub::{EventHub, EventWatcher, SessionEvent, WatchEvent};
 
 /// Builds the default session: a numerical domain and the same solver
 /// composition rule the desktop app uses (one electric field, two candidate
@@ -80,11 +85,20 @@ pub struct HeadlessServer {
     source: AsyncLocalDataSource,
     sequencer: CommandSequencer,
     /// Registered by [`submit_and_await`](Self::submit_and_await), fulfilled
-    /// by [`drain_events`](Self::drain_events) — whichever transport happens
-    /// to call `drain_events` next completes every pending waiter it finds,
-    /// not only its own. That is what makes it safe for more than one
-    /// transport to poll the same session concurrently.
+    /// by [`publish`](Self::publish) the moment a command actually goes
+    /// terminal — not by whichever transport next happens to call
+    /// [`drain_events`](Self::drain_events), which is what used to make two
+    /// concurrent transports race for the same waiter.
     waiters: HashMap<CommandId, oneshot::Sender<CommandEvent>>,
+    /// The broadcast hub every transport subscribes to independently. See
+    /// `docs/tasks/session-events-and-queue-control.md`.
+    hub: EventHub,
+    /// Buffered for [`drain_events`](Self::drain_events), refilled by
+    /// [`publish`](Self::publish) — the sole call site of
+    /// [`AsyncLocalDataSource::drain_command_events`] in this crate, keeping
+    /// this crate's one-canonical-drain discipline for the *inner* source
+    /// even though publication now also happens here.
+    events: Vec<CommandEvent>,
 }
 
 impl HeadlessServer {
@@ -93,6 +107,8 @@ impl HeadlessServer {
             source,
             sequencer: CommandSequencer::default(),
             waiters: HashMap::new(),
+            hub: EventHub::default(),
+            events: Vec::new(),
         }
     }
 
@@ -107,12 +123,14 @@ impl HeadlessServer {
     /// for a transport that tracks its own client-issued ids rather than
     /// this server's sequencer.
     pub fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
-        self.source.execute(command)
+        let receipt = self.source.execute(command)?;
+        self.publish();
+        Ok(receipt)
     }
 
     /// Mint a command identity, submit it, and register interest in its
-    /// completion — atomically, under one call, so no [`drain_events`] can
-    /// land between submission and registration and fulfill the waiter
+    /// completion — atomically, under one call, so no [`publish`](Self::publish)
+    /// can land between submission and registration and fulfill the waiter
     /// before anyone is listening for it.
     ///
     /// Returns `None` in the receiver position when the command was applied
@@ -135,31 +153,66 @@ impl HeadlessServer {
     /// (a run loop, a timer) — the numerical `dt` is the model's own
     /// business and never changes to compensate for a slow caller.
     pub fn advance(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
-        self.source.poll(elapsed)
+        let outcome = self.source.poll(elapsed)?;
+        self.publish();
+        Ok(outcome)
     }
 
-    /// Completion/rejection events for commands submitted non-blockingly.
-    ///
-    /// The only call site of [`AsyncLocalDataSource::drain_command_events`]
-    /// in this crate — every transport's completion events, and every
-    /// registered [`submit_and_await`](Self::submit_and_await) waiter, are
-    /// resolved from here, whichever transport happens to call it. A
-    /// transport that only wants "did my command finish" does not need to
-    /// call this at all; a transport that wants a running log of everything
-    /// (the desktop UI's per-frame diagnostics) still gets the full list
-    /// unchanged.
-    pub fn drain_events(&mut self) -> Vec<CommandEvent> {
-        let events = self.source.drain_command_events();
-        for event in &events {
-            let id = match event {
-                CommandEvent::Completed(receipt) => receipt.command,
-                CommandEvent::Failed { command, .. } => *command,
-            };
-            if let Some(waiter) = self.waiters.remove(&id) {
+    /// The one place events leave the inner source and fan out: to whichever
+    /// `submit_and_await` waiter is registered for that id, to the broadcast
+    /// hub, and into `self.events` for `drain_events()`. Waiter resolution no
+    /// longer depends on anyone calling `drain_events()`, which is what
+    /// removes "whichever transport calls it next completes every pending
+    /// waiter" as a race entirely — both [`execute`](Self::execute) and
+    /// [`advance`](Self::advance) fold through here, whether the caller
+    /// reached them through this type's own methods or through its
+    /// [`FieldDataSource`] impl.
+    fn publish(&mut self) {
+        for event in self.source.drain_command_events() {
+            if let Some(waiter) = self.waiters.remove(&event.command_id()) {
                 let _ = waiter.send(event.clone());
             }
+            self.hub.publish_command_event(&event);
+            self.events.push(event);
         }
-        events
+        self.hub.publish_state(&self.source);
+    }
+
+    /// Completion/rejection/cancellation events for commands submitted
+    /// non-blockingly.
+    ///
+    /// Every transport's completion events, and every registered
+    /// [`submit_and_await`](Self::submit_and_await) waiter, are resolved by
+    /// [`publish`](Self::publish), not by this call — draining here only
+    /// hands back what already accumulated. A transport that only wants "did
+    /// my command finish" does not need to call this at all; a transport
+    /// that wants a running log of everything (the desktop UI's per-frame
+    /// diagnostics) still gets the full list unchanged.
+    pub fn drain_events(&mut self) -> Vec<CommandEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// An independent, non-destructive subscription to this session's
+    /// events — any number of callers may hold one at once without
+    /// competing with [`drain_events`](Self::drain_events) or with each
+    /// other.
+    pub fn subscribe_events(&self) -> EventWatcher {
+        self.hub.subscribe()
+    }
+
+    /// Authoritative queue state: paused flag, ordered pending commands, and
+    /// recent terminal history.
+    pub fn get_queue(&self) -> QueueStatus {
+        self.source.get_queue()
+    }
+
+    /// The queue's shape without its contents — see
+    /// [`FieldDataSource::queue_summary`]. Delegates to
+    /// `AsyncLocalDataSource`'s own cheap implementation rather than the
+    /// trait's default (which would derive this from [`Self::get_queue`],
+    /// defeating the point).
+    pub fn queue_summary(&self) -> QueueSummary {
+        self.source.queue_summary()
     }
 
     pub fn status(&self) -> DataSourceStatus {
@@ -216,6 +269,14 @@ impl FieldDataSource for HeadlessServer {
         self.source.pending_command_count()
     }
 
+    fn get_queue(&self) -> QueueStatus {
+        HeadlessServer::get_queue(self)
+    }
+
+    fn queue_summary(&self) -> QueueSummary {
+        HeadlessServer::queue_summary(self)
+    }
+
     fn subscription(&self) -> Subscription {
         self.source.subscription()
     }
@@ -239,12 +300,19 @@ impl FieldDataSource for HeadlessServer {
         self.source.body_forces()
     }
 
+    // Not `self.source.execute(command)` directly: this must go through
+    // `Self::execute` above, which also calls `publish()` — the desktop's
+    // per-frame pump reaches this crate only through this trait, and
+    // publication (waiter resolution, the broadcast hub) must not be
+    // bypassable by that path.
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
-        self.source.execute(command)
+        HeadlessServer::execute(self, command)
     }
 
+    // Not `self.source.poll(elapsed)` directly, for the same reason as
+    // `execute` above.
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
-        self.source.poll(elapsed)
+        HeadlessServer::advance(self, elapsed)
     }
 
     fn latest_snapshot(&self) -> Option<Arc<FieldSnapshot>> {

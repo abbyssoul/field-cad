@@ -9,7 +9,7 @@
 //! without loading this Rust object into the visualizer process.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -350,6 +350,61 @@ pub trait EquationSystemSolver: Send {
 
     fn diagnostics(&self) -> Vec<SolverDiagnostic> {
         Vec::new()
+    }
+}
+
+/// A small, size-bounded memoization of the last few sample geometries a
+/// solver was asked to evaluate, keyed by structural equality on
+/// [`SampleGeometry`] and evicted oldest-first once full.
+///
+/// A runtime publication samples the same handful of geometries (each
+/// visible plane, box, sphere, and the probe set) once per channel; without
+/// this, an analytic solver with several channels over the same geometry
+/// redoes the same evaluation once per channel, every tick.
+pub struct SampleCache<T> {
+    capacity: usize,
+    entries: Mutex<Vec<(SampleGeometry, Arc<[T]>)>>,
+}
+
+impl<T> SampleCache<T> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The cached samples for `geometry`, or `compute`'s freshly-evaluated
+    /// result, stored for next time. `compute` runs at most once, and not
+    /// at all on a cache hit.
+    pub fn get_or_try_insert_with(
+        &self,
+        geometry: &SampleGeometry,
+        compute: impl FnOnce() -> Result<Vec<T>, PluginError>,
+    ) -> Result<Arc<[T]>, PluginError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| PluginError::Solver("sample cache poisoned".to_owned()))?;
+        if let Some((_, samples)) = entries.iter().find(|(cached, _)| cached == geometry) {
+            return Ok(Arc::clone(samples));
+        }
+        let samples: Arc<[T]> = compute()?.into();
+        if entries.len() >= self.capacity {
+            entries.remove(0);
+        }
+        entries.push((geometry.clone(), Arc::clone(&samples)));
+        Ok(samples)
+    }
+
+    /// Discard every cached entry — call when the world changes and cached
+    /// values would no longer reflect it.
+    pub fn clear(&mut self) -> Result<(), PluginError> {
+        self.entries
+            .get_mut()
+            .map_err(|_| PluginError::Solver("sample cache poisoned".to_owned()))?
+            .clear();
+        Ok(())
     }
 }
 

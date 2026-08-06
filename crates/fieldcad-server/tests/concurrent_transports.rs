@@ -42,7 +42,9 @@ async fn submit_and_await(
 ) -> CommandEvent {
     let (receipt, waiter) = {
         let mut server = model.lock().unwrap();
-        server.submit_and_await(payload).expect("submission accepted")
+        server
+            .submit_and_await(payload)
+            .expect("submission accepted")
     };
     let Some(waiter) = waiter else {
         panic!("expected a non-blocking submission with a waiter, got {receipt:?}");
@@ -91,9 +93,15 @@ async fn concurrent_pumpers_do_not_hang_or_cross_deliver_completions() {
             CommandEvent::Failed { error, .. } => {
                 panic!("object-{index} was rejected unexpectedly: {error}")
             }
+            CommandEvent::Cancelled(_) => {
+                panic!("object-{index} was cancelled unexpectedly")
+            }
         }
     }
-    assert_eq!(completed, 50, "every concurrently submitted command resolved");
+    assert_eq!(
+        completed, 50,
+        "every concurrently submitted command resolved"
+    );
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
 

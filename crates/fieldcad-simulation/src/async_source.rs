@@ -6,7 +6,7 @@
 //! boundary, not a second implementation of simulation semantics.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,9 +21,10 @@ use fieldcad_plugin_api::SolverCancellation;
 use glam::DVec3;
 
 use crate::{
-    Command, CommandDisposition, CommandId, CommandReceipt, DataSourceStatus, EditHistoryStatus,
-    FieldDataSource, FieldSystemStatus, LocalDataSource, PlaybackSpeed, PollOutcome,
-    SimulationStatus, SnapshotMailbox, SourceError, Subscription,
+    Command, CommandDisposition, CommandId, CommandKind, CommandReceipt, CommandRecord,
+    DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, LocalDataSource,
+    PlaybackSpeed, PollOutcome, QueueStatus, QueueSummary, SimulationStatus, SnapshotMailbox,
+    SourceError, Subscription,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +34,16 @@ pub enum CommandEvent {
         command: CommandId,
         error: SourceError,
     },
+    Cancelled(CommandId),
+}
+
+impl CommandEvent {
+    pub fn command_id(&self) -> CommandId {
+        match self {
+            Self::Completed(receipt) => receipt.command,
+            Self::Failed { command, .. } | Self::Cancelled(command) => *command,
+        }
+    }
 }
 
 enum WorkerRequest {
@@ -45,15 +56,28 @@ enum WorkerEvent {
     CommandCompleted {
         receipt: CommandReceipt,
         state: SourceState,
+        /// Terminal events this command's own execution produced as a side
+        /// effect (a running edit flushed by `pause`/`step`/`undo`/`redo`, a
+        /// target cancelled by `cancel_queued_command`) — drained from the
+        /// worker-side source right away rather than left to accumulate
+        /// until some later `Poll` happens to drain them.
+        terminal: Vec<CommandEvent>,
     },
     CommandFailed {
         command: CommandId,
         error: SourceError,
         state: SourceState,
+        /// Side-effect terminal events, as with `CommandCompleted::terminal`.
+        terminal: Vec<CommandEvent>,
     },
     PollCompleted {
         outcome: PollOutcome,
         state: SourceState,
+        /// Terminal events the poll's own tick-boundary flush produced —
+        /// drained from the worker-side source immediately after `poll`
+        /// succeeds, so a command that was `Queued` at submission gets its
+        /// completion reported once it actually applies, not before.
+        terminal: Vec<CommandEvent>,
     },
     PollFailed(SourceError),
 }
@@ -62,7 +86,7 @@ struct SourceState {
     simulation: SimulationStatus,
     domain: Domain,
     playback_speed: PlaybackSpeed,
-    pending_commands: usize,
+    queue: QueueStatus,
     subscription: Subscription,
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
@@ -77,7 +101,7 @@ impl SourceState {
             simulation: source.simulation_status(),
             domain: source.domain(),
             playback_speed: source.playback_speed(),
-            pending_commands: source.pending_command_count(),
+            queue: source.get_queue(),
             subscription: source.subscription(),
             field_systems: source.field_systems(),
             edit_history: source.edit_history(),
@@ -98,8 +122,11 @@ pub struct AsyncLocalDataSource {
     simulation: SimulationStatus,
     domain: Domain,
     playback_speed: PlaybackSpeed,
-    worker_pending_commands: usize,
-    submitted_commands: BTreeSet<CommandId>,
+    worker_queue: QueueStatus,
+    /// Commands sent to the worker but not yet executed there, with the
+    /// kind needed to synthesize a `Submitted`-state display record for
+    /// `get_queue()`.
+    submitted_commands: BTreeMap<CommandId, CommandKind>,
     subscription: Subscription,
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
@@ -138,8 +165,8 @@ impl AsyncLocalDataSource {
             simulation: initial.simulation,
             domain: initial.domain,
             playback_speed: initial.playback_speed,
-            worker_pending_commands: initial.pending_commands,
-            submitted_commands: BTreeSet::new(),
+            worker_queue: initial.queue,
+            submitted_commands: BTreeMap::new(),
             subscription: initial.subscription,
             field_systems: initial.field_systems,
             edit_history: initial.edit_history,
@@ -157,7 +184,7 @@ impl AsyncLocalDataSource {
         self.simulation = state.simulation;
         self.domain = state.domain;
         self.playback_speed = state.playback_speed;
-        self.worker_pending_commands = state.pending_commands;
+        self.worker_queue = state.queue;
         self.subscription = state.subscription;
         self.field_systems = state.field_systems;
         self.edit_history = state.edit_history;
@@ -173,22 +200,39 @@ impl AsyncLocalDataSource {
         let mut aggregate = PollOutcome::default();
         loop {
             match self.events.try_recv() {
-                Ok(WorkerEvent::CommandCompleted { receipt, state }) => {
+                Ok(WorkerEvent::CommandCompleted {
+                    receipt,
+                    state,
+                    terminal,
+                }) => {
                     self.submitted_commands.remove(&receipt.command);
                     aggregate.snapshot_updated |= self.adopt(state)?;
-                    self.command_events.push(CommandEvent::Completed(receipt));
+                    self.command_events.extend(terminal);
+                    // A queued acknowledgement is not terminal completion:
+                    // its real completion (or rejection) arrives later, via
+                    // a `PollCompleted.terminal` entry, once a tick boundary
+                    // actually applies it.
+                    if receipt.disposition != CommandDisposition::Queued {
+                        self.command_events.push(CommandEvent::Completed(receipt));
+                    }
                 }
                 Ok(WorkerEvent::CommandFailed {
                     command,
                     error,
                     state,
+                    terminal,
                 }) => {
                     self.submitted_commands.remove(&command);
                     aggregate.snapshot_updated |= self.adopt(state)?;
+                    self.command_events.extend(terminal);
                     self.command_events
                         .push(CommandEvent::Failed { command, error });
                 }
-                Ok(WorkerEvent::PollCompleted { outcome, state }) => {
+                Ok(WorkerEvent::PollCompleted {
+                    outcome,
+                    state,
+                    terminal,
+                }) => {
                     self.poll_in_flight = false;
                     aggregate.snapshot_updated |= outcome.snapshot_updated;
                     aggregate.snapshot_updated |= self.adopt(state)?;
@@ -199,6 +243,7 @@ impl AsyncLocalDataSource {
                         .commands_applied
                         .saturating_add(outcome.commands_applied);
                     aggregate.fell_behind |= outcome.fell_behind;
+                    self.command_events.extend(terminal);
                 }
                 Ok(WorkerEvent::PollFailed(error)) => {
                     self.poll_in_flight = false;
@@ -258,7 +303,35 @@ impl FieldDataSource for AsyncLocalDataSource {
     }
 
     fn pending_command_count(&self) -> usize {
-        self.worker_pending_commands + self.submitted_commands.len()
+        self.worker_queue.pending.len() + self.submitted_commands.len()
+    }
+
+    fn get_queue(&self) -> QueueStatus {
+        let mut status = self.worker_queue.clone();
+        // Commands sent to the worker but not yet executed there have no
+        // record in `worker_queue` yet — synthesize a `Submitted` display
+        // entry for each so a caller sees them immediately, before the
+        // worker even reports back.
+        for (&command, &kind) in &self.submitted_commands {
+            status.pending.push(CommandRecord::submitted(command, kind));
+        }
+        status
+    }
+
+    /// `pending_len` folds in `submitted_commands` the same way
+    /// [`Self::pending_command_count`] and `get_queue`'s synthesized
+    /// `Submitted` entries do, so the two stay consistent.
+    fn queue_summary(&self) -> QueueSummary {
+        QueueSummary {
+            paused: self.worker_queue.paused,
+            pending_len: self.worker_queue.pending.len() + self.submitted_commands.len(),
+            history_len: self.worker_queue.history.len(),
+            newest_history: self
+                .worker_queue
+                .history
+                .last()
+                .map(|record| record.command),
+        }
     }
 
     fn subscription(&self) -> Subscription {
@@ -286,10 +359,11 @@ impl FieldDataSource for AsyncLocalDataSource {
             return Err(SourceError::Disconnected);
         }
         let command_id = command.id;
+        let kind = command.payload.kind();
         self.requests
             .send(WorkerRequest::Execute(command))
             .map_err(|_| SourceError::Disconnected)?;
-        self.submitted_commands.insert(command_id);
+        self.submitted_commands.insert(command_id, kind);
         Ok(CommandReceipt {
             command: command_id,
             world_revision: self.simulation.world_revision,
@@ -340,15 +414,26 @@ fn worker_loop(
         match request {
             WorkerRequest::Execute(command) => {
                 let command_id = command.id;
-                let event = match source.execute(command) {
+                let result = source.execute(command);
+                let state = SourceState::capture(&source);
+                // Drained here, not just on `Poll`: a command that flushes
+                // another, already-queued one as its own side effect (e.g.
+                // `pause` flushing a running edit) produces that other
+                // command's terminal event synchronously, inside this same
+                // `execute` call — leaving it buffered until some later
+                // `Poll` happens to run would strand any waiter for it.
+                let terminal = source.drain_command_events();
+                let event = match result {
                     Ok(receipt) => WorkerEvent::CommandCompleted {
                         receipt,
-                        state: SourceState::capture(&source),
+                        state,
+                        terminal,
                     },
                     Err(error) => WorkerEvent::CommandFailed {
                         command: command_id,
                         error,
-                        state: SourceState::capture(&source),
+                        state,
+                        terminal,
                     },
                 };
                 if events.send(event).is_err() {
@@ -360,6 +445,7 @@ fn worker_loop(
                     Ok(outcome) => WorkerEvent::PollCompleted {
                         outcome,
                         state: SourceState::capture(&source),
+                        terminal: source.drain_command_events(),
                     },
                     Err(error) => WorkerEvent::PollFailed(error),
                 };

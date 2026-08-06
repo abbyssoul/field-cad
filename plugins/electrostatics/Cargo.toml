@@ -7,4 +7,5 @@ edition = "2024"
 fieldcad-core = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
+fieldcad-superposition = { workspace = true }
 glam = { workspace = true }

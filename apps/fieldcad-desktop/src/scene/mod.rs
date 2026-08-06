@@ -18,14 +18,13 @@ mod pick;
 pub use authoring::{SceneVisibility, append_authoring_geometry, append_compute_bounds};
 pub use field::field_geometry;
 pub use gizmo::{
-    GizmoDisplay, TransformHandle, TransformPreview, append_transform_gizmo,
-    append_transform_gizmo_with_display, constrained_translation, dragged_box_rotation,
-    dragged_plane_normal, dragged_trackball_rotation, dragged_view_rotation, pick_transform_handle,
-    pick_transform_handle_with_display, plane_normal_label_position, plane_normal_tip,
-    rotation_gizmo_radius, rotation_gizmo_radius_with_display, selection_gizmo_length,
+    GizmoDisplay, TransformHandle, TransformPreview, append_transform_gizmo_with_display,
+    constrained_translation, dragged_box_rotation, dragged_plane_normal,
+    dragged_trackball_rotation, dragged_view_rotation, pick_transform_handle_with_display,
+    plane_normal_label_position, plane_normal_tip, rotation_gizmo_radius_with_display,
     selection_gizmo_length_with_display, selection_origin, view_plane_translation,
 };
-pub use pick::{pick_object, pick_scene};
+pub use pick::pick_scene;
 
 use fieldcad_core::{
     BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SphereId, WorldObject, WorldSnapshot,
@@ -73,7 +72,13 @@ impl ObjectInstance {
     }
 
     /// World-space centre and radius, for camera framing.
-    pub fn bounding_sphere(&self) -> (Vec3, f32) {
+    ///
+    /// Not `pub`, and only compiled for tests: no production caller uses
+    /// this today — `app.rs`'s own camera-framing code goes through
+    /// `WorldObject::bounding_sphere` (`fieldcad-core`) directly, not this
+    /// `ObjectInstance` method.
+    #[cfg(test)]
+    fn bounding_sphere(&self) -> (Vec3, f32) {
         (
             self.model.w_axis.truncate(),
             self.half_extent.length().max(0.01),

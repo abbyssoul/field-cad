@@ -4,12 +4,11 @@
 //! is deliberately small and explicit: it is the correctness oracle for every
 //! later parallel or GPU implementation.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use fieldcad_core::{
     ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, ObjectId, PluginId,
-    PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic, UndefinedReason,
-    WorldSnapshot,
+    PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic, WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
     ChargeDistribution, ChargeSource, charge_component_id, charge_properties, charge_property_id,
@@ -20,8 +19,9 @@ use fieldcad_electromagnetic_sources::{
 };
 use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
-    PluginMetadata, SampledColumn, SolverContext, SolverKind,
+    PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
 };
+use fieldcad_superposition::InverseSquareSource;
 use glam::DVec3;
 
 #[cfg(test)]
@@ -100,74 +100,25 @@ impl ElectrostaticBatchEvaluator for CpuBatchEvaluator {
     }
 }
 
-impl ElectrostaticSample {
-    fn undefined(reason: UndefinedReason) -> Self {
-        Self {
-            electric_field: DVec3::ZERO,
-            potential: 0.0,
-            validity: SampleValidity::Undefined(reason),
-        }
+fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
+    InverseSquareSource {
+        position: source.position,
+        strength: source.charge_coulombs,
+        distribution: source.distribution.into(),
     }
 }
 
 /// Evaluate the superposed electrostatic field and potential in SI units.
 pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> ElectrostaticSample {
-    let mut electric_field = DVec3::ZERO;
-    let mut potential = 0.0;
-
-    for source in sources {
-        if source.charge_coulombs == 0.0 {
-            continue;
-        }
-        let displacement = position - source.position;
-        let distance_squared = displacement.length_squared();
-        let distance = distance_squared.sqrt();
-
-        let (field_contribution, potential_contribution) = match source.distribution {
-            ChargeDistribution::Point { exclusion_radius } => {
-                if distance <= exclusion_radius {
-                    return ElectrostaticSample::undefined(UndefinedReason::InsideSourceRadius);
-                }
-                let inverse_distance = distance.recip();
-                (
-                    COULOMB_CONSTANT
-                        * source.charge_coulombs
-                        * displacement
-                        * inverse_distance.powi(3),
-                    COULOMB_CONSTANT * source.charge_coulombs * inverse_distance,
-                )
-            }
-            ChargeDistribution::UniformSphere { radius } if distance < radius => {
-                let radius_cubed = radius.powi(3);
-                (
-                    COULOMB_CONSTANT * source.charge_coulombs * displacement / radius_cubed,
-                    COULOMB_CONSTANT * source.charge_coulombs / (2.0 * radius)
-                        * (3.0 - distance_squared / radius.powi(2)),
-                )
-            }
-            ChargeDistribution::UniformSphere { .. } => {
-                let inverse_distance = distance.recip();
-                (
-                    COULOMB_CONSTANT
-                        * source.charge_coulombs
-                        * displacement
-                        * inverse_distance.powi(3),
-                    COULOMB_CONSTANT * source.charge_coulombs * inverse_distance,
-                )
-            }
-        };
-
-        electric_field += field_contribution;
-        potential += potential_contribution;
-        if !electric_field.is_finite() || !potential.is_finite() {
-            return ElectrostaticSample::undefined(UndefinedReason::NumericalOverflow);
-        }
-    }
-
+    let sample = fieldcad_superposition::evaluate_sources(
+        COULOMB_CONSTANT,
+        sources.iter().map(inverse_square_source),
+        position,
+    );
     ElectrostaticSample {
-        electric_field,
-        potential,
-        validity: SampleValidity::Exact,
+        electric_field: sample.field,
+        potential: sample.potential,
+        validity: sample.validity,
     }
 }
 
@@ -237,10 +188,15 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
                 .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
             world_revision: context.world.revision(),
             evaluator: Arc::clone(&self.evaluator),
-            cache: Mutex::new(Vec::new()),
+            cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
         }))
     }
 }
+
+/// A subscription currently has probes plus any number of planes and one
+/// grid. Bounds stale entries left by density changes without complicating
+/// the plugin contract with publication lifecycle callbacks.
+const SAMPLE_CACHE_CAPACITY: usize = 16;
 
 struct ElectrostaticsSolver {
     domain: Domain,
@@ -249,7 +205,7 @@ struct ElectrostaticsSolver {
     evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
     /// Runtime publication asks for E and V separately. Retain the small set of
     /// geometries from this publication so both channels share one evaluation.
-    cache: Mutex<Vec<(SampleGeometry, Arc<[ElectrostaticSample]>)>>,
+    cache: SampleCache<ElectrostaticSample>,
 }
 
 impl EquationSystemSolver for ElectrostaticsSolver {
@@ -267,11 +223,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
         self.sources = collect_sources(world)
             .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?;
         self.world_revision = world.revision();
-        self.cache
-            .get_mut()
-            .map_err(|_| PluginError::Solver(POISONED_CACHE.to_owned()))?
-            .clear();
-        Ok(())
+        self.cache.clear()
     }
 
     fn sample(
@@ -347,8 +299,6 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     }
 }
 
-const POISONED_CACHE: &str = "electrostatics evaluation cache is poisoned";
-
 impl ElectrostaticsSolver {
     /// The electric field at `position` from every source except `object`.
     ///
@@ -356,62 +306,39 @@ impl ElectrostaticsSolver {
     /// source list differs per body and the evaluator's contract is one field
     /// for one geometry from *all* sources.
     fn field_excluding(&self, object: ObjectId, position: DVec3) -> Result<DVec3, PluginError> {
-        let mut field = DVec3::ZERO;
-        for source in self.sources.iter().filter(|source| source.object != object) {
-            let offset = position - source.position;
-            let distance = offset.length();
-            let exclusion = match source.distribution {
-                ChargeDistribution::Point { exclusion_radius } => exclusion_radius,
-                ChargeDistribution::UniformSphere { radius } => radius,
-            };
-            if distance <= exclusion || distance == 0.0 {
-                // Inside a source's own radius the analytic point field is not
-                // merely large but undefined. Contributing nothing is honest;
-                // contributing a huge number would look like physics.
-                continue;
-            }
-            field += offset * (COULOMB_CONSTANT * source.charge_coulombs / distance.powi(3));
-        }
-        if !field.is_finite() {
-            return Err(PluginError::Solver(
+        fieldcad_superposition::field_excluding(
+            COULOMB_CONSTANT,
+            self.sources
+                .iter()
+                .filter(|source| source.object != object)
+                .map(inverse_square_source),
+            position,
+        )
+        .ok_or_else(|| {
+            PluginError::Solver(
                 "electrostatic force evaluation produced a non-finite field".to_owned(),
-            ));
-        }
-        Ok(field)
+            )
+        })
     }
 
     fn samples_for(
         &self,
         geometry: &SampleGeometry,
     ) -> Result<Arc<[ElectrostaticSample]>, PluginError> {
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| PluginError::Solver(POISONED_CACHE.to_owned()))?;
-        if let Some((_, samples)) = cache.iter().find(|(cached, _)| cached == geometry) {
-            return Ok(Arc::clone(samples));
-        }
-
-        let evaluated = self
-            .evaluator
-            .evaluate(&self.sources, &self.domain, geometry)
-            .map_err(PluginError::Solver)?;
-        if evaluated.len() != geometry.len() {
-            return Err(PluginError::Solver(format!(
-                "batched evaluator returned {} samples for a geometry of length {}",
-                evaluated.len(),
-                geometry.len()
-            )));
-        }
-        let evaluated: Arc<[ElectrostaticSample]> = evaluated.into();
-        // A subscription currently has probes plus any number of planes and one
-        // grid. Bound stale entries left by density changes without complicating
-        // the plugin contract with publication lifecycle callbacks.
-        if cache.len() >= 16 {
-            cache.remove(0);
-        }
-        cache.push((geometry.clone(), Arc::clone(&evaluated)));
-        Ok(evaluated)
+        self.cache.get_or_try_insert_with(geometry, || {
+            let evaluated = self
+                .evaluator
+                .evaluate(&self.sources, &self.domain, geometry)
+                .map_err(PluginError::Solver)?;
+            if evaluated.len() != geometry.len() {
+                return Err(PluginError::Solver(format!(
+                    "batched evaluator returned {} samples for a geometry of length {}",
+                    evaluated.len(),
+                    geometry.len()
+                )));
+            }
+            Ok(evaluated)
+        })
     }
 }
 
@@ -421,7 +348,7 @@ mod tests {
 
     use fieldcad_core::{
         BoundaryConditions, DomainBounds, ObjectId, ObjectShape, ObjectSpec, PlaneLattice,
-        Resolution, Transform, Velocity, World, WorldCommand,
+        Resolution, Transform, UndefinedReason, Velocity, World, WorldCommand,
     };
     use glam::UVec2;
 
@@ -588,6 +515,71 @@ mod tests {
             solver_for_charged_shape(Some(ObjectShape::boxed(DVec3::ONE).unwrap())),
             Err(PluginError::UnsupportedWorld(_))
         ));
+    }
+
+    /// PH-3 regression: `field_excluding` used to collapse a uniformly
+    /// charged sphere's interior to the same "excluded, contributes
+    /// nothing" treatment as a point source's exclusion radius, even
+    /// though `evaluate_sources` has always had the correct finite
+    /// interior formula right next to it — a body dragged inside a charged
+    /// sphere felt exactly zero force from it. Fixed by sharing one
+    /// implementation with `fieldcad-newtonian-gravity`, which already got
+    /// this right for gravity (PH-2/PH-19).
+    #[test]
+    fn a_body_inside_a_charged_sphere_feels_its_finite_interior_field() {
+        let mut world = World::new();
+        let schema = ElectrostaticsPlugin::new().component_schemas().remove(0);
+        let report = world
+            .commit([
+                WorldCommand::RegisterComponentSchema(schema),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("sphere")
+                        .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                        .with_shape(ObjectShape::sphere(1.0).unwrap())
+                        .with_component(charge_component_id(), charge_properties(2.0e-9).unwrap()),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("probe charge")
+                        .with_transform(Transform::at(DVec3::X * 0.4).unwrap())
+                        .with_shape(ObjectShape::point(0.01).unwrap())
+                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                ),
+            ])
+            .unwrap();
+        let probe_id = report.created_objects[1];
+
+        let domain = Domain::centred_cube(4.0, 8).unwrap();
+        let mut solver = ElectrostaticsPlugin::new()
+            .create_solver(SolverContext {
+                configuration: &PropertyBag::default(),
+                domain: &domain,
+                world: &world.snapshot(),
+                initial_step: fieldcad_core::StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+                },
+                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
+            })
+            .unwrap();
+        solver.on_world_changed(&world.snapshot()).unwrap();
+
+        let forces = solver
+            .forces(&[DynamicBody {
+                object: probe_id,
+                inertial_mass_kg: 1.0,
+                position: DVec3::X * 0.4,
+                velocity: DVec3::ZERO,
+            }])
+            .unwrap();
+
+        assert!(forces[0].x.is_finite());
+        assert!(
+            forces[0].x > 0.0,
+            "a positive probe charge inside a positively charged sphere must \
+             feel a real outward force from it, got {:?}",
+            forces[0]
+        );
     }
 
     struct CountingEvaluator {

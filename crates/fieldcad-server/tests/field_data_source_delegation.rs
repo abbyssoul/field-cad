@@ -51,30 +51,38 @@ fn body_forces_reach_the_trait_object_not_just_the_inherent_method() {
     // Deliberately goes through `submit`, not a direct `AsyncLocalDataSource`
     // call: this is the same path a real transport uses.
     server
-        .execute(sequencer.issue(CommandPayload::CommitWorld(
-            mass_component_schemas()
-                .into_iter()
-                .map(WorldCommand::RegisterComponentSchema)
-                .chain([
-                    WorldCommand::CreateObject(
-                        ObjectSpec::new("source")
-                            .with_pinned(true)
-                            .with_shape(ObjectShape::point(0.05).unwrap())
-                            .with_component(charge_component_id(), charge_properties(1.0e-6).unwrap()),
-                    ),
-                    WorldCommand::CreateObject(
-                        ObjectSpec::new("free")
-                            .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
-                            .with_shape(ObjectShape::point(0.05).unwrap())
-                            .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap())
-                            .with_component(
-                                inertial_mass_component_id(),
-                                inertial_mass_properties(1.0e-6).unwrap(),
-                            ),
-                    ),
-                ])
-                .collect(),
-        )))
+        .execute(
+            sequencer.issue(CommandPayload::CommitWorld(
+                mass_component_schemas()
+                    .into_iter()
+                    .map(WorldCommand::RegisterComponentSchema)
+                    .chain([
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("source")
+                                .with_pinned(true)
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                        WorldCommand::CreateObject(
+                            ObjectSpec::new("free")
+                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_shape(ObjectShape::point(0.05).unwrap())
+                                .with_component(
+                                    charge_component_id(),
+                                    charge_properties(1.0e-9).unwrap(),
+                                )
+                                .with_component(
+                                    inertial_mass_component_id(),
+                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                ),
+                        ),
+                    ])
+                    .collect(),
+            )),
+        )
         .unwrap();
     // `execute` only submits; the commit is applied asynchronously on the
     // worker thread (ADR 0011), so wait for it before reading `world()`.
@@ -96,7 +104,9 @@ fn body_forces_reach_the_trait_object_not_just_the_inherent_method() {
         .unwrap()
         .0;
 
-    source.execute(sequencer.issue(CommandPayload::Step)).unwrap();
+    source
+        .execute(sequencer.issue(CommandPayload::Step))
+        .unwrap();
     assert!(
         matches!(wait_for_event(source), CommandEvent::Completed(_)),
         "the step is accepted once a scene exists"
@@ -119,9 +129,9 @@ fn drain_command_events_reaches_the_trait_object_not_just_the_inherent_method() 
     // (ADR 0011: the worker validates a commit, not the initial `execute`
     // call), so this only surfaces via `drain_command_events`.
     server
-        .execute(sequencer.issue(CommandPayload::CommitWorld(vec![WorldCommand::RemoveObject(
-            fieldcad_core::ObjectId::new(0xdead_beef),
-        )])))
+        .execute(sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::RemoveObject(fieldcad_core::ObjectId::new(0xdead_beef)),
+        ])))
         .unwrap();
 
     let source: &mut dyn FieldDataSource = &mut server;

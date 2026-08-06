@@ -17,14 +17,25 @@
 //! wasn't given) — the loopback restriction itself is not relaxed in this
 //! change; that's deliberately deferred, see `docs/mcp-plan.md`.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
+};
 
 use fieldcad_mcp::McpServer;
 use fieldcad_server::HeadlessServer;
-use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8642";
+
+/// How often the standalone session's own wall clock advances. Matches
+/// `fieldcad-server`'s equivalent headless loop; fast enough that a queued
+/// edit reaches its next tick boundary promptly, slow enough not to matter
+/// against typical simulation time steps.
+const DRIVE_INTERVAL: Duration = Duration::from_millis(16);
 
 const HELP: &str = "\
 fieldcad-mcp — MCP transport onto the Field CAD simulation model
@@ -147,7 +158,7 @@ async fn main() -> ExitCode {
         }
     };
     let model = Arc::new(Mutex::new(HeadlessServer::new(source)));
-    let server = McpServer::new(model);
+    let server = McpServer::new(Arc::clone(&model));
 
     let root_ct = CancellationToken::new();
     tokio::spawn({
@@ -161,6 +172,7 @@ async fn main() -> ExitCode {
     });
 
     let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(drive_session(model, root_ct.child_token()));
     if transports.stdio {
         let server = server.clone();
         let ct = root_ct.child_token();
@@ -202,6 +214,39 @@ async fn main() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// This session's wall-clock driver for a standalone `fieldcad-mcp`: no MCP
+/// tool exposes wall-clock advance (by design — that isn't a client
+/// decision), so something in-process has to call `HeadlessServer::advance`
+/// on a fixed cadence the way the embedded desktop app's per-frame pump does
+/// when this crate is embedded there instead. `submit_and_wait`'s own
+/// per-tool-call tick deliberately does *not* do this (see its doc comment):
+/// it would double this task's real elapsed time into the same shared
+/// `TickPacer` whenever both ran concurrently.
+async fn drive_session(
+    model: Arc<Mutex<HeadlessServer>>,
+    ct: CancellationToken,
+) -> Result<(), String> {
+    let mut interval = tokio::time::interval(DRIVE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_tick = Instant::now();
+    loop {
+        tokio::select! {
+            () = ct.cancelled() => return Ok(()),
+            _ = interval.tick() => {
+                let elapsed = last_tick.elapsed();
+                last_tick = Instant::now();
+                let mut server = model.lock().unwrap_or_else(PoisonError::into_inner);
+                server
+                    .advance(elapsed)
+                    .map_err(|error| format!("simulation advance failed: {error}"))?;
+                for event in server.drain_events() {
+                    tracing::debug!(?event, "command event");
+                }
+            }
+        }
     }
 }
 

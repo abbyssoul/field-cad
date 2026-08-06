@@ -17,7 +17,10 @@ mod viewcontrols;
 pub use compute::ComputeView;
 
 use help::help_window;
-use panels::{diagnostics_window, field_brush_dialog, inspector, mcp_window, menu_bar, scene_tree};
+use panels::{
+    diagnostics_window, field_brush_dialog, inspector, mcp_window, menu_bar, queue_window,
+    scene_tree,
+};
 use plot::floating_probe_plots;
 use viewcontrols::view_controls;
 
@@ -231,6 +234,10 @@ pub struct UiModel {
     /// diagnostics: enabling remote control is a deliberate, security-
     /// relevant opt-in, not something to surface unasked.
     pub mcp_panel_open: bool,
+    /// Whether the Queue panel is shown. Defaults closed, matching
+    /// `mcp_panel_open`: an empty queue is the common case and shouldn't
+    /// demand screen space by default.
+    pub queue_panel_open: bool,
 }
 
 impl UiModel {
@@ -256,6 +263,7 @@ impl UiModel {
             command_error: None,
             domain_draft: None,
             mcp_panel_open: false,
+            queue_panel_open: false,
         }
     }
 
@@ -595,6 +603,9 @@ pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -
     if model.mcp_panel_open {
         output.mcp_action = mcp_window(&context, frame.mcp);
     }
+    if model.queue_panel_open {
+        queue_window(&context, &frame, &mut output);
+    }
     floating_probe_plots(&context, model, &frame);
     field_brush_dialog(&context, model, frame.compute);
 
@@ -763,7 +774,7 @@ mod tests {
     ) -> String {
         let world = seeded_world();
         let snapshot = world.snapshot();
-        let compute = ComputeView::build(&source(), &snapshot);
+        let compute = ComputeView::build(&source(), &snapshot, None);
         let history = ProbeHistory::default();
 
         let input = egui::RawInput {
@@ -825,7 +836,7 @@ mod tests {
         // constructing a runtime per frame.
         let world = seeded_world();
         let snapshot = world.snapshot();
-        let compute = ComputeView::build(&source(), &snapshot);
+        let compute = ComputeView::build(&source(), &snapshot, None);
         let history = ProbeHistory::default();
         let mut output = UiFrameOutput::default();
 
@@ -1185,7 +1196,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut view = ComputeView::build(&source, &world.snapshot());
+        let mut view = ComputeView::build(&source, &world.snapshot(), None);
         let mut model = UiModel::new();
         let published = vector_channel_id();
 
@@ -1218,7 +1229,7 @@ mod tests {
     /// the control useless rather than merely surprising.
     #[test]
     fn hiding_the_only_field_layer_is_not_undone_on_the_next_frame() {
-        let mut view = ComputeView::build(&source(), &seeded_world().snapshot());
+        let mut view = ComputeView::build(&source(), &seeded_world().snapshot(), None);
         view.vector_channels = vec![vector_channel_id()];
         let mut model = UiModel::new();
 
@@ -1247,7 +1258,7 @@ mod tests {
     /// because the user has everything else hidden.
     #[test]
     fn a_new_channel_does_not_reveal_itself_over_a_hidden_scene() {
-        let mut view = ComputeView::build(&source(), &seeded_world().snapshot());
+        let mut view = ComputeView::build(&source(), &seeded_world().snapshot(), None);
         view.vector_channels = vec![vector_channel_id()];
         let mut model = UiModel::new();
         model.synchronize_field_layers(&view);

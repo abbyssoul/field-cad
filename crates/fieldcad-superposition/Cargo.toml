@@ -1,0 +1,9 @@
+[package]
+name = "fieldcad-superposition"
+version = "0.1.0"
+edition = "2024"
+description = "Generic point/sphere source superposition kernel for an inverse-square coupling law"
+
+[dependencies]
+fieldcad-core = { workspace = true }
+glam = { workspace = true }

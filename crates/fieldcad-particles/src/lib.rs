@@ -357,7 +357,9 @@ mod tests {
     /// `CATALOG` must not require also remembering to list it in a test.
     #[test]
     fn catalog_entries_compose_from_independently_attachable_components() {
-        for template in ParticleTemplate::all().filter(|template| *template != ParticleTemplate::Custom) {
+        for template in
+            ParticleTemplate::all().filter(|template| *template != ParticleTemplate::Custom)
+        {
             let spec = template_particle_spec(template, false, DVec3::ZERO, DVec3::X, 0.1).unwrap();
             assert!(spec.components.contains_key(&inertial_mass_component_id()));
             assert!(spec.components.contains_key(&charge_component_id()));
@@ -369,7 +371,10 @@ mod tests {
     fn anti_proton_has_proton_mass_and_opposite_charge() {
         let anti_proton = ParticleTemplate::Catalog("Anti-proton");
         assert_eq!(anti_proton.mass_kg(), Some(PROTON_MASS_KG));
-        assert_eq!(anti_proton.charge_coulombs(), Some(-ELEMENTARY_CHARGE_COULOMBS));
+        assert_eq!(
+            anti_proton.charge_coulombs(),
+            Some(-ELEMENTARY_CHARGE_COULOMBS)
+        );
     }
 
     #[test]

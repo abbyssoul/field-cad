@@ -806,6 +806,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
 ]
 
@@ -881,6 +882,7 @@ dependencies = [
  "fieldcad-core",
  "fieldcad-electromagnetic-sources",
  "fieldcad-plugin-api",
+ "fieldcad-superposition",
  "glam",
 ]
 
@@ -936,6 +938,7 @@ version = "0.1.0"
 dependencies = [
  "fieldcad-core",
  "fieldcad-mass-sources",
+ "fieldcad-superposition",
  "glam",
 ]
 
@@ -993,6 +996,14 @@ dependencies = [
  "glam",
  "serde",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "fieldcad-superposition"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "glam",
 ]
 
 [[package]]

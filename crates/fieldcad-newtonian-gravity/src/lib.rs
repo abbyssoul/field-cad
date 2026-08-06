@@ -3,9 +3,16 @@
 //! This crate owns no plugin, renderer, runtime, or transport. Local Field CAD,
 //! a future accelerator, and an Orishu workload adapter can therefore use the
 //! same source law and singularity semantics.
+//!
+//! The actual point/sphere superposition kernel lives in
+//! `fieldcad-superposition`, shared with `plugins/electrostatics` — Newton's
+//! law of gravitation and Coulomb's law are the same functional form with a
+//! different coupling constant and an opposite sign. This crate is the thin,
+//! gravity-specific adapter over it: `MassSource` in, `NewtonianSample` out.
 
-use fieldcad_core::{SampleGeometry, SampleValidity, UndefinedReason};
-use fieldcad_mass_sources::{MassDistribution, MassSource};
+use fieldcad_core::{SampleGeometry, SampleValidity};
+use fieldcad_mass_sources::MassSource;
+use fieldcad_superposition::InverseSquareSource;
 use glam::DVec3;
 
 /// Newton's gravitational constant in m³·kg⁻¹·s⁻² (CODATA 2018).
@@ -19,65 +26,46 @@ pub struct NewtonianSample {
     pub validity: SampleValidity,
 }
 
-impl NewtonianSample {
-    fn undefined(reason: UndefinedReason) -> Self {
-        Self {
-            acceleration: DVec3::ZERO,
-            potential: 0.0,
-            validity: SampleValidity::Undefined(reason),
-        }
-    }
+/// `None` for a body with inertia but no gravitational mass (the
+/// gravitational equivalent of an uncharged body) or with zero
+/// gravitational mass — neither sources a field.
+fn inverse_square_source(source: &MassSource) -> Option<InverseSquareSource> {
+    let mass = source.gravitational_mass_kg?;
+    (mass != 0.0).then_some(InverseSquareSource {
+        position: source.position,
+        strength: mass,
+        distribution: source.distribution.into(),
+    })
 }
 
 /// Evaluate the superposed Newtonian field and potential in SI units.
 pub fn evaluate_sources(sources: &[MassSource], position: DVec3) -> NewtonianSample {
-    let mut acceleration = DVec3::ZERO;
-    let mut potential = 0.0;
-    for source in sources {
-        let Some(mass) = source.gravitational_mass_kg else {
-            continue;
-        };
-        if mass == 0.0 {
-            continue;
-        }
-        let displacement = position - source.position;
-        let distance_squared = displacement.length_squared();
-        let distance = distance_squared.sqrt();
-        let (field, phi) = match source.distribution {
-            MassDistribution::Point { exclusion_radius } => {
-                if distance <= exclusion_radius {
-                    return NewtonianSample::undefined(UndefinedReason::InsideSourceRadius);
-                }
-                let inverse = distance.recip();
-                (
-                    -GRAVITATIONAL_CONSTANT * mass * displacement * inverse.powi(3),
-                    -GRAVITATIONAL_CONSTANT * mass * inverse,
-                )
-            }
-            MassDistribution::UniformSphere { radius } if distance < radius => (
-                -GRAVITATIONAL_CONSTANT * mass * displacement / radius.powi(3),
-                -GRAVITATIONAL_CONSTANT * mass / (2.0 * radius)
-                    * (3.0 - distance_squared / radius.powi(2)),
-            ),
-            MassDistribution::UniformSphere { .. } => {
-                let inverse = distance.recip();
-                (
-                    -GRAVITATIONAL_CONSTANT * mass * displacement * inverse.powi(3),
-                    -GRAVITATIONAL_CONSTANT * mass * inverse,
-                )
-            }
-        };
-        acceleration += field;
-        potential += phi;
-        if !acceleration.is_finite() || !potential.is_finite() {
-            return NewtonianSample::undefined(UndefinedReason::NumericalOverflow);
-        }
-    }
+    let sample = fieldcad_superposition::evaluate_sources(
+        -GRAVITATIONAL_CONSTANT,
+        sources.iter().filter_map(inverse_square_source),
+        position,
+    );
     NewtonianSample {
-        acceleration,
-        potential,
-        validity: SampleValidity::Exact,
+        acceleration: sample.field,
+        potential: sample.potential,
+        validity: sample.validity,
     }
+}
+
+/// Superposed acceleration at `position`, skipping only whichever source's
+/// own exclusion geometry contains it rather than voiding the whole sample —
+/// the analytic point field is undefined near that source specifically, not
+/// near an unrelated, perfectly well-defined one. Unlike [`evaluate_sources`],
+/// which the display grid needs a single well-defined-or-not sample from, a
+/// force calculation needs the well-defined sources summed regardless of
+/// what a nearby, unrelated one is doing. `None` if the summed acceleration
+/// overflowed to a non-finite value.
+pub fn evaluate_acceleration_excluding(sources: &[MassSource], position: DVec3) -> Option<DVec3> {
+    fieldcad_superposition::field_excluding(
+        -GRAVITATIONAL_CONSTANT,
+        sources.iter().filter_map(inverse_square_source),
+        position,
+    )
 }
 
 /// Evaluate one complete geometry through the canonical source law.
@@ -95,6 +83,7 @@ pub fn evaluate_geometry(
 mod tests {
     use super::*;
     use fieldcad_core::{ObjectId, Velocity};
+    use fieldcad_mass_sources::MassDistribution;
 
     fn point(mass: f64) -> MassSource {
         MassSource {

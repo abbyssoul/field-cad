@@ -347,6 +347,40 @@ impl SlicePlaneSpec {
             visible: plane.visible,
         }
     }
+
+    /// Every field's own constructor invariant, re-checked. Needed because
+    /// this type's fields are private but it derives `Deserialize` — a
+    /// value can reach `apply_command` by deserializing caller-supplied
+    /// JSON directly (`commit_world`), bypassing every constructor above.
+    pub(crate) fn validate(&self) -> Result<(), WorldError> {
+        if !self.origin.is_finite()
+            || !is_usable_direction(self.normal)
+            || !self.half_extent.is_finite()
+            || self.half_extent.min_element() <= 0.0
+        {
+            return Err(WorldError::InvalidPlane);
+        }
+        let normal = self.normal.normalize();
+        let projected_u = self.u_axis - normal * self.u_axis.dot(normal);
+        if !is_usable_direction(projected_u) {
+            return Err(WorldError::InvalidPlane);
+        }
+        Ok(())
+    }
+
+    /// `normal` to unit length, `u_axis` to the same orthonormal-to-`normal`
+    /// basis every safe constructor already guarantees. Only meaningful
+    /// once [`Self::validate`] has passed — same split as
+    /// [`Transform::validate`]/[`Transform::normalized`].
+    pub(crate) fn normalized(self) -> Self {
+        let normal = self.normal.normalize();
+        let u_axis = (self.u_axis - normal * self.u_axis.dot(normal)).normalize();
+        Self {
+            normal,
+            u_axis,
+            ..self
+        }
+    }
 }
 
 /// Choose a stable in-plane axis for a normal, so that two planes with the same
@@ -474,6 +508,30 @@ impl FieldBoxSpec {
             visible: field_box.visible,
         }
     }
+
+    /// Every field's own constructor invariant, re-checked — see
+    /// [`SlicePlaneSpec::validate`] for why this is needed despite private
+    /// fields.
+    pub(crate) fn validate(&self) -> Result<(), WorldError> {
+        if !self.origin.is_finite()
+            || !self.half_extent.is_finite()
+            || self.half_extent.min_element() <= 0.0
+            || !self.rotation.is_finite()
+            || self.rotation.length_squared() == 0.0
+        {
+            return Err(WorldError::InvalidBox);
+        }
+        Ok(())
+    }
+
+    /// `rotation` to unit length. Only meaningful once [`Self::validate`]
+    /// has passed.
+    pub(crate) fn normalized(self) -> Self {
+        Self {
+            rotation: self.rotation.normalize(),
+            ..self
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -568,6 +626,16 @@ impl FieldSphereSpec {
             radius: sphere.radius,
             visible: sphere.visible,
         }
+    }
+
+    /// Every field's own constructor invariant, re-checked — see
+    /// [`SlicePlaneSpec::validate`] for why this is needed despite private
+    /// fields.
+    pub(crate) fn validate(&self) -> Result<(), WorldError> {
+        if !self.origin.is_finite() || !self.radius.is_finite() || self.radius <= 0.0 {
+            return Err(WorldError::InvalidSphere);
+        }
+        Ok(())
     }
 }
 
@@ -1208,8 +1276,8 @@ fn apply_command(
             }
         }
         WorldCommand::CreatePlane(spec) => {
-            // `SlicePlaneSpec` cannot be constructed unvalidated, so there is no
-            // second copy of the plane predicate here.
+            spec.validate()?;
+            let spec = spec.normalized();
             let id = counters.next_plane();
             state.planes.insert(
                 id,
@@ -1240,6 +1308,8 @@ fn apply_command(
                 .visible = visible;
         }
         WorldCommand::SetPlane { plane, spec } => {
+            spec.validate()?;
+            let spec = spec.normalized();
             let current = state
                 .planes
                 .get_mut(&plane)
@@ -1260,8 +1330,8 @@ fn apply_command(
             }
         }
         WorldCommand::CreateBox(spec) => {
-            // `FieldBoxSpec` cannot be constructed unvalidated, so there is no
-            // second copy of the box predicate here.
+            spec.validate()?;
+            let spec = spec.normalized();
             let id = counters.next_box();
             state.boxes.insert(
                 id,
@@ -1291,6 +1361,8 @@ fn apply_command(
                 .visible = visible;
         }
         WorldCommand::SetBox { region, spec } => {
+            spec.validate()?;
+            let spec = spec.normalized();
             let current = state
                 .boxes
                 .get_mut(&region)
@@ -1310,6 +1382,7 @@ fn apply_command(
             }
         }
         WorldCommand::CreateSphere(spec) => {
+            spec.validate()?;
             let id = counters.next_sphere();
             state.spheres.insert(
                 id,
@@ -1338,6 +1411,7 @@ fn apply_command(
                 .visible = visible;
         }
         WorldCommand::SetSphere { sphere, spec } => {
+            spec.validate()?;
             let current = state
                 .spheres
                 .get_mut(&sphere)
@@ -1660,6 +1734,74 @@ mod tests {
                 - (4.0_f64 * 2.0_f64.sqrt())
                 < 1.0e-9
         );
+    }
+
+    /// PH-7 regression: `SlicePlaneSpec` has private fields, but derives
+    /// `Deserialize`, and `WorldCommand` is `Deserialize` end-to-end — a
+    /// caller-supplied JSON `commit_world` command (the exact path
+    /// `crates/fieldcad-mcp` uses) can carry a value no safe constructor
+    /// would ever produce. `apply_command` must reject it rather than trust
+    /// a "cannot be constructed unvalidated" invariant that was never true
+    /// for this type.
+    #[test]
+    fn commit_world_rejects_a_deserialized_plane_that_bypassed_its_constructor() {
+        let valid = SlicePlaneSpec::new("plane", DVec3::ZERO, DVec3::Z)
+            .unwrap()
+            .with_half_extent(DVec2::splat(2.0))
+            .unwrap();
+        let mut json = serde_json::to_value(&valid).unwrap();
+        json["normal"] = serde_json::json!([0.0, 0.0, 0.0]);
+        json["half_extent"] = serde_json::json!([-1.0, 1.0]);
+        let tampered: SlicePlaneSpec = serde_json::from_value(json).unwrap();
+
+        let mut world = World::new();
+        assert!(world.commit([WorldCommand::CreatePlane(tampered)]).is_err());
+    }
+
+    /// Same hazard, `FieldBoxSpec`.
+    #[test]
+    fn commit_world_rejects_a_deserialized_box_that_bypassed_its_constructor() {
+        let valid = FieldBoxSpec::new("box", DVec3::ZERO, DVec3::splat(1.0)).unwrap();
+        let mut json = serde_json::to_value(&valid).unwrap();
+        json["rotation"] = serde_json::to_value(DQuat::from_xyzw(0.0, 0.0, 0.0, 0.0)).unwrap();
+        json["half_extent"] = serde_json::json!([-1.0, 1.0, 1.0]);
+        let tampered: FieldBoxSpec = serde_json::from_value(json).unwrap();
+
+        let mut world = World::new();
+        assert!(world.commit([WorldCommand::CreateBox(tampered)]).is_err());
+    }
+
+    /// Same hazard, `FieldSphereSpec`.
+    #[test]
+    fn commit_world_rejects_a_deserialized_sphere_that_bypassed_its_constructor() {
+        let valid = FieldSphereSpec::new("sphere", DVec3::ZERO, 1.0).unwrap();
+        let mut json = serde_json::to_value(&valid).unwrap();
+        json["radius"] = serde_json::json!(-1.0);
+        let tampered: FieldSphereSpec = serde_json::from_value(json).unwrap();
+
+        let mut world = World::new();
+        assert!(
+            world
+                .commit([WorldCommand::CreateSphere(tampered)])
+                .is_err()
+        );
+    }
+
+    /// The fix validates *and* normalizes, the same split `Transform` already
+    /// uses — a finite, non-degenerate but non-unit normal is not an error,
+    /// it is silently corrected, the same as every safe constructor already
+    /// does.
+    #[test]
+    fn commit_world_normalizes_a_deserialized_planes_non_unit_normal() {
+        let valid = SlicePlaneSpec::new("plane", DVec3::ZERO, DVec3::Z).unwrap();
+        let mut json = serde_json::to_value(&valid).unwrap();
+        json["normal"] = serde_json::json!([0.0, 0.0, 3.0]);
+        let tampered: SlicePlaneSpec = serde_json::from_value(json).unwrap();
+
+        let mut world = World::new();
+        world.commit([WorldCommand::CreatePlane(tampered)]).unwrap();
+        let plane = world.snapshot().planes().values().next().unwrap().clone();
+        assert!((plane.normal.length() - 1.0).abs() < 1.0e-12);
     }
 
     #[test]

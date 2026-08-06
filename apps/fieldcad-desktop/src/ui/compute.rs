@@ -4,15 +4,19 @@
 //! Built once per frame so that panels take a plain value. Nothing here depends
 //! on whether compute is local or remote, and nothing here can issue a command.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use fieldcad_core::{
-    BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, Domain, FieldValue,
-    FieldValueKind, ObjectId, PluginId, SampleValidity, SimulationMode, SnapshotFreshness,
-    UndefinedReason, WorldRevision, WorldSnapshot,
+    BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, Domain, FieldSnapshot,
+    FieldValue, FieldValueKind, ObjectId, PluginId, SampleValidity, SimulationMode,
+    SnapshotFreshness, UndefinedReason, WorldRevision, WorldSnapshot,
 };
 use fieldcad_simulation::{
-    DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, Subscription,
+    DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, QueueStatus,
+    QueueSummary, Subscription,
 };
 use glam::DVec3;
 
@@ -31,6 +35,9 @@ pub struct ComputeView {
     pub time_step_seconds: f64,
     pub playback_speed: f64,
     pub pending_commands: usize,
+    /// Authoritative queue state: paused flag, ordered pending commands, and
+    /// recent terminal history — for the Queue panel to inspect and control.
+    pub queue: QueueStatus,
     pub world_revision: WorldRevision,
     pub snapshot_sequence: Option<u64>,
     pub freshness: Option<SnapshotFreshness>,
@@ -57,106 +64,83 @@ pub struct ComputeView {
     pub body_forces: BTreeMap<ObjectId, DVec3>,
 }
 
+/// The fields [`ComputeView::build`] derives purely from the latest
+/// snapshot (plus which field systems are active, which cannot change
+/// without a new snapshot being published — see the note on `snapshot`
+/// below) rather than being individually cheap to read from the source.
+/// Bundled so [`ComputeView::build`] can reuse the whole group at once
+/// when the snapshot it was built from is still current.
+#[derive(Clone)]
+struct SnapshotDerived {
+    total_samples: usize,
+    domain_summary: String,
+    probe_readings: Vec<ProbeRow>,
+    channel_names: BTreeMap<ChannelId, String>,
+    vector_channels: Vec<ChannelId>,
+    diagnostics: Vec<String>,
+    has_errors: bool,
+}
+
 impl ComputeView {
-    pub fn build(source: &dyn FieldDataSource, world: &WorldSnapshot) -> Self {
+    /// Built once per frame so that panels take a plain value — but
+    /// building it is not free (`total_samples`, `probe_readings`, and
+    /// `diagnostics` scale with channels and probes, and `queue` clones up
+    /// to 256 terminal records), and a redraw can run at up to the
+    /// display's refresh rate while the source itself changes far less
+    /// often. `previous` is last frame's view, if there was one: its
+    /// snapshot-derived fields are reused verbatim when `source.latest_snapshot()`
+    /// reports the same `identity.sequence` (every path that changes them —
+    /// a committed world edit, a field system enabled/disabled, a field
+    /// brush stroke — publishes a new snapshot; see
+    /// `SimulationRuntime::commit_world_commands`/`set_field_system_enabled`),
+    /// and its `queue` is reused when `source.queue_summary()` agrees with
+    /// it. Everything else here is already an O(1) or small, bounded read,
+    /// so it stays unconditional.
+    pub fn build(
+        source: &dyn FieldDataSource,
+        world: &WorldSnapshot,
+        previous: Option<&Self>,
+    ) -> Self {
         let simulation = source.simulation_status();
         let domain = source.domain();
         let snapshot = source.latest_snapshot();
+        let snapshot_sequence = snapshot.as_ref().map(|snapshot| snapshot.identity.sequence);
 
-        let mut probe_readings = Vec::new();
-        let mut diagnostics = Vec::new();
-        let mut has_errors = false;
-        let mut channel_names = BTreeMap::new();
-        let mut vector_channels = Vec::new();
-        let mut total_samples = 0;
-        let mut domain_summary = "No data".to_owned();
         let field_systems = source.field_systems();
         let mutable_vector_channels = field_systems
             .iter()
             .filter(|system| system.enabled)
             .flat_map(|system| system.mutable_vector_channels.iter().cloned())
             .collect();
-        let active_plugins: BTreeSet<_> = field_systems
-            .iter()
-            .filter(|system| system.enabled)
-            .map(|system| system.plugin.id.clone())
-            .collect();
 
-        // Available field names outlive publication. This keeps inactive
-        // channels identifiable in probe recorders and the scene inspector.
-        for system in &field_systems {
-            for channel in &system.channels {
-                channel_names.insert(channel.id.clone(), channel.display_name.clone());
+        let reusable = previous.filter(|previous| previous.snapshot_sequence == snapshot_sequence);
+        let SnapshotDerived {
+            total_samples,
+            domain_summary,
+            probe_readings,
+            channel_names,
+            vector_channels,
+            diagnostics,
+            has_errors,
+        } = match reusable {
+            Some(previous) => SnapshotDerived {
+                total_samples: previous.total_samples,
+                domain_summary: previous.domain_summary.clone(),
+                probe_readings: previous.probe_readings.clone(),
+                channel_names: previous.channel_names.clone(),
+                vector_channels: previous.vector_channels.clone(),
+                diagnostics: previous.diagnostics.clone(),
+                has_errors: previous.has_errors,
+            },
+            None => snapshot_derived(&snapshot, world, &field_systems),
+        };
+
+        let queue = match previous {
+            Some(previous) if queue_matches_summary(&previous.queue, source.queue_summary()) => {
+                previous.queue.clone()
             }
-        }
-
-        if let Some(snapshot) = &snapshot {
-            // A remote source can acknowledge composition before the replacement
-            // snapshot arrives. Filter the retained complete snapshot by the
-            // acknowledged system state so a disabled field never remains
-            // visible during that delivery gap.
-            total_samples = snapshot
-                .channels
-                .iter()
-                .filter(|(_, channel)| active_plugins.contains(&channel.provider))
-                .map(|(_, channel)| {
-                    channel
-                        .batches
-                        .iter()
-                        .map(fieldcad_core::FieldBatch::len)
-                        .sum::<usize>()
-                })
-                .sum();
-            vector_channels = snapshot
-                .vector_channels()
-                .filter(|channel| active_plugins.contains(&channel.provider))
-                .map(|channel| channel.schema.id.clone())
-                .collect();
-            let cells = snapshot.domain.resolution().cells();
-            domain_summary = format!(
-                "{}×{}×{} = {} cells, {}, {}",
-                cells.x,
-                cells.y,
-                cells.z,
-                snapshot.domain.resolution().cell_count(),
-                snapshot.domain.precision().label(),
-                format_boundaries(snapshot.domain.boundaries()),
-            );
-            diagnostics = snapshot
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| active_plugins.contains(&diagnostic.plugin))
-                .map(|diagnostic| {
-                    has_errors |= diagnostic.severity == DiagnosticSeverity::Error;
-                    format!("[{:?}] {}", diagnostic.severity, diagnostic.message)
-                })
-                .collect();
-
-            for (channel_id, channel) in &snapshot.channels {
-                // Which system produced a value, not which namespace names it:
-                // a field channel is shared, so its identifier cannot say who
-                // computed it and a retained snapshot must be filtered by the
-                // provenance it carries.
-                if !active_plugins.contains(&channel.provider) {
-                    continue;
-                }
-                channel_names.insert(channel_id.clone(), channel.schema.display_name.clone());
-                for probe in world.probes().values() {
-                    if !probe.channels.contains(channel_id) {
-                        continue;
-                    }
-                    let Some(sample) = channel.probe_sample(probe.id) else {
-                        continue;
-                    };
-                    probe_readings.push(ProbeRow {
-                        probe_name: probe.name.clone(),
-                        channel_name: channel.schema.display_name.clone(),
-                        value: format_value(sample.value),
-                        validity: sample.validity,
-                    });
-                }
-            }
-        }
+            _ => source.get_queue(),
+        };
 
         Self {
             description: source.description().to_owned(),
@@ -168,8 +152,9 @@ impl ComputeView {
             time_step_seconds: simulation.time_step().seconds(),
             playback_speed: source.playback_speed().multiplier(),
             pending_commands: source.pending_command_count(),
+            queue,
             world_revision: simulation.world_revision,
-            snapshot_sequence: snapshot.as_ref().map(|snapshot| snapshot.identity.sequence),
+            snapshot_sequence,
             freshness: snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.freshness_against(simulation.world_revision)),
@@ -227,6 +212,126 @@ impl ComputeView {
             },
         }
     }
+}
+
+/// The expensive part of [`ComputeView::build`]: everything that scales
+/// with the number of published channels and probes, computed fresh only
+/// when there is no snapshot to reuse it from.
+fn snapshot_derived(
+    snapshot: &Option<Arc<FieldSnapshot>>,
+    world: &WorldSnapshot,
+    field_systems: &[FieldSystemStatus],
+) -> SnapshotDerived {
+    let mut probe_readings = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut has_errors = false;
+    let mut channel_names = BTreeMap::new();
+    let mut vector_channels = Vec::new();
+    let mut total_samples = 0;
+    let mut domain_summary = "No data".to_owned();
+
+    // Available field names outlive publication. This keeps inactive
+    // channels identifiable in probe recorders and the scene inspector.
+    for system in field_systems {
+        for channel in &system.channels {
+            channel_names.insert(channel.id.clone(), channel.display_name.clone());
+        }
+    }
+
+    if let Some(snapshot) = snapshot {
+        let active_plugins: BTreeSet<_> = field_systems
+            .iter()
+            .filter(|system| system.enabled)
+            .map(|system| system.plugin.id.clone())
+            .collect();
+
+        // A remote source can acknowledge composition before the replacement
+        // snapshot arrives. Filter the retained complete snapshot by the
+        // acknowledged system state so a disabled field never remains
+        // visible during that delivery gap.
+        total_samples = snapshot
+            .channels
+            .iter()
+            .filter(|(_, channel)| active_plugins.contains(&channel.provider))
+            .map(|(_, channel)| {
+                channel
+                    .batches
+                    .iter()
+                    .map(fieldcad_core::FieldBatch::len)
+                    .sum::<usize>()
+            })
+            .sum();
+        vector_channels = snapshot
+            .vector_channels()
+            .filter(|channel| active_plugins.contains(&channel.provider))
+            .map(|channel| channel.schema.id.clone())
+            .collect();
+        let cells = snapshot.domain.resolution().cells();
+        domain_summary = format!(
+            "{}×{}×{} = {} cells, {}, {}",
+            cells.x,
+            cells.y,
+            cells.z,
+            snapshot.domain.resolution().cell_count(),
+            snapshot.domain.precision().label(),
+            format_boundaries(snapshot.domain.boundaries()),
+        );
+        diagnostics = snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| active_plugins.contains(&diagnostic.plugin))
+            .map(|diagnostic| {
+                has_errors |= diagnostic.severity == DiagnosticSeverity::Error;
+                format!("[{:?}] {}", diagnostic.severity, diagnostic.message)
+            })
+            .collect();
+
+        for (channel_id, channel) in &snapshot.channels {
+            // Which system produced a value, not which namespace names it: a
+            // field channel is shared, so its identifier cannot say who
+            // computed it and a retained snapshot must be filtered by the
+            // provenance it carries.
+            if !active_plugins.contains(&channel.provider) {
+                continue;
+            }
+            channel_names.insert(channel_id.clone(), channel.schema.display_name.clone());
+            for probe in world.probes().values() {
+                if !probe.channels.contains(channel_id) {
+                    continue;
+                }
+                let Some(sample) = channel.probe_sample(probe.id) else {
+                    continue;
+                };
+                probe_readings.push(ProbeRow {
+                    probe_name: probe.name.clone(),
+                    channel_name: channel.schema.display_name.clone(),
+                    value: format_value(sample.value),
+                    validity: sample.validity,
+                });
+            }
+        }
+    }
+
+    SnapshotDerived {
+        total_samples,
+        domain_summary,
+        probe_readings,
+        channel_names,
+        vector_channels,
+        diagnostics,
+        has_errors,
+    }
+}
+
+/// Whether `cached` (last frame's `get_queue()` result) already reflects
+/// what `summary` (this frame's cheap [`FieldDataSource::queue_summary`])
+/// reports — checked without touching `cached.pending`/`.history`'s
+/// contents, only their lengths and the newest history id.
+fn queue_matches_summary(cached: &QueueStatus, summary: QueueSummary) -> bool {
+    cached.paused == summary.paused
+        && cached.pending.len() == summary.pending_len
+        && cached.history.len() == summary.history_len
+        && cached.history.last().map(|record| record.command) == summary.newest_history
 }
 
 fn format_boundaries(boundaries: BoundaryConditions) -> String {
@@ -442,7 +547,7 @@ mod tests {
     #[test]
     fn the_compute_view_reports_provenance_from_the_source() {
         let world = seeded_world();
-        let view = ComputeView::build(&source(), &world.snapshot());
+        let view = ComputeView::build(&source(), &world.snapshot(), None);
 
         assert_eq!(view.mode, SimulationMode::Paused);
         assert_eq!(view.freshness, Some(SnapshotFreshness::Current));
@@ -472,7 +577,7 @@ mod tests {
     #[test]
     fn probe_values_are_shown_with_their_units() {
         let world = seeded_world();
-        let view = ComputeView::build(&source(), &world.snapshot());
+        let view = ComputeView::build(&source(), &world.snapshot(), None);
 
         // The probe sits at z = 0.6, so the linear scalar reads 3 * 0.6 m.
         assert!(view.probe_readings[0].value.starts_with("1.800000"));
@@ -492,7 +597,7 @@ mod tests {
 
     #[test]
     fn a_disconnected_source_cannot_be_commanded_from_the_ui() {
-        let mut view = ComputeView::build(&source(), &seeded_world().snapshot());
+        let mut view = ComputeView::build(&source(), &seeded_world().snapshot(), None);
         assert!(view.accepts_commands());
 
         view.status = DataSourceStatus::Disconnected;
@@ -537,7 +642,7 @@ mod tests {
             .unwrap(),
         );
 
-        let view = ComputeView::build(&source, &fieldcad_core::World::new().snapshot());
+        let view = ComputeView::build(&source, &fieldcad_core::World::new().snapshot(), None);
 
         let electric: Vec<_> = view
             .fields
@@ -609,7 +714,7 @@ mod tests {
             ))
             .unwrap();
 
-        let view = ComputeView::build(&source, &world.snapshot());
+        let view = ComputeView::build(&source, &world.snapshot(), None);
 
         assert_eq!(view.field_systems.len(), 1);
         assert!(!view.field_systems[0].enabled);
@@ -622,7 +727,7 @@ mod tests {
 
     #[test]
     fn workbench_state_distinguishes_paused_solving_stale_and_invalid() {
-        let mut view = ComputeView::build(&source(), &seeded_world().snapshot());
+        let mut view = ComputeView::build(&source(), &seeded_world().snapshot(), None);
         assert_eq!(view.workbench_state(), WorkbenchState::Paused);
 
         view.freshness = Some(SnapshotFreshness::Stale);
@@ -657,5 +762,160 @@ mod tests {
         assert_eq!(parse_playback_speed("0.25×"), Some(0.25));
         assert_eq!(parse_playback_speed("1e2x"), Some(100.0));
         assert_eq!(parse_playback_speed("fast"), None);
+    }
+
+    #[test]
+    fn queue_matches_summary_agrees_only_when_shape_and_newest_entry_match() {
+        use fieldcad_simulation::{CommandId, CommandKind, CommandRecord};
+
+        let cached = QueueStatus {
+            paused: false,
+            pending: vec![CommandRecord::submitted(
+                CommandId::new(1),
+                CommandKind::Play,
+            )],
+            history: vec![CommandRecord::submitted(
+                CommandId::new(0),
+                CommandKind::Pause,
+            )],
+        };
+        let matching = QueueSummary {
+            paused: false,
+            pending_len: 1,
+            history_len: 1,
+            newest_history: Some(CommandId::new(0)),
+        };
+        assert!(queue_matches_summary(&cached, matching));
+
+        assert!(!queue_matches_summary(
+            &cached,
+            QueueSummary {
+                paused: true,
+                ..matching
+            }
+        ));
+        assert!(!queue_matches_summary(
+            &cached,
+            QueueSummary {
+                pending_len: 2,
+                ..matching
+            }
+        ));
+        assert!(!queue_matches_summary(
+            &cached,
+            QueueSummary {
+                history_len: 0,
+                ..matching
+            }
+        ));
+        assert!(!queue_matches_summary(
+            &cached,
+            QueueSummary {
+                newest_history: Some(CommandId::new(7)),
+                ..matching
+            }
+        ));
+    }
+
+    /// The regression this guards: [`ComputeView::build`] must not simply
+    /// recompute its snapshot- and queue-derived fields identically every
+    /// frame (that would make `previous` a no-op) nor hand back `previous`'s
+    /// fields once they are actually out of date. Poisoning `previous` with
+    /// values a real rebuild would never produce, then asserting they either
+    /// survive or are discarded, tells the two cases apart in a way that
+    /// comparing two honest rebuilds never could — those always agree.
+    #[test]
+    fn build_reuses_snapshot_derived_fields_until_the_snapshot_changes() {
+        let world = seeded_world();
+        let baseline = ComputeView::build(&source(), &world.snapshot(), None);
+
+        let mut poisoned = baseline.clone();
+        poisoned.domain_summary = "POISONED".to_owned();
+
+        let source = source();
+        let reused = ComputeView::build(&source, &world.snapshot(), Some(&poisoned));
+        assert_eq!(
+            reused.domain_summary, "POISONED",
+            "unchanged snapshot sequence must reuse the cached snapshot-derived fields verbatim"
+        );
+
+        let mut source = source;
+        let system = source.field_systems()[0].plugin.id.clone();
+        source
+            .execute(fieldcad_simulation::CommandSequencer::default().issue(
+                fieldcad_simulation::CommandPayload::SetFieldSystemEnabled {
+                    plugin: system,
+                    enabled: false,
+                },
+            ))
+            .unwrap();
+
+        let rebuilt = ComputeView::build(&source, &world.snapshot(), Some(&poisoned));
+        assert_eq!(
+            rebuilt.domain_summary, baseline.domain_summary,
+            "a new snapshot must discard the stale cache and recompute rather than propagate it"
+        );
+    }
+
+    /// Mirrors the snapshot-sequence test above but for the queue, which is
+    /// gated on [`FieldDataSource::queue_summary`] instead: an issued command
+    /// changes the queue without necessarily publishing a new snapshot (see
+    /// `SimulationRuntime::set_field_system_realtime`), so the two caches must
+    /// invalidate independently.
+    #[test]
+    fn build_reuses_the_queue_until_it_changes_shape() {
+        use fieldcad_simulation::{CommandKind, CommandPayload, CommandSequencer};
+
+        let world = seeded_world();
+        let mut source = source();
+        // A `CommitWorld` only reaches `history` once flushed: submit it
+        // while running (so it queues instead of applying immediately) and
+        // then pause, which flushes the queue.
+        let mut sequencer = CommandSequencer::default();
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+        source
+            .execute(sequencer.issue(CommandPayload::CommitWorld(Vec::new())))
+            .unwrap();
+        source
+            .execute(sequencer.issue(CommandPayload::Pause))
+            .unwrap();
+        let baseline = ComputeView::build(&source, &world.snapshot(), None);
+        assert_eq!(
+            baseline.queue.history.last().map(|record| record.kind),
+            Some(CommandKind::CommitWorld),
+            "test setup: expected the flushed `CommitWorld` command to land in history"
+        );
+
+        // `kind` plays no part in `queue_summary`/`queue_matches_summary`, so
+        // it survives a correct reuse untouched — unlike `paused` or a
+        // length, which the comparator would only ever agree on by
+        // reflecting the real, current queue.
+        let mut poisoned = baseline.clone();
+        poisoned.queue.history.last_mut().unwrap().kind = CommandKind::Pause;
+
+        // Nothing about the queue has changed since `baseline`, so the
+        // poisoned `kind` must come back verbatim.
+        let reused = ComputeView::build(&source, &world.snapshot(), Some(&poisoned));
+        assert_eq!(
+            reused.queue.history.last().map(|record| record.kind),
+            Some(CommandKind::Pause),
+            "an unchanged queue summary must reuse the cached queue verbatim"
+        );
+
+        // Pausing the queue changes `queue_summary().paused`, which must be
+        // caught independently of the snapshot sequence (nothing here
+        // publishes a new snapshot).
+        source
+            .execute(CommandSequencer::default().issue(CommandPayload::PauseQueue))
+            .unwrap();
+
+        let rebuilt = ComputeView::build(&source, &world.snapshot(), Some(&poisoned));
+        assert_ne!(
+            rebuilt.queue.history.last().map(|record| record.kind),
+            Some(CommandKind::Pause),
+            "a changed queue summary must discard the stale cache and read the real queue"
+        );
     }
 }

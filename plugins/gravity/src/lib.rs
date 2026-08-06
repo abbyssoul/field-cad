@@ -1,17 +1,19 @@
 //! Analytic Newtonian gravity over the reusable backend-neutral kernel.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, DiagnosticSeverity, Dimension, Domain, FieldColumn,
-    FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry, SampleValidity,
-    SolverDiagnostic, WorldSnapshot,
+    FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry, SolverDiagnostic,
+    WorldSnapshot,
 };
 use fieldcad_mass_sources::{MassSource, collect_mass_sources, mass_component_schemas};
-use fieldcad_newtonian_gravity::{NewtonianSample, evaluate_geometry, evaluate_sources};
+use fieldcad_newtonian_gravity::{
+    NewtonianSample, evaluate_acceleration_excluding, evaluate_geometry,
+};
 use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
-    PluginMetadata, SampledColumn, SolverContext, SolverKind,
+    PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
 };
 use glam::DVec3;
 
@@ -21,7 +23,10 @@ pub const GRAVITATIONAL_POTENTIAL: &str = "gravitational-potential";
 pub const GRAVITATIONAL_ACCELERATION_HANDLE: ChannelHandle = ChannelHandle::new(0);
 pub const GRAVITATIONAL_POTENTIAL_HANDLE: ChannelHandle = ChannelHandle::new(1);
 const POTENTIAL_DIMENSION: Dimension = Dimension::new(0, 2, -2, 0, 0, 0, 0);
-const POISONED_CACHE: &str = "Newtonian gravity evaluation cache is poisoned";
+/// Retains the small set of geometries one runtime publication samples
+/// (each visible plane, box, sphere, the probe set) so multiple channels
+/// over the same geometry share one evaluation.
+const SAMPLE_CACHE_CAPACITY: usize = 16;
 
 pub fn plugin_id() -> PluginId {
     PluginId::new(PLUGIN_ID).expect("static plugin ID is valid")
@@ -81,7 +86,7 @@ impl EquationSystemPlugin for NewtonianGravityPlugin {
             domain: *context.domain,
             sources: sources(context.world)?,
             world_revision: context.world.revision(),
-            cache: Mutex::new(Vec::new()),
+            cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
         }))
     }
 }
@@ -94,7 +99,7 @@ struct NewtonianGravitySolver {
     domain: Domain,
     sources: Vec<MassSource>,
     world_revision: fieldcad_core::WorldRevision,
-    cache: Mutex<Vec<(SampleGeometry, Arc<[NewtonianSample]>)>>,
+    cache: SampleCache<NewtonianSample>,
 }
 
 impl EquationSystemSolver for NewtonianGravitySolver {
@@ -107,11 +112,7 @@ impl EquationSystemSolver for NewtonianGravitySolver {
     fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
         self.sources = sources(world)?;
         self.world_revision = world.revision();
-        self.cache
-            .get_mut()
-            .map_err(|_| PluginError::Solver(POISONED_CACHE.to_owned()))?
-            .clear();
-        Ok(())
+        self.cache.clear()
     }
 
     fn sample(
@@ -153,11 +154,13 @@ impl EquationSystemSolver for NewtonianGravitySolver {
                     .copied()
                     .filter(|source| source.object != body.object)
                     .collect();
-                let sample = evaluate_sources(&sources, body.position);
-                match sample.validity {
-                    SampleValidity::Exact => Ok(sample.acceleration * mass),
-                    _ => Ok(DVec3::ZERO),
-                }
+                // A nearby, unrelated small body grazing its own exclusion
+                // radius must not zero out the force from every other
+                // source too — only that one source's contribution is
+                // skipped, not the whole sample.
+                let acceleration =
+                    evaluate_acceleration_excluding(&sources, body.position).unwrap_or(DVec3::ZERO);
+                Ok(acceleration * mass)
             })
             .collect()
     }
@@ -181,23 +184,12 @@ impl NewtonianGravitySolver {
         &self,
         geometry: &SampleGeometry,
     ) -> Result<Arc<[NewtonianSample]>, PluginError> {
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| PluginError::Solver(POISONED_CACHE.to_owned()))?;
-        if let Some((_, samples)) = cache.iter().find(|(cached, _)| cached == geometry) {
-            return Ok(Arc::clone(samples));
-        }
-        let samples: Arc<[NewtonianSample]> = evaluate_geometry(&self.sources, geometry)
-            .into_iter()
-            .map(|sample| quantize(sample, self.domain.precision()))
-            .collect::<Vec<_>>()
-            .into();
-        if cache.len() >= 16 {
-            cache.remove(0);
-        }
-        cache.push((geometry.clone(), Arc::clone(&samples)));
-        Ok(samples)
+        self.cache.get_or_try_insert_with(geometry, || {
+            Ok(evaluate_geometry(&self.sources, geometry)
+                .into_iter()
+                .map(|sample| quantize(sample, self.domain.precision()))
+                .collect())
+        })
     }
 }
 
@@ -282,5 +274,100 @@ mod tests {
         };
         assert!(acceleration_values[0].x < 0.0);
         assert!(potential_values[0] < 0.0);
+    }
+
+    /// PH-2 regression: a body grazing one source's exclusion radius must not
+    /// lose gravity from every *other* source too. Two-body pull plus a
+    /// small third body grazing the sample point — before the fix,
+    /// `evaluate_sources` returned a whole-sample `Undefined` on the first
+    /// source in range without visiting the primary, and `forces()` mapped
+    /// that to zero.
+    #[test]
+    fn a_body_grazing_one_sources_exclusion_radius_still_feels_the_others() {
+        let plugin = NewtonianGravityPlugin;
+        let mut world = World::new();
+        world
+            .commit(
+                mass_component_schemas()
+                    .into_iter()
+                    .map(WorldCommand::RegisterComponentSchema),
+            )
+            .unwrap();
+
+        let primary = ObjectSpec::new("primary")
+            .with_transform(Transform::at(DVec3::new(-10.0, 0.0, 0.0)).unwrap())
+            .with_shape(ObjectShape::point(0.01).unwrap())
+            .with_component(
+                inertial_mass_component_id(),
+                inertial_mass_properties(1.0e12).unwrap(),
+            )
+            .with_component(
+                gravitational_mass_component_id(),
+                linked_gravitational_mass_properties(),
+            );
+        // Small and irrelevant except for its exclusion radius, which the
+        // sample point (the origin) sits well inside.
+        let grazing = ObjectSpec::new("grazing")
+            .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+            .with_shape(ObjectShape::point(2.0).unwrap())
+            .with_component(
+                inertial_mass_component_id(),
+                inertial_mass_properties(1.0).unwrap(),
+            )
+            .with_component(
+                gravitational_mass_component_id(),
+                linked_gravitational_mass_properties(),
+            );
+        let body = ObjectSpec::new("body")
+            .with_transform(Transform::at(DVec3::ZERO).unwrap())
+            .with_shape(ObjectShape::point(0.01).unwrap())
+            .with_component(
+                inertial_mass_component_id(),
+                inertial_mass_properties(1.0).unwrap(),
+            )
+            .with_component(
+                gravitational_mass_component_id(),
+                linked_gravitational_mass_properties(),
+            );
+
+        let report = world
+            .commit([
+                WorldCommand::CreateObject(primary),
+                WorldCommand::CreateObject(grazing),
+                WorldCommand::CreateObject(body),
+            ])
+            .unwrap();
+        let body_id = report.created_objects[2];
+
+        let domain = Domain::centred_cube(40.0, 8).unwrap();
+        let solver = plugin
+            .create_solver(SolverContext {
+                configuration: &Default::default(),
+                domain: &domain,
+                world: &world.snapshot(),
+                initial_step: StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: TimeStep::from_seconds(1.0).unwrap(),
+                },
+                cancellation: Default::default(),
+            })
+            .unwrap();
+
+        let forces = solver
+            .forces(&[DynamicBody {
+                object: body_id,
+                inertial_mass_kg: 1.0,
+                position: DVec3::ZERO,
+                velocity: DVec3::ZERO,
+            }])
+            .unwrap();
+
+        assert!(
+            forces[0].x < 0.0,
+            "a body 1m inside a small grazing source's exclusion radius must \
+             still feel the distant primary's pull; got {:?}",
+            forces[0]
+        );
     }
 }

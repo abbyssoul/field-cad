@@ -75,7 +75,10 @@ pub fn enable(model: Arc<Mutex<HeadlessServer>>) -> Result<McpRunning, String> {
     let thread_ct = ct.clone();
     let thread_connections = connections.clone();
     std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(runtime) => runtime,
             Err(error) => {
                 let _ = ready_tx.send(Err(format!("starting the MCP runtime: {error}")));
@@ -117,9 +120,9 @@ pub fn enable(model: Arc<Mutex<HeadlessServer>>) -> Result<McpRunning, String> {
             connections,
         }),
         Ok(Err(error)) => Err(error),
-        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Err(format!(
-            "MCP server did not confirm startup within {BIND_TIMEOUT:?}"
-        )),
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Err(
+            format!("MCP server did not confirm startup within {BIND_TIMEOUT:?}"),
+        ),
     }
 }
 

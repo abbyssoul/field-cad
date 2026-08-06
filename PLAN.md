@@ -9,7 +9,7 @@ catalog templates that instantiate generic mass/charge objects; the active
 field equations determine their behaviour. The current electrostatic and
 Maxwell milestones establish that intended modelling foundation.
 
-Progress as of 2026-08-03:
+Progress as of 2026-08-06:
 
 - Milestone 0 is accepted. Its decisions are now recorded as ADRs in
   `docs/adr/`, which was the outstanding deliverable.
@@ -27,16 +27,16 @@ Progress as of 2026-08-03:
   and the [remediation report](docs/reviews/2026-08-02-remediation-report.md).
 - The integration increment between Milestones 2 and 3 is done: the viewport now
   draws the real world model rather than a hardcoded placeholder.
-- Milestone 3 is implemented. Electrostatic point/sphere sources publish E and
+- Milestone 3 is complete. Electrostatic point/sphere sources publish E and
   potential to probes, arbitrary planes, and sparse 3D grids; validity-aware
   colour/glyph layers consume those snapshots; authoring covers sources, probes,
   and planes; and a batched WGSL `f32` evaluator is checked against the CPU
-  `f64` oracle. The visual-legibility review gate remains for manual review.
-- Milestone 4 is implemented. Playback pacing remains separate from numerical
+  `f64` oracle. The visual-legibility review gate has been accepted.
+- Milestone 4 is complete. Playback pacing remains separate from numerical
   `dt`; running edits queue to fixed-tick boundaries; probes attach to objects
   and plot bounded scalar/vector history; workbench state is explicit; and
   semantic command recordings replay deterministically. Manual UX acceptance
-  of the new plot and transport controls remains.
+  of the new plot and transport controls has been accepted.
 - A code review of Milestones 3 and 4 was held and its findings applied. It
   found no failing guarantee, but three structural problems: the local and
   loopback data sources duplicated the session semantics they were meant to
@@ -94,6 +94,21 @@ Progress as of 2026-08-03:
   diagnostics. ADRs 0019 and 0020 record the model and numerical choices; the
   [implementation report](docs/reviews/2026-08-03-milestone-6-implementation-report.md)
   records the evidence and remaining review items.
+- The post-Milestone-6 interaction refinement is implemented: display helpers
+  are grouped in the View controls, plane visibility also hides its field
+  geometry, objects can be renamed through undoable Inspector edits, compute
+  bounds and configurable transform-gizmo sizing are available, and whole-
+  domain glyphs span the actual numerical bounds. The viewport now has
+  Selection, Transform, and paused-only Field Brush tools. Field Brush is a
+  solver-owned, undoable numerical intervention; it uses a selected slice
+  plane's normal and works only for vector channels advertised mutable by a
+  time-stepped solver. Analytical fields remain explicitly read-only.
+- Milestone 7 is implemented. `fieldcad-newtonian-gravity` owns the reusable
+  analytic point/sphere source law; `fieldcad-gravity` adapts it to the generic
+  solver interface, publishes gravitational acceleration and potential, and
+  contributes gravitational force through the existing dynamics interface. The
+  desktop registers it as an opt-in field system. The Orishu integration plan
+  records the corresponding shared-kernel adapter task.
 
 The plan deliberately built a thin end-to-end product before the time-domain
 Maxwell solver. Each milestone ends in something observable and testable, and
@@ -112,6 +127,7 @@ crates/
   fieldcad-core/         world, domain, sampling, units, time        [present]
   fieldcad-electromagnetic-sources/ shared charge schema/sources     [present]
   fieldcad-mass-sources/ shared mass schema/sources                  [present]
+  fieldcad-newtonian-gravity/ reusable Newtonian gravity kernel      [present]
   fieldcad-particles/    catalog provenance and particle view        [present]
   fieldcad-plugin-api/   equation-system contract and schemas        [present]
   fieldcad-simulation/   runtime and data-source boundary            [present]
@@ -122,6 +138,7 @@ plugins/
   test-field/            analytic contract fixture                   [present]
   electrostatics/        first real equation system                  [present]
   electromagnetism/      Maxwell/FDTD CPU reference                  [present]
+  gravity/               Newtonian gravi-static equation system      [present]
 ```
 
 `fieldcad-render` and `fieldcad-ui` remain modules inside `fieldcad-desktop`
@@ -225,7 +242,7 @@ clock.
 
 ## Milestone 3 — useful electrostatic vertical slice
 
-Implementation status: **complete; final manual UX acceptance pending.**
+Implementation status: **complete; UX acceptance granted.**
 
 The local WGSL backend is injected by the application host and publishes
 ordinary snapshots rather than solver GPU handles (ADR 0010). GPU/CPU parity is
@@ -288,7 +305,7 @@ actually legible before investing in more techniques.
 
 ## Milestone 4 — time controls, probes, and edit workflow
 
-Implementation status: **complete; final manual UX acceptance pending.**
+Implementation status: **complete; UX acceptance granted.**
 
 Turn the vertical slice into a coherent simulation workbench:
 
@@ -405,27 +422,43 @@ Exit criteria:
 
 ## Milestone 7 — prove extensibility with gravity
 
+Implementation status: **complete.** `fieldcad-newtonian-gravity` is a
+headless reusable kernel for Newton's point/sphere source law and is kept free
+of the plugin/runtime/UI/transport layers. `fieldcad-gravity` is its local
+equation-system adapter. It publishes gravitational acceleration `g` (`m/s²`)
+and potential `Φ` (`m²/s²`), returns `m_g g` through the generic force path,
+and is registered as an opt-in desktop model. This is deliberately
+gravi-static; dynamic gravity is a later stateful solver, not an extension of
+this oracle.
+
 Implement a minimal gravity plugin to test that abstractions are not secretly
 electromagnetic:
 
 - mass as an independently declared object component — **done** ahead of this
   milestone by ADR 0021: `fieldcad-mass-sources` owns the schema, and one object
   may already carry both charge and mass;
-- gravitational potential and acceleration channels;
-- analytic point/sphere sources first; and
+- gravitational potential and acceleration channels — **done**;
+- analytic point/sphere sources first — **done**; and
 - reuse of generic planes, glyphs, colour maps, probes, and property editing.
   Property editing is **done**: the inspector is schema-driven, so gravity's
   component becomes authorable with no desktop change.
 
 Exit criteria:
 
-- gravity adds no dependency to electromagnetism;
+- gravity adds no dependency to electromagnetism — **met**;
 - one object may carry both charge and mass components — **met**;
 - the application can enable and inspect both equation systems without channel
-  ID or unit ambiguity; and
-- any plugin API change is documented with the concrete need that forced it.
+  ID or unit ambiguity — **met**; and
+- any plugin API change is documented with the concrete need that forced it —
+  **met** (no gravity-specific plugin API change was required).
 
 ## Milestone 8 — runtime plugin and project format
+
+Implementation status: **contract accepted; executable host, project-document,
+and package-install implementation remain.** ADR 0023 and
+[`fieldcad.workload-package/v1`](docs/fieldcad-workload-package-v1.md) define
+the shared Field CAD/Orishu package standard. The contract intentionally reuses
+Orishu's workload lifecycle ABI and state-artifact compatibility rules.
 
 Only after at least two real equation systems:
 

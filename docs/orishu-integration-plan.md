@@ -361,6 +361,15 @@ Gravity is analytic in the first profile, so it has no Yee state, time-step
 kernel, or halo exchange. A future dynamic gravity model is a separate
 stateful/profiled workload and must not replace this static source-law oracle.
 
+## Shared workload-package contract
+
+`fieldcad.workload-package/v1` is defined in Field CAD's
+[`fieldcad-workload-package-v1.md`](fieldcad-workload-package-v1.md) and is the
+proposed common package standard for Orishu. It intentionally packages an
+Orishu `wl_*` lifecycle component instead of defining a second Field CAD ABI.
+The remaining joint work is an Orishu manifest/artifact adapter and matching
+component-host compatibility tests, not a competing package design.
+
 ## Phased delivery plan
 
 ### Phase 0 — agree contracts before code

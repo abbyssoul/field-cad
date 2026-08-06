@@ -35,8 +35,7 @@
 //! (see `docs/adr/0022-dynamics-is-a-first-party-system.md`).
 
 use fieldcad_core::{
-    ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError, WorldSnapshot,
-    relativistic_momentum,
+    ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError, WorldSnapshot, relativistic_momentum,
 };
 use fieldcad_mass_sources::{MassSourceError, collect_mass_sources};
 use fieldcad_plugin_api::{DynamicBody, ObjectKinematicsUpdate};
