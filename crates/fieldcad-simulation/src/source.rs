@@ -588,6 +588,8 @@ pub enum SourceError {
         "no queued command with id {0:?} to cancel (already applied, rejected, cancelled, or unknown)"
     )]
     CommandNotQueued(CommandId),
+    #[error("command {0:?} is in flight on the compute worker and cannot be cancelled")]
+    CommandInFlight(CommandId),
     #[error(
         "'{command}' cannot proceed: a queued mutation was rejected while flushing the pending queue"
     )]
@@ -727,12 +729,12 @@ impl SessionCore {
                 self.pacer.reset();
             }
             CommandPayload::Pause => {
-                self.reject_if_queue_paused("pause")?;
+                self.reject_if_queue_paused(id, kind, "pause")?;
                 self.flush_and_check("pause")?;
                 self.runtime.pause();
             }
             CommandPayload::Step => {
-                self.reject_if_queue_paused("step")?;
+                self.reject_if_queue_paused(id, kind, "step")?;
                 self.flush_and_check("step")?;
                 self.runtime.step_once()?;
             }
@@ -803,12 +805,12 @@ impl SessionCore {
                 // Never queued. An edit waiting for a tick boundary is an edit
                 // the history has not recorded yet, so undoing past it would
                 // step over an edit that is still on its way in.
-                self.reject_if_queue_paused("undo")?;
+                self.reject_if_queue_paused(id, kind, "undo")?;
                 self.flush_and_check("undo")?;
                 self.runtime.undo()?;
             }
             CommandPayload::Redo => {
-                self.reject_if_queue_paused("redo")?;
+                self.reject_if_queue_paused(id, kind, "redo")?;
                 self.flush_and_check("redo")?;
                 self.runtime.redo()?;
             }
@@ -843,9 +845,35 @@ impl SessionCore {
     /// `Pause`/`Step`/`Undo`/`Redo` must not silently flush a paused queue.
     /// Fires only when there is something a flush would actually hold back —
     /// pausing an idle queue must not block these commands.
-    fn reject_if_queue_paused(&self, command: &'static str) -> Result<(), SourceError> {
+    ///
+    /// Records the rejection in terminal history and emits a `CommandEvent::Failed`
+    /// before returning the error, matching the contract that every terminal
+    /// command state is recoverable through queue history (BE-7).
+    fn reject_if_queue_paused(
+        &mut self,
+        id: CommandId,
+        kind: CommandKind,
+        command_label: &'static str,
+    ) -> Result<(), SourceError> {
         if self.queue_paused && !self.pending_mutations.is_empty() {
-            return Err(SourceError::QueuePaused { command });
+            let error = SourceError::QueuePaused {
+                command: command_label,
+            };
+            let record = CommandRecord {
+                command: id,
+                kind,
+                sequence: self.next_sequence(),
+                state: CommandLifecycle::Rejected,
+                receipt: None,
+                error: Some(error.to_string()),
+                payload: None,
+            };
+            self.record_terminal(record);
+            self.emitted.push(CommandEvent::Failed {
+                command: id,
+                error: error.clone(),
+            });
+            return Err(error);
         }
         Ok(())
     }

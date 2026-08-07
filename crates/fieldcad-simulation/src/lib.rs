@@ -1602,6 +1602,35 @@ mod tests {
         assert!(matches!(result, Err(SourceError::CommandNotQueued(_))));
     }
 
+    /// BE-6 regression: cancelling a command that is still in flight (in the
+    /// mpsc channel, not yet acknowledged by the worker) must return a clear
+    /// `CommandInFlight` error, not a misleading "not found" error.
+    #[test]
+    fn cancelling_a_command_that_is_still_in_flight_returns_command_in_flight() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        source.execute(command(CommandPayload::Play)).unwrap();
+
+        let world_cmd = command(CommandPayload::CommitWorld(vec![
+            WorldCommand::CreateObject(ObjectSpec::new("test object")),
+        ]));
+        let target_id = world_cmd.id;
+        let receipt = source.execute(world_cmd).unwrap();
+        assert_eq!(receipt.disposition, CommandDisposition::Submitted);
+
+        // drain_worker_events only runs on poll(), not on execute(), so
+        // the target is still in submitted_commands at this point even if
+        // the worker already acknowledged it — the events buffer hasn't
+        // been drained yet.
+        let result = source.execute(command(CommandPayload::CancelQueuedCommand(target_id)));
+        assert!(
+            matches!(result, Err(SourceError::CommandInFlight(id)) if id == target_id),
+            "expected CommandInFlight({target_id:?}), got {result:?}"
+        );
+
+        // Clean up: drain events so the worker doesn't stall.
+        source.poll(Duration::ZERO).unwrap();
+    }
+
     fn queue_paused_conflict(payload: CommandPayload) -> Result<CommandReceipt, SourceError> {
         let mut source = LocalDataSource::new(runtime());
         source.execute(command(CommandPayload::Play)).unwrap();
@@ -1612,6 +1641,127 @@ mod tests {
             .unwrap();
         source.execute(command(CommandPayload::PauseQueue)).unwrap();
         source.execute(command(payload))
+    }
+
+    /// BE-7 regression: a queue-paused rejection must record a `Rejected`
+    /// terminal record and emit `CommandEvent::Failed`, so clients can find
+    /// the outcome through queue history rather than seeing a silent error.
+    #[test]
+    fn a_queue_paused_rejection_leaves_a_terminal_history_entry() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+        source
+            .execute(sequencer.issue(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+            ])))
+            .unwrap();
+        source
+            .execute(sequencer.issue(CommandPayload::PauseQueue))
+            .unwrap();
+
+        let step = sequencer.issue(CommandPayload::Step);
+        let step_id = step.id;
+        let result = source.execute(step);
+        assert!(matches!(result, Err(SourceError::QueuePaused { .. })));
+
+        // The rejected command must appear in queue history.
+        let queue = source.get_queue();
+        let rejected = queue
+            .history
+            .iter()
+            .find(|record| record.command == step_id)
+            .expect("the rejected step must appear in terminal history");
+        assert_eq!(rejected.state, CommandLifecycle::Rejected);
+        assert!(
+            rejected.error.is_some(),
+            "a rejected terminal record carries an error message"
+        );
+
+        // A CommandEvent::Failed must have been emitted.
+        let events = source.drain_command_events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CommandEvent::Failed { command, .. } if *command == step_id
+            )),
+            "a CommandEvent::Failed must be emitted for the rejected command"
+        );
+    }
+
+    /// BE-7 regression for the async path: a queue-paused rejection must emit
+    /// `CommandEvent::Failed` exactly once, not twice (once from the worker's
+    /// `terminal` drain and once from the `CommandFailed` wrapper).
+    #[test]
+    fn a_queue_paused_rejection_emits_failed_exactly_once_via_async_source() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+
+        // Helper: pump until pending_command_count drops to the expected
+        // level, meaning the worker has caught up.
+        let wait_for_pending = |source: &mut AsyncLocalDataSource, expected: usize| {
+            for _ in 0..1000 {
+                source.poll(Duration::from_millis(1)).unwrap();
+                if source.pending_command_count() == expected {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!(
+                "worker never caught up: pending = {}, expected {expected}",
+                source.pending_command_count()
+            );
+        };
+
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+        wait_for_pending(&mut source, 0);
+
+        source
+            .execute(sequencer.issue(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+            ])))
+            .unwrap();
+        wait_for_pending(&mut source, 1);
+
+        source
+            .execute(sequencer.issue(CommandPayload::PauseQueue))
+            .unwrap();
+        wait_for_pending(&mut source, 1);
+
+        source.drain_command_events();
+
+        let step = sequencer.issue(CommandPayload::Step);
+        let step_id = step.id;
+        let result = source.execute(step);
+        assert!(result.is_ok(), "async execute returns Submitted, not Err");
+
+        // Pump until the worker processes the Step and we can drain events.
+        for _ in 0..1000 {
+            source.poll(Duration::from_millis(1)).unwrap();
+            let events = source.drain_command_events();
+            if !events.is_empty() {
+                let failed_count = events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            CommandEvent::Failed { command, .. } if *command == step_id
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    failed_count, 1,
+                    "CommandEvent::Failed must be emitted exactly once, not {failed_count}"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("worker never processed the Step command");
     }
 
     #[test]

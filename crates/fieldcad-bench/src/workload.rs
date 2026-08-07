@@ -16,16 +16,21 @@
 //! solver to do.
 
 use fieldcad_core::{
-    PlaneId, PlaneLattice, ProbePosition, SampleGeometry, SessionId, StepContext, TimeStep,
-    Transform, World, WorldCommand,
+    ObjectShape, ObjectSpec, PlaneId, PlaneLattice, ProbePosition, SampleGeometry, SessionId,
+    StepContext, TimeStep, Transform, World, WorldCommand,
 };
 use fieldcad_electromagnetism::{
     ELECTRIC_FIELD_HANDLE as MAXWELL_ELECTRIC_HANDLE, ElectromagnetismPlugin, courant_limit,
     prescribed_plane_wave_configuration,
 };
 use fieldcad_electrostatics::{ELECTRIC_FIELD_HANDLE, ElectrostaticsPlugin};
+use fieldcad_gravity::GRAVITATIONAL_ACCELERATION_HANDLE;
+use fieldcad_mass_sources::{
+    gravitational_mass_component_id, inertial_mass_component_id, inertial_mass_properties,
+    linked_gravitational_mass_properties, mass_component_schemas,
+};
 use fieldcad_plugin_api::{
-    EquationSystemPlugin, EquationSystemSolver, SolverCancellation, SolverContext,
+    DynamicBody, EquationSystemPlugin, EquationSystemSolver, SolverCancellation, SolverContext,
 };
 use fieldcad_simulation::{RuntimeConfig, SimulationRuntime};
 use glam::{DVec3, UVec2};
@@ -122,6 +127,53 @@ fn electrostatics_solver(scene: &Scene, world: &World) -> Box<dyn EquationSystem
             cancellation: SolverCancellation::default(),
         })
         .expect("benchmark scenes are valid electrostatic configurations")
+}
+
+/// A world populated with massive bodies at the scene's charge positions.
+///
+/// Each body carries linked inertial and gravitational mass so every source
+/// gravitates. The mass value grows with source count so the total field
+/// strength stays physical at any scale, avoiding overflow in the sampling
+/// kernel's superposition arithmetic.
+fn gravity_world(scene: &Scene) -> World {
+    let mut world = World::new();
+    let mut commands: Vec<WorldCommand> = mass_component_schemas()
+        .into_iter()
+        .map(WorldCommand::RegisterComponentSchema)
+        .collect();
+    for (index, position) in scene.charge_positions().into_iter().enumerate() {
+        // Mass grows with the source count so per-source strength is constant,
+        // giving a clean linear-in-sources superposition test.
+        let mass_kg = 1.0e10 / (scene.charges as f64).sqrt().max(1.0);
+        commands.push(WorldCommand::CreateObject(
+            ObjectSpec::new(format!("mass {index}"))
+                .with_transform(Transform::at(position).expect("mass position is finite"))
+                .with_shape(ObjectShape::point(0.15).expect("source radius is positive"))
+                .with_component(
+                    inertial_mass_component_id(),
+                    inertial_mass_properties(mass_kg).expect("mass is a valid quantity"),
+                )
+                .with_component(
+                    gravitational_mass_component_id(),
+                    linked_gravitational_mass_properties(),
+                ),
+        ));
+    }
+    world.commit(commands).expect("gravity world is valid");
+    world
+}
+
+fn gravity_solver(scene: &Scene, world: &World) -> Box<dyn EquationSystemSolver> {
+    use fieldcad_gravity::NewtonianGravityPlugin;
+    NewtonianGravityPlugin
+        .create_solver(SolverContext {
+            configuration: &Default::default(),
+            domain: &scene.domain(),
+            world: &world.snapshot(),
+            initial_step: initial_step(scene),
+            cancellation: SolverCancellation::default(),
+        })
+        .expect("benchmark scenes are valid Newtonian gravity configurations")
 }
 
 /// A plane lattice carrying the scene's requested presentation density.
@@ -321,6 +373,47 @@ fn electrostatics_sample_plane(scene: &Scene, config: &MeasureConfig) -> Timing 
                 .expect("the electric channel is published")
         },
     )
+}
+
+fn gravity_sample_plane(scene: &Scene, config: &MeasureConfig) -> Timing {
+    let world = gravity_world(scene);
+    let geometry = plane_geometry(scene);
+    measure(
+        config,
+        || gravity_solver(scene, &world),
+        |solver, _| {
+            solver
+                .sample(GRAVITATIONAL_ACCELERATION_HANDLE, &geometry)
+                .expect("the gravitational acceleration channel is published")
+        },
+    )
+}
+
+fn gravity_forces(scene: &Scene, config: &MeasureConfig) -> Timing {
+    let world = gravity_world(scene);
+    let snapshot = world.snapshot();
+    let sources = fieldcad_mass_sources::collect_gravity_sources(&snapshot)
+        .expect("gravity world has valid mass sources");
+    let body = DynamicBody {
+        object: sources[0].object,
+        inertial_mass_kg: sources[0].inertial_mass_kg,
+        position: sources[0].position,
+        velocity: Default::default(),
+    };
+    measure(
+        config,
+        || gravity_solver(scene, &world),
+        |solver, _| {
+            solver
+                .forces(&[body])
+                .expect("force calculation from a valid scene is defined")
+        },
+    )
+}
+
+fn gravity_solver_init(scene: &Scene, config: &MeasureConfig) -> Timing {
+    let world = gravity_world(scene);
+    measure(config, || (), |(), _| gravity_solver(scene, &world))
 }
 
 /// One end-to-end fixed tick: every active solver advances, then the runtime
@@ -537,6 +630,58 @@ pub fn benchmarks(quick: bool) -> Vec<Benchmark> {
                 quick,
             ),
             runner: electrostatics_sample_plane,
+        },
+        Benchmark {
+            id: "gravity/sample-plane",
+            group: "gravity",
+            what: "analytic Newtonian superposition over a slice plane",
+            why: "the newest solver's sampling cost; same inverse-square kernel as \
+                  electrostatics but with signed G constant and an opposite sign",
+            parameter: Parameter::Samples,
+            declared: Complexity::Linear,
+            scenes: sample_sweep(default.clone().with_name("g-sample"), quick),
+            runner: gravity_sample_plane,
+        },
+        Benchmark {
+            id: "gravity/sample-by-charges",
+            group: "gravity",
+            what: "analytic Newtonian evaluation as the source count grows",
+            why: "superposition is linear in sources at fixed density; this is the \
+                  gravity analogue of electrostatics/sample-by-charges and the two \
+                  should agree on exponent",
+            parameter: Parameter::Charges,
+            declared: Complexity::Linear,
+            scenes: charge_sweep(
+                default
+                    .clone()
+                    .with_name("g-sample")
+                    .with_plane_samples_per_axis(65)
+                    .with_domain_stride(None),
+                quick,
+            ),
+            runner: gravity_sample_plane,
+        },
+        Benchmark {
+            id: "gravity/forces",
+            group: "gravity",
+            what: "force on one body from every other source",
+            why: "O(n) in sources at fixed cell count; tracks the per-tick cost \
+                  the dynamics system accumulates",
+            parameter: Parameter::Charges,
+            declared: Complexity::Linear,
+            scenes: charge_sweep(default.clone().with_name("g-forces"), quick),
+            runner: gravity_forces,
+        },
+        Benchmark {
+            id: "gravity/solver-init",
+            group: "gravity",
+            what: "create_solver for the analytic Newtonian backend",
+            why: "runs on activation; the analytic solver is trivially \
+                  constructed so this is a baseline for the Maxwell init cost",
+            parameter: Parameter::Cells,
+            declared: Complexity::Constant,
+            scenes: cell_sweep(default.clone().with_name("g-init"), quick),
+            runner: gravity_solver_init,
         },
         Benchmark {
             id: "runtime/tick",

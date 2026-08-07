@@ -577,7 +577,7 @@ impl McpServer {
                 .iter()
                 .map(|(id, channel)| (id.to_string(), channel.sample_count()))
                 .collect();
-            breakdown.sort_by(|left, right| right.1.cmp(&left.1));
+            breakdown.sort_by_key(|right| std::cmp::Reverse(right.1));
             let listed = breakdown
                 .iter()
                 .map(|(id, count)| format!("{id}: {count}"))
@@ -931,7 +931,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Cancel one command still waiting for a tick boundary. Only a command that has not yet applied is cancellable; an already-applied, rejected, cancelled, or unknown id is refused."
+        description = "Cancel one command still waiting for a tick boundary. A command already submitted to the compute worker (in flight) cannot be cancelled; an already-applied, rejected, cancelled, unknown, or in-flight id is refused."
     )]
     async fn cancel_queued_command(
         &self,

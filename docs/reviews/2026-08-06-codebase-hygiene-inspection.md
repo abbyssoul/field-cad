@@ -169,14 +169,14 @@ through it — both `crates/fieldcad-server/tests/concurrent_transports.rs:31`
 and `tests/event_hub.rs:30` pump this way, and a `submit_and_await` waiter on
 such a command would hang.
 
-**BE-6 — `async_source.rs:294-304` + `source.rs:746-753` — a `Submitted` record is advertised as pending but is not cancellable. (medium)**
+**BE-6 — `async_source.rs:294-304` + `source.rs:746-753` — a `Submitted` record is advertised as pending but is not cancellable. (medium)** — **Fixed.** Added `SourceError::CommandInFlight(CommandId)` variant. `AsyncLocalDataSource::execute` now intercepts `CancelQueuedCommand` when the target is still in `submitted_commands` and returns `Err(SourceError::CommandInFlight)` instead of sending the cancel to the worker where it would fail with a misleading "not found" error against `pending_mutations`. The desktop queue UI already only shows a Cancel button for `Queued` records (not `Submitted`), so no UI change was needed there. Regression test: `cancelling_a_command_that_is_still_in_flight_returns_command_in_flight` (`fieldcad-simulation/src/lib.rs`).
 `get_queue()` synthesizes `Submitted` records into `status.pending`, and the
 MCP tool docs tell clients to cancel by id from that list, but
 `CancelQueuedCommand` only searches `pending_mutations`, which never contains
 a `Submitted` record — cancelling the newest queued item returns a spurious
 "already applied, rejected, cancelled, or unknown" error.
 
-**BE-7 — `source.rs:770-775` — execute-time rejections leave no queue-history trace. (medium)**
+**BE-7 — `source.rs:770-775` — execute-time rejections leave no queue-history trace. (medium)** — **Fixed.** Changed `reject_if_queue_paused` from `&self` to `&mut self`, added `id`/`kind` parameters. When the rejection fires it now creates a `CommandRecord(state: Rejected)`, records it via `record_terminal`, and emits `CommandEvent::Failed` — matching how `flush_pending_mutations` already handles flush-time rejections. All four call sites (`Pause`/`Step`/`Undo`/`Redo`) updated. Regression test: `a_queue_paused_rejection_leaves_a_terminal_history_entry`.
 `reject_if_queue_paused` returns `Err` without recording a `Rejected` record
 or emitting `CommandEvent::Failed`; only flush-time rejections do. Contradicts
 `docs/tasks/session-events-and-queue-control.md:60` ("command terminal
@@ -283,7 +283,7 @@ treatment as `Point`, even though `evaluate_sources` has a correct finite
 interior solution (`E = kQr/R³`) for that region. A charge inside a large
 uniform sphere is drawn with a real interior field and feels exactly nothing.
 
-**PH-4 — `crates/fieldcad-mass-sources/src/lib.rs:231-236` — an object with gravitational mass but no inertial mass silently sources no gravity. (medium)**
+**PH-4 — `crates/fieldcad-mass-sources/src/lib.rs:231-236` — an object with gravitational mass but no inertial mass silently sources no gravity. (medium)** — **Fixed.** Added `collect_gravity_sources` that iterates objects with either inertial or gravitational mass; the gravity plugin (`plugins/gravity/src/lib.rs`) now calls it instead of `collect_mass_sources`. Objects with only gravitational mass receive `inertial_mass_kg: 0.0` (the gravity solver never reads that field from its source list). `collect_mass_sources` is unchanged and still requires inertial mass. Regression test: `gravitational_mass_alone_sources_gravity` (`crates/fieldcad-mass-sources/src/lib.rs`).
 `collect_mass_sources` gates on inertial mass despite the crate's own
 documentation stating gravitational mass is an independent coupling.
 Attaching only `gravitational-mass` via the generic component editor produces
@@ -310,13 +310,13 @@ this (its `normalized()` doc explains the deserialization argument, and
 `apply_command` validates/normalizes every transform) — the hazard was
 recognized and patched in one of four places, not all four.
 
-**PH-8 — `plugins/electromagnetism/src/lib.rs:761-768` vs `810-857` — `validate_world` accepts edits that `on_world_changed` then rejects, after the world has already moved to the new revision. (medium)**
+**PH-8 — `plugins/electromagnetism/src/lib.rs:761-768` vs `810-857` — `validate_world` accepts edits that `on_world_changed` then rejects, after the world has already moved to the new revision. (medium)** — **Fixed.** Added `periodic_charge_initial_state` call to `MaxwellCore::validate_world` (guarded on `StaticCharges` initial condition plus `coupling_is_requested`, matching `constrained_state_for`'s guard). Poisson-solver failures (non-convergence, lost positive-definiteness) are now caught before the world revision advances. Regression tests: `validate_world_runs_periodic_charge_initial_state_when_coupling_is_requested` (happy path), `validate_world_rejects_charge_configuration_that_poisson_cannot_solve` (extreme charge overflow → caught by validate_world).
 `validate_world` doesn't run `periodic_charge_initial_state`, which the
 post-commit path calls and which can fail (solver non-convergence or lost
 positive-definiteness). ADR 0007 requires rejection to happen before
 adoption; here it can happen after.
 
-**PH-9 — `plugins/gravity/src/lib.rs:157-160` — gravity maps both "undefined" and "numerical overflow" results to zero force, indistinguishable from "no force here." (medium)**
+**PH-9 — `plugins/gravity/src/lib.rs:157-160` — gravity maps both "undefined" and "numerical overflow" results to zero force, indistinguishable from "no force here." (medium)** — **Fixed.** Changed `unwrap_or(DVec3::ZERO)` to `.ok_or_else(PluginError::Solver(...))` so a non-finite acceleration propagates as a solver error rather than being silently converted to zero — matching electrostatics' treatment. The existing `NonFiniteForce` rejection in `fieldcad-dynamics::accumulate_forces` can now trigger for gravity the same way it does for every other field system.
 Electrostatics reports non-finite fields as `PluginError::Solver`, and
 `fieldcad-dynamics` has a dedicated `NonFiniteForce` rejection gravity can
 never trigger — two implementations of the same trait method report the same
@@ -376,7 +376,7 @@ doesn't land in only one of them again.
 
 ### Dead code / hygiene
 
-**PH-21 — `crates/fieldcad-bench/` has zero gravity/mass-source coverage. (medium)**
+**PH-21 — `crates/fieldcad-bench/` has zero gravity/mass-source coverage. (medium)** — **Fixed.** Added four gravity benchmarks: `gravity/sample-plane` (linear in samples), `gravity/sample-by-charges` (linear in sources), `gravity/forces` (linear in sources), and `gravity/solver-init` (constant — analytic solver construction). A `gravity_world` helper places mass sources at the scene's charge positions with linked inertial/gravitational mass. A `gravity_solver` helper wraps `NewtonianGravityPlugin::create_solver`. All four run through the existing benchmark smoke tests.
 Every workload benchmark is Maxwell or electrostatics; the newest solver —
 and the one carrying the O(n²) `forces()` path (PH-12) — has no scaling
 verdict at all, despite the project's explicit scaling-discipline convention
@@ -599,8 +599,8 @@ duplication/performance items that compound if left alone, then hygiene:
 
 1. ~~**Fix the queue/flush regression** (BE-1, BE-2)~~ — **Done.** Restored
    abort-on-rejected-flush in `SessionCore::execute`.
-2. ~~**Fix the two physics correctness bugs** (PH-1 divide-by-zero, PH-2
-   exclusion-radius zeroing)~~ — **Done.**
+2. ~~**Fix the three physics correctness bugs** (PH-1 divide-by-zero, PH-2
+   exclusion-radius zeroing, PH-4 silent gravitational-mass-only)~~ — **Done.**
 3. ~~**Fix MCP's destructive event drain and double-clocking** (BE-3, BE-4)~~
    — **Done**, along with BE-5 (`crates/fieldcad-simulation/src/async_source.rs`),
    which turned out to be the same underlying issue: BE-4's real-interval
@@ -619,4 +619,4 @@ duplication/performance items that compound if left alone, then hygiene:
    blocks (UI-16/17/18/19)~~ — **Done.**
 7. **Everything else** (remaining mediums/lows above) is reasonable
    refactoring-iteration backlog — none block correctness. ~~BE-16~~,
-                               ~~UI-11~~, ~~UI-12~~, ~~UI-13~~, ~~UI-14~~, ~~UI-15~~, ~~PH-11~~, ~~PH-12~~, ~~PH-13~~, ~~PH-14~~, ~~PH-15~~, and ~~PH-16~~ are **done** (see above).
+                                ~~UI-11~~, ~~UI-12~~, ~~UI-13~~, ~~UI-14~~, ~~UI-15~~, ~~PH-11~~, ~~PH-12~~, ~~PH-13~~, ~~PH-14~~, ~~PH-15~~, ~~PH-16~~, ~~PH-8~~, ~~PH-21~~, ~~BE-6~~, and ~~BE-7~~ are **done** (see above).

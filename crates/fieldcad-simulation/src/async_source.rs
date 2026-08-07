@@ -21,10 +21,10 @@ use fieldcad_plugin_api::SolverCancellation;
 use glam::DVec3;
 
 use crate::{
-    Command, CommandDisposition, CommandId, CommandKind, CommandReceipt, CommandRecord,
-    DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, LocalDataSource,
-    PlaybackSpeed, PollOutcome, QueueStatus, QueueSummary, SimulationStatus, SnapshotMailbox,
-    SourceError, Subscription,
+    Command, CommandDisposition, CommandId, CommandKind, CommandPayload, CommandReceipt,
+    CommandRecord, DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus,
+    LocalDataSource, PlaybackSpeed, PollOutcome, QueueStatus, QueueSummary, SimulationStatus,
+    SnapshotMailbox, SourceError, Subscription,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -229,9 +229,21 @@ impl AsyncLocalDataSource {
                 }) => {
                     self.submitted_commands.remove(&command);
                     aggregate.snapshot_updated |= self.adopt(state)?;
+                    // terminal may already contain a Failed for this command
+                    // (e.g. from reject_if_queue_paused in BE-7). Only push
+                    // one if it's not already there — otherwise the same
+                    // command failure is reported twice.
+                    let already_reported = terminal.iter().any(|event| {
+                        matches!(
+                            event,
+                            CommandEvent::Failed { command: id, .. } if *id == command
+                        )
+                    });
                     self.command_events.extend(terminal);
-                    self.command_events
-                        .push(CommandEvent::Failed { command, error });
+                    if !already_reported {
+                        self.command_events
+                            .push(CommandEvent::Failed { command, error });
+                    }
                 }
                 Ok(WorkerEvent::PollCompleted {
                     outcome,
@@ -366,6 +378,16 @@ impl FieldDataSource for AsyncLocalDataSource {
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
         if self.failure.is_some() {
             return Err(SourceError::Disconnected);
+        }
+        // BE-6: a command that is still in flight (in the mpsc channel, not
+        // yet acknowledged by the worker) cannot be cancelled — there is no
+        // way to pull it from the FIFO. Return a clear error rather than
+        // sending the cancel to the worker where it would fail with a
+        // misleading "not found" against pending_mutations.
+        if let CommandPayload::CancelQueuedCommand(target) = &command.payload
+            && self.submitted_commands.contains_key(target)
+        {
+            return Err(SourceError::CommandInFlight(*target));
         }
         let command_id = command.id;
         let kind = command.payload.kind();

@@ -5,7 +5,50 @@
 //! them; the geometry question itself is the same one, so it is answered
 //! once here rather than once per coupling.
 
-use crate::ObjectShape;
+use crate::{ObjectId, ObjectShape, Velocity};
+use glam::DVec3;
+
+/// A universal field-coupled source in solver-neutral terms.
+///
+/// An object interacts with a field via a coupling property (electric charge,
+/// gravitational mass, etc.). A field solver acts on sources that carry that
+/// coupling property.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoupledSource<T = f64> {
+    pub object: ObjectId,
+    pub position: DVec3,
+    pub velocity: Velocity,
+    pub coupling_value: T,
+    pub distribution: PointOrSphere,
+}
+
+impl<T> CoupledSource<T> {
+    pub fn new(
+        object: ObjectId,
+        position: DVec3,
+        velocity: Velocity,
+        coupling_value: T,
+        distribution: PointOrSphere,
+    ) -> Self {
+        Self {
+            object,
+            position,
+            velocity,
+            coupling_value,
+            distribution,
+        }
+    }
+}
+
+impl CoupledSource<f64> {
+    pub fn charge_coulombs(&self) -> f64 {
+        self.coupling_value
+    }
+
+    pub fn gravitational_mass_kg(&self) -> f64 {
+        self.coupling_value
+    }
+}
 
 /// A point or uniform sphere source geometry.
 ///

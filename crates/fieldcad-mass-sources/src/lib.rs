@@ -254,6 +254,32 @@ pub fn collect_mass_sources(world: &WorldSnapshot) -> Result<Vec<MassSource>, Ma
         .collect()
 }
 
+/// Extract every body that gravitates, including those whose inertia was
+/// never authored — a body with only `gravitational-mass` sources gravity
+/// even though it cannot be dynamically pushed. Deterministic object-ID
+/// order. For ordinary massive bodies (those with inertial mass) the
+/// returned `MassSource` is identical to [`collect_mass_sources`]; the
+/// difference is confined to bodies that have `gravitational-mass` but no
+/// `inertial-mass` — see PH-4.
+///
+/// The gravity plugin calls this instead of [`collect_mass_sources`] so a
+/// gravitational-mass-only body in the scene is not silently invisible.
+pub fn collect_gravity_sources(world: &WorldSnapshot) -> Result<Vec<MassSource>, MassSourceError> {
+    world
+        .objects()
+        .values()
+        .filter(|object| {
+            object
+                .components
+                .contains_key(&inertial_mass_component_id())
+                || object
+                    .components
+                    .contains_key(&gravitational_mass_component_id())
+        })
+        .map(source_from_object_for_gravity)
+        .collect()
+}
+
 /// The gravitational coupling charge of one object, resolving the link.
 ///
 /// Separated from [`collect_mass_sources`] so a gravity plugin can ask about a
@@ -324,6 +350,36 @@ fn source_from_object(
         position: object.transform.translation,
         velocity: object.velocity,
         inertial_mass_kg: inertial_mass_of(object)?,
+        gravitational_mass_kg: gravitational_mass_of(object)?,
+        pinned: object.pinned,
+        distribution,
+    })
+}
+
+/// Like [`source_from_object`], but does not require inertial mass — the
+/// gravity solver never reads that field from its source list (it reads
+/// `gravitational_mass_kg` instead), so a body with only gravitational mass
+/// can contribute to the field without claiming a non-zero inertia.
+fn source_from_object_for_gravity(object: &WorldObject) -> Result<MassSource, MassSourceError> {
+    let distribution = PointOrSphere::from_shape(object.shape, DEFAULT_POINT_RADIUS)
+        .map_err(|error| match error {
+            PointOrSphereError::NonPositiveSphere => MassSourceError::NonPositiveSphere {
+                object: object.name.clone(),
+            },
+            PointOrSphereError::UnsupportedShape => MassSourceError::UnsupportedShape {
+                object: object.name.clone(),
+            },
+        })?
+        .into();
+    Ok(MassSource {
+        object: object.id,
+        position: object.transform.translation,
+        velocity: object.velocity,
+        // 0.0 is safe here — the gravity plugin never reads `inertial_mass_kg`
+        // from its source list; it reads `gravitational_mass_kg` instead. The
+        // dynamics system uses `collect_mass_sources` (which requires inertial
+        // mass), so this sentinel never reaches an integrator.
+        inertial_mass_kg: inertial_mass_of(object).unwrap_or(0.0),
         gravitational_mass_kg: gravitational_mass_of(object)?,
         pinned: object.pinned,
         distribution,
@@ -539,5 +595,33 @@ mod tests {
 
         assert!(sources[0].pinned);
         assert!(!sources[1].pinned);
+    }
+
+    /// PH-4 regression: an object with only `gravitational-mass` (no
+    /// `inertial-mass`) must still appear in `collect_gravity_sources`, even
+    /// though `collect_mass_sources` does not return it (no inertia to push
+    /// against).
+    #[test]
+    fn gravitational_mass_alone_sources_gravity() {
+        let world = world_with([ObjectSpec::new("moon")
+            .with_transform(Transform::at(DVec3::X * 10.0).unwrap())
+            .with_component(
+                gravitational_mass_component_id(),
+                independent_gravitational_mass_properties(7.0).unwrap(),
+            )]);
+
+        let via_mass = collect_mass_sources(&world.snapshot()).unwrap();
+        assert!(
+            via_mass.is_empty(),
+            "a body with no inertial mass must not appear in collect_mass_sources"
+        );
+
+        let via_gravity = collect_gravity_sources(&world.snapshot()).unwrap();
+        assert_eq!(via_gravity.len(), 1);
+        assert_eq!(via_gravity[0].gravitational_mass_kg, Some(7.0));
+        // inertial mass is zero because none was authored; the gravity
+        // plugin never reads this field from its source list.
+        assert_eq!(via_gravity[0].inertial_mass_kg, 0.0);
+        assert_eq!(via_gravity[0].position, DVec3::X * 10.0);
     }
 }

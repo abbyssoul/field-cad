@@ -13,6 +13,9 @@ fieldcad-core = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-electromagnetism = { workspace = true }
 fieldcad-electrostatics = { workspace = true }
+fieldcad-gravity = { workspace = true }
+fieldcad-mass-sources = { workspace = true }
+fieldcad-newtonian-gravity = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 fieldcad-simulation = { workspace = true }
 glam = { workspace = true }

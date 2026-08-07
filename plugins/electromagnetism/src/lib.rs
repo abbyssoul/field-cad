@@ -778,6 +778,15 @@ impl MaxwellCore {
             let particles = collect_coupled_particles(self.domain, world)?;
             validate_coupled_sources(&collect_sources(world)?, &particles)?;
         }
+        // PH-8: periodic_charge_initial_state can fail for charge
+        // configurations that pass structural validation (e.g. Poisson-solver
+        // non-convergence). Reject here, before the world revision moves.
+        // Only run when coupling is requested, matching constrained_state_for.
+        if self.initial_condition == MaxwellInitialCondition::StaticCharges
+            && coupling_is_requested(world)?
+        {
+            periodic_charge_initial_state(self.domain, &collect_sources(world)?)?;
+        }
         Ok(())
     }
 
@@ -2111,6 +2120,172 @@ mod tests {
             })
             .sum();
         (squared_error / f64::from(x_cells)).sqrt()
+    }
+
+    /// PH-8: validate_world must call periodic_charge_initial_state when
+    /// coupling is requested, so Poisson-solver failures are caught before
+    /// the world revision advances (ADR 0007). This test proves the happy
+    /// path: a normal charged particle produces a converged Poisson solution
+    /// and validate_world returns Ok.
+    #[test]
+    fn validate_world_runs_periodic_charge_initial_state_when_coupling_is_requested() {
+        use fieldcad_core::{ObjectShape, ObjectSpec, Transform, WorldCommand};
+        use fieldcad_electromagnetic_sources::{
+            charge_component_id, charge_component_schema, charge_properties,
+        };
+        use fieldcad_mass_sources::{
+            inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+        };
+
+        let domain = Domain::new(
+            DomainBounds::centred_cube(5.0).unwrap(),
+            Resolution::uniform(8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.5).unwrap();
+
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::RegisterComponentSchema(
+                charge_component_schema(),
+            )])
+            .unwrap();
+        for schema in mass_component_schemas() {
+            world
+                .commit([WorldCommand::RegisterComponentSchema(schema)])
+                .unwrap();
+        }
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("charge")
+                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_shape(ObjectShape::point(0.15).unwrap())
+                    .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap())
+                    .with_component(
+                        inertial_mass_component_id(),
+                        inertial_mass_properties(1.0e-6).unwrap(),
+                    ),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let plugin = ElectromagnetismPlugin::new();
+        let mut solver = plugin
+            .create_solver(SolverContext {
+                configuration: &plugin.default_configuration(),
+                domain: &domain,
+                world: &snapshot,
+                initial_step: StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: step,
+                },
+                cancellation: SolverCancellation::default(),
+            })
+            .unwrap();
+
+        // Before the PH-8 fix this only did structural validation. Now it
+        // also calls periodic_charge_initial_state (coupling_is_requested is
+        // true for an unpinned massive charged body).
+        solver.validate_world(&snapshot).unwrap();
+
+        // The post-commit path also succeeds for a normal configuration.
+        solver.on_world_changed(&snapshot).unwrap();
+    }
+
+    /// PH-8 negative case: create the solver with a non-coupled world (so
+    /// solver creation succeeds without calling periodic_charge_initial_state),
+    /// then call validate_world against a world that has a massive charged
+    /// particle with extreme charge — the Poisson solver overflows and the
+    /// error surfaces through validate_world instead of being deferred to
+    /// on_world_changed (ADR 0007).
+    #[test]
+    fn validate_world_rejects_charge_configuration_that_poisson_cannot_solve() {
+        use fieldcad_core::{ObjectShape, ObjectSpec, Transform, WorldCommand};
+        use fieldcad_electromagnetic_sources::{
+            charge_component_id, charge_component_schema, charge_properties,
+        };
+        use fieldcad_mass_sources::{
+            inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+        };
+
+        let domain = Domain::new(
+            DomainBounds::centred_cube(5.0).unwrap(),
+            Resolution::uniform(8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.5).unwrap();
+
+        // World 1: charge only, no mass — no particle coupling, so solver
+        // creation does not run periodic_charge_initial_state.
+        let mut initial = World::new();
+        initial
+            .commit([WorldCommand::RegisterComponentSchema(
+                charge_component_schema(),
+            )])
+            .unwrap();
+        initial
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("charge")
+                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_shape(ObjectShape::point(0.15).unwrap())
+                    .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+            )])
+            .unwrap();
+        let plugin = ElectromagnetismPlugin::new();
+        let solver = plugin
+            .create_solver(SolverContext {
+                configuration: &plugin.default_configuration(),
+                domain: &domain,
+                world: &initial.snapshot(),
+                initial_step: StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: step,
+                },
+                cancellation: SolverCancellation::default(),
+            })
+            .unwrap();
+
+        // World 2: charge + mass + extreme charge — coupling is requested,
+        // so validate_world now runs periodic_charge_initial_state.
+        let mut extreme = World::new();
+        extreme
+            .commit([WorldCommand::RegisterComponentSchema(
+                charge_component_schema(),
+            )])
+            .unwrap();
+        for schema in mass_component_schemas() {
+            extreme
+                .commit([WorldCommand::RegisterComponentSchema(schema)])
+                .unwrap();
+        }
+        // A charge large enough that the conjugate-gradient dot product
+        // overflows f64, causing `!denominator.is_finite()` in the Poisson
+        // solver (see coupling.rs:594).
+        extreme
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("extreme charge")
+                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_shape(ObjectShape::point(0.15).unwrap())
+                    .with_component(charge_component_id(), charge_properties(1.0e200).unwrap())
+                    .with_component(
+                        inertial_mass_component_id(),
+                        inertial_mass_properties(1.0e-6).unwrap(),
+                    ),
+            )])
+            .unwrap();
+
+        // Before the PH-8 fix this call would succeed (structural validation
+        // only), and the failure would happen later in on_world_changed —
+        // after the world revision had already advanced.
+        let result = solver.validate_world(&extreme.snapshot());
+        assert!(
+            result.is_err(),
+            "an extreme charge should be rejected by the Poisson solver, \
+             not pass structural validation; got {result:?}"
+        );
     }
 
     #[test]

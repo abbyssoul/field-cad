@@ -7,7 +7,7 @@ use fieldcad_core::{
     FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry, SolverDiagnostic,
     WorldSnapshot,
 };
-use fieldcad_mass_sources::{MassSource, collect_mass_sources, mass_component_schemas};
+use fieldcad_mass_sources::{MassSource, collect_gravity_sources, mass_component_schemas};
 use fieldcad_newtonian_gravity::{
     NewtonianSample, evaluate_acceleration_excluding, evaluate_geometry,
 };
@@ -92,7 +92,7 @@ impl EquationSystemPlugin for NewtonianGravityPlugin {
 }
 
 fn sources(world: &WorldSnapshot) -> Result<Vec<MassSource>, PluginError> {
-    collect_mass_sources(world).map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
+    collect_gravity_sources(world).map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
 }
 
 struct NewtonianGravitySolver {
@@ -158,7 +158,11 @@ impl EquationSystemSolver for NewtonianGravitySolver {
                         .filter(|source| source.object != body.object),
                     body.position,
                 )
-                .unwrap_or(DVec3::ZERO);
+                .ok_or_else(|| {
+                    PluginError::Solver(
+                        "gravitational acceleration overflowed to a non-finite value".to_owned(),
+                    )
+                })?;
                 Ok(acceleration * mass)
             })
             .collect()
