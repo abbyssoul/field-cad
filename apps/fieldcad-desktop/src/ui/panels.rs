@@ -3146,7 +3146,7 @@ fn format_count(n: usize) -> String {
         let s = n.to_string();
         let mut result = String::with_capacity(s.len() + 2);
         for (i, c) in s.chars().enumerate() {
-            if (s.len() - i) % 3 == 0 && i > 0 {
+            if (s.len() - i).is_multiple_of(3) && i > 0 {
                 result.push('\u{202f}');
             }
             result.push(c);

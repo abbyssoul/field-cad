@@ -2212,7 +2212,7 @@ mod tests {
                 Some(&snapshot),
                 &layers,
                 show,
-                &[channel.clone()],
+                std::slice::from_ref(&channel),
             );
             assert!(
                 !baseline.vector_lines.is_empty(),
@@ -2234,7 +2234,7 @@ mod tests {
                 Some(&snapshot),
                 &layers,
                 show,
-                &[channel.clone()],
+                std::slice::from_ref(&channel),
             );
             assert_eq!(reused.vector_lines.len(), poisoned_len);
             assert!(
@@ -2250,7 +2250,7 @@ mod tests {
                 Some(&next_snapshot),
                 &layers,
                 show,
-                &[channel.clone()],
+                std::slice::from_ref(&channel),
             );
             assert_eq!(
                 rebuilt.vector_lines.len(),
@@ -2277,7 +2277,7 @@ mod tests {
                 Some(&snapshot),
                 &layers,
                 show,
-                &[channel.clone()],
+                std::slice::from_ref(&channel),
             );
             let mut cache = new_cache.unwrap();
             cache.geometry.vector_lines.push(scene::ColoredVertex {
@@ -2297,7 +2297,7 @@ mod tests {
                 Some(&snapshot),
                 &hidden_layers,
                 show,
-                &[channel.clone()],
+                std::slice::from_ref(&channel),
             );
             assert!(
                 rebuilt.vector_lines.is_empty(),

@@ -4,7 +4,7 @@ So as a user I want to be able to control the simulation from an external client
 
 ---
 
-Expanded plan (research done 2026-08-05, not implemented):
+Expanded plan (research done 2026-08-05; fully implemented 2026-08-05 — all 7 phases closed):
 
 Most of the hard design work for this already exists and should not be
 redone: `docs/user-stories/README.md` is the authoritative capability
