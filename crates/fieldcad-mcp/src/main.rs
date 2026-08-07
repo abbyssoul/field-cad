@@ -271,7 +271,11 @@ async fn run_http(
 
 #[cfg(unix)]
 async fn run_unix(server: McpServer, path: PathBuf, ct: CancellationToken) -> Result<(), String> {
-    let listener = fieldcad_mcp::bind_unix(&path).await?;
+    // The lock guards this path for the server's whole life: it is what
+    // makes another server's stale-socket cleanup refuse this path while we
+    // are bound to it, so it must outlive both the listener and the
+    // socket-file removal below.
+    let (listener, _lock) = fieldcad_mcp::bind_unix(&path).await?;
     let result = fieldcad_mcp::serve_unix(
         listener,
         server,

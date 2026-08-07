@@ -175,6 +175,12 @@ impl HeadlessServer {
             self.hub.publish_command_event(&event);
             self.events.push(event);
         }
+        // Prune waiters whose receiver was dropped (caller timed out,
+        // disconnected, etc.) — the only removal path was the
+        // `waiters.remove` above, which only fires for a completed
+        // command.  Without this, an MCP 30 s timeout that drops the
+        // receiver leaves the sender in the map forever (BE-8).
+        self.waiters.retain(|_id, sender| !sender.is_closed());
         self.hub.publish_state(&self.source);
     }
 
@@ -204,6 +210,12 @@ impl HeadlessServer {
     /// recent terminal history.
     pub fn get_queue(&self) -> QueueStatus {
         self.source.get_queue()
+    }
+
+    /// The number of unresolved [`submit_and_await`](Self::submit_and_await)
+    /// waiters.
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.len()
     }
 
     /// The queue's shape without its contents — see

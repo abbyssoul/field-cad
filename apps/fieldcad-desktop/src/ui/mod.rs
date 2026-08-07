@@ -226,7 +226,11 @@ pub struct UiModel {
     /// command succeeds so the user can act on it rather than consult a log.
     pub command_error: Option<String>,
     /// Staged numerical-domain values. They are intentionally independent of
-    /// the authoritative source until the user applies the whole candidate.
+    /// the authoritative source until the user applies the whole candidate —
+    /// but only against the domain they were staged from: when the
+    /// authoritative domain moves out of band (an MCP reconfigure, undo/redo
+    /// crossing a domain change), the staged values are stale by definition
+    /// and the draft is reseeded (see [`UiModel::domain_draft_for`]).
     pub domain_draft: Option<DomainDraft>,
     /// Whether the MCP panel is shown. Independent of whether the embedded
     /// server is actually running (`crate::mcp::McpSession`, read-only from
@@ -273,6 +277,25 @@ impl UiModel {
     pub fn select_world(&mut self) {
         self.set_scene_selection(None);
         self.world_selected = true;
+    }
+
+    /// The staged domain edit, kept only while the authoritative domain it
+    /// was staged against is unchanged. A staged candidate is meaningful only
+    /// relative to that base, so when the domain moves out of band — an MCP
+    /// `ReconfigureDomain`, undo/redo crossing a domain change — the draft is
+    /// reseeded rather than left showing (and offering to apply) lattice
+    /// values nobody typed.
+    pub fn domain_draft_for(&mut self, authoritative: Domain) -> &mut DomainDraft {
+        let stale = match &self.domain_draft {
+            Some(draft) => draft.base != authoritative,
+            None => true,
+        };
+        if stale {
+            self.domain_draft = Some(DomainDraft::from_domain(authoritative));
+        }
+        self.domain_draft
+            .as_mut()
+            .expect("seeded immediately above when absent or stale")
     }
 
     pub fn open_probe_plot(&mut self, probe: &fieldcad_core::Probe) {
@@ -345,6 +368,10 @@ pub struct DomainDraft {
     pub cells: UVec3,
     pub boundaries: BoundaryConditions,
     pub precision: Precision,
+    /// The authoritative domain this draft is staged against. Not editable;
+    /// [`UiModel::domain_draft_for`] compares it with the current domain to
+    /// decide whether the staged values are still meaningful.
+    base: Domain,
 }
 
 impl DomainDraft {
@@ -355,6 +382,7 @@ impl DomainDraft {
             cells: domain.resolution().cells(),
             boundaries: domain.boundaries(),
             precision: domain.precision(),
+            base: domain,
         }
     }
 
@@ -1653,5 +1681,68 @@ mod tests {
 
         assert_eq!(receipt.command, id);
         assert_eq!(receipt.tick, 1);
+    }
+
+    /// UI-3 regression: the staged domain draft is staged against one
+    /// authoritative domain; when that domain moves out of band (an MCP
+    /// `ReconfigureDomain`, undo/redo crossing a domain change), the draft is
+    /// stale by definition and must be reseeded — otherwise the inspector
+    /// shows lattice values nobody typed with "Apply domain and reset"
+    /// spuriously enabled.
+    #[test]
+    fn domain_draft_reseeds_when_the_authoritative_domain_moves() {
+        let a = Domain::centred_cube(8.0, 8).unwrap();
+        let b = Domain::centred_cube(4.0, 16).unwrap();
+        let mut model = UiModel::new();
+
+        // Seeded from A, then edited: a staged candidate the user is working
+        // on.
+        let draft = model.domain_draft_for(a);
+        draft.min.x = -12.5;
+
+        // The authoritative domain moves out of band; the editor asks for its
+        // draft again against the new domain.
+        let draft = model.domain_draft_for(b);
+
+        assert_eq!(
+            draft.build().unwrap(),
+            b,
+            "after the authoritative domain moved, the editor must show the \
+             new domain, not the stale draft"
+        );
+    }
+
+    #[test]
+    fn domain_draft_keeps_user_edits_while_the_authoritative_domain_is_unchanged() {
+        let a = Domain::centred_cube(8.0, 8).unwrap();
+        let mut model = UiModel::new();
+
+        let draft = model.domain_draft_for(a);
+        draft.min.x = -12.5;
+        draft.cells.y = 24;
+        draft.precision = Precision::F32;
+
+        let draft = model.domain_draft_for(a);
+        assert_eq!(draft.min.x, -12.5);
+        assert_eq!(draft.cells.y, 24);
+        assert_eq!(draft.precision, Precision::F32);
+    }
+
+    #[test]
+    fn domain_draft_does_not_resurrect_edits_when_the_domain_moves_back() {
+        let a = Domain::centred_cube(8.0, 8).unwrap();
+        let b = Domain::centred_cube(4.0, 16).unwrap();
+        let mut model = UiModel::new();
+
+        model.domain_draft_for(a).min.x = -12.5;
+        model.domain_draft_for(b);
+
+        let draft = model.domain_draft_for(a);
+        assert_eq!(
+            *draft,
+            DomainDraft::from_domain(a),
+            "returning to a domain reseeds a fresh draft; the earlier staged \
+             edit belongs to a base that no longer exists"
+        );
     }
 }

@@ -223,12 +223,20 @@ Phased plan:
      "opt-in flag plus bearer token before any non-loopback bind" doesn't
      exist yet, so there is currently no way to ask for a non-loopback bind
      at all, rather than a default that could be overridden unsafely.
-   - The Unix socket gets `0600` permissions set explicitly after `bind`
-     (its ambient `umask`-derived permissions are not a security boundary
-     to depend on for a full scene-mutation control surface), and a stale
-     socket file from a killed previous run is detected by attempting a
-     connect before removing it — only replaced once nothing answers, never
-     blindly.
+    - The Unix socket gets `0600` permissions set explicitly after `bind`
+      (its ambient `umask`-derived permissions are not a security boundary
+      to depend on for a full scene-mutation control surface). Stale-socket
+      reclamation is serialized through an exclusive advisory lock on
+      `<path>.lock`, acquired before any probe and held for the listener's
+      whole lifetime (hardened 2026-08-07, review finding BE-11): a probe /
+      remove / bind sequence cannot be atomic against a racing peer, but
+      the lock can — a server holding it knows no cooperating server is
+      bound at the path, so removing the file there can never orphan a live
+      one. The connect probe remains, now only to diagnose a live
+      *non-cooperating* binder (e.g. an older binary) with a proper error,
+      and a non-socket file at the path is refused rather than removed. The
+      lock file itself is never deleted — unlinking a held lock file would
+      void the exclusion.
    - Shutdown: one root `CancellationToken`, cancelled by Ctrl+C, handed to
      every transport as a child token — `RunningService::serve_with_ct` for
      stdio, `StreamableHttpServerConfig::with_cancellation_token` plus

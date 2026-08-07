@@ -171,6 +171,18 @@ impl TickPacer {
         }
     }
 
+    /// Hands back the budget for ticks that were demanded but never run:
+    /// a flush rejection vetoes a cycle after `ticks_due` has already been
+    /// paid for it, and the vetoed ticks must stay owed rather than vanish.
+    /// Only the demanded (capped) ticks can be returned — backlog beyond the
+    /// per-poll budget was already discarded by `ticks_due`, by design.
+    pub fn return_ticks(&mut self, ticks: u32, step: TimeStep) {
+        let step = Duration::from_secs_f64(step.seconds());
+        self.accumulated = self
+            .accumulated
+            .saturating_add(step.checked_mul(ticks).unwrap_or(Duration::MAX));
+    }
+
     pub fn reset(&mut self) {
         self.accumulated = Duration::ZERO;
     }
@@ -2178,6 +2190,24 @@ mod tests {
 
         // 1000 polls of 25 ms is 25 s, which is exactly 250 ticks of 0.1 s.
         assert_eq!(total, 250);
+    }
+
+    #[test]
+    fn returned_ticks_are_owed_again() {
+        let step = TimeStep::from_seconds(0.1).unwrap();
+        let mut pacer = TickPacer::default();
+
+        let demand = pacer.ticks_due(Duration::from_millis(350), step);
+        assert_eq!(demand.ticks, 3);
+
+        // The vetoed ticks come back in full; the 50 ms sub-tick remainder
+        // is carried through both calls, not double-counted.
+        pacer.return_ticks(demand.ticks, step);
+        let demand = pacer.ticks_due(Duration::ZERO, step);
+        assert_eq!(demand.ticks, 3);
+
+        pacer.return_ticks(0, step);
+        assert_eq!(pacer.ticks_due(Duration::ZERO, step).ticks, 0);
     }
 
     #[test]

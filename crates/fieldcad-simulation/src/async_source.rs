@@ -126,9 +126,9 @@ pub struct AsyncLocalDataSource {
     playback_speed: PlaybackSpeed,
     worker_queue: QueueStatus,
     /// Commands sent to the worker but not yet executed there, with the
-    /// kind needed to synthesize a `Submitted`-state display record for
-    /// `get_queue()`.
-    submitted_commands: BTreeMap<CommandId, CommandKind>,
+    /// kind and submission-order sequence needed to synthesize a
+    /// `Submitted`-state display record for `get_queue()`.
+    submitted_commands: BTreeMap<CommandId, (CommandKind, u64)>,
     subscription: Subscription,
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
@@ -138,8 +138,14 @@ pub struct AsyncLocalDataSource {
     mailbox: SnapshotMailbox,
     poll_in_flight: bool,
     accumulated_elapsed: Duration,
+    /// Monotonically increasing counter assigned as `sequence` on synthetic
+    /// `Submitted` records so external sorters (MCP clients) see them in
+    /// submission order, not all at sequence 0 (BE-15).
+    submission_counter: u64,
     command_events: Vec<CommandEvent>,
     failure: Option<String>,
+    #[cfg(test)]
+    test_events_tx: mpsc::Sender<WorkerEvent>,
 }
 
 impl AsyncLocalDataSource {
@@ -152,6 +158,8 @@ impl AsyncLocalDataSource {
         }
         let (request_sender, request_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
+        #[cfg(test)]
+        let test_events_tx = event_sender.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
@@ -170,6 +178,7 @@ impl AsyncLocalDataSource {
             playback_speed: initial.playback_speed,
             worker_queue: initial.queue,
             submitted_commands: BTreeMap::new(),
+            submission_counter: 0,
             subscription: initial.subscription,
             field_systems: initial.field_systems,
             edit_history: initial.edit_history,
@@ -181,6 +190,8 @@ impl AsyncLocalDataSource {
             accumulated_elapsed: Duration::ZERO,
             command_events: Vec::new(),
             failure: None,
+            #[cfg(test)]
+            test_events_tx,
         }
     }
 
@@ -265,10 +276,15 @@ impl AsyncLocalDataSource {
                 Ok(WorkerEvent::PollFailed(error)) => {
                     self.poll_in_flight = false;
                     self.failure = Some(error.to_string());
-                    return Err(error);
+                    // Don't return early (BE-9): earlier events in this
+                    // batch already called adopt() and their aggregate is
+                    // valid. Return it so the caller (e.g. the desktop's
+                    // per-frame pump) still redraws. The failure is visible
+                    // through status().
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    self.poll_in_flight = false;
                     self.failure = Some("local compute worker stopped".to_owned());
                     break;
                 }
@@ -329,8 +345,10 @@ impl FieldDataSource for AsyncLocalDataSource {
         // record in `worker_queue` yet — synthesize a `Submitted` display
         // entry for each so a caller sees them immediately, before the
         // worker even reports back.
-        for (&command, &kind) in &self.submitted_commands {
-            status.pending.push(CommandRecord::submitted(command, kind));
+        for (&command, &(kind, seq)) in &self.submitted_commands {
+            status
+                .pending
+                .push(CommandRecord::submitted(command, kind, seq));
         }
         status
     }
@@ -394,7 +412,9 @@ impl FieldDataSource for AsyncLocalDataSource {
         self.requests
             .send(WorkerRequest::Execute(command))
             .map_err(|_| SourceError::Disconnected)?;
-        self.submitted_commands.insert(command_id, kind);
+        let seq = self.submission_counter;
+        self.submission_counter += 1;
+        self.submitted_commands.insert(command_id, (kind, seq));
         Ok(CommandReceipt {
             command: command_id,
             world_revision: self.simulation.world_revision,
@@ -486,5 +506,118 @@ fn worker_loop(
             }
             WorkerRequest::Stop => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use fieldcad_core::{
+        BoundaryCondition, BoundaryConditions, Domain, DomainBounds, Precision, Resolution,
+        SessionId, TimeStep,
+    };
+    use fieldcad_electromagnetism::courant_limit;
+    use fieldcad_test_field::TestFieldPlugin;
+    use glam::DVec3;
+
+    use crate::{
+        CommandPayload, CommandSequencer, DataSourceStatus, FieldDataSource, LocalDataSource,
+        RuntimeConfig, SimulationRuntime, SourceError,
+    };
+
+    use super::{AsyncLocalDataSource, WorkerEvent, WorkerRequest};
+
+    fn runtime() -> SimulationRuntime {
+        let domain = Domain::new(
+            DomainBounds::new(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)).unwrap(),
+            Resolution::new(8, 8, 8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        let step = TimeStep::from_seconds(courant_limit(&domain) * 0.5).unwrap();
+        SimulationRuntime::new(
+            RuntimeConfig::new(domain, step, SessionId::from_u128(99))
+                .with_plugin(Box::new(TestFieldPlugin)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn poll_failed_does_not_discard_aggregate_from_earlier_events() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+
+        // Play the simulation: submit Play, then poll with real elapsed
+        // to let the worker tick at least once.
+        source
+            .execute(CommandSequencer::default().issue(CommandPayload::Play))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            source.poll(Duration::ZERO).unwrap();
+            if source.simulation_status().tick() > 0 {
+                break;
+            }
+            source.poll(Duration::from_millis(100)).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never advanced a tick"
+            );
+            std::thread::yield_now();
+        }
+
+        // Inject a PollFailed via the test sender (the cloned mpsc sender
+        // that shares the same receiver as the real worker). This simulates
+        // a transient poll failure arriving *after* real worker events.
+        source
+            .test_events_tx
+            .send(WorkerEvent::PollFailed(SourceError::Solver {
+                code: "test-error".to_owned(),
+                message: "simulated transient failure".to_owned(),
+            }))
+            .unwrap();
+
+        // drain_worker_events must NOT propagate the PollFailed as Err —
+        // events processed before it already called adopt() and their aggregate is valid.
+        let _ = source.drain_worker_events().unwrap();
+
+        // The failure is recorded in status() for diagnostics.
+        assert!(
+            matches!(source.status(), DataSourceStatus::Failed(_)),
+            "the failure must be visible through status()"
+        );
+    }
+
+    #[test]
+    fn disconnected_clears_poll_in_flight_and_returns_error() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+
+        // Give the worker a chance to send initial events.
+        source.poll(Duration::ZERO).unwrap();
+
+        // Stop the worker thread gracefully.
+        source
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        source.cancellation.cancel();
+        let _ = source.requests.send(WorkerRequest::Stop);
+        if let Some(handle) = source.worker.take() {
+            handle.join().unwrap();
+        }
+
+        // Replace the request channel with a dead one (receiver dropped
+        // immediately) so submit_poll_if_idle fails on the next call.
+        let (dead_tx, _dead_rx) = std::sync::mpsc::channel();
+        drop(_dead_rx);
+        let _old = std::mem::replace(&mut source.requests, dead_tx);
+
+        // drain_worker_events hits Disconnected. With the fix it clears
+        // poll_in_flight before breaking.
+        let _outcome = source.drain_worker_events().unwrap();
+
+        // poll_in_flight was cleared. submit_poll_if_idle now attempts to
+        // send to the dead channel and returns Err(Disconnected).
+        let err = source.poll(Duration::from_millis(1)).unwrap_err();
+        assert_eq!(err, SourceError::Disconnected);
     }
 }

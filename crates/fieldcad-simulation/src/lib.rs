@@ -1842,6 +1842,44 @@ mod tests {
         }
     }
 
+    /// A flush rejection vetoes this cycle's ticks, but the wall-clock
+    /// budget those ticks were paid for must be handed back to the pacer —
+    /// otherwise every rejected flush silently discards up to a whole
+    /// poll's worth of simulation time (BE-10). Regression test.
+    #[test]
+    fn a_rejected_flush_hands_its_tick_budget_back() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        // An invalid mutation the flush will reject (removing an object
+        // that does not exist), queued while running.
+        let invalid = sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::RemoveObject(ObjectId::new(500)),
+        ]));
+        assert_eq!(
+            source.execute(invalid).unwrap().disposition,
+            CommandDisposition::Queued
+        );
+
+        // Three ticks' worth of wall clock: the flush rejects, so no ticks
+        // run this cycle. dt is 0.1s and the per-poll budget is 8 ticks.
+        let rejected = source.poll(Duration::from_millis(300)).unwrap();
+        assert_eq!(rejected.ticks_advanced, 0);
+
+        // The rejection terminal-recorded and removed the bad mutation, so
+        // the next poll's flush is clean — and the three ticks the rejected
+        // cycle was paid for are still owed.
+        let catch_up = source.poll(Duration::ZERO).unwrap();
+        assert_eq!(catch_up.ticks_advanced, 3);
+
+        // Normal pacing continues from there.
+        let next = source.poll(Duration::from_millis(100)).unwrap();
+        assert_eq!(next.ticks_advanced, 1);
+    }
+
     #[test]
     fn pause_step_undo_redo_proceed_normally_when_the_queue_is_paused_but_empty() {
         for payload in [

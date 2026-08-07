@@ -9,22 +9,21 @@
 //!
 //! Scope of this first slice (mapped from the "Suggested MCP surface" table in
 //! `docs/user-stories/README.md`): simulation control, world inventory and
-//! mutation, experiment (field system) configuration, subscriptions, the
-//! latest snapshot, and undo/redo. Left for later, because the underlying
-//! capability doesn't exist in the model yet or needs its own design: scene
-//! lifecycle (create/open/save), particle templates, rename, probe history
-//! and trajectories as retained server-side series, diagnostics as a
-//! dedicated read (today folded into the snapshot), run comparison,
-//! record/replay, export, and push notifications for snapshot/status/
-//! diagnostic events (`watch_session` — everything here is pull, via a tool
-//! call, not yet a resource subscription).
+//! mutation, experiment (field system) configuration, subscriptions through
+//! four `fieldcad://session/{status,snapshot,diagnostics,queue}` resources with
+//! push notifications via `subscriptions/listen`, the latest snapshot, and
+//! undo/redo. Left for later, because the underlying capability doesn't exist
+//! in the model yet or needs its own design: scene lifecycle (create/open/save),
+//! particle templates, rename, probe history and trajectories as retained
+//! server-side series, diagnostics as a dedicated read (today folded into the
+//! snapshot), run comparison, record/replay, and export.
 //!
 //! World commands too varied to give a typed MCP schema in this slice
-//! (`commit_world`) are accepted as a JSON-encoded string of
-//! [`fieldcad_core::WorldCommand`] values rather than a native MCP input
-//! schema: those types are not `schemars::JsonSchema`, and deriving it across
-//! all of `fieldcad-core` is bigger than this slice. Every other tool takes
-//! plain primitives so its schema is exact.
+//! (`edit_world` and `commit_world`) are accepted as a `Vec<serde_json::Value>`
+//! array of [`fieldcad_core::WorldCommand`] values rather than a native MCP
+//! input schema per variant: those types are not `schemars::JsonSchema`, and
+//! deriving it across all of `fieldcad-core` is bigger than this slice. Every
+//! other tool takes plain primitives so its schema is exact.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,9 +57,9 @@ use serde::{Deserialize, Serialize};
 
 mod transport;
 mod typed_world;
-#[cfg(unix)]
-pub use transport::serve_unix;
 pub use transport::{McpConnections, bind_http, bind_unix, generate_token, run_stdio, serve_http};
+#[cfg(unix)]
+pub use transport::{UnixSocketLock, serve_unix};
 use typed_world::into_world_command;
 pub use typed_world::{ChannelRefParam, EditWorldParams, WorldEditParam};
 
@@ -442,6 +441,7 @@ fn resource_text(
 fn affected_resource_uris(event: &WatchEvent) -> &'static [&'static str] {
     match event {
         WatchEvent::Lagged => &SESSION_RESOURCE_URIS,
+        WatchEvent::Closed => &[],
         WatchEvent::Session(SessionEvent::SnapshotUpdated(_)) => &[SESSION_SNAPSHOT_URI],
         WatchEvent::Session(SessionEvent::DiagnosticsUpdated(_)) => &[SESSION_DIAGNOSTICS_URI],
         WatchEvent::Session(
@@ -1056,6 +1056,9 @@ impl ServerHandler for McpServer {
                 () = context.cancelled() => return Ok(()),
                 event = watcher.recv() => {
                     let Some(event) = event else { return Ok(()) };
+                    if matches!(event, WatchEvent::Closed) {
+                        return Ok(());
+                    }
                     for &uri in affected_resource_uris(&event) {
                         let accepted = context
                             .accepted()
@@ -1802,6 +1805,15 @@ mod tests {
     fn a_lag_marker_invalidates_every_stable_resource() {
         let affected = affected_resource_uris(&WatchEvent::Lagged);
         assert_eq!(affected, SESSION_RESOURCE_URIS);
+    }
+
+    #[test]
+    fn a_closed_hub_invalidates_no_resources() {
+        assert_eq!(
+            affected_resource_uris(&WatchEvent::Closed),
+            &[] as &[&str],
+            "a closed hub has no resources to invalidate"
+        );
     }
 
     #[test]

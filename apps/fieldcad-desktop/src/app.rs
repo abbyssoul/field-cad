@@ -223,15 +223,53 @@ struct FieldGeometryKey {
     snapshot: Option<(SessionId, u64)>,
     field_layers: BTreeMap<ChannelId, ui::ChannelLayerSettings>,
     show: scene::SceneVisibility,
+    entity_visibility: EntityVisibility,
+}
+
+/// Which measurement entities were visible when the cached geometry was
+/// built. `scene::field_geometry` reads the believed world for this, so a
+/// visibility toggle must invalidate the cache even when it publishes no new
+/// snapshot. Vectors over `BTreeMap` iteration are in id order, so `==` is an
+/// exact comparison, not a heuristic. Deliberately not the world revision:
+/// that moves on every pointer-move of a drag, which would defeat the cache
+/// precisely while it is most needed.
+#[derive(Clone, PartialEq)]
+struct EntityVisibility {
+    planes: Vec<(fieldcad_core::PlaneId, bool)>,
+    boxes: Vec<(fieldcad_core::BoxId, bool)>,
+    spheres: Vec<(fieldcad_core::SphereId, bool)>,
+}
+
+impl EntityVisibility {
+    fn of(world: &WorldSnapshot) -> Self {
+        Self {
+            planes: world
+                .planes()
+                .iter()
+                .map(|(id, plane)| (*id, plane.visible))
+                .collect(),
+            boxes: world
+                .boxes()
+                .iter()
+                .map(|(id, region)| (*id, region.visible))
+                .collect(),
+            spheres: world
+                .spheres()
+                .iter()
+                .map(|(id, sphere)| (*id, sphere.visible))
+                .collect(),
+        }
+    }
 }
 
 /// A vector layer's triangles and arrows are pure functions of the snapshot
-/// it reads, the layer settings that shaped it, and which scene classes are
-/// visible — see [`scene::field_geometry`]. None of that changes between two
-/// frames of a paused, static scene, yet the interpolation this drives
-/// (trilinear per glyph, both surface and vector passes) is the most
-/// expensive thing this module does per frame. `field_snapshot` is compared
-/// by `(session, sequence)` rather than by value for the same reason
+/// it reads, the layer settings that shaped it, which scene classes are
+/// visible, and which measurement entities are — see
+/// [`scene::field_geometry`]. None of that changes between two frames of a
+/// paused, static scene, yet the interpolation this drives (trilinear per
+/// glyph, both surface and vector passes) is the most expensive thing this
+/// module does per frame. `field_snapshot` is compared by
+/// `(session, sequence)` rather than by value for the same reason
 /// [`ComputeView::build`] does: every path that changes a channel's
 /// published batches publishes a new sequence.
 ///
@@ -245,16 +283,19 @@ struct FieldGeometryKey {
 fn compute_field_layer_geometry(
     cache: Option<&FieldGeometryCache>,
     field_snapshot: Option<&fieldcad_core::FieldSnapshot>,
+    world: &WorldSnapshot,
     field_layers: &BTreeMap<ChannelId, ui::ChannelLayerSettings>,
     show: scene::SceneVisibility,
     vector_channels: &[ChannelId],
 ) -> (scene::FieldGeometry, Option<FieldGeometryCache>) {
     let snapshot_identity =
         field_snapshot.map(|snapshot| (snapshot.identity.session, snapshot.identity.sequence));
+    let entity_visibility = EntityVisibility::of(world);
     if let Some(cache) = cache
         && cache.key.snapshot == snapshot_identity
         && cache.key.show == show
         && cache.key.field_layers == *field_layers
+        && cache.key.entity_visibility == entity_visibility
     {
         return (cache.geometry.clone(), None);
     }
@@ -269,10 +310,13 @@ fn compute_field_layer_geometry(
                 field_snapshot,
                 channel,
                 layer.whole_domain,
-                &layer.planes,
-                &layer.boxes,
-                &layer.spheres,
+                scene::RegionLayers {
+                    planes: &layer.planes,
+                    boxes: &layer.boxes,
+                    spheres: &layer.spheres,
+                },
                 show,
+                world,
             );
             geometry
                 .surface_triangles
@@ -285,6 +329,7 @@ fn compute_field_layer_geometry(
             snapshot: snapshot_identity,
             field_layers: field_layers.clone(),
             show,
+            entity_visibility,
         },
         geometry: geometry.clone(),
     };
@@ -473,6 +518,7 @@ impl WindowState {
         let (geometry, new_cache) = compute_field_layer_geometry(
             self.field_geometry_cache.as_ref(),
             field_snapshot,
+            &self.world,
             &self.ui_model.field_layers,
             show,
             vector_channels,
@@ -628,6 +674,7 @@ impl WindowState {
                     selection,
                     transform_preview,
                     self.ui_model.view.gizmo_display,
+                    pixels_per_point_before_frame,
                 )
             })
             .map(|position| {
@@ -778,6 +825,7 @@ impl WindowState {
                     .and_then(|drag| drag.constraint.handle()),
                 transform_preview,
                 self.ui_model.view.gizmo_display,
+                pixels_per_point,
             );
         }
 
@@ -979,6 +1027,7 @@ impl WindowState {
                 self.viewport,
                 pointer,
                 self.ui_model.view.gizmo_display,
+                pixels_per_point,
             );
             let constraint = match picked_handle {
                 Some(TransformHandle::PlaneNormal) => Some(ManipulationConstraint::PlaneNormal),
@@ -1039,10 +1088,16 @@ impl WindowState {
         {
             match active.constraint {
                 ManipulationConstraint::PlaneNormal => {
-                    self.drag_plane_normal(active, pointer)?;
+                    self.drag_plane_normal(active, pointer, pixels_per_point)?;
                 }
                 ManipulationConstraint::Rotate(handle) => {
-                    self.drag_box_rotation(active, handle, pointer, pointer_delta)?;
+                    self.drag_box_rotation(
+                        active,
+                        handle,
+                        pointer,
+                        pointer_delta,
+                        pixels_per_point,
+                    )?;
                 }
                 ManipulationConstraint::Handle(handle) => {
                     let length = scene::selection_gizmo_length_with_display(
@@ -1051,6 +1106,7 @@ impl WindowState {
                         self.viewport,
                         active.target,
                         self.ui_model.view.gizmo_display,
+                        pixels_per_point,
                     )
                     .ok_or_else(|| "selected entity no longer has a transform gizmo".to_owned())?;
                     if let Some(translation) = scene::constrained_translation(
@@ -1253,6 +1309,7 @@ impl WindowState {
         &mut self,
         active: ActiveTransformDrag,
         pointer: Vec2,
+        pixels_per_point: f32,
     ) -> Result<(), String> {
         let scene::SceneSelection::Plane(plane_id) = active.target else {
             return Ok(());
@@ -1272,6 +1329,7 @@ impl WindowState {
             active.target,
             Some(active.preview()),
             self.ui_model.view.gizmo_display,
+            pixels_per_point,
         )
         .ok_or_else(|| "selected plane no longer has a normal handle".to_owned())?;
         let radius = tip.distance(active.origin.as_vec3());
@@ -1314,6 +1372,7 @@ impl WindowState {
         handle: TransformHandle,
         pointer: Vec2,
         pointer_delta: Vec2,
+        pixels_per_point: f32,
     ) -> Result<(), String> {
         let scene::SceneSelection::Box(region_id) = active.target else {
             return Ok(());
@@ -1358,6 +1417,7 @@ impl WindowState {
                     self.viewport,
                     active.target,
                     self.ui_model.view.gizmo_display,
+                    pixels_per_point,
                 ) else {
                     return Ok(());
                 };
@@ -2132,25 +2192,36 @@ mod tests {
 
         use fieldcad_core::{
             ChannelId, ChannelSchema, ChannelSnapshot, Dimension, Domain, FieldBatch, FieldColumn,
-            FieldSnapshot, FieldValueKind, PlaneLattice, PluginId, SampleGeometry, SampleValidity,
-            SessionId, SnapshotCompleteness, SnapshotIdentity, WorldRevision,
+            FieldSnapshot, FieldValueKind, PlaneId, PlaneLattice, PluginId, SampleGeometry,
+            SampleValidity, SessionId, SlicePlaneSpec, SnapshotCompleteness, SnapshotIdentity,
+            World, WorldCommand, WorldRevision,
         };
         use glam::{DVec3, UVec2};
 
         use super::super::compute_field_layer_geometry;
         use crate::{scene, ui};
 
+        /// A world holding one visible slice plane, so the batch id in the
+        /// snapshot and the world's id agree — the same correspondence the
+        /// runtime's own publication guarantees.
+        fn world_with_plane() -> (World, PlaneId) {
+            let mut world = World::new();
+            let report = world
+                .commit([WorldCommand::CreatePlane(
+                    SlicePlaneSpec::new("Plane", DVec3::ZERO, DVec3::Z).unwrap(),
+                )])
+                .unwrap();
+            (world, report.created_planes[0])
+        }
+
         /// One vector channel publishing a single plane batch — just enough
         /// for [`scene::field_geometry`] to produce non-empty arrows.
-        fn make_snapshot(sequence: u64) -> (FieldSnapshot, ChannelId) {
+        fn make_snapshot(sequence: u64, plane: PlaneId) -> (FieldSnapshot, ChannelId) {
             let plugin = PluginId::new("test").unwrap();
             let channel = ChannelId::new(plugin.clone(), "vector").unwrap();
             let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(2));
             let batch = FieldBatch::new(
-                SampleGeometry::Plane {
-                    plane: fieldcad_core::PlaneId::new(0),
-                    lattice,
-                },
+                SampleGeometry::Plane { plane, lattice },
                 FieldColumn::vectors(vec![DVec3::X; 4]),
                 vec![SampleValidity::Exact; 4],
             )
@@ -2203,13 +2274,15 @@ mod tests {
         /// agree.
         #[test]
         fn reuses_the_cache_until_the_snapshot_sequence_changes() {
-            let (snapshot, channel) = make_snapshot(0);
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
             let layers = visible_layers(&channel);
             let show = scene::SceneVisibility::ALL;
 
             let (baseline, new_cache) = compute_field_layer_geometry(
                 None,
                 Some(&snapshot),
+                &world.snapshot(),
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
@@ -2232,6 +2305,7 @@ mod tests {
             let (reused, new_cache) = compute_field_layer_geometry(
                 Some(&cache),
                 Some(&snapshot),
+                &world.snapshot(),
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
@@ -2244,10 +2318,11 @@ mod tests {
 
             // A new snapshot sequence must discard the stale cache and
             // recompute rather than propagate it.
-            let (next_snapshot, _) = make_snapshot(1);
+            let (next_snapshot, _) = make_snapshot(1, plane);
             let (rebuilt, new_cache) = compute_field_layer_geometry(
                 Some(&cache),
                 Some(&next_snapshot),
+                &world.snapshot(),
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
@@ -2268,13 +2343,15 @@ mod tests {
         /// snapshot, so it must invalidate the cache on its own.
         #[test]
         fn reuses_the_cache_until_the_layer_settings_change() {
-            let (snapshot, channel) = make_snapshot(0);
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
             let layers = visible_layers(&channel);
             let show = scene::SceneVisibility::ALL;
 
             let (_, new_cache) = compute_field_layer_geometry(
                 None,
                 Some(&snapshot),
+                &world.snapshot(),
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
@@ -2295,6 +2372,7 @@ mod tests {
             let (rebuilt, new_cache) = compute_field_layer_geometry(
                 Some(&cache),
                 Some(&snapshot),
+                &world.snapshot(),
                 &hidden_layers,
                 show,
                 std::slice::from_ref(&channel),
@@ -2308,15 +2386,84 @@ mod tests {
 
         #[test]
         fn no_snapshot_and_no_cache_produces_empty_geometry_without_panicking() {
+            let (world, _) = world_with_plane();
             let (geometry, new_cache) = compute_field_layer_geometry(
                 None,
                 None,
+                &world.snapshot(),
                 &BTreeMap::new(),
                 scene::SceneVisibility::ALL,
                 &[],
             );
             assert!(geometry.surface_triangles.is_empty());
             assert!(geometry.vector_lines.is_empty());
+            assert!(new_cache.is_some());
+        }
+
+        /// Mirrors the layer-settings case above for the entity's own
+        /// `visible` flag: hiding a plane changes what `field_geometry`
+        /// draws, and until the toggle joins the cache key a retained
+        /// snapshot keeps serving the hidden plane's arrows (UI-4).
+        #[test]
+        fn reuses_the_cache_until_entity_visibility_changes() {
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+
+            let (baseline, new_cache) = compute_field_layer_geometry(
+                None,
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+            );
+            assert!(
+                !baseline.vector_lines.is_empty(),
+                "test setup: expected arrows"
+            );
+            let mut cache = new_cache.unwrap();
+            cache.geometry.vector_lines.push(scene::ColoredVertex {
+                position: glam::Vec3::splat(9_999.0),
+                color: glam::Vec4::ZERO,
+            });
+            let poisoned_len = cache.geometry.vector_lines.len();
+
+            // Same snapshot, same settings, same visibility: reused verbatim.
+            let (reused, new_cache) = compute_field_layer_geometry(
+                Some(&cache),
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+            );
+            assert_eq!(reused.vector_lines.len(), poisoned_len);
+            assert!(new_cache.is_none());
+
+            // Hide the plane in the believed world. Nothing republishes — the
+            // snapshot and every layer setting are unchanged — yet the cache
+            // must still invalidate, and the recomputed geometry is empty.
+            let mut hidden = world;
+            hidden
+                .commit([WorldCommand::SetPlaneVisible {
+                    plane,
+                    visible: false,
+                }])
+                .unwrap();
+            let (rebuilt, new_cache) = compute_field_layer_geometry(
+                Some(&cache),
+                Some(&snapshot),
+                &hidden.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+            );
+            assert!(
+                rebuilt.vector_lines.is_empty(),
+                "a hidden plane must discard the stale cache and draw nothing"
+            );
             assert!(new_cache.is_some());
         }
     }

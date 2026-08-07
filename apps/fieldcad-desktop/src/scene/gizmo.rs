@@ -141,8 +141,12 @@ impl TransformHandle {
 const AXIS_LENGTH_PX: f32 = 120.0;
 
 /// Presentation settings for the scale-independent transform gizmo, expressed
-/// in logical screen pixels. They affect neither authored geometry nor the
-/// transform produced by a drag.
+/// in logical screen pixels — the same points egui lays the panels out in,
+/// independent of display scaling. They affect neither authored geometry nor
+/// the transform produced by a drag. The public functions in this module take
+/// the display scale alongside them and convert with
+/// [`GizmoDisplay::to_physical`], because the gizmo's math — like the
+/// [`Viewport`] — is physical.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GizmoDisplay {
     pub axis_length_px: f32,
@@ -163,6 +167,22 @@ impl Default for GizmoDisplay {
 }
 
 impl GizmoDisplay {
+    /// These settings are logical points, but the gizmo's math is physical
+    /// pixels — like the [`Viewport`], and like the pointer position the
+    /// picking path hit-tests, both of which arrive already converted. So the
+    /// display converts once, here, at each public entry point; conversion is
+    /// the functions' job rather than the caller's so that an
+    /// already-physical value can never be handed in and doubled by mistake.
+    pub fn to_physical(self, pixels_per_point: f32) -> Self {
+        let scale = pixels_per_point.max(0.01);
+        Self {
+            axis_length_px: self.axis_length_px * scale,
+            axis_thickness_px: self.axis_thickness_px * scale,
+            rotation_diameter_px: self.rotation_diameter_px * scale,
+            rotation_thickness_px: self.rotation_thickness_px * scale,
+        }
+    }
+
     fn axis_length_px(self) -> f32 {
         self.axis_length_px.max(12.0)
     }
@@ -194,7 +214,9 @@ pub fn append_transform_gizmo_with_display(
     active: Option<TransformHandle>,
     preview: Option<TransformPreview>,
     display: GizmoDisplay,
+    pixels_per_point: f32,
 ) {
+    let display = display.to_physical(pixels_per_point);
     let Some(selection) = selection else {
         return;
     };
@@ -340,6 +362,10 @@ fn transform_gizmo(
     transform_gizmo_with_display(world, camera, viewport, selection, GizmoDisplay::default())
 }
 
+/// `display` must already be physical — every public entry point converts the
+/// caller's logical [`GizmoDisplay`] with [`GizmoDisplay::to_physical`]
+/// before calling here, so the scale arithmetic reads physical pixels
+/// throughout this module.
 fn transform_gizmo_with_display(
     world: &WorldSnapshot,
     camera: &OrbitCamera,
@@ -469,7 +495,9 @@ pub fn pick_transform_handle_with_display(
     viewport: Viewport,
     pointer: Vec2,
     display: GizmoDisplay,
+    pixels_per_point: f32,
 ) -> Option<TransformHandle> {
+    let display = display.to_physical(pixels_per_point);
     let (origin, length) =
         transform_gizmo_with_display(world, camera, viewport, selection, display)?;
     let is_box = matches!(selection, SceneSelection::Box(_));
@@ -661,9 +689,16 @@ pub fn selection_gizmo_length_with_display(
     viewport: Viewport,
     selection: SceneSelection,
     display: GizmoDisplay,
+    pixels_per_point: f32,
 ) -> Option<f32> {
-    transform_gizmo_with_display(world, camera, viewport, selection, display)
-        .map(|(_, length)| length)
+    transform_gizmo_with_display(
+        world,
+        camera,
+        viewport,
+        selection,
+        display.to_physical(pixels_per_point),
+    )
+    .map(|(_, length)| length)
 }
 
 /// The rotation gizmo's sphere radius for a box selection — mirrors
@@ -675,7 +710,9 @@ pub fn rotation_gizmo_radius_with_display(
     viewport: Viewport,
     selection: SceneSelection,
     display: GizmoDisplay,
+    pixels_per_point: f32,
 ) -> Option<f32> {
+    let display = display.to_physical(pixels_per_point);
     transform_gizmo_with_display(world, camera, viewport, selection, display).map(|(origin, _)| {
         display.rotation_radius_px() * camera.world_units_per_pixel(origin, viewport.height as f32)
     })
@@ -699,13 +736,19 @@ pub fn plane_normal_tip(
     selection: SceneSelection,
     preview: Option<TransformPreview>,
     display: GizmoDisplay,
+    pixels_per_point: f32,
 ) -> Option<(Vec3, Vec3)> {
     let SceneSelection::Plane(id) = selection else {
         return None;
     };
     let plane = world.planes().get(&id).filter(|plane| plane.visible)?;
-    let (world_origin, gizmo_length) =
-        transform_gizmo_with_display(world, camera, viewport, selection, display)?;
+    let (world_origin, gizmo_length) = transform_gizmo_with_display(
+        world,
+        camera,
+        viewport,
+        selection,
+        display.to_physical(pixels_per_point),
+    )?;
     let origin = preview.map_or(world_origin, |preview| preview.origin);
     let normal = preview
         .and_then(|preview| preview.plane_normal)
@@ -721,8 +764,17 @@ pub fn plane_normal_label_position(
     selection: SceneSelection,
     preview: Option<TransformPreview>,
     display: GizmoDisplay,
+    pixels_per_point: f32,
 ) -> Option<Vec2> {
-    let (_, tip) = plane_normal_tip(world, camera, viewport, selection, preview, display)?;
+    let (_, tip) = plane_normal_tip(
+        world,
+        camera,
+        viewport,
+        selection,
+        preview,
+        display,
+        pixels_per_point,
+    )?;
     let position = project_to_viewport(camera, viewport, tip)?;
     viewport.contains(position).then_some(position)
 }
@@ -1076,6 +1128,7 @@ mod tests {
                 VIEWPORT,
                 pointer,
                 GizmoDisplay::default(),
+                1.0,
             ),
             Some(TransformHandle::AxisX)
         );
@@ -1173,6 +1226,7 @@ mod tests {
                 VIEWPORT,
                 pointer,
                 GizmoDisplay::default(),
+                1.0,
             ),
             Some(TransformHandle::PlaneXY)
         );
@@ -1209,6 +1263,7 @@ mod tests {
                 None,
                 None,
                 GizmoDisplay::default(),
+                1.0,
             );
             assert!(!geometry.vector_lines.is_empty());
             assert_eq!(selection_origin(&snapshot, selection), Some(Vec3::ZERO));
@@ -1239,6 +1294,7 @@ mod tests {
             selection,
             None,
             GizmoDisplay::default(),
+            1.0,
         )
         .unwrap();
         assert!(tip.distance(origin) > 0.0);
@@ -1252,6 +1308,7 @@ mod tests {
                 VIEWPORT,
                 pointer,
                 GizmoDisplay::default(),
+                1.0,
             ),
             Some(TransformHandle::PlaneNormal)
         );
@@ -1306,6 +1363,7 @@ mod tests {
             selection,
             None,
             default_display,
+            1.0,
         )
         .unwrap();
         let (configured_origin, configured_tip) = plane_normal_tip(
@@ -1315,6 +1373,7 @@ mod tests {
             selection,
             None,
             configured_display,
+            1.0,
         )
         .unwrap();
 
@@ -1372,6 +1431,125 @@ mod tests {
         );
     }
 
+    /// The sibling invariance to the camera-distance one above: the settings
+    /// are *logical* pixels, so at 2x display scaling the gizmo must cover
+    /// twice as many physical pixels and keep the same world-space size —
+    /// the `Viewport` doubles with the scale factor, and both conversions
+    /// have to meet in the middle (UI-5).
+    #[test]
+    fn the_gizmo_keeps_its_logical_size_across_display_scales() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("source"))])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Object(fieldcad_core::ObjectId::new(0));
+        let camera = OrbitCamera::default();
+        let display = GizmoDisplay::default();
+
+        let hidpi = Viewport {
+            x: 0,
+            y: 0,
+            width: VIEWPORT.width * 2,
+            height: VIEWPORT.height * 2,
+        };
+        let length_1x = selection_gizmo_length_with_display(
+            &snapshot, &camera, VIEWPORT, selection, display, 1.0,
+        )
+        .unwrap();
+        let length_2x =
+            selection_gizmo_length_with_display(&snapshot, &camera, hidpi, selection, display, 2.0)
+                .unwrap();
+
+        assert!(
+            (length_2x / length_1x - 1.0).abs() < 1.0e-4,
+            "the same logical size must be the same world-space size when the \
+             viewport doubles with the scale factor: {length_1x} at 1x, \
+             {length_2x} at 2x"
+        );
+
+        // And the on-screen size is the same number of *logical* points —
+        // twice as many physical pixels.
+        let origin = selection_origin(&snapshot, selection).unwrap();
+        let pixels = |viewport: Viewport, length: f32| {
+            let base = project_to_viewport(&camera, viewport, origin).unwrap();
+            let tip = project_to_viewport(&camera, viewport, origin + Vec3::X * length).unwrap();
+            tip.distance(base)
+        };
+        let physical_1x = pixels(VIEWPORT, length_1x);
+        let physical_2x = pixels(hidpi, length_2x);
+        assert!(
+            (physical_2x / physical_1x - 2.0).abs() < 1.0e-3,
+            "a 2x display must draw the gizmo at twice the physical pixels: \
+             {physical_1x}px at 1x, {physical_2x}px at 2x"
+        );
+    }
+
+    /// Drawing and picking share one converted display: at 2x scaling a
+    /// pointer at the drawn arrow's physical-pixel position must still pick
+    /// it. (Consistency held before UI-5 too — this guards against the
+    /// conversions ever diverging.)
+    #[test]
+    fn picking_matches_the_drawn_gizmo_on_a_hidpi_display() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("source").with_shape(ObjectShape::sphere(0.25).unwrap()),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let selection = SceneSelection::Object(snapshot.objects().values().next().unwrap().id);
+        let camera = OrbitCamera::default();
+        let display = GizmoDisplay::default();
+        let hidpi = Viewport {
+            x: 0,
+            y: 0,
+            width: VIEWPORT.width * 2,
+            height: VIEWPORT.height * 2,
+        };
+
+        let origin = selection_origin(&snapshot, selection).unwrap();
+        let length =
+            selection_gizmo_length_with_display(&snapshot, &camera, hidpi, selection, display, 2.0)
+                .unwrap();
+        let (start, end) = gizmo_axis_segment(origin, Vec3::X, length);
+        let start = project_to_viewport(&camera, hidpi, start).unwrap();
+        let end = project_to_viewport(&camera, hidpi, end).unwrap();
+        let pointer = start.lerp(end, 0.5);
+
+        assert_eq!(
+            pick_transform_handle_with_display(
+                &snapshot, selection, &camera, hidpi, pointer, display, 2.0,
+            ),
+            Some(TransformHandle::AxisX),
+            "the axis must be pickable where it is drawn at 2x scaling"
+        );
+    }
+
+    #[test]
+    fn display_settings_convert_to_physical_pixels() {
+        let display = GizmoDisplay {
+            axis_length_px: 120.0,
+            axis_thickness_px: 4.0,
+            rotation_diameter_px: 220.0,
+            rotation_thickness_px: 8.0,
+        };
+
+        assert_eq!(display.to_physical(1.0), display, "1x is the identity");
+        assert_eq!(
+            display.to_physical(2.0),
+            GizmoDisplay {
+                axis_length_px: 240.0,
+                axis_thickness_px: 8.0,
+                rotation_diameter_px: 440.0,
+                rotation_thickness_px: 16.0,
+            }
+        );
+        // The clamp matches `Viewport::from_logical`/`pointer_to_physical`: a
+        // degenerate scale factor is pinned, never propagated.
+        assert_eq!(display.to_physical(0.0), display.to_physical(0.01));
+    }
+
     #[test]
     fn display_options_control_arrow_length_and_rotation_diameter() {
         let mut world = World::new();
@@ -1391,9 +1569,10 @@ mod tests {
             transform_gizmo_with_display(&snapshot, &camera, VIEWPORT, selection, display).unwrap();
         let expected_scale = camera.world_units_per_pixel(Vec3::ZERO, VIEWPORT.height as f32);
         assert!((length - 140.0 * expected_scale).abs() < 1.0e-5);
-        let radius =
-            rotation_gizmo_radius_with_display(&snapshot, &camera, VIEWPORT, selection, display)
-                .unwrap();
+        let radius = rotation_gizmo_radius_with_display(
+            &snapshot, &camera, VIEWPORT, selection, display, 1.0,
+        )
+        .unwrap();
         assert!((radius - 160.0 * expected_scale).abs() < 1.0e-5);
     }
 
@@ -1473,6 +1652,7 @@ mod tests {
                         VIEWPORT,
                         pointer,
                         GizmoDisplay::default(),
+                        1.0,
                     ) == Some(handle)
                     {
                         correct += 1;
@@ -1514,6 +1694,7 @@ mod tests {
                 VIEWPORT,
                 pointer,
                 GizmoDisplay::default(),
+                1.0,
             ),
             Some(TransformHandle::RotateZ)
         );
@@ -1570,6 +1751,7 @@ mod tests {
                 VIEWPORT,
                 pointer,
                 GizmoDisplay::default(),
+                1.0,
             ),
             Some(TransformHandle::RotateView)
         );
@@ -1621,6 +1803,7 @@ mod tests {
                 VIEWPORT,
                 *pointer,
                 GizmoDisplay::default(),
+                1.0,
             ) == Some(TransformHandle::RotateFree)
         })
         .expect("some unclaimed point inside the rotation sphere must start free rotation");
@@ -1687,6 +1870,7 @@ mod tests {
                     VIEWPORT,
                     pointer,
                     GizmoDisplay::default(),
+                    1.0,
                 ) == Some(axis.0)
                 {
                     hit = Some(());

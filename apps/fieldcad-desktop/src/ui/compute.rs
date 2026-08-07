@@ -777,10 +777,12 @@ mod tests {
             pending: vec![CommandRecord::submitted(
                 CommandId::new(1),
                 CommandKind::Play,
+                1,
             )],
             history: vec![CommandRecord::submitted(
                 CommandId::new(0),
                 CommandKind::Pause,
+                0,
             )],
         };
         let matching = QueueSummary {

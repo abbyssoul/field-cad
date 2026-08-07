@@ -182,25 +182,17 @@ or emitting `CommandEvent::Failed`; only flush-time rejections do. Contradicts
 `docs/tasks/session-events-and-queue-control.md:60` ("command terminal
 records must remain recoverable through queue history").
 
-**BE-8 — `crates/fieldcad-server/src/lib.rs:91,147` — `waiters` entries are never pruned. (medium)**
-Only `publish()` removes a `submit_and_await` waiter. A 30s MCP timeout drops
-the receiver but leaves the sender in the map forever; nothing bounds it.
+**BE-8 — `crates/fieldcad-server/src/lib.rs:91,147` — `waiters` entries are never pruned. (medium)** — **Fixed.** Added `self.waiters.retain(|_id, sender| !sender.is_closed())` to `publish()`, pruning orphaned senders whose receiver was dropped (e.g. on MCP 30 s timeout) instead of leaking them indefinitely. Regression test: `dropped_receiver_is_pruned_on_the_next_publish` (`fieldcad-server/tests/concurrent_transports.rs`).
 
-**BE-9 — `async_source.rs:233-237` — `PollFailed` discards an already-applied aggregate, and `poll_in_flight` never clears after worker disconnect. (low)**
-An error return after a partial `adopt(state)` means the caller never learns
-`snapshot_updated` was true and won't redraw; after a disconnect, no further
-poll is ever submitted.
+**BE-9 — `async_source.rs:233-237` — `PollFailed` discards an already-applied aggregate, and `poll_in_flight` never clears after worker disconnect. (low)** — **Fixed.** `PollFailed` no longer `return Err(error)` — it clears `poll_in_flight`, records the failure, and continues draining remaining events so the aggregate from earlier successful events is preserved. `Disconnected` now also clears `poll_in_flight` before breaking, so `submit_poll_if_idle` can detect the dead channel and return `Err(Disconnected)` instead of silently returning `Ok(default)`. Regression tests: `poll_failed_does_not_discard_aggregate_from_earlier_events` and `disconnected_clears_poll_in_flight_and_returns_error` (`fieldcad-simulation/src/async_source.rs`).
 
-**BE-10 — `source.rs:796-803` — a rejected flush silently discards the tick budget already taken from the pacer. (low)**
+**BE-10 — `source.rs:796-803` — a rejected flush silently discards the tick budget already taken from the pacer. (low)** — **Fixed.** Added `TickPacer::return_ticks` (`fieldcad-simulation/src/runtime.rs`); `SessionCore::advance` now hands the vetoed cycle's demanded ticks back to the pacer, so a rejected flush's budget re-surfaces as ordinary demand on the next `advance` (and is reported as `fell_behind` at catch-up if it outgrows the per-poll budget) instead of vanishing. Only the capped demand is re-creditable — the beyond-cap backlog stays discarded by the pacer's own design (ADR 0011). Regression test: `a_rejected_flush_hands_its_tick_budget_back` (`fieldcad-simulation/src/lib.rs`), verified to fail against the old code; plus pacer unit test `returned_ticks_are_owed_again` (`runtime.rs`).
 
-**BE-11 — `crates/fieldcad-mcp/src/transport.rs:175-192` — TOCTOU on stale Unix-socket removal. (low, local/owner-only so low impact)**
+**BE-11 — `crates/fieldcad-mcp/src/transport.rs:175-192` — TOCTOU on stale Unix-socket removal. (low, local/owner-only so low impact)** — **Fixed.** `bind_unix` now serializes probe/remove/bind behind an exclusive advisory lock on `<path>.lock` (`UnixSocketLock`, std `File::try_lock`, no new dependency), acquired before the probe and held for the listener's whole lifetime, so a racing cooperating peer can never have its live socket file removed out from under it. The connect probe remains only to diagnose live *non-cooperating* binders; a non-socket file at the path is refused rather than deleted; the lock file is never unlinked (that would void flock exclusion). Regression tests (`fieldcad-mcp/src/transport.rs`): `a_second_bind_is_refused_even_after_the_socket_file_is_removed_externally` and `a_regular_file_at_the_socket_path_is_not_deleted`, both verified to fail against the old code, plus three behavior-preservation tests (stale reclamation, live-server refusal, rebind-after-shutdown).
 
 ### Contract violations
 
-**BE-12 — `crates/fieldcad-server/src/event_hub.rs:26-28` vs `:110` — the docstring says the opposite of what the code does. (medium)**
-Docstring promises change detection "without cloning [the queue] on every
-publish"; `publish_state` calls `source.get_queue()`, which deep-clones the
-queue (up to 256 records) to read four scalars.
+**BE-12 — `crates/fieldcad-server/src/event_hub.rs:26-28` vs `:110` — the docstring says the opposite of what the code does. (medium)** — **Fixed** (collateral of BE-16). `publish_state` now calls `source.queue_summary()` instead of `source.get_queue()`, matching the documented design of change detection without cloning the full queue.
 
 **BE-13 — `source.rs:1123-1128` — `LoopbackDataSource::get_queue` returns authoritative state through a source that otherwise deliberately only exposes "believed" state. (low)**
 Every other read on this type is filtered through `believed_*` specifically
@@ -211,8 +203,7 @@ one exception, acknowledged but not justified in the inline comment.
 Not currently exercised (desktop routes through `submit`), but the public API
 permits a caller to resolve the wrong `submit_and_await` waiter.
 
-**BE-15 — `source.rs:295-305` — `CommandRecord::submitted` sets `sequence: 0`, serialized to MCP clients whose docs say to sort pending by sequence. (low)**
-Sorting by the documented field puts every `Submitted` record first — backwards.
+**BE-15 — `source.rs:295-305` — `CommandRecord::submitted` sets `sequence: 0`, serialized to MCP clients whose docs say to sort pending by sequence. (low)** — **Fixed.** `CommandRecord::submitted()` now takes an explicit `sequence: u64` parameter. `AsyncLocalDataSource` assigns a monotonically increasing submission counter to each synthetic `Submitted` record so external sorters see them in proper submission order.
 
 ### Performance
 
@@ -234,16 +225,11 @@ Could live once on `SessionCore` with both wrappers forwarding.
 
 ### Hygiene
 
-**BE-20 — `crates/fieldcad-mcp/src/lib.rs:13-27` — module doc contradicts the code it documents. (medium)**
-Claims push notifications are "left for later, everything here is pull" —
-but `listen()`, `enable_resources_subscribe()`, and four `fieldcad://session/*`
-resources exist in the same file. Also claims `commit_world` takes a
-JSON-encoded string; its param type is `Vec<serde_json::Value>` and its own
-field doc says the opposite.
+**BE-20 — `crates/fieldcad-mcp/src/lib.rs:13-27` — module doc contradicts the code it documents. (medium)** — **Fixed.** Updated module doc to describe the four `fieldcad://session/*` resources and `subscriptions/listen` push notifications that exist, and to match `commit_world`'s actual `Vec<serde_json::Value>` parameter type (not a JSON-embedded string).
 
 **BE-21 — `crates/fieldcad-server/src/lib.rs:13-14` — "No transport is wired up yet," while `fieldcad-mcp` is a working transport depending on this crate. (medium)** — **Fixed.** Updated to name `fieldcad-mcp` as the working transport, both standalone and embedded in the desktop app sharing one session with its own UI commands.
 
-**BE-22 — `event_hub.rs:157-160` — `Closed` and `Empty` are indistinguishable via `try_next`, so a polling consumer can't tell "nothing right now" from "hub is gone" and will poll a dead session forever. (low)**
+**BE-22 — `event_hub.rs:157-160` — `Closed` and `Empty` are indistinguishable via `try_next`, so a polling consumer can't tell "nothing right now" from "hub is gone" and will poll a dead session forever. (low)** — **Fixed.** Added `WatchEvent::Closed` variant; `try_next` returns `Some(Closed)` on a closed broadcast sender and `None` only on `Empty`. `drain` stops at the first `Closed` to avoid an infinite loop (the receiver returns `Closed` on every subsequent call). `recv` also returns `Some(Closed)` for consistency. MCP `listen` handler exits on `Closed`; `affected_resource_uris` returns an empty slice. Regression tests: `a_closed_hub_yields_closed_on_try_next_and_drain` (`fieldcad-server/tests/event_hub.rs`), `a_closed_hub_invalidates_no_resources` (`fieldcad-mcp/src/lib.rs`).
 
 **BE-23 — `docs/tasks/session-events-and-queue-control.md:32` asks for "enabled/paused state"; `QueueStatus` exposes only `paused`. (low, doc/code reconciliation)**
 
@@ -323,8 +309,7 @@ never trigger — two implementations of the same trait method report the same
 failure class two different ways.
 
 **PH-10 — `plugins/test-field/src/lib.rs:144-159` — declares `SolverKind::Analytic` ("ticks do not change the result") while `step` mutates observable state that `diagnostics()` reports. (low)**
-This is a test fixture whose own diagnostics go stale exactly when the
-runtime honors the contract the fixture exists to verify.
+This is a test fixture whose own diagnostics go stale exactly when the runtime honors the contract the fixture exists to verify.
 
 ### Performance
 
@@ -433,13 +418,13 @@ bracket, and release still submits `Play`. This is the newest UI feature
 (queue control) interacting badly with one of the oldest documented
 contracts in PLAN.md.
 
-**UI-3 — `apps/fieldcad-desktop/src/ui/panels.rs:855` — `domain_draft` is seeded once (`get_or_insert`) and never resynchronized or invalidated. (medium)**
+**UI-3 — `apps/fieldcad-desktop/src/ui/panels.rs:855` — `domain_draft` is seeded once (`get_or_insert`) and never resynchronized or invalidated. (medium)** — **Fixed.** `DomainDraft` now records the authoritative `base: Domain` it was staged against (private field, set by `from_domain`), and the editor's one call site goes through `UiModel::domain_draft_for`, which keeps the staged edits only while `compute.domain` still equals that base and reseeds otherwise — a staged candidate is meaningful only relative to the domain it was staged against. `compute.domain` is an unconditional per-frame `source.domain()` read, so an MCP reconfigure or an undo crossing a domain change reseeds the next frame, and Apply's `changed` gate correctly disables. Regression tests (`ui/mod.rs`): `domain_draft_reseeds_when_the_authoritative_domain_moves` (verified to fail against the old `get_or_insert` pattern), `domain_draft_keeps_user_edits_while_the_authoritative_domain_is_unchanged`, `domain_draft_does_not_resurrect_edits_when_the_domain_moves_back`.
 If an MCP client reconfigures the domain, or Undo crosses a domain change,
 while the user has the Simulation node deselected, reselecting it shows stale
 draft values with "Apply domain and reset" spuriously enabled — clicking it
 resets the run to a lattice the user never typed.
 
-**UI-4 — `apps/fieldcad-desktop/src/scene/field.rs:46-144` — field geometry is filtered by the class-wide view toggle but not by the individual entity's own `visible` flag. (medium)**
+**UI-4 — `apps/fieldcad-desktop/src/scene/field.rs:46-144` — field geometry is filtered by the class-wide view toggle but not by the individual entity's own `visible` flag. (medium)** — **Fixed.** `field_geometry` now takes the believed `&WorldSnapshot` and gates each Plane/Box/Sphere batch on the entity's own `visible` flag — the same check the authoring-outline, picking, and gizmo paths already made — so a hidden entity's arrows/magnitude mesh stop depending on republication timing to disappear; an entity absent from the believed world draws nothing. The three per-entity settings maps that already traveled together are now one borrowed `scene::RegionLayers` parameter (keeping the signature inside clippy's arity limit). The UI-12 geometry cache key gained an `EntityVisibility` fingerprint (per-kind id→visible vectors; deliberately not the world revision, which moves per pointer-move during drags), so a visibility toggle invalidates even when no new snapshot publishes. The source-side sampling filter is unchanged — it saves evaluation/transport work, a different question from what a retained snapshot may draw. Regression tests (`scene/field.rs`): `a_hidden_plane_draws_no_field_geometry`, `a_hidden_box_draws_no_field_geometry`, `a_hidden_sphere_draws_no_field_geometry` — red-verified against the new signature with the checks not yet applied (the bug was a missing input, so no test compiles against the old one) — plus `reuses_the_cache_until_entity_visibility_changes` (`app.rs`).
 The authoring-geometry path filters per-entity `visible`; `field_geometry`
 only checks the class-level `show.planes/boxes/spheres` toggle and relies on
 the source not publishing batches for hidden regions. Paused, toggling one of
@@ -448,7 +433,7 @@ mesh keep drawing from the retained snapshot. This is a one-level-down
 sibling of the bug goal.md already recorded as fixed at the plane-class
 level.
 
-**UI-5 — `apps/fieldcad-desktop/src/scene/gizmo.rs:144` vs `apps/fieldcad-desktop/src/camera.rs:49` — `GizmoDisplay` is documented in logical pixels but applied in physical pixels. (medium)**
+**UI-5 — `apps/fieldcad-desktop/src/scene/gizmo.rs:144` vs `apps/fieldcad-desktop/src/camera.rs:49` — `GizmoDisplay` is documented in logical pixels but applied in physical pixels. (medium)** — **Fixed.** The gizmo's math stays physical (matching the deliberately physical `Viewport` and pointer); the conversion now happens once per public entry point via `GizmoDisplay::to_physical(pixels_per_point)` on the six `*_with_display`/`plane_normal_*` functions, each of which takes the display scale alongside the settings — conversion is the functions' job, not the caller's, so an already-physical value can never be double-scaled by mistake. `app.rs` threads `pixels_per_point` through (including into `drag_plane_normal`/`drag_box_rotation`); the private `transform_gizmo_with_display` documents that its `display` arrives already physical. Regression test: `the_gizmo_keeps_its_logical_size_across_display_scales` (world-space size invariant when the viewport doubles with the scale factor; physical pixel size exactly 2×) — red-verified against the new signature with the conversion not yet applied — plus `picking_matches_the_drawn_gizmo_on_a_hidpi_display` (draw/pick agreement at 2×) and `display_settings_convert_to_physical_pixels` (unit coverage of `to_physical`, including the 0-clamp). The view-controls "px" labels now tell the truth: they are egui logical points.
 `Viewport::from_logical` multiplies by `pixels_per_point` (asserted by its
 own test), so a configured `axis_length_px: 120.0` renders a 60-logical-point
 gizmo on a 2× HiDPI display — half the intended apparent size. Picking stays

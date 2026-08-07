@@ -136,3 +136,39 @@ fn submit_and_await_resolves_a_queued_then_later_applied_command() {
         CommandEvent::Completed(ref receipt) if receipt.disposition == CommandDisposition::Applied
     ));
 }
+
+#[test]
+fn a_closed_hub_yields_closed_on_try_next_and_drain() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let server = HeadlessServer::new(source);
+    let mut watcher = server.subscribe_events();
+
+    // Drop the server, which drops the EventHub and its broadcast sender.
+    drop(server);
+
+    // try_next on a closed hub must yield Some(Closed), not None
+    // (indistinguishable from Empty as it was before BE-22).
+    assert!(
+        matches!(watcher.try_next(), Some(WatchEvent::Closed)),
+        "try_next must report Closed"
+    );
+
+    // Subsequent calls continue to yield Closed (the broadcast receiver's
+    // own behaviour), not loop forever.
+    assert!(
+        matches!(watcher.try_next(), Some(WatchEvent::Closed)),
+        "subsequent try_next still reports Closed"
+    );
+
+    // drain must stop at Closed without looping.
+    let events = watcher.drain();
+    assert!(
+        events.iter().any(|e| matches!(e, WatchEvent::Closed)),
+        "drain must include the Closed event"
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "drain returns exactly one Closed after the hub is gone"
+    );
+}

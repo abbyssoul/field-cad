@@ -132,6 +132,11 @@ pub enum WatchEvent {
     /// were dropped. Re-read every authoritative resource rather than trying
     /// to reconstruct what was missed.
     Lagged,
+    /// The underlying broadcast sender was dropped and no more events will
+    /// arrive. A polling consumer that receives this should stop; a
+    /// previously-closed watcher continues to yield `Closed` on every call
+    /// (the broadcast receiver's own behaviour).
+    Closed,
 }
 
 /// One subscriber's independent cursor into the [`EventHub`]'s broadcast.
@@ -140,19 +145,31 @@ pub enum WatchEvent {
 pub struct EventWatcher(broadcast::Receiver<SessionEvent>);
 
 impl EventWatcher {
-    /// For a synchronous caller (the desktop's per-frame pump).
+    /// For a synchronous caller.
     pub fn try_next(&mut self) -> Option<WatchEvent> {
         match self.0.try_recv() {
             Ok(event) => Some(WatchEvent::Session(event)),
             Err(broadcast::error::TryRecvError::Lagged(_)) => Some(WatchEvent::Lagged),
-            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
-                None
-            }
+            Err(broadcast::error::TryRecvError::Closed) => Some(WatchEvent::Closed),
+            Err(broadcast::error::TryRecvError::Empty) => None,
         }
     }
 
+    /// Drain all available events up to and including the first `Closed`.
+    /// Stops at `Closed` rather than looping forever (the broadcast receiver
+    /// returns `Closed` on every subsequent call).
     pub fn drain(&mut self) -> Vec<WatchEvent> {
-        std::iter::from_fn(|| self.try_next()).collect()
+        let mut events = Vec::new();
+        loop {
+            match self.try_next() {
+                Some(WatchEvent::Closed) => {
+                    events.push(WatchEvent::Closed);
+                    return events;
+                }
+                Some(event) => events.push(event),
+                None => return events,
+            }
+        }
     }
 
     /// For an async caller (an MCP `subscriptions/listen` loop).
@@ -160,7 +177,7 @@ impl EventWatcher {
         match self.0.recv().await {
             Ok(event) => Some(WatchEvent::Session(event)),
             Err(broadcast::error::RecvError::Lagged(_)) => Some(WatchEvent::Lagged),
-            Err(broadcast::error::RecvError::Closed) => None,
+            Err(broadcast::error::RecvError::Closed) => Some(WatchEvent::Closed),
         }
     }
 }

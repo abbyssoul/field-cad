@@ -4,17 +4,15 @@
 //! never from a named equation system: a generic layer must be able to draw
 //! whatever a plugin publishes.
 
-use std::collections::BTreeMap;
-
 use fieldcad_core::{
-    BoxId, BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GridLattice, PlaneId, SampleGeometry,
-    SampleValidity, SphereId, SphereLattice,
+    BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GridLattice, SampleGeometry, SampleValidity,
+    SphereLattice, WorldSnapshot,
 };
 use glam::{DVec3, Vec3};
 
 use super::{
-    BoxLayerSettings, ColoredVertex, FieldGeometry, FieldLayerSettings, PlaneLayerSettings,
-    PlaneVectorMode, SceneVisibility, SphereLayerSettings, VectorDisplay, append_arrow,
+    ColoredVertex, FieldGeometry, FieldLayerSettings, PlaneVectorMode, RegionLayers,
+    SceneVisibility, VectorDisplay, append_arrow,
 };
 
 /// Convert one vector channel's batches into generic coloured triangles and
@@ -24,14 +22,19 @@ use super::{
 /// The channel is a parameter rather than a constant: a snapshot declares the
 /// shape and dimension of everything it publishes, which is all a generic glyph
 /// layer needs, so this stays independent of which equation systems are loaded.
+///
+/// A batch whose region the believed `world` reports as hidden — or no longer
+/// holds at all — is not drawn, however the batch arrived: what a retained
+/// snapshot still contains is publication timing, and presentation must not
+/// depend on it. This is the same per-entity check the authoring outline,
+/// picking, and gizmo paths make.
 pub fn field_geometry(
     snapshot: &FieldSnapshot,
     channel: &ChannelId,
     settings: FieldLayerSettings,
-    plane_layers: &BTreeMap<PlaneId, PlaneLayerSettings>,
-    box_layers: &BTreeMap<BoxId, BoxLayerSettings>,
-    sphere_layers: &BTreeMap<SphereId, SphereLayerSettings>,
+    layers: RegionLayers<'_>,
     show: SceneVisibility,
+    world: &WorldSnapshot,
 ) -> FieldGeometry {
     let Some(channel) = snapshot.channel(channel) else {
         return FieldGeometry::default();
@@ -47,7 +50,12 @@ pub fn field_geometry(
                 if !show.planes {
                     continue;
                 }
-                let plane_settings = plane_layers.get(plane).copied().unwrap_or_default();
+                // The entity's own visibility, from the believed world — the
+                // same gate the plane's authoring outline answers to.
+                if !world.planes().get(plane).is_some_and(|plane| plane.visible) {
+                    continue;
+                }
+                let plane_settings = layers.planes.get(plane).copied().unwrap_or_default();
                 // Whether this plane draws this field is the plane's own
                 // setting. The channel's visibility is checked by the caller,
                 // which is what keeps the two independent: hiding a field here
@@ -106,7 +114,14 @@ pub fn field_geometry(
                 if !show.boxes {
                     continue;
                 }
-                let box_settings = box_layers.get(region).copied().unwrap_or_default();
+                if !world
+                    .boxes()
+                    .get(region)
+                    .is_some_and(|region| region.visible)
+                {
+                    continue;
+                }
+                let box_settings = layers.boxes.get(region).copied().unwrap_or_default();
                 if !box_settings.visible || !box_settings.vectors.visible {
                     continue;
                 }
@@ -126,7 +141,14 @@ pub fn field_geometry(
                 if !show.spheres {
                     continue;
                 }
-                let sphere_settings = sphere_layers.get(region).copied().unwrap_or_default();
+                if !world
+                    .spheres()
+                    .get(region)
+                    .is_some_and(|region| region.visible)
+                {
+                    continue;
+                }
+                let sphere_settings = layers.spheres.get(region).copied().unwrap_or_default();
                 if !sphere_settings.visible || !sphere_settings.vectors.visible {
                     continue;
                 }
@@ -786,10 +808,13 @@ fn field_color(value: f32) -> Vec3 {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{PlaneLattice, SampleValidity, UndefinedReason};
+    use std::collections::BTreeMap;
+
+    use fieldcad_core::{PlaneId, PlaneLattice, SampleValidity, UndefinedReason};
     use glam::{DVec3, UVec2, UVec3};
 
     use super::*;
+    use crate::scene::PlaneLayerSettings;
 
     /// A uniform batch of unit +X vectors, every sample exact.
     fn uniform_plane_field<'a>(
@@ -917,8 +942,10 @@ mod tests {
         assert_eq!(lines.len() / 6, 8 * 8);
     }
 
-    /// A snapshot publishing one vector channel on two slice planes.
-    fn two_plane_snapshot() -> (FieldSnapshot, ChannelId, [PlaneId; 2]) {
+    /// A snapshot publishing one vector channel over the given batches.
+    fn single_vector_channel_snapshot(
+        batches: Vec<fieldcad_core::FieldBatch>,
+    ) -> (FieldSnapshot, ChannelId) {
         use fieldcad_core::{
             ChannelSchema, Dimension, Domain, FieldValueKind, PluginId, SessionId,
             SnapshotCompleteness, SnapshotIdentity, WorldRevision,
@@ -927,22 +954,6 @@ mod tests {
 
         let plugin = PluginId::new("test").unwrap();
         let channel = ChannelId::new(plugin.clone(), "vector").unwrap();
-        let planes = [PlaneId::new(0), PlaneId::new(1)];
-        let batches: Vec<_> = planes
-            .iter()
-            .map(|plane| {
-                let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(2));
-                fieldcad_core::FieldBatch::new(
-                    SampleGeometry::Plane {
-                        plane: *plane,
-                        lattice,
-                    },
-                    FieldColumn::vectors(vec![DVec3::X; 4]),
-                    vec![SampleValidity::Exact; 4],
-                )
-                .unwrap()
-            })
-            .collect();
         let snapshot = FieldSnapshot {
             identity: SnapshotIdentity {
                 session: SessionId::from_u128(1),
@@ -969,7 +980,46 @@ mod tests {
             )]),
             diagnostics: Arc::from([]),
         };
-        (snapshot, channel, planes)
+        (snapshot, channel)
+    }
+
+    /// A world holding two visible slice planes, so the batch ids in a
+    /// snapshot and the world's ids agree — the same correspondence the
+    /// runtime's own publication guarantees.
+    fn world_with_two_planes() -> (fieldcad_core::World, [PlaneId; 2]) {
+        let mut world = fieldcad_core::World::new();
+        let report = world
+            .commit([
+                fieldcad_core::WorldCommand::CreatePlane(
+                    fieldcad_core::SlicePlaneSpec::new("Plane A", DVec3::ZERO, DVec3::Z).unwrap(),
+                ),
+                fieldcad_core::WorldCommand::CreatePlane(
+                    fieldcad_core::SlicePlaneSpec::new("Plane B", DVec3::ZERO, DVec3::Z).unwrap(),
+                ),
+            ])
+            .unwrap();
+        (world, [report.created_planes[0], report.created_planes[1]])
+    }
+
+    /// A snapshot publishing one vector channel on the world's two slice
+    /// planes.
+    fn two_plane_snapshot(planes: [PlaneId; 2]) -> (FieldSnapshot, ChannelId) {
+        let batches: Vec<_> = planes
+            .iter()
+            .map(|plane| {
+                let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(2));
+                fieldcad_core::FieldBatch::new(
+                    SampleGeometry::Plane {
+                        plane: *plane,
+                        lattice,
+                    },
+                    FieldColumn::vectors(vec![DVec3::X; 4]),
+                    vec![SampleValidity::Exact; 4],
+                )
+                .unwrap()
+            })
+            .collect();
+        single_vector_channel_snapshot(batches)
     }
 
     /// Two controls, two questions. Whether a field is drawn at all belongs to
@@ -978,16 +1028,20 @@ mod tests {
     /// everywhere.
     #[test]
     fn a_plane_hides_a_field_without_hiding_it_on_other_planes() {
-        let (snapshot, channel, planes) = two_plane_snapshot();
+        let (world, planes) = world_with_two_planes();
+        let (snapshot, channel) = two_plane_snapshot(planes);
         let arrows = |layers: BTreeMap<PlaneId, PlaneLayerSettings>| {
             field_geometry(
                 &snapshot,
                 &channel,
                 FieldLayerSettings::default(),
-                &layers,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
+                RegionLayers {
+                    planes: &layers,
+                    boxes: &BTreeMap::new(),
+                    spheres: &BTreeMap::new(),
+                },
                 SceneVisibility::ALL,
+                &world.snapshot(),
             )
             .vector_lines
             .len()
@@ -1018,22 +1072,189 @@ mod tests {
 
     #[test]
     fn hiding_planes_hides_their_field_geometry_too() {
-        let (snapshot, channel, _) = two_plane_snapshot();
+        let (world, planes) = world_with_two_planes();
+        let (snapshot, channel) = two_plane_snapshot(planes);
         let geometry = field_geometry(
             &snapshot,
             &channel,
             FieldLayerSettings::default(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
+            RegionLayers {
+                planes: &BTreeMap::new(),
+                boxes: &BTreeMap::new(),
+                spheres: &BTreeMap::new(),
+            },
             SceneVisibility {
                 planes: false,
                 ..SceneVisibility::ALL
             },
+            &world.snapshot(),
         );
 
         assert!(geometry.surface_triangles.is_empty());
         assert!(geometry.vector_lines.is_empty());
+    }
+
+    /// UI-4 regression: the entity's own `visible` flag gates its field
+    /// geometry exactly the way it gates the authoring outline, picking, and
+    /// the gizmo. Until this check existed, a hidden plane's arrows and
+    /// magnitude mesh kept drawing from a retained snapshot for as long as no
+    /// republication happened to drop its batches — presentation depending on
+    /// publication timing, which is not the desktop's to control.
+    #[test]
+    fn a_hidden_plane_draws_no_field_geometry() {
+        let (mut world, planes) = world_with_two_planes();
+        let (snapshot, channel) = two_plane_snapshot(planes);
+        let arrows = |world: &fieldcad_core::World| {
+            field_geometry(
+                &snapshot,
+                &channel,
+                FieldLayerSettings::default(),
+                RegionLayers {
+                    planes: &BTreeMap::new(),
+                    boxes: &BTreeMap::new(),
+                    spheres: &BTreeMap::new(),
+                },
+                SceneVisibility::ALL,
+                &world.snapshot(),
+            )
+            .vector_lines
+            .len()
+        };
+
+        let both = arrows(&world);
+        assert!(both > 0, "test setup: two visible planes draw arrows");
+
+        world
+            .commit([fieldcad_core::WorldCommand::SetPlaneVisible {
+                plane: planes[0],
+                visible: false,
+            }])
+            .unwrap();
+        assert_eq!(
+            arrows(&world),
+            both / 2,
+            "a hidden plane draws nothing, even with its layer settings still \
+             showing the field"
+        );
+
+        world
+            .commit([fieldcad_core::WorldCommand::SetPlaneVisible {
+                plane: planes[1],
+                visible: false,
+            }])
+            .unwrap();
+        assert_eq!(arrows(&world), 0);
+    }
+
+    #[test]
+    fn a_hidden_box_draws_no_field_geometry() {
+        let mut world = fieldcad_core::World::new();
+        let report = world
+            .commit([fieldcad_core::WorldCommand::CreateBox(
+                fieldcad_core::FieldBoxSpec::new("Box", DVec3::ZERO, DVec3::splat(1.0)).unwrap(),
+            )])
+            .unwrap();
+        let region = report.created_boxes[0];
+        let (snapshot, channel) = single_vector_channel_snapshot(vec![
+            fieldcad_core::FieldBatch::new(
+                SampleGeometry::Box {
+                    region,
+                    lattice: BoxLattice::new(
+                        DVec3::splat(-1.0),
+                        DVec3::X,
+                        DVec3::Y,
+                        DVec3::Z,
+                        UVec3::splat(2),
+                    ),
+                },
+                FieldColumn::vectors(vec![DVec3::X; 8]),
+                vec![SampleValidity::Exact; 8],
+            )
+            .unwrap(),
+        ]);
+        let arrows = |world: &fieldcad_core::World| {
+            field_geometry(
+                &snapshot,
+                &channel,
+                FieldLayerSettings::default(),
+                RegionLayers {
+                    planes: &BTreeMap::new(),
+                    boxes: &BTreeMap::new(),
+                    spheres: &BTreeMap::new(),
+                },
+                SceneVisibility::ALL,
+                &world.snapshot(),
+            )
+            .vector_lines
+            .len()
+        };
+
+        assert!(arrows(&world) > 0, "test setup: a visible box draws arrows");
+
+        world
+            .commit([fieldcad_core::WorldCommand::SetBoxVisible {
+                region,
+                visible: false,
+            }])
+            .unwrap();
+        assert_eq!(arrows(&world), 0, "a hidden box draws nothing");
+    }
+
+    #[test]
+    fn a_hidden_sphere_draws_no_field_geometry() {
+        let mut world = fieldcad_core::World::new();
+        let report = world
+            .commit([fieldcad_core::WorldCommand::CreateSphere(
+                fieldcad_core::FieldSphereSpec::new("Sphere", DVec3::ZERO, 1.0).unwrap(),
+            )])
+            .unwrap();
+        let region = report.created_spheres[0];
+        let (snapshot, channel) = single_vector_channel_snapshot(vec![
+            fieldcad_core::FieldBatch::new(
+                SampleGeometry::Sphere {
+                    region,
+                    lattice: SphereLattice::new(
+                        DVec3::splat(-1.0),
+                        DVec3::splat(1.0),
+                        UVec3::splat(3),
+                        DVec3::ZERO,
+                        1.0,
+                    ),
+                },
+                FieldColumn::vectors(vec![DVec3::X; 27]),
+                vec![SampleValidity::Exact; 27],
+            )
+            .unwrap(),
+        ]);
+        let arrows = |world: &fieldcad_core::World| {
+            field_geometry(
+                &snapshot,
+                &channel,
+                FieldLayerSettings::default(),
+                RegionLayers {
+                    planes: &BTreeMap::new(),
+                    boxes: &BTreeMap::new(),
+                    spheres: &BTreeMap::new(),
+                },
+                SceneVisibility::ALL,
+                &world.snapshot(),
+            )
+            .vector_lines
+            .len()
+        };
+
+        assert!(
+            arrows(&world) > 0,
+            "test setup: a visible sphere draws arrows"
+        );
+
+        world
+            .commit([fieldcad_core::WorldCommand::SetSphereVisible {
+                sphere: region,
+                visible: false,
+            }])
+            .unwrap();
+        assert_eq!(arrows(&world), 0, "a hidden sphere draws nothing");
     }
 
     /// A uniform 3×3×3 domain batch of unit +X vectors.

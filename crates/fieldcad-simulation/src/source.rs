@@ -263,10 +263,11 @@ enum PendingPayload {
 pub struct CommandRecord {
     pub command: CommandId,
     pub kind: CommandKind,
-    /// Submission order. Assigned by `SessionCore`'s own monotonic counter —
-    /// a wall-clock timestamp isn't needed for "submission order" and this
-    /// keeps the type deterministic and dependency-free. Meaningless (always
-    /// `0`) for a `Submitted` record synthesized before it reaches the queue.
+    /// Submission order. Assigned by `SessionCore`'s own monotonic counter or
+    /// by `AsyncLocalDataSource`'s submission counter for a `Submitted` record
+    /// synthesized before it reaches the queue — a wall-clock timestamp isn't
+    /// needed for "submission order" and this keeps the type deterministic and
+    /// dependency-free.
     pub sequence: u64,
     pub state: CommandLifecycle,
     /// Set once `state` is `Applied`.
@@ -297,11 +298,11 @@ impl CommandRecord {
 
     /// A display-only record for a command already sent to a worker thread
     /// but not yet executed there. See [`CommandLifecycle::Submitted`].
-    pub fn submitted(command: CommandId, kind: CommandKind) -> Self {
+    pub fn submitted(command: CommandId, kind: CommandKind, sequence: u64) -> Self {
         Self {
             command,
             kind,
-            sequence: 0,
+            sequence,
             state: CommandLifecycle::Submitted,
             receipt: None,
             error: None,
@@ -910,10 +911,18 @@ impl SessionCore {
         let status_after_flush = self.runtime.status();
 
         // A rejected flush stops this cycle's ticks rather than advancing
-        // past a boundary whose mutation just failed; the tick resumes
-        // normally on the next `advance` call.
+        // past a boundary whose mutation just failed. The pacer has already
+        // been paid for the demand, so the vetoed ticks' budget is handed
+        // back: the blockage re-surfaces as ordinary demand on the next
+        // `advance` (reported as `fell_behind` there if it has outgrown the
+        // per-poll budget) instead of silently discarding simulation time.
+        // `status.time_step()` is stable across the flush — the only queued
+        // mutation that resets the pacer, `ReconfigureDomain`, does not
+        // change `dt`.
         let mut ticks_advanced = 0;
-        if !summary.rejected {
+        if summary.rejected {
+            self.pacer.return_ticks(demand.ticks, status.time_step());
+        } else {
             for _ in 0..demand.ticks {
                 if !self.runtime.advance_running()? {
                     break;

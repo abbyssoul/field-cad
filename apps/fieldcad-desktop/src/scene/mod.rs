@@ -244,6 +244,17 @@ pub struct FieldGeometry {
     pub vector_lines: Vec<ColoredVertex>,
 }
 
+/// One channel's per-region layer settings, borrowed from its owner (the
+/// desktop keeps them inside `ui::ChannelLayerSettings`). The three maps
+/// travel together through the drawing path, so they are one parameter —
+/// and being borrowed, passing them costs nothing.
+#[derive(Clone, Copy)]
+pub struct RegionLayers<'a> {
+    pub planes: &'a std::collections::BTreeMap<PlaneId, PlaneLayerSettings>,
+    pub boxes: &'a std::collections::BTreeMap<BoxId, BoxLayerSettings>,
+    pub spheres: &'a std::collections::BTreeMap<SphereId, SphereLayerSettings>,
+}
+
 fn append_arrow(
     lines: &mut Vec<ColoredVertex>,
     origin: Vec3,

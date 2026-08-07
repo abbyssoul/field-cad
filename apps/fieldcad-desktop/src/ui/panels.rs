@@ -22,8 +22,7 @@ use super::compute::{
 };
 use super::plot::{history_plot, probe_history_plots};
 use super::{
-    CameraAction, ChannelLayerSettings, DomainDraft, FrameContext, UiFrameOutput, UiModel,
-    ViewportTool,
+    CameraAction, ChannelLayerSettings, FrameContext, UiFrameOutput, UiModel, ViewportTool,
 };
 use crate::{
     mcp::{self, McpAction, McpSession},
@@ -911,8 +910,7 @@ fn numerical_domain_editor(
     edit_in_progress: bool,
     output: &mut UiFrameOutput,
 ) {
-    let authoritative = DomainDraft::from_domain(compute.domain);
-    let draft = model.domain_draft.get_or_insert(authoritative);
+    let draft = model.domain_draft_for(compute.domain);
 
     ui.small(
         "Changing this lattice resets the local simulation to t = 0 and leaves it paused. \
