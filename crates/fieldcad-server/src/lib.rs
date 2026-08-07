@@ -300,6 +300,11 @@ impl FieldDataSource for HeadlessServer {
         self.source.body_forces()
     }
 
+    // Not the trait default, for the same reason as `body_forces` above.
+    fn step_compute_ms(&self) -> f32 {
+        self.source.step_compute_ms()
+    }
+
     // Not `self.source.execute(command)` directly: this must go through
     // `Self::execute` above, which also calls `publish()` — the desktop's
     // per-frame pump reaches this crate only through this trait, and

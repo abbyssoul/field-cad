@@ -551,8 +551,7 @@ Already drifted: the box copy's hover-text continuation is mis-indented.
 **UI-18 — `apps/fieldcad-desktop/src/ui/panels.rs:1913-2260` — `plane_properties`/`box_properties`/`sphere_properties` share the same skeleton with three hand-rolled `Duplicate X` bodies. (low)** — **Fixed**, narrowly: `entity_actions` shares just the trailing "duplicate / focus / remove" block (the actually-identical part — `Focus selection` needed no parameterization at all). The name editor, hint text, and two `super::section` calls above it stay inline per function; genericizing those too would have needed more closure parameters than the three-function duplication it removed.
 
 **UI-19 — `apps/fieldcad-desktop/src/ui/panels.rs:2686-2758` — `transport_sampling` repeats one block four times; the first copy is structured differently from the other three and is correct only because it happens to run first. (low)** — **Fixed.** `density_field` (new) gates a write on its own widget response only — there is no shared `changed` accumulator left to leak from, so the bug is structurally impossible now regardless of call order (previously live only by accident of position, not exercised by the shipped order, so no test could distinguish old from new behavior for this one — added a smoke test for "no interaction, no submission" instead).
-Reordering the four blocks would make it write a stale value — a latent bug
-waiting on an unrelated edit.
+Reordering the four blocks would make it write a stale value — a latent bug waiting on an unrelated edit.
 
 **UI-20 — `apps/fieldcad-desktop/src/scene/gizmo.rs:288,573` — the view-ring radius factor and `rotation_radius_px()` scaling are written as literals in both the draw and pick paths. (low)**
 

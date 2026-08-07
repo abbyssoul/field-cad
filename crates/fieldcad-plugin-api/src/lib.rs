@@ -10,7 +10,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use fieldcad_core::{

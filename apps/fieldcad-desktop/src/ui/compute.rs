@@ -62,6 +62,9 @@ pub struct ComputeView {
     /// The dynamics system's summed force on every body it advanced at the
     /// most recent tick, for the inspector's read-only derived-values display.
     pub body_forces: BTreeMap<ObjectId, DVec3>,
+    /// Wall-clock milliseconds the most recent simulation tick took to
+    /// compute. Zero before the first tick.
+    pub step_compute_ms: f32,
 }
 
 /// The fields [`ComputeView::build`] derives purely from the latest
@@ -171,6 +174,7 @@ impl ComputeView {
             diagnostics,
             has_errors,
             body_forces: source.body_forces(),
+            step_compute_ms: source.step_compute_ms(),
         }
     }
 

@@ -6,7 +6,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use fieldcad_core::{
@@ -474,6 +474,14 @@ pub struct SimulationRuntime {
     /// `fieldcad_dynamics`'s module docs) and pinned/carried bodies have no
     /// entry, because neither has a force this system computed for it.
     last_forces: BTreeMap<ObjectId, DVec3>,
+    /// Wall-clock time `apply_tick` took to complete its most recent tick,
+    /// in milliseconds — everything a fixed step actually costs: force
+    /// collection, every time-stepped solver's own advance, dynamics
+    /// integration, and the snapshot it publishes. Zero until the first tick
+    /// runs. Presentation only, like `last_forces`: nothing here reads this
+    /// to decide a physical result, only to tell a user whether their
+    /// machine can keep up with the configured dt.
+    last_tick_compute_ms: f32,
 }
 
 /// Everything needed to stand up a runtime.
@@ -676,6 +684,7 @@ impl SimulationRuntime {
             interactive_edit: None,
             history: EditHistory::new(undo_depth),
             last_forces: BTreeMap::new(),
+            last_tick_compute_ms: 0.0,
         };
         runtime.check_single_provider_per_field()?;
         let world_snapshot = runtime.world.snapshot();
@@ -1284,6 +1293,12 @@ impl SimulationRuntime {
         self.last_forces.clone()
     }
 
+    /// Wall-clock milliseconds `apply_tick` took to complete the most recent
+    /// tick. Zero before the first tick runs.
+    pub fn last_tick_compute_ms(&self) -> f32 {
+        self.last_tick_compute_ms
+    }
+
     /// True if any registered solver evolves in time. When false, ticks cannot
     /// change a result and the runtime need not republish one.
     pub fn has_time_dependent_solver(&self) -> bool {
@@ -1413,7 +1428,17 @@ impl SimulationRuntime {
         Ok(true)
     }
 
+    /// Times `apply_tick_inner` and records the result regardless of outcome
+    /// — a tick that errored out still cost wall-clock time, and hiding that
+    /// would make a solver bug look like a free tick in the history.
     fn apply_tick(&mut self, context: StepContext) -> Result<(), RuntimeError> {
+        let started = Instant::now();
+        let result = self.apply_tick_inner(context);
+        self.last_tick_compute_ms = started.elapsed().as_secs_f64() as f32 * 1_000.0;
+        result
+    }
+
+    fn apply_tick_inner(&mut self, context: StepContext) -> Result<(), RuntimeError> {
         // Resolve motion ownership before any solver advances. Discovering a
         // conflict after a field/particle integrator mutated its private state
         // would leave that state ahead of the authoritative world.
@@ -2179,6 +2204,23 @@ mod tests {
         runtime.redo().unwrap();
         assert_eq!(*runtime.domain(), replacement);
         assert_eq!(runtime.status().run_generation, 3);
+    }
+
+    #[test]
+    fn a_completed_tick_records_positive_wall_clock_compute_time() {
+        // The regression this guards: `apply_tick`'s early-return path (no
+        // kinematics to adopt, see `apply_tick_inner`) used to skip whatever
+        // bookkeeping sat after it — a timer wrapped around the wrong span
+        // would silently under-report every tick that took that path.
+        let (mut runtime, _) = motion_runtime([]);
+        assert_eq!(runtime.last_tick_compute_ms(), 0.0, "no tick has run yet");
+
+        runtime.step_once().unwrap();
+
+        assert!(
+            runtime.last_tick_compute_ms() > 0.0,
+            "a completed tick must report measurable compute time"
+        );
     }
 
     #[test]

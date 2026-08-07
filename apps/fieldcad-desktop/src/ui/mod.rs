@@ -203,6 +203,7 @@ pub struct UiModel {
     pub field_brush_dialog_open: bool,
     pub field_brush: FieldBrushDraft,
     pub diagnostics_visible: bool,
+    pub diagnostics_config: DiagnosticsConfig,
     /// The getting-started window. Open on a first run, because the composition
     /// model is the part of this application a user cannot guess.
     pub help_visible: bool,
@@ -248,6 +249,7 @@ impl UiModel {
             field_brush_dialog_open: false,
             field_brush: FieldBrushDraft::default(),
             diagnostics_visible: true,
+            diagnostics_config: DiagnosticsConfig::default(),
             help_visible: true,
             // A new session opens on the world node, so the inspector explains
             // the scene's domain and field systems before anything is selected
@@ -442,12 +444,52 @@ pub struct ViewportGesture {
     pub primary_dragged: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct DiagnosticsConfig {
+    pub show_frame_time: bool,
+    pub show_memory: bool,
+    pub show_cpu: bool,
+    pub show_scene_info: bool,
+    pub show_solver_step: bool,
+    pub show_solver_diagnostics: bool,
+    pub update_interval_ms: u32,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            show_frame_time: true,
+            show_memory: true,
+            show_cpu: true,
+            show_scene_info: true,
+            show_solver_step: true,
+            show_solver_diagnostics: true,
+            update_interval_ms: 100,
+        }
+    }
+}
+
 pub struct FrameContext<'a> {
     pub compute: &'a ComputeView,
     pub world: &'a WorldSnapshot,
     pub probe_history: &'a ProbeHistory,
     pub adapter_name: &'a str,
     pub frame_time_ms: f32,
+    /// Oldest first, newest last — every history slice on this context
+    /// shares that convention so a panel never has to know which metric it
+    /// is drawing to get the sweep direction right.
+    pub frame_history: &'a [f32],
+    pub frame_min_ms: f32,
+    pub frame_max_ms: f32,
+    pub process_rss_kb: u64,
+    pub process_cpu_ms: f64,
+    /// Sampled at the diagnostics panel's configured update interval, not
+    /// once per render frame — see `mem_history_mib` on `FrameStats`.
+    pub mem_history: &'a [f32],
+    pub cpu_history: &'a [f32],
+    /// One sample per completed simulation tick, not per render frame — see
+    /// `StepComputeStats` in `app.rs`.
+    pub step_compute_history: &'a [f32],
     pub active_translation: Option<&'static str>,
     /// Screen-space annotation at the selected plane normal's arrow tip.
     pub plane_normal_label: Option<egui::Pos2>,
@@ -598,7 +640,8 @@ pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -
     view_controls(&context, model, &frame, &mut output);
     help_window(&context, model);
     if model.diagnostics_visible {
-        diagnostics_window(&context, &frame, model.command_error.as_deref());
+        let command_error = model.command_error.clone();
+        diagnostics_window(&context, model, &frame, command_error.as_deref());
     }
     if model.mcp_panel_open {
         output.mcp_action = mcp_window(&context, frame.mcp);
@@ -801,6 +844,14 @@ mod tests {
                     edit_in_progress: false,
                     projection: Projection::default(),
                     mcp: &McpSession::Disabled,
+                    frame_history: &[],
+                    frame_min_ms: 0.0,
+                    frame_max_ms: 0.0,
+                    process_rss_kb: 0,
+                    process_cpu_ms: 0.0,
+                    mem_history: &[],
+                    cpu_history: &[],
+                    step_compute_history: &[],
                 },
             );
         });
@@ -862,6 +913,14 @@ mod tests {
                     edit_in_progress: false,
                     projection: Projection::default(),
                     mcp: &McpSession::Disabled,
+                    frame_history: &[],
+                    frame_min_ms: 0.0,
+                    frame_max_ms: 0.0,
+                    process_rss_kb: 0,
+                    process_cpu_ms: 0.0,
+                    mem_history: &[],
+                    cpu_history: &[],
+                    step_compute_history: &[],
                 },
             );
         });

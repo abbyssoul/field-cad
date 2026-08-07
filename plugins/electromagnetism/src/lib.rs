@@ -1150,7 +1150,8 @@ impl<'a> YeeFieldView<'a> {
                         * axis_weight(fraction.z, dz);
                     let cell = self.wrapped_cell(base.x + dx, base.y + dy, base.z + dz);
                     let index = linear_index(self.counts, cell.x, cell.y, cell.z);
-                    result += weight * select((self.centred_electric[index], self.centred_magnetic[index]));
+                    result += weight
+                        * select((self.centred_electric[index], self.centred_magnetic[index]));
                 }
             }
         }

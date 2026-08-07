@@ -41,6 +41,7 @@ default-members = ["apps/fieldcad-desktop"]
 # both sides implement in lockstep.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 egui = "0.35"
 egui-wgpu = "0.35"
 egui-winit = "0.35"

@@ -54,13 +54,24 @@ pub enum McpAction {
     Disable,
 }
 
-/// Start serving the shared model over HTTP with a fresh bearer token.
+/// Start serving the shared model over HTTP with a fresh bearer token, on
+/// the default address (see `DEFAULT_ADDR`) — what the MCP panel's "Enable"
+/// button asks for, since a user clicking it has not named an address.
 /// Known, accepted rough edge: re-`enable`ing immediately after `disable`
 /// can transiently fail with "address in use" if the previous listener
 /// hasn't finished tearing down yet — the message below names that as the
 /// likely cause rather than surfacing a raw OS error.
 pub fn enable(model: Arc<Mutex<HeadlessServer>>) -> Result<McpRunning, String> {
     let addr: SocketAddr = DEFAULT_ADDR.parse().expect("hardcoded address is valid");
+    enable_at(model, addr)
+}
+
+/// Same as [`enable`], against an explicit address — what `--mcp <address>`
+/// asks for at launch, where the caller has named where to listen.
+pub fn enable_at(
+    model: Arc<Mutex<HeadlessServer>>,
+    addr: SocketAddr,
+) -> Result<McpRunning, String> {
     let token = fieldcad_mcp::generate_token();
     let ct = CancellationToken::new();
 

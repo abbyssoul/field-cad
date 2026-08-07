@@ -93,6 +93,7 @@ struct SourceState {
     world: WorldSnapshot,
     snapshot: Option<Arc<FieldSnapshot>>,
     forces: BTreeMap<ObjectId, DVec3>,
+    step_compute_ms: f32,
 }
 
 impl SourceState {
@@ -108,6 +109,7 @@ impl SourceState {
             world: source.world(),
             snapshot: source.latest_snapshot(),
             forces: source.runtime().body_forces(),
+            step_compute_ms: source.runtime().last_tick_compute_ms(),
         }
     }
 }
@@ -132,6 +134,7 @@ pub struct AsyncLocalDataSource {
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
     forces: BTreeMap<ObjectId, DVec3>,
+    step_compute_ms: f32,
     mailbox: SnapshotMailbox,
     poll_in_flight: bool,
     accumulated_elapsed: Duration,
@@ -172,6 +175,7 @@ impl AsyncLocalDataSource {
             edit_history: initial.edit_history,
             world: initial.world,
             forces: initial.forces,
+            step_compute_ms: initial.step_compute_ms,
             mailbox,
             poll_in_flight: false,
             accumulated_elapsed: Duration::ZERO,
@@ -190,6 +194,7 @@ impl AsyncLocalDataSource {
         self.edit_history = state.edit_history;
         self.world = state.world;
         self.forces = state.forces;
+        self.step_compute_ms = state.step_compute_ms;
         match state.snapshot {
             Some(snapshot) => Ok(self.mailbox.offer(snapshot)?),
             None => Ok(false),
@@ -352,6 +357,10 @@ impl FieldDataSource for AsyncLocalDataSource {
 
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         self.forces.clone()
+    }
+
+    fn step_compute_ms(&self) -> f32 {
+        self.step_compute_ms
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {

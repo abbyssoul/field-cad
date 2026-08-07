@@ -491,6 +491,15 @@ pub trait FieldDataSource: Send {
         BTreeMap::new()
     }
 
+    /// Wall-clock milliseconds the most recent simulation tick took to
+    /// compute — for an inspector telling a user whether their machine can
+    /// keep up with the configured dt. Zero for a source that does not
+    /// locally hold this (no tick yet, or a remote session that has not
+    /// chosen to transmit it), same convention as `body_forces`.
+    fn step_compute_ms(&self) -> f32 {
+        0.0
+    }
+
     /// Accept a transport command. World edits issued while running may return
     /// a queued receipt and become authoritative at the next fixed-tick
     /// boundary; consumers can inspect `pending_command_count` meanwhile.
@@ -1052,6 +1061,10 @@ impl FieldDataSource for LocalDataSource {
 
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         self.core.runtime.body_forces()
+    }
+
+    fn step_compute_ms(&self) -> f32 {
+        self.core.runtime.last_tick_compute_ms()
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {

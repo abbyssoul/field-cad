@@ -209,17 +209,7 @@ fn paint_probe_plot(ui: &mut egui::Ui, readings: &[fieldcad_simulation::ProbeRea
         .last()
         .map_or(x_min, |reading| reading.time_seconds);
 
-    let desired = egui::vec2(ui.available_width().max(120.0), 150.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    let plot = rect.shrink2(egui::vec2(8.0, 20.0));
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(45));
-    painter.rect_stroke(
-        plot,
-        0.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(75)),
-        egui::StrokeKind::Inside,
-    );
+    let (rect, plot, painter) = plot_frame(ui, 150.0);
 
     if y_min <= 0.0 && y_max >= 0.0 {
         let y = remap(0.0, y_min, y_max, plot.bottom(), plot.top());
@@ -282,6 +272,86 @@ fn paint_probe_plot(ui: &mut egui::Ui, readings: &[fieldcad_simulation::ProbeRea
         rect.right_bottom() + egui::vec2(-4.0, -3.0),
         egui::Align2::RIGHT_BOTTOM,
         format!("{x_max:.3e} s"),
+        egui::FontId::monospace(9.0),
+        egui::Color32::GRAY,
+    );
+}
+
+/// The chrome every plot in this app shares: a filled background, an inset
+/// bordered plotting rect, and a painter scoped to the outer rect. Kept in
+/// one place so a probe trace and a diagnostics sparkline read as the same
+/// kind of object rather than two widgets that happen to sit near each
+/// other.
+///
+/// Returns `(outer, inner, painter)` — `outer` for corner-anchored labels,
+/// `inner` for the traces themselves.
+fn plot_frame(ui: &mut egui::Ui, height: f32) -> (egui::Rect, egui::Rect, egui::Painter) {
+    let desired = egui::vec2(ui.available_width().max(120.0), height);
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let plot = rect.shrink2(egui::vec2(8.0, 20.0));
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(45));
+    painter.rect_stroke(
+        plot,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(75)),
+        egui::StrokeKind::Inside,
+    );
+    (rect, plot, painter)
+}
+
+/// A single-trace time series, oldest sample first. Used by the diagnostics
+/// panel for frame time, memory, and CPU — anything that is one number
+/// sampled repeatedly, as opposed to a probe's multi-component field
+/// reading.
+pub(super) fn history_plot(ui: &mut egui::Ui, values: &[f32], color: egui::Color32) {
+    if values.len() < 2 {
+        ui.weak("Not enough samples yet");
+        return;
+    }
+    let (mut y_min, mut y_max) = values
+        .iter()
+        .copied()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), value| {
+            (lo.min(value), hi.max(value))
+        });
+    if y_min == y_max {
+        let padding = y_min.abs().max(1.0) * 0.05;
+        y_min -= padding;
+        y_max += padding;
+    }
+
+    let (rect, plot, painter) = plot_frame(ui, 60.0);
+
+    let last_index = (values.len() - 1) as f64;
+    let points: Vec<_> = values
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            let x = remap(i as f64, 0.0, last_index, plot.left(), plot.right());
+            let y = remap(
+                value as f64,
+                y_min as f64,
+                y_max as f64,
+                plot.bottom(),
+                plot.top(),
+            );
+            egui::pos2(x, y)
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.4, color)));
+
+    painter.text(
+        rect.left_bottom() + egui::vec2(4.0, -3.0),
+        egui::Align2::LEFT_BOTTOM,
+        "oldest",
+        egui::FontId::monospace(9.0),
+        egui::Color32::GRAY,
+    );
+    painter.text(
+        rect.right_bottom() + egui::vec2(-4.0, -3.0),
+        egui::Align2::RIGHT_BOTTOM,
+        "now",
         egui::FontId::monospace(9.0),
         egui::Color32::GRAY,
     );

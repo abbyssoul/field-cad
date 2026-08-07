@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -68,15 +69,30 @@ const OCCLUDED_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run() -> Result<(), RunError> {
-    run_for(None)
+    run_for(LaunchOptions::default())
 }
 
-/// Run the application, optionally quitting by itself after `lifetime`.
+/// What a caller (currently only `main.rs`'s CLI parsing) can ask of a run
+/// before the window exists.
+#[derive(Default)]
+pub struct LaunchOptions {
+    /// Quit by itself after this long, instead of running until the window
+    /// closes.
+    pub lifetime: Option<Duration>,
+    /// Start with the embedded MCP server already listening here, its bearer
+    /// token printed to the startup log instead of waiting for a user to
+    /// open the MCP panel — for an agent that launches this process itself
+    /// and needs the token before it can connect.
+    pub mcp: Option<SocketAddr>,
+}
+
+/// Run the application per `options`.
 ///
-/// A self-imposed deadline makes an interactive test safe to attempt on a
-/// machine where a windowed run has previously wedged the compositor: the
-/// process leaves on its own rather than needing to be killed from elsewhere.
-pub fn run_for(lifetime: Option<Duration>) -> Result<(), RunError> {
+/// A self-imposed deadline (`options.lifetime`) makes an interactive test
+/// safe to attempt on a machine where a windowed run has previously wedged
+/// the compositor: the process leaves on its own rather than needing to be
+/// killed from elsewhere.
+pub fn run_for(options: LaunchOptions) -> Result<(), RunError> {
     let event_loop = EventLoop::new()?;
     // Deliberately not `Poll`. Requesting a redraw unconditionally on every
     // iteration keeps a Wayland compositor permanently busy with this client
@@ -84,7 +100,8 @@ pub fn run_for(lifetime: Option<Duration>) -> Result<(), RunError> {
     // egui's requested repaint time and whether the simulation is advancing.
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut application = DesktopApplication {
-        deadline: lifetime.map(|lifetime| Instant::now() + lifetime),
+        deadline: options.lifetime.map(|lifetime| Instant::now() + lifetime),
+        mcp_autostart: options.mcp,
         ..DesktopApplication::default()
     };
     event_loop.run_app(&mut application)?;
@@ -101,6 +118,10 @@ struct DesktopApplication {
     initialization_error: Option<String>,
     /// When set, the application exits cleanly at this instant.
     deadline: Option<Instant>,
+    /// Consumed by the first `resumed()` — `WindowState::new` starts the MCP
+    /// server itself, once, rather than this being re-applied on every
+    /// suspend/resume cycle a window can go through.
+    mcp_autostart: Option<SocketAddr>,
 }
 
 impl ApplicationHandler for DesktopApplication {
@@ -109,7 +130,7 @@ impl ApplicationHandler for DesktopApplication {
             return;
         }
 
-        match WindowState::new(event_loop) {
+        match WindowState::new(event_loop, self.mcp_autostart.take()) {
             Ok(window_state) => self.window_state = Some(window_state),
             Err(error) => {
                 tracing::error!(%error, "application initialization failed");
@@ -313,6 +334,7 @@ struct WindowState {
     /// The interactive edit currently in progress, if any.
     edit_gesture: Option<EditGesture>,
     frame_stats: FrameStats,
+    step_compute_stats: StepComputeStats,
     /// When the next frame is due. Drives the event loop's control flow.
     next_redraw: Instant,
     /// Set from `WindowEvent::Occluded`; suppresses rendering entirely.
@@ -323,7 +345,10 @@ struct WindowState {
 }
 
 impl WindowState {
-    fn new(event_loop: &ActiveEventLoop) -> Result<Self, String> {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        mcp_autostart: Option<SocketAddr>,
+    ) -> Result<Self, String> {
         let attributes = WindowAttributes::default()
             .with_title("Field CAD")
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
@@ -368,6 +393,29 @@ impl WindowState {
         // first field a session sees — so the shell does not also decide it here
         // and leave two places that can disagree.
         let ui_model = UiModel::new();
+        let data_source = Arc::new(Mutex::new(HeadlessServer::new(data_source)));
+
+        // Started here rather than left to the MCP panel's own "Enable"
+        // button: an agent driving `--mcp <address>` needs the token before
+        // the window has even finished coming up, and the startup log is
+        // the one place guaranteed to reach it before any UI does.
+        let mcp = match mcp_autostart {
+            Some(addr) => match mcp::enable_at(data_source.clone(), addr) {
+                Ok(running) => {
+                    tracing::info!(
+                        addr = %running.addr,
+                        token = %running.token,
+                        "MCP server listening — pass this token and address to your agent's MCP client config"
+                    );
+                    McpSession::Running(running)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "MCP server failed to start at launch");
+                    McpSession::Failed(error)
+                }
+            },
+            None => McpSession::default(),
+        };
 
         Ok(Self {
             egui_state,
@@ -378,7 +426,7 @@ impl WindowState {
             camera: OrbitCamera::default(),
             ui_model,
             viewport: Viewport::default(),
-            data_source: Arc::new(Mutex::new(HeadlessServer::new(data_source))),
+            data_source,
             world,
             compute: None,
             field_geometry_cache: None,
@@ -389,9 +437,10 @@ impl WindowState {
             inspector_editing: false,
             edit_gesture: None,
             frame_stats: FrameStats::default(),
+            step_compute_stats: StepComputeStats::default(),
             next_redraw: Instant::now(),
             occluded: false,
-            mcp: McpSession::default(),
+            mcp,
         })
     }
 
@@ -505,7 +554,9 @@ impl WindowState {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let frame_started = Instant::now();
-        let elapsed = self.frame_stats.begin_frame();
+        let metrics_interval =
+            Duration::from_millis(self.ui_model.diagnostics_config.update_interval_ms as u64);
+        let elapsed = self.frame_stats.begin_frame(metrics_interval);
 
         // If an embedded MCP server died after a successful bind (a panic in
         // a tool handler, the listener erroring out), stop claiming it's
@@ -561,6 +612,8 @@ impl WindowState {
         }
 
         let compute = ComputeView::build(&*self.model(), &self.world, self.compute.as_ref());
+        self.step_compute_stats
+            .observe(compute.tick, compute.step_compute_ms);
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let pixels_per_point_before_frame = self.egui_context.pixels_per_point().max(0.01);
         let transform_preview = self.active_transform.map(ActiveTransformDrag::preview);
@@ -585,6 +638,14 @@ impl WindowState {
             });
         let mut ui_frame = ui::UiFrameOutput::default();
         let frame_time_ms = self.frame_stats.smoothed_frame_ms;
+        let frame_history = self.frame_stats.frame_history.ordered();
+        let frame_min_ms = self.frame_stats.min_ms;
+        let frame_max_ms = self.frame_stats.max_ms;
+        let process_rss_kb = self.frame_stats.metrics.rss_kb;
+        let process_cpu_ms = self.frame_stats.metrics.cpu_time_ms;
+        let mem_history = self.frame_stats.mem_history_mib.ordered();
+        let cpu_history = self.frame_stats.cpu_history_seconds.ordered();
+        let step_compute_history = self.step_compute_stats.history.ordered();
         let world = self.world.clone();
 
         let full_output = self.egui_context.run_ui(raw_input, |root_ui| {
@@ -597,6 +658,14 @@ impl WindowState {
                     probe_history: &self.probe_history,
                     adapter_name: &self.adapter_name,
                     frame_time_ms,
+                    frame_history,
+                    frame_min_ms,
+                    frame_max_ms,
+                    process_rss_kb,
+                    process_cpu_ms,
+                    mem_history,
+                    cpu_history,
+                    step_compute_history,
                     active_translation: self.active_transform.map(|drag| drag.constraint.label()),
                     plane_normal_label,
                     plane_normal_active: self
@@ -1716,9 +1785,113 @@ fn create_local_data_source(
     Ok(AsyncLocalDataSource::new(LocalDataSource::new(runtime)))
 }
 
+const HISTORY_SIZE: usize = 120;
+
+/// A bounded, insertion-ordered time series.
+///
+/// Backed by a ring buffer for O(1) writes, but a UI panel wants to borrow an
+/// oldest-to-newest slice without knowing about wraparound — so the ordered
+/// view is rebuilt on every push instead. At `HISTORY_SIZE` samples that is
+/// far cheaper than the bug it replaces: reading the raw ring buffer from
+/// index 0 up to its length, which is only chronological before the buffer
+/// first wraps and is scrambled every frame after.
+struct History<const N: usize> {
+    raw: [f32; N],
+    ordered: [f32; N],
+    index: usize,
+    len: usize,
+}
+
+impl<const N: usize> Default for History<N> {
+    fn default() -> Self {
+        Self {
+            raw: [0.0; N],
+            ordered: [0.0; N],
+            index: 0,
+            len: 0,
+        }
+    }
+}
+
+impl<const N: usize> History<N> {
+    fn push(&mut self, value: f32) {
+        self.raw[self.index] = value;
+        self.index = (self.index + 1) % N;
+        self.len = (self.len + 1).min(N);
+
+        let start = if self.len < N { 0 } else { self.index };
+        for i in 0..self.len {
+            self.ordered[i] = self.raw[(start + i) % N];
+        }
+    }
+
+    /// Oldest first, newest last.
+    fn ordered(&self) -> &[f32] {
+        &self.ordered[..self.len]
+    }
+}
+
+/// Process-level resource usage. Linux reads from `/proc/self/status` and
+/// `/proc/self/stat`; other platforms return zeroed structs.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessMetrics {
+    rss_kb: u64,
+    cpu_time_ms: f64,
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_metrics() -> ProcessMetrics {
+    let rss_kb = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|val| val.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+
+    // Fields 13 (utime) and 14 (stime) in clock ticks. CLK_TCK is 100 Hz
+    // on all common Linux configurations — multiply by 10 for milliseconds.
+    let cpu_time_ms = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            if parts.len() > 14 {
+                let utime = parts[13].parse::<u64>().ok().unwrap_or(0);
+                let stime = parts[14].parse::<u64>().ok().unwrap_or(0);
+                Some((utime + stime) as f64 * 10.0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0.0);
+
+    ProcessMetrics {
+        rss_kb,
+        cpu_time_ms,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_metrics() -> ProcessMetrics {
+    ProcessMetrics::default()
+}
+
 struct FrameStats {
     previous_frame: Instant,
     smoothed_frame_ms: f32,
+    frame_history: History<HISTORY_SIZE>,
+    min_ms: f32,
+    max_ms: f32,
+    last_metrics_collection: Instant,
+    metrics: ProcessMetrics,
+    /// Sampled once per metrics collection, not once per render frame — a
+    /// rendered frame can arrive far faster than `/proc` is worth reading,
+    /// so this tracks the same cadence as `metrics` rather than the
+    /// smoothed-frame-time history above.
+    mem_history_mib: History<HISTORY_SIZE>,
+    cpu_history_seconds: History<HISTORY_SIZE>,
 }
 
 impl Default for FrameStats {
@@ -1726,6 +1899,13 @@ impl Default for FrameStats {
         Self {
             previous_frame: Instant::now(),
             smoothed_frame_ms: 0.0,
+            frame_history: History::default(),
+            min_ms: f32::MAX,
+            max_ms: 0.0,
+            last_metrics_collection: Instant::now(),
+            metrics: ProcessMetrics::default(),
+            mem_history_mib: History::default(),
+            cpu_history_seconds: History::default(),
         }
     }
 }
@@ -1733,10 +1913,24 @@ impl Default for FrameStats {
 impl FrameStats {
     /// Returns wall-clock time since the previous redraw for simulation pacing.
     /// Idle time is deliberately not reported as render work.
-    fn begin_frame(&mut self) -> Duration {
+    ///
+    /// `metrics_interval` is the diagnostics panel's configured update rate —
+    /// read fresh each call rather than cached, so dragging the panel's
+    /// slider takes effect on the next frame instead of needing a restart.
+    fn begin_frame(&mut self, metrics_interval: Duration) -> Duration {
         let now = Instant::now();
         let elapsed = now - self.previous_frame;
         self.previous_frame = now;
+
+        if now - self.last_metrics_collection >= metrics_interval {
+            self.metrics = read_process_metrics();
+            self.last_metrics_collection = now;
+            self.mem_history_mib
+                .push(self.metrics.rss_kb as f32 / 1024.0);
+            self.cpu_history_seconds
+                .push((self.metrics.cpu_time_ms / 1000.0) as f32);
+        }
+
         elapsed
     }
 
@@ -1747,12 +1941,50 @@ impl FrameStats {
         } else {
             self.smoothed_frame_ms * 0.9 + elapsed_ms * 0.1
         };
+
+        self.frame_history.push(elapsed_ms);
+
+        self.min_ms = if elapsed_ms < self.min_ms {
+            elapsed_ms
+        } else {
+            self.min_ms
+        };
+        self.max_ms = if elapsed_ms > self.max_ms {
+            elapsed_ms
+        } else {
+            self.max_ms
+        };
+    }
+}
+
+/// How long the compute thread took to finish each simulation tick.
+///
+/// Sampled once per *tick*, not once per render frame: `ComputeView` reports
+/// the same `step_compute_ms` on every redraw between two ticks (a paused
+/// simulation, or a tick slower than the frame rate), and pushing that into
+/// history on every redraw would pad the plot with duplicate flat segments
+/// instead of showing one point per step actually taken.
+#[derive(Default)]
+struct StepComputeStats {
+    history: History<HISTORY_SIZE>,
+    last_observed_tick: Option<u64>,
+}
+
+impl StepComputeStats {
+    fn observe(&mut self, tick: u64, compute_ms: f32) {
+        // `compute_ms <= 0.0` means no tick has actually run yet, whatever
+        // `tick` itself reads as.
+        if compute_ms <= 0.0 || self.last_observed_tick == Some(tick) {
+            return;
+        }
+        self.last_observed_tick = Some(tick);
+        self.history.push(compute_ms);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EditGesture, FrameStats};
+    use super::{EditGesture, FrameStats, StepComputeStats};
     use fieldcad_core::SimulationMode;
     use fieldcad_simulation::{CommandId, CommandPayload};
     use std::time::Duration;
@@ -1871,6 +2103,28 @@ mod tests {
         stats.finish_frame(Duration::from_millis(2));
 
         assert!((stats.smoothed_frame_ms - 9.2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn step_compute_history_records_one_sample_per_tick_not_per_redraw() {
+        let mut stats = StepComputeStats::default();
+
+        // A paused simulation, or one slower than the frame rate, reports the
+        // same tick and the same compute time on every redraw in between —
+        // that must not pad the history with duplicates.
+        stats.observe(5, 1.5);
+        stats.observe(5, 1.5);
+        stats.observe(5, 1.5);
+        assert_eq!(stats.history.ordered(), &[1.5]);
+
+        stats.observe(6, 2.0);
+        assert_eq!(stats.history.ordered(), &[1.5, 2.0]);
+
+        // No tick has run yet — `compute_ms` is the sentinel default from
+        // `SimulationRuntime::last_tick_compute_ms`, not a real sample.
+        let mut fresh = StepComputeStats::default();
+        fresh.observe(0, 0.0);
+        assert!(fresh.history.ordered().is_empty());
     }
 
     mod field_layer_geometry_cache {

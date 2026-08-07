@@ -38,8 +38,19 @@ pub fn relativistic_momentum(velocity: DVec3, mass_kg: f64) -> DVec3 {
 /// relativistic speeds, rest energy is many orders of magnitude larger than
 /// the kinetic energy actually changing as it moves, and would swamp the one
 /// number a display of "how much energy does this motion have" is for.
+///
+/// Computed as `β²mc² / (√(1−β²)(1+√(1−β²)))` rather than `(γ−1)mc²` directly.
+/// Below relativistic speeds `γ` rounds to exactly `1.0` in `f64` — the
+/// `β²/2` correction is smaller than an ULP of `1.0` for anything under
+/// roughly 60 m/s — so subtracting `1.0` from it returns exactly zero no
+/// matter the mass. This form multiplies through by the conjugate instead,
+/// leaving a `β²` that is computed directly rather than recovered from a
+/// near-cancelled subtraction, and it agrees with `(γ−1)mc²` everywhere both
+/// are numerically meaningful.
 pub fn relativistic_kinetic_energy(velocity: DVec3, mass_kg: f64) -> f64 {
-    (lorentz_factor(velocity) - 1.0) * mass_kg * SPEED_OF_LIGHT * SPEED_OF_LIGHT
+    let beta_squared = velocity.length_squared() / (SPEED_OF_LIGHT * SPEED_OF_LIGHT);
+    let root = (1.0 - beta_squared).max(f64::MIN_POSITIVE).sqrt();
+    mass_kg * SPEED_OF_LIGHT * SPEED_OF_LIGHT * beta_squared / (root * (1.0 + root))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -248,9 +259,6 @@ mod tests {
 
     #[test]
     fn relativistic_kinetic_energy_matches_the_classical_limit_at_low_speed() {
-        // A speed low enough for `K ≈ ½mv²` to hold, but not so low that
-        // `(γ−1)` loses all its significant digits to floating-point
-        // cancellation (γ itself rounds to exactly 1.0 well before that).
         let velocity = DVec3::X * 1.0e6;
         let mass_kg = 2.0;
         let classical = 0.5 * mass_kg * velocity.length_squared();
@@ -258,6 +266,23 @@ mod tests {
         let relativistic = relativistic_kinetic_energy(velocity, mass_kg);
         assert!(
             ((relativistic - classical) / classical).abs() < 1.0e-3,
+            "relativistic {relativistic} vs classical {classical}"
+        );
+    }
+
+    #[test]
+    fn relativistic_kinetic_energy_is_nonzero_at_everyday_speed() {
+        // At v = 1 m/s, γ rounds to exactly 1.0 in f64 — well below the
+        // ~60 m/s where (γ−1) still has a representable bit. A naive
+        // `(γ−1)mc²` returns exactly zero here for any mass; a walking-pace
+        // body must still show a nonzero kinetic energy.
+        let velocity = DVec3::Y;
+        let mass_kg = 1.0;
+        let classical = 0.5 * mass_kg * velocity.length_squared();
+
+        let relativistic = relativistic_kinetic_energy(velocity, mass_kg);
+        assert!(
+            ((relativistic - classical) / classical).abs() < 1.0e-9,
             "relativistic {relativistic} vs classical {classical}"
         );
     }

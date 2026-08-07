@@ -1,27 +1,42 @@
-use std::process::ExitCode;
+use std::{net::SocketAddr, process::ExitCode, time::Duration};
 
-const HELP: &str = "\
-Field CAD — interactive laboratory for spatial fields
+use clap::Parser;
+use fieldcad_desktop::LaunchOptions;
 
-USAGE:
-    fieldcad [OPTIONS]
-
-OPTIONS:
-    --smoke [FRAMES]     Render offscreen with no window, report the adapter,
-                         and exit. Use this to check whether a graphics backend
-                         works on this machine without risking a windowed
-                         session.
-    --exit-after SECONDS Open the window normally, then quit on its own after
-                         SECONDS. Use this the first time you try a windowed run
-                         on a machine where one has previously misbehaved.
-    -h, --help           Show this message.
-
+const ENV_HELP: &str = "\
 ENVIRONMENT:
     WGPU_BACKEND            vulkan | gl | metal | dx12 (comma-separated list)
     FIELDCAD_PRESENT_MODE   vsync | no-vsync | fifo | mailbox | immediate
     FIELDCAD_FORCE_FALLBACK 1 to demand a software adapter
-    RUST_LOG                e.g. fieldcad_desktop=debug
-";
+    RUST_LOG                e.g. fieldcad_desktop=debug";
+
+#[derive(Parser)]
+#[command(
+    name = "fieldcad",
+    version,
+    about = "Field CAD — interactive laboratory for spatial fields",
+    after_help = ENV_HELP
+)]
+struct Cli {
+    /// Render offscreen with no window, report the adapter, and exit. Use
+    /// this to check whether a graphics backend works on this machine
+    /// without risking a windowed session.
+    #[arg(long, value_name = "FRAMES", num_args = 0..=1, default_missing_value = "60")]
+    smoke: Option<u32>,
+
+    /// Open the window normally, then quit on its own after SECONDS. Use
+    /// this the first time you try a windowed run on a machine where one
+    /// has previously misbehaved.
+    #[arg(long, value_name = "SECONDS")]
+    exit_after: Option<f64>,
+
+    /// Start with the embedded MCP server already listening at ADDRESS
+    /// (e.g. 127.0.0.1:8642) and print its bearer token to the startup log,
+    /// instead of leaving MCP off until a user opens the panel. For an agent
+    /// that launches this process itself and needs to connect immediately.
+    #[arg(long, value_name = "ADDRESS")]
+    mcp: Option<SocketAddr>,
+}
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -32,36 +47,19 @@ fn main() -> ExitCode {
         )
         .init();
 
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("-h" | "--help") => {
-            print!("{HELP}");
-            ExitCode::SUCCESS
-        }
-        Some("--smoke") => {
-            let frames = args
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(60);
-            run_smoke_test(frames)
-        }
-        Some("--exit-after") => {
-            let Some(seconds) = args.next().and_then(|value| value.parse::<f64>().ok()) else {
-                eprintln!("--exit-after needs a duration in seconds\n\n{HELP}");
-                return ExitCode::FAILURE;
-            };
-            launch(Some(std::time::Duration::from_secs_f64(seconds.max(0.1))))
-        }
-        Some(unknown) => {
-            eprintln!("unrecognised argument '{unknown}'\n\n{HELP}");
-            ExitCode::FAILURE
-        }
-        None => launch(None),
-    }
-}
+    let cli = Cli::parse();
 
-fn launch(lifetime: Option<std::time::Duration>) -> ExitCode {
-    match fieldcad_desktop::run_for(lifetime) {
+    if let Some(frames) = cli.smoke {
+        return run_smoke_test(frames);
+    }
+
+    let options = LaunchOptions {
+        lifetime: cli
+            .exit_after
+            .map(|seconds| Duration::from_secs_f64(seconds.max(0.1))),
+        mcp: cli.mcp,
+    };
+    match fieldcad_desktop::run_for(options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error}");
