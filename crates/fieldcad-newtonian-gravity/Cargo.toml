@@ -6,6 +6,6 @@ description = "Reusable analytic Newtonian gravity kernel for Field CAD backends
 
 [dependencies]
 fieldcad-core = { workspace = true }
-fieldcad-mass-sources = { workspace = true }
+fieldcad-sources = { workspace = true }
 fieldcad-superposition = { workspace = true }
 glam = { workspace = true }

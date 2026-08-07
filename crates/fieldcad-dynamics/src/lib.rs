@@ -37,31 +37,28 @@
 use fieldcad_core::{
     ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError, WorldSnapshot, relativistic_momentum,
 };
-use fieldcad_mass_sources::{MassSourceError, collect_mass_sources};
 use fieldcad_plugin_api::{DynamicBody, ObjectKinematicsUpdate};
+use fieldcad_sources::{SourceError, inertial_mass_component_id, inertial_mass_of};
 use glam::DVec3;
 
 /// Every body the dynamics system is responsible for, partitioned into unpinned
 /// (force-integrated) and pinned-moving (carried at authored velocity) bodies.
-///
-/// A single scan of the world's mass sources produces both partitions,
-/// replacing what were two independent scans before (PH-16).
 pub fn collect_bodies(
     world: &WorldSnapshot,
 ) -> Result<(Vec<DynamicBody>, Vec<DynamicBody>), DynamicsError> {
-    let sources = collect_mass_sources(world)?;
-    let mut dynamic = Vec::with_capacity(sources.len());
+    let mut dynamic = Vec::new();
     let mut carried = Vec::new();
-    for source in sources {
+    for (object, _properties) in world.objects_with(&inertial_mass_component_id()) {
+        let inertial_mass_kg = inertial_mass_of(object)?;
         let body = DynamicBody {
-            object: source.object,
-            inertial_mass_kg: source.inertial_mass_kg,
-            position: source.position,
-            velocity: source.velocity.linear,
+            object: object.id,
+            inertial_mass_kg,
+            position: object.transform.translation,
+            velocity: object.velocity.linear,
         };
-        if !source.pinned {
+        if !object.pinned {
             dynamic.push(body);
-        } else if source.velocity.linear != DVec3::ZERO {
+        } else if object.velocity.linear != DVec3::ZERO {
             carried.push(body);
         }
     }
@@ -202,7 +199,7 @@ fn kinematics(
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum DynamicsError {
     #[error(transparent)]
-    MassSource(#[from] MassSourceError),
+    Source(#[from] SourceError),
     #[error(transparent)]
     World(#[from] WorldError),
     #[error("expected one force per body: {expected} bodies, {actual} forces")]
@@ -220,7 +217,7 @@ pub enum DynamicsError {
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{ObjectSpec, Transform as CoreTransform, World, WorldCommand};
-    use fieldcad_mass_sources::{
+    use fieldcad_sources::{
         inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
     };
 

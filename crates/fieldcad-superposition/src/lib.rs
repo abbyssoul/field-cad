@@ -11,7 +11,7 @@
 //! dependency, matching `fieldcad-newtonian-gravity`'s own existing split
 //! between physics kernel and plugin glue.
 
-use fieldcad_core::{PointOrSphere, SampleValidity, UndefinedReason};
+use fieldcad_core::{ChargeDistribution, SampleValidity, UndefinedReason};
 use glam::DVec3;
 
 /// One source of a superposed field: a position, a coupling strength
@@ -21,7 +21,7 @@ use glam::DVec3;
 pub struct InverseSquareSource {
     pub position: DVec3,
     pub strength: f64,
-    pub distribution: PointOrSphere,
+    pub distribution: ChargeDistribution,
 }
 
 /// A superposed field vector and potential at one point.
@@ -54,7 +54,7 @@ fn contribution(
     let distance_squared = displacement.length_squared();
     let distance = distance_squared.sqrt();
     match source.distribution {
-        PointOrSphere::Point { exclusion_radius } => {
+        ChargeDistribution::Point { exclusion_radius } => {
             if distance <= exclusion_radius {
                 return None;
             }
@@ -64,12 +64,12 @@ fn contribution(
                 coupling_constant * source.strength * inverse_distance,
             ))
         }
-        PointOrSphere::UniformSphere { radius } if distance < radius => Some((
+        ChargeDistribution::UniformSphere { radius } if distance < radius => Some((
             coupling_constant * source.strength * displacement / radius.powi(3),
             coupling_constant * source.strength / (2.0 * radius)
                 * (3.0 - distance_squared / radius.powi(2)),
         )),
-        PointOrSphere::UniformSphere { .. } => {
+        ChargeDistribution::UniformSphere { .. } => {
             let inverse_distance = distance.recip();
             Some((
                 coupling_constant * source.strength * displacement * inverse_distance.powi(3),
@@ -151,7 +151,7 @@ mod tests {
         InverseSquareSource {
             position,
             strength,
-            distribution: PointOrSphere::Point {
+            distribution: ChargeDistribution::Point {
                 exclusion_radius: 0.0,
             },
         }
@@ -177,7 +177,7 @@ mod tests {
         let source = InverseSquareSource {
             position: DVec3::ZERO,
             strength: 1.0,
-            distribution: PointOrSphere::Point {
+            distribution: ChargeDistribution::Point {
                 exclusion_radius: 0.5,
             },
         };
@@ -193,7 +193,7 @@ mod tests {
         let source = InverseSquareSource {
             position: DVec3::ZERO,
             strength: 3.0,
-            distribution: PointOrSphere::UniformSphere { radius: 2.0 },
+            distribution: ChargeDistribution::UniformSphere { radius: 2.0 },
         };
         let sample = evaluate_sources(1.0, [source], DVec3::ZERO);
         assert_eq!(sample.field, DVec3::ZERO);
@@ -211,7 +211,7 @@ mod tests {
         let grazing = InverseSquareSource {
             position: DVec3::new(1.0, 0.0, 0.0),
             strength: 1.0,
-            distribution: PointOrSphere::Point {
+            distribution: ChargeDistribution::Point {
                 exclusion_radius: 2.0,
             },
         };
@@ -227,7 +227,7 @@ mod tests {
         let source = InverseSquareSource {
             position: DVec3::ZERO,
             strength: 1.0,
-            distribution: PointOrSphere::UniformSphere { radius: 2.0 },
+            distribution: ChargeDistribution::UniformSphere { radius: 2.0 },
         };
         let field = field_excluding(1.0, [source], DVec3::X).unwrap();
         // Interior of a uniform sphere: field grows linearly with distance

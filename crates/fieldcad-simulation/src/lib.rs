@@ -520,8 +520,8 @@ mod tests {
         // Charge is declared by both plugins and registered once.
         assert_eq!(runtime.world_snapshot().component_schemas().len(), 4);
         for shared in [
-            fieldcad_mass_sources::inertial_mass_component_id(),
-            fieldcad_mass_sources::gravitational_mass_component_id(),
+            fieldcad_sources::inertial_mass_component_id(),
+            fieldcad_sources::gravitational_mass_component_id(),
         ] {
             assert!(
                 runtime
@@ -617,7 +617,7 @@ mod tests {
     /// the result — with no equation system integrating anything itself.
     #[test]
     fn a_field_moves_a_body_through_the_dynamics_system() {
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 
@@ -684,7 +684,7 @@ mod tests {
     /// any tick supplied one.
     #[test]
     fn body_force_reflects_the_most_recent_ticks_dynamics() {
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 
@@ -747,7 +747,7 @@ mod tests {
     /// the acceleration — whatever field supplied the force.
     #[test]
     fn inertial_mass_alone_sets_the_response_to_a_force() {
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 
@@ -1232,7 +1232,7 @@ mod tests {
     /// itself is a one-line map lookup.
     #[test]
     fn a_local_source_reports_body_force_through_the_trait_boundary() {
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 
@@ -2671,7 +2671,7 @@ mod tests {
     /// did.
     #[test]
     fn solver_motion_discards_the_authored_history() {
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 

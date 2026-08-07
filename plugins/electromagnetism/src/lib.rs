@@ -18,23 +18,23 @@ pub use coupling::{
 use std::sync::Arc;
 
 use fieldcad_core::{
-    BoundaryCondition, ChannelId, ChannelSchema, ComponentSchema, DiagnosticSeverity, Dimension,
-    Domain, FieldColumn, FieldValueKind, InterpolationMethod, PluginId, PluginVersion, Precision,
-    PropertyBag, PropertyId, PropertyKind, PropertySchema, PropertyValue, Quantity, SampleGeometry,
-    SampleValidity, SolverDiagnostic, StepContext, TimeStep, UndefinedReason, WorldRevision,
-    WorldSnapshot,
+    BoundaryCondition, ChannelId, ChannelSchema, ChargeDistribution, ComponentSchema,
+    DiagnosticSeverity, Dimension, Domain, FieldColumn, FieldValueKind, InterpolationMethod,
+    PluginId, PluginVersion, Precision, PropertyBag, PropertyId, PropertyKind, PropertySchema,
+    PropertyValue, Quantity, SampleGeometry, SampleValidity, SolverDiagnostic, StepContext,
+    TimeStep, UndefinedReason, WorldRevision, WorldSnapshot,
 };
 use fieldcad_electromagnetic_sources::{
-    ChargeDistribution, ChargeSource, charge_component_id, charge_component_schema,
-    collect_charge_sources, electric_field_channel_schema, magnetic_field_channel_schema,
+    ChargeSource, charge_component_id, charge_component_schema, collect_charge_sources,
+    electric_field_channel_schema, magnetic_field_channel_schema,
 };
-use fieldcad_mass_sources::mass_component_schemas;
 use fieldcad_particles::particle_component_schema;
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
     PluginError, PluginMetadata, ResolvedFieldBrushStroke, SampledColumn, SolverCancellation,
     SolverContext, SolverKind, SolverStepOutcome,
 };
+use fieldcad_sources::mass_component_schemas;
 use glam::{DVec3, IVec3, UVec3};
 
 use coupling::{ParticleCoupling, collect_coupled_particles, coupling_is_requested};
@@ -640,25 +640,23 @@ pub fn static_charge_state_from_sources(domain: Domain, sources: &[ChargeSource]
 fn regularized_potential(sources: &[ChargeSource], position: DVec3, minimum_radius: f64) -> f64 {
     sources
         .iter()
-        .filter(|source| source.charge_coulombs != 0.0)
+        .filter(|source| source.coupling_value != 0.0)
         .map(|source| {
             let distance_squared = (position - source.position).length_squared();
             let declared_radius = match source.distribution {
                 ChargeDistribution::Point { exclusion_radius } => exclusion_radius,
                 ChargeDistribution::UniformSphere { radius } => radius,
             };
-            // Only the degenerate (zero-radius) case is floored — a legitimately
-            // small but positive radius keeps its own exact interior/exterior split.
             let radius = if declared_radius > 0.0 {
                 declared_radius
             } else {
                 minimum_radius
             };
             if distance_squared < radius * radius {
-                COULOMB_CONSTANT * source.charge_coulombs / (2.0 * radius)
+                COULOMB_CONSTANT * source.coupling_value / (2.0 * radius)
                     * (3.0 - distance_squared / (radius * radius))
             } else {
-                COULOMB_CONSTANT * source.charge_coulombs / distance_squared.sqrt()
+                COULOMB_CONSTANT * source.coupling_value / distance_squared.sqrt()
             }
         })
         .sum()
@@ -2133,7 +2131,7 @@ mod tests {
         use fieldcad_electromagnetic_sources::{
             charge_component_id, charge_component_schema, charge_properties,
         };
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 
@@ -2205,7 +2203,7 @@ mod tests {
         use fieldcad_electromagnetic_sources::{
             charge_component_id, charge_component_schema, charge_properties,
         };
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 

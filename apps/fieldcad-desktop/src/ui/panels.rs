@@ -9,11 +9,11 @@ use fieldcad_core::{
     SlicePlane, SlicePlaneSpec, SnapshotFreshness, TimeStep, Transform, VectorQuantity, Velocity,
     WorldCommand, WorldObject, WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
 };
-use fieldcad_mass_sources::{inertial_mass_component_id, mass_property_id};
 use fieldcad_particles::{ParticleTemplate, template_particle_spec};
 use fieldcad_simulation::{
     CommandLifecycle, CommandPayload, CommandRecord, PlaybackSpeed, ProbeHistory,
 };
+use fieldcad_sources::{inertial_mass_component_id, mass_property_id};
 use glam::{DQuat, DVec2, DVec3};
 
 use super::compute::{
@@ -1597,7 +1597,7 @@ fn motion_summary(object: &WorldObject) -> &'static str {
 
 /// The object's inertial mass, if it has a valid one attached. Reading
 /// straight off the component rather than through
-/// `fieldcad_mass_sources::collect_mass_sources` because the inspector wants
+/// `fieldcad_sources::inertial_mass_of` because the inspector wants
 /// this one object's value, not every massive body in the scene.
 fn inertial_mass_kg(object: &WorldObject) -> Option<f64> {
     object
@@ -3867,7 +3867,7 @@ mod tests {
         world
             .commit([
                 WorldCommand::RegisterComponentSchema(
-                    fieldcad_mass_sources::inertial_mass_component_schema(),
+                    fieldcad_sources::inertial_mass_component_schema(),
                 ),
                 WorldCommand::CreateObject(ObjectSpec::new("gizmo")),
             ])
@@ -3881,7 +3881,7 @@ mod tests {
         );
 
         // Exactly what the "+ Add → Mass" menu item issues.
-        let schema = fieldcad_mass_sources::inertial_mass_component_schema();
+        let schema = fieldcad_sources::inertial_mass_component_schema();
         world
             .commit([WorldCommand::AttachComponent {
                 object,
@@ -3934,7 +3934,7 @@ mod tests {
         // defaults, the "+ Add" menu would offer a dead entry.
         for schema in [
             fieldcad_electromagnetic_sources::charge_component_schema(),
-            fieldcad_mass_sources::inertial_mass_component_schema(),
+            fieldcad_sources::inertial_mass_component_schema(),
             fieldcad_particles::particle_component_schema(),
         ] {
             let properties = schema
@@ -3954,7 +3954,7 @@ mod tests {
     /// which is exactly the defect this exists to prevent.
     #[test]
     fn a_linked_gravitational_mass_cannot_be_edited_through_the_inspector() {
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             gravitational_mass_component_schema, independent_gravitational_mass_properties,
             linked_gravitational_mass_properties, mass_property_id,
         };
@@ -4003,7 +4003,7 @@ mod tests {
     /// declares the switch first, which is what makes that true.
     #[test]
     fn clearing_the_link_enables_the_value_within_one_frame() {
-        use fieldcad_mass_sources::{
+        use fieldcad_sources::{
             follows_inertial_property_id, gravitational_mass_component_schema,
             linked_gravitational_mass_properties, mass_property_id,
         };
@@ -4045,7 +4045,7 @@ mod tests {
         world
             .commit([
                 WorldCommand::RegisterComponentSchema(
-                    fieldcad_mass_sources::inertial_mass_component_schema(),
+                    fieldcad_sources::inertial_mass_component_schema(),
                 ),
                 WorldCommand::CreateObject(ObjectSpec::new("gizmo")),
             ])
@@ -4058,8 +4058,8 @@ mod tests {
         world
             .commit([WorldCommand::AttachComponent {
                 object,
-                component: fieldcad_mass_sources::inertial_mass_component_id(),
-                properties: fieldcad_mass_sources::inertial_mass_properties(3.5).unwrap(),
+                component: fieldcad_sources::inertial_mass_component_id(),
+                properties: fieldcad_sources::inertial_mass_properties(3.5).unwrap(),
             }])
             .unwrap();
 

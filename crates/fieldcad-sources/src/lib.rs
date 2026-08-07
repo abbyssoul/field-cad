@@ -22,11 +22,10 @@
 //! model, a catalog identity, or a charge.
 
 use fieldcad_core::{
-    ComponentSchema, ComponentTypeId, Dimension, ObjectId, PluginId, PointOrSphere,
-    PointOrSphereError, PropertyBag, PropertyCondition, PropertyId, PropertyKind, PropertySchema,
-    PropertyValue, Quantity, QuantityError, Velocity, WorldObject, WorldSnapshot,
+    ChargeDistribution, ComponentSchema, ComponentTypeId, Dimension, PluginId, PointOrSphereError,
+    PropertyBag, PropertyCondition, PropertyId, PropertyKind, PropertySchema, PropertyValue,
+    Quantity, QuantityError, WorldObject, WorldSnapshot,
 };
-use glam::DVec3;
 
 pub const SCHEMA_NAMESPACE: &str = "fieldcad.mass-sources";
 pub const INERTIAL_MASS_COMPONENT: &str = "inertial-mass";
@@ -178,113 +177,31 @@ pub fn independent_gravitational_mass_properties(
     .collect())
 }
 
-/// How a massive body's volume is distributed, for solvers that need more than
-/// a point.
-///
-/// The variants mirror [`fieldcad_electromagnetic_sources::ChargeDistribution`]
-/// because the geometry question is the same one — [`PointOrSphere`] answers
-/// it once, shared by both — the quantity being spread over that geometry is
-/// what differs.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum MassDistribution {
-    Point { exclusion_radius: f64 },
-    UniformSphere { radius: f64 },
-}
+pub use fieldcad_core::CoupledSource;
 
-impl From<PointOrSphere> for MassDistribution {
-    fn from(value: PointOrSphere) -> Self {
-        match value {
-            PointOrSphere::Point { exclusion_radius } => Self::Point { exclusion_radius },
-            PointOrSphere::UniformSphere { radius } => Self::UniformSphere { radius },
-        }
-    }
-}
-
-impl From<MassDistribution> for PointOrSphere {
-    fn from(value: MassDistribution) -> Self {
-        match value {
-            MassDistribution::Point { exclusion_radius } => Self::Point { exclusion_radius },
-            MassDistribution::UniformSphere { radius } => Self::UniformSphere { radius },
-        }
-    }
-}
-
-/// One authored massive body, in solver-neutral terms.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MassSource {
-    pub object: ObjectId,
-    pub position: DVec3,
-    pub velocity: Velocity,
-    /// The inertia the dynamics system divides an accumulated force by.
-    pub inertial_mass_kg: f64,
-    /// The charge a gravitational field couples to, if this body gravitates.
-    ///
-    /// `None` means the body has inertia but does not source or feel gravity —
-    /// the gravitational equivalent of an uncharged body.
-    pub gravitational_mass_kg: Option<f64>,
-    /// Whether the user, rather than a solver, decides this body's motion.
-    pub pinned: bool,
-    pub distribution: MassDistribution,
-}
-
-impl MassSource {
-    /// Whether this body's gravitational and inertial masses differ.
-    ///
-    /// Worth surfacing: a scene where these are unequal is not modelling the
-    /// universe as measured, and a reader of its results needs to know that.
-    pub fn violates_equivalence(&self) -> bool {
-        self.gravitational_mass_kg
-            .is_some_and(|gravitational| gravitational != self.inertial_mass_kg)
-    }
-}
+pub type MassDistribution = ChargeDistribution;
 
 /// The exclusion radius given to a massive body with no authored shape.
-///
-/// A bare gizmo that has just been given mass is a legitimate point body. It
-/// gets the same treatment as a charge attached to a shapeless object rather
-/// than being rejected, so that composing an object one component at a time
-/// never passes through an invalid intermediate state.
 pub const DEFAULT_POINT_RADIUS: f64 = fieldcad_core::DEFAULT_PROXY_RADIUS;
 
-/// Extract every authored massive body in deterministic object-ID order.
-pub fn collect_mass_sources(world: &WorldSnapshot) -> Result<Vec<MassSource>, MassSourceError> {
-    world
-        .objects_with(&inertial_mass_component_id())
-        .map(|(object, properties)| source_from_object(object, properties))
-        .collect()
-}
-
-/// Extract every body that gravitates, including those whose inertia was
-/// never authored — a body with only `gravitational-mass` sources gravity
-/// even though it cannot be dynamically pushed. Deterministic object-ID
-/// order. For ordinary massive bodies (those with inertial mass) the
-/// returned `MassSource` is identical to [`collect_mass_sources`]; the
-/// difference is confined to bodies that have `gravitational-mass` but no
-/// `inertial-mass` — see PH-4.
-///
-/// The gravity plugin calls this instead of [`collect_mass_sources`] so a
-/// gravitational-mass-only body in the scene is not silently invisible.
-pub fn collect_gravity_sources(world: &WorldSnapshot) -> Result<Vec<MassSource>, MassSourceError> {
+/// Extract every body that gravitates as a `CoupledSource<f64>`, including those
+/// whose inertia was never authored.
+pub fn collect_gravity_sources(
+    world: &WorldSnapshot,
+) -> Result<Vec<CoupledSource<f64>>, SourceError> {
     world
         .objects()
         .values()
-        .filter(|object| {
-            object
-                .components
-                .contains_key(&inertial_mass_component_id())
-                || object
-                    .components
-                    .contains_key(&gravitational_mass_component_id())
+        .filter_map(|object| match gravitational_mass_of(object) {
+            Ok(Some(mass)) => Some(source_from_object_for_coupling(object, mass)),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
         })
-        .map(source_from_object_for_gravity)
         .collect()
 }
 
 /// The gravitational coupling charge of one object, resolving the link.
-///
-/// Separated from [`collect_mass_sources`] so a gravity plugin can ask about a
-/// body it already holds without rebuilding the whole list.
-pub fn gravitational_mass_of(object: &WorldObject) -> Result<Option<f64>, MassSourceError> {
+pub fn gravitational_mass_of(object: &WorldObject) -> Result<Option<f64>, SourceError> {
     let Some(properties) = object.components.get(&gravitational_mass_component_id()) else {
         return Ok(None);
     };
@@ -293,114 +210,79 @@ pub fn gravitational_mass_of(object: &WorldObject) -> Result<Option<f64>, MassSo
         Some(PropertyValue::Boolean(true))
     );
     if follows {
-        // Linked: the authored gravitational value is ignored entirely rather
-        // than kept in sync, so the two can never disagree while the link is on.
         return inertial_mass_of(object).map(Some);
     }
     let mass = properties.scalar(&mass_property_id()).ok_or_else(|| {
-        MassSourceError::InvalidGravitationalMass {
+        SourceError::InvalidGravitationalMass {
             object: object.name.clone(),
         }
     })?;
-    // Zero is meaningful here — a body with inertia that does not gravitate —
-    // but a negative gravitational mass is not something this model represents.
     if !mass.is_finite() || mass < 0.0 {
-        return Err(MassSourceError::InvalidGravitationalMass {
+        return Err(SourceError::InvalidGravitationalMass {
             object: object.name.clone(),
         });
     }
     Ok(Some(mass))
 }
 
-fn inertial_mass_of(object: &WorldObject) -> Result<f64, MassSourceError> {
+pub fn inertial_mass_of(object: &WorldObject) -> Result<f64, SourceError> {
     let mass = object
         .components
         .get(&inertial_mass_component_id())
         .and_then(|properties| properties.scalar(&mass_property_id()))
-        .ok_or_else(|| MassSourceError::InvalidMass {
+        .ok_or_else(|| SourceError::InvalidMass {
             object: object.name.clone(),
         })?;
-    // Inertia divides. A zero or negative mass is not a body a pusher can
-    // integrate, so it is rejected at the boundary rather than producing an
-    // infinity several layers deeper.
     if !mass.is_finite() || mass <= 0.0 {
-        return Err(MassSourceError::InvalidMass {
+        return Err(SourceError::InvalidMass {
             object: object.name.clone(),
         });
     }
     Ok(mass)
 }
 
-fn source_from_object(
+fn source_from_object_for_coupling(
     object: &WorldObject,
-    _properties: &PropertyBag,
-) -> Result<MassSource, MassSourceError> {
-    let distribution = PointOrSphere::from_shape(object.shape, DEFAULT_POINT_RADIUS)
-        .map_err(|error| match error {
-            PointOrSphereError::NonPositiveSphere => MassSourceError::NonPositiveSphere {
-                object: object.name.clone(),
-            },
-            PointOrSphereError::UnsupportedShape => MassSourceError::UnsupportedShape {
-                object: object.name.clone(),
-            },
-        })?
-        .into();
-    Ok(MassSource {
-        object: object.id,
-        position: object.transform.translation,
-        velocity: object.velocity,
-        inertial_mass_kg: inertial_mass_of(object)?,
-        gravitational_mass_kg: gravitational_mass_of(object)?,
-        pinned: object.pinned,
+    coupling_value: f64,
+) -> Result<CoupledSource<f64>, SourceError> {
+    let distribution =
+        ChargeDistribution::from_shape(object.shape, DEFAULT_POINT_RADIUS).map_err(|error| {
+            match error {
+                PointOrSphereError::NonPositiveSphere => SourceError::NonPositiveSphere {
+                    object: object.name.clone(),
+                },
+                PointOrSphereError::UnsupportedShape => SourceError::UnsupportedShape {
+                    object: object.name.clone(),
+                },
+            }
+        })?;
+    Ok(CoupledSource::new(
+        object.id,
+        object.transform.translation,
+        object.velocity,
+        coupling_value,
         distribution,
-    })
-}
-
-/// Like [`source_from_object`], but does not require inertial mass — the
-/// gravity solver never reads that field from its source list (it reads
-/// `gravitational_mass_kg` instead), so a body with only gravitational mass
-/// can contribute to the field without claiming a non-zero inertia.
-fn source_from_object_for_gravity(object: &WorldObject) -> Result<MassSource, MassSourceError> {
-    let distribution = PointOrSphere::from_shape(object.shape, DEFAULT_POINT_RADIUS)
-        .map_err(|error| match error {
-            PointOrSphereError::NonPositiveSphere => MassSourceError::NonPositiveSphere {
-                object: object.name.clone(),
-            },
-            PointOrSphereError::UnsupportedShape => MassSourceError::UnsupportedShape {
-                object: object.name.clone(),
-            },
-        })?
-        .into();
-    Ok(MassSource {
-        object: object.id,
-        position: object.transform.translation,
-        velocity: object.velocity,
-        // 0.0 is safe here — the gravity plugin never reads `inertial_mass_kg`
-        // from its source list; it reads `gravitational_mass_kg` instead. The
-        // dynamics system uses `collect_mass_sources` (which requires inertial
-        // mass), so this sentinel never reaches an integrator.
-        inertial_mass_kg: inertial_mass_of(object).unwrap_or(0.0),
-        gravitational_mass_kg: gravitational_mass_of(object)?,
-        pinned: object.pinned,
-        distribution,
-    })
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum MassSourceError {
+pub enum SourceError {
     #[error("object '{object}' must have a finite, positive inertial mass")]
     InvalidMass { object: String },
     #[error("object '{object}' must have a finite, non-negative gravitational mass")]
     InvalidGravitationalMass { object: String },
-    #[error("massive sphere '{object}' must have a positive radius")]
+    #[error("sphere source '{object}' must have a positive radius")]
     NonPositiveSphere { object: String },
-    #[error("massive object '{object}' must use a point or sphere shape")]
+    #[error("source object '{object}' must use a point or sphere shape")]
     UnsupportedShape { object: String },
 }
 
+pub type MassSourceError = SourceError;
+
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{ObjectSpec, Transform, World, WorldCommand};
+    use fieldcad_core::{ObjectId, ObjectSpec, Transform, World, WorldCommand};
+    use glam::DVec3;
 
     use super::*;
 
@@ -423,21 +305,23 @@ mod tests {
 
     #[test]
     fn a_shapeless_gizmo_given_mass_is_a_point_body() {
-        // The composition flow adds a bare object first and mass second. That
-        // intermediate object has no shape, and must not be rejected for it.
         let (component, properties) = inertial(2.0);
         let world = world_with([ObjectSpec::new("gizmo")
             .with_transform(Transform::at(DVec3::Y).unwrap())
-            .with_component(component, properties)]);
+            .with_component(component, properties)
+            .with_component(
+                gravitational_mass_component_id(),
+                linked_gravitational_mass_properties(),
+            )]);
 
-        let sources = collect_mass_sources(&world.snapshot()).unwrap();
+        let sources = collect_gravity_sources(&world.snapshot()).unwrap();
 
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].inertial_mass_kg, 2.0);
+        assert_eq!(sources[0].coupling_value, 2.0);
         assert_eq!(sources[0].position, DVec3::Y);
         assert_eq!(
             sources[0].distribution,
-            MassDistribution::Point {
+            ChargeDistribution::Point {
                 exclusion_radius: DEFAULT_POINT_RADIUS
             }
         );
@@ -445,16 +329,20 @@ mod tests {
 
     #[test]
     fn inertia_alone_does_not_make_a_body_gravitate() {
-        // The point of the split: having somewhere for a force to act is a
-        // different claim from coupling to the gravitational field.
         let (component, properties) = inertial(5.0);
         let world = world_with([ObjectSpec::new("inert").with_component(component, properties)]);
 
-        let sources = collect_mass_sources(&world.snapshot()).unwrap();
+        let sources = collect_gravity_sources(&world.snapshot()).unwrap();
 
-        assert_eq!(sources[0].inertial_mass_kg, 5.0);
-        assert_eq!(sources[0].gravitational_mass_kg, None);
-        assert!(!sources[0].violates_equivalence());
+        assert!(sources.is_empty());
+        assert_eq!(
+            inertial_mass_of(world.snapshot().objects().values().next().unwrap()).unwrap(),
+            5.0
+        );
+        assert_eq!(
+            gravitational_mass_of(world.snapshot().objects().values().next().unwrap()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -464,17 +352,12 @@ mod tests {
             .with_component(component, properties)
             .with_component(
                 gravitational_mass_component_id(),
-                // The stored value is deliberately wrong; while linked it must
-                // never be consulted, or the two can silently disagree.
                 linked_gravitational_mass_properties(),
             )]);
 
-        let sources = collect_mass_sources(&world.snapshot()).unwrap();
-        assert_eq!(sources[0].gravitational_mass_kg, Some(3.0));
-        assert!(!sources[0].violates_equivalence());
+        let sources = collect_gravity_sources(&world.snapshot()).unwrap();
+        assert_eq!(sources[0].coupling_value, 3.0);
 
-        // Changing inertia carries the gravitational mass with it, with no
-        // second edit and no opportunity to drift.
         world
             .commit([WorldCommand::AttachComponent {
                 object: ObjectId::new(0),
@@ -483,14 +366,10 @@ mod tests {
             }])
             .unwrap();
 
-        let sources = collect_mass_sources(&world.snapshot()).unwrap();
-        assert_eq!(sources[0].inertial_mass_kg, 11.0);
-        assert_eq!(sources[0].gravitational_mass_kg, Some(11.0));
+        let sources = collect_gravity_sources(&world.snapshot()).unwrap();
+        assert_eq!(sources[0].coupling_value, 11.0);
     }
 
-    /// While the link is on, the gravitational mass value must not be offered
-    /// for editing: the model does not read it, so a number typed there would
-    /// silently do nothing.
     #[test]
     fn the_gravitational_mass_value_is_inert_while_it_follows_inertia() {
         let schema = gravitational_mass_component_schema();
@@ -506,7 +385,6 @@ mod tests {
             "unlinking must make the value editable again"
         );
 
-        // The switch itself is never conditional, or there would be no way back.
         let switch = schema
             .properties
             .iter()
@@ -514,13 +392,9 @@ mod tests {
             .expect("the component declares the link switch");
         assert!(switch.relevant_when.is_none());
 
-        // Declaration order matters: a generic editor renders in schema order,
-        // and the switch has to appear above the value it governs.
         assert_eq!(schema.properties[0].id, follows_inertial_property_id());
     }
 
-    /// The inertial mass shares its property schema with the gravitational one,
-    /// so a copy-paste of the condition would make it uneditable too.
     #[test]
     fn the_inertial_mass_value_is_always_editable() {
         let schema = inertial_mass_component_schema();
@@ -539,20 +413,17 @@ mod tests {
                 independent_gravitational_mass_properties(7.0).unwrap(),
             )]);
 
-        let sources = collect_mass_sources(&world.snapshot()).unwrap();
+        let sources = collect_gravity_sources(&world.snapshot()).unwrap();
 
-        assert_eq!(sources[0].inertial_mass_kg, 2.0);
-        assert_eq!(sources[0].gravitational_mass_kg, Some(7.0));
-        assert!(
-            sources[0].violates_equivalence(),
-            "an unequal pair must be reportable, not silent"
+        assert_eq!(sources[0].coupling_value, 7.0);
+        assert_eq!(
+            inertial_mass_of(world.snapshot().objects().values().next().unwrap()).unwrap(),
+            2.0
         );
     }
 
     #[test]
     fn a_body_may_gravitate_with_zero_gravitational_mass() {
-        // Zero is a physical state — inert under gravity — unlike zero inertia,
-        // which is a body a pusher cannot integrate.
         let (component, properties) = inertial(1.0);
         let world = world_with([ObjectSpec::new("neutral")
             .with_component(component, properties)
@@ -561,8 +432,8 @@ mod tests {
                 independent_gravitational_mass_properties(0.0).unwrap(),
             )]);
 
-        let sources = collect_mass_sources(&world.snapshot()).unwrap();
-        assert_eq!(sources[0].gravitational_mass_kg, Some(0.0));
+        let sources = collect_gravity_sources(&world.snapshot()).unwrap();
+        assert_eq!(sources[0].coupling_value, 0.0);
     }
 
     #[test]
@@ -573,34 +444,13 @@ mod tests {
         )]);
 
         assert_eq!(
-            collect_mass_sources(&world.snapshot()),
-            Err(MassSourceError::InvalidMass {
+            inertial_mass_of(world.snapshot().objects().values().next().unwrap()),
+            Err(SourceError::InvalidMass {
                 object: "massless".to_owned()
             })
         );
     }
 
-    #[test]
-    fn pinning_is_read_from_the_object_not_the_component() {
-        let (component, properties) = inertial(1.0);
-        let (other, other_properties) = inertial(1.0);
-        let world = world_with([
-            ObjectSpec::new("held")
-                .with_pinned(true)
-                .with_component(component, properties),
-            ObjectSpec::new("free").with_component(other, other_properties),
-        ]);
-
-        let sources = collect_mass_sources(&world.snapshot()).unwrap();
-
-        assert!(sources[0].pinned);
-        assert!(!sources[1].pinned);
-    }
-
-    /// PH-4 regression: an object with only `gravitational-mass` (no
-    /// `inertial-mass`) must still appear in `collect_gravity_sources`, even
-    /// though `collect_mass_sources` does not return it (no inertia to push
-    /// against).
     #[test]
     fn gravitational_mass_alone_sources_gravity() {
         let world = world_with([ObjectSpec::new("moon")
@@ -610,18 +460,9 @@ mod tests {
                 independent_gravitational_mass_properties(7.0).unwrap(),
             )]);
 
-        let via_mass = collect_mass_sources(&world.snapshot()).unwrap();
-        assert!(
-            via_mass.is_empty(),
-            "a body with no inertial mass must not appear in collect_mass_sources"
-        );
-
         let via_gravity = collect_gravity_sources(&world.snapshot()).unwrap();
         assert_eq!(via_gravity.len(), 1);
-        assert_eq!(via_gravity[0].gravitational_mass_kg, Some(7.0));
-        // inertial mass is zero because none was authored; the gravity
-        // plugin never reads this field from its source list.
-        assert_eq!(via_gravity[0].inertial_mass_kg, 0.0);
+        assert_eq!(via_gravity[0].coupling_value, 7.0);
         assert_eq!(via_gravity[0].position, DVec3::X * 10.0);
     }
 }

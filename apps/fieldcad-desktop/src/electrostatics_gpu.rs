@@ -9,8 +9,10 @@
 use std::{sync::mpsc, time::Duration};
 
 use bytemuck::{Pod, Zeroable};
-use fieldcad_core::{Precision, SampleGeometry, SampleValidity, UndefinedReason};
-use fieldcad_electromagnetic_sources::{ChargeDistribution, ChargeSource};
+use fieldcad_core::{
+    ChargeDistribution, Precision, SampleGeometry, SampleValidity, UndefinedReason,
+};
+use fieldcad_electromagnetic_sources::ChargeSource;
 use fieldcad_electrostatics::{ElectrostaticBatchEvaluator, ElectrostaticSample};
 use glam::DVec3;
 use wgpu::util::DeviceExt;
@@ -248,7 +250,7 @@ fn gpu_source(source: &ChargeSource) -> Result<GpuSource, String> {
             finite_f32(source.position.x, "source x")?,
             finite_f32(source.position.y, "source y")?,
             finite_f32(source.position.z, "source z")?,
-            finite_f32(source.charge_coulombs, "source charge")?,
+            finite_f32(source.coupling_value, "source charge")?,
         ],
         distribution_radius: [kind, finite_f32(radius, "source radius")?, 0.0, 0.0],
     })
@@ -338,31 +340,31 @@ mod tests {
                 Precision::F32,
             );
             let sources = [
-                ChargeSource {
-                    object: fieldcad_core::ObjectId::new(0),
-                    position: DVec3::new(-0.3, 0.0, 0.0),
-                    velocity: fieldcad_core::Velocity::default(),
-                    charge_coulombs: 1.2e-9,
-                    distribution: ChargeDistribution::Point {
+                ChargeSource::new(
+                    fieldcad_core::ObjectId::new(0),
+                    DVec3::new(-0.3, 0.0, 0.0),
+                    fieldcad_core::Velocity::default(),
+                    1.2e-9,
+                    ChargeDistribution::Point {
                         exclusion_radius: 0.08,
                     },
-                },
-                ChargeSource {
-                    object: fieldcad_core::ObjectId::new(1),
-                    position: DVec3::new(0.5, -0.2, 0.3),
-                    velocity: fieldcad_core::Velocity::default(),
-                    charge_coulombs: -0.7e-9,
-                    distribution: ChargeDistribution::Point {
+                ),
+                ChargeSource::new(
+                    fieldcad_core::ObjectId::new(1),
+                    DVec3::new(0.5, -0.2, 0.3),
+                    fieldcad_core::Velocity::default(),
+                    -0.7e-9,
+                    ChargeDistribution::Point {
                         exclusion_radius: 0.05,
                     },
-                },
-                ChargeSource {
-                    object: fieldcad_core::ObjectId::new(2),
-                    position: DVec3::new(0.2, 0.7, -0.4),
-                    velocity: fieldcad_core::Velocity::default(),
-                    charge_coulombs: 0.4e-9,
-                    distribution: ChargeDistribution::UniformSphere { radius: 0.35 },
-                },
+                ),
+                ChargeSource::new(
+                    fieldcad_core::ObjectId::new(2),
+                    DVec3::new(0.2, 0.7, -0.4),
+                    fieldcad_core::Velocity::default(),
+                    0.4e-9,
+                    ChargeDistribution::UniformSphere { radius: 0.35 },
+                ),
             ];
             let geometries = [
                 SampleGeometry::Plane {

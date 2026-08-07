@@ -6,6 +6,6 @@ edition = "2024"
 [dependencies]
 fieldcad-core = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
-fieldcad-mass-sources = { workspace = true }
+fieldcad-sources = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }

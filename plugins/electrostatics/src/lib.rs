@@ -11,7 +11,7 @@ use fieldcad_core::{
     PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic, WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
-    ChargeDistribution, ChargeSource, charge_component_id, charge_properties, charge_property_id,
+    ChargeSource, charge_component_id, charge_properties, charge_property_id,
     collect_charge_sources as collect_sources,
 };
 use fieldcad_electromagnetic_sources::{
@@ -103,8 +103,8 @@ impl ElectrostaticBatchEvaluator for CpuBatchEvaluator {
 fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
     InverseSquareSource {
         position: source.position,
-        strength: source.charge_coulombs,
-        distribution: source.distribution.into(),
+        strength: source.coupling_value,
+        distribution: source.distribution,
     }
 }
 
@@ -266,7 +266,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
                 self.sources
                     .iter()
                     .find(|source| source.object == body.object)
-                    .map_or(0.0, |source| source.charge_coulombs)
+                    .map_or(0.0, |source| source.coupling_value)
             })
             .collect();
 
@@ -347,8 +347,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use fieldcad_core::{
-        BoundaryConditions, DomainBounds, ObjectId, ObjectShape, ObjectSpec, PlaneLattice,
-        Resolution, Transform, UndefinedReason, Velocity, World, WorldCommand,
+        BoundaryConditions, ChargeDistribution, DomainBounds, ObjectId, ObjectShape, ObjectSpec,
+        PlaneLattice, Resolution, Transform, UndefinedReason, Velocity, World, WorldCommand,
     };
     use glam::UVec2;
 
@@ -363,15 +363,15 @@ mod tests {
     }
 
     fn point(position: DVec3, charge_coulombs: f64, radius: f64) -> ChargeSource {
-        ChargeSource {
-            object: ObjectId::new(0),
+        ChargeSource::new(
+            ObjectId::new(0),
             position,
-            velocity: Velocity::default(),
+            Velocity::default(),
             charge_coulombs,
-            distribution: ChargeDistribution::Point {
+            ChargeDistribution::Point {
                 exclusion_radius: radius,
             },
-        }
+        )
     }
 
     #[test]
@@ -436,13 +436,13 @@ mod tests {
     fn uniformly_charged_sphere_is_finite_and_continuous_at_its_surface() {
         let charge = 2.0e-9;
         let radius = 0.5;
-        let source = ChargeSource {
-            object: ObjectId::new(0),
-            position: DVec3::ZERO,
-            velocity: Velocity::default(),
-            charge_coulombs: charge,
-            distribution: ChargeDistribution::UniformSphere { radius },
-        };
+        let source = ChargeSource::new(
+            ObjectId::new(0),
+            DVec3::ZERO,
+            Velocity::default(),
+            charge,
+            ChargeDistribution::UniformSphere { radius },
+        );
         let centre = evaluate_sources(&[source], DVec3::ZERO);
         let surface = evaluate_sources(&[source], DVec3::X * radius);
 

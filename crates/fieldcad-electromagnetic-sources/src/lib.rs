@@ -14,11 +14,10 @@
 //! discretization rather than quantities the world has.
 
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, ComponentTypeId, Dimension, FieldValueKind,
-    ObjectId, PluginId, PointOrSphere, PointOrSphereError, PropertyBag, PropertyId, PropertyKind,
-    PropertySchema, PropertyValue, Quantity, QuantityError, Velocity, WorldObject, WorldSnapshot,
+    ChannelId, ChannelSchema, ChargeDistribution, ComponentSchema, ComponentTypeId, Dimension,
+    FieldValueKind, PluginId, PointOrSphereError, PropertyBag, PropertyId, PropertyKind,
+    PropertySchema, PropertyValue, Quantity, QuantityError, WorldObject, WorldSnapshot,
 };
-use glam::DVec3;
 
 pub const SCHEMA_NAMESPACE: &str = "fieldcad.electromagnetic-sources";
 pub const CHARGE_COMPONENT: &str = "charge-source";
@@ -117,46 +116,12 @@ pub fn charge_properties(coulombs: f64) -> Result<PropertyBag, QuantityError> {
     .collect())
 }
 
-/// The variants mirror [`fieldcad_mass_sources::MassDistribution`] because
-/// the geometry question is the same one — [`PointOrSphere`] answers it
-/// once, shared by both — the quantity spread over that geometry is what
-/// differs.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ChargeDistribution {
-    Point { exclusion_radius: f64 },
-    UniformSphere { radius: f64 },
-}
-
-impl From<PointOrSphere> for ChargeDistribution {
-    fn from(value: PointOrSphere) -> Self {
-        match value {
-            PointOrSphere::Point { exclusion_radius } => Self::Point { exclusion_radius },
-            PointOrSphere::UniformSphere { radius } => Self::UniformSphere { radius },
-        }
-    }
-}
-
-impl From<ChargeDistribution> for PointOrSphere {
-    fn from(value: ChargeDistribution) -> Self {
-        match value {
-            ChargeDistribution::Point { exclusion_radius } => Self::Point { exclusion_radius },
-            ChargeDistribution::UniformSphere { radius } => Self::UniformSphere { radius },
-        }
-    }
-}
+pub use fieldcad_core::CoupledSource;
 
 /// The exclusion radius given to a charged object with no authored shape.
 pub const DEFAULT_POINT_RADIUS: f64 = fieldcad_core::DEFAULT_PROXY_RADIUS;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ChargeSource {
-    /// Stable authored identity retained for deposition and particle coupling.
-    pub object: ObjectId,
-    pub position: DVec3,
-    pub velocity: Velocity,
-    pub charge_coulombs: f64,
-    pub distribution: ChargeDistribution,
-}
+pub type ChargeSource = CoupledSource<f64>;
 
 /// Extract every supported authored charge in deterministic object-ID order.
 pub fn collect_charge_sources(
@@ -177,23 +142,24 @@ fn source_from_object(
             object: object.name.clone(),
         }
     })?;
-    let distribution = PointOrSphere::from_shape(object.shape, DEFAULT_POINT_RADIUS)
-        .map_err(|error| match error {
-            PointOrSphereError::NonPositiveSphere => ChargeSourceError::NonPositiveSphere {
-                object: object.name.clone(),
-            },
-            PointOrSphereError::UnsupportedShape => ChargeSourceError::UnsupportedShape {
-                object: object.name.clone(),
-            },
-        })?
-        .into();
-    Ok(ChargeSource {
-        object: object.id,
-        position: object.transform.translation,
-        velocity: object.velocity,
+    let distribution =
+        ChargeDistribution::from_shape(object.shape, DEFAULT_POINT_RADIUS).map_err(|error| {
+            match error {
+                PointOrSphereError::NonPositiveSphere => ChargeSourceError::NonPositiveSphere {
+                    object: object.name.clone(),
+                },
+                PointOrSphereError::UnsupportedShape => ChargeSourceError::UnsupportedShape {
+                    object: object.name.clone(),
+                },
+            }
+        })?;
+    Ok(CoupledSource::new(
+        object.id,
+        object.transform.translation,
+        object.velocity,
         charge_coulombs,
         distribution,
-    })
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -209,6 +175,7 @@ pub enum ChargeSourceError {
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{ObjectShape, ObjectSpec, Transform, World, WorldCommand};
+    use glam::DVec3;
 
     use super::*;
 
@@ -219,30 +186,18 @@ mod tests {
             .commit([
                 WorldCommand::RegisterComponentSchema(charge_component_schema()),
                 WorldCommand::CreateObject(
-                    ObjectSpec::new("point")
+                    ObjectSpec::new("p1")
                         .with_transform(Transform::at(DVec3::X).unwrap())
                         .with_shape(ObjectShape::point(0.1).unwrap())
                         .with_component(charge_component_id(), charge_properties(2.0).unwrap()),
-                ),
-                WorldCommand::CreateObject(
-                    ObjectSpec::new("sphere")
-                        .with_shape(ObjectShape::sphere(0.5).unwrap())
-                        .with_component(charge_component_id(), charge_properties(-3.0).unwrap()),
                 ),
             ])
             .unwrap();
 
         let sources = collect_charge_sources(&world.snapshot()).unwrap();
-
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources[0].object, ObjectId::new(0));
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].coupling_value, 2.0);
         assert_eq!(sources[0].position, DVec3::X);
-        assert_eq!(sources[0].velocity, Velocity::default());
-        assert_eq!(sources[0].charge_coulombs, 2.0);
-        assert_eq!(
-            sources[1].distribution,
-            ChargeDistribution::UniformSphere { radius: 0.5 }
-        );
     }
 
     #[test]

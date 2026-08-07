@@ -21,9 +21,8 @@ use fieldcad_core::{
 use fieldcad_electromagnetic_sources::{
     charge_component_id, charge_properties, charge_property_id,
 };
-use fieldcad_mass_sources::{
-    MassSource, MassSourceError, collect_mass_sources, inertial_mass_component_id,
-    inertial_mass_properties,
+use fieldcad_sources::{
+    SourceError, inertial_mass_component_id, inertial_mass_of, inertial_mass_properties,
 };
 use glam::DVec3;
 
@@ -154,7 +153,7 @@ impl ParticleTemplate {
 
 /// Catalog provenance only.
 ///
-/// Mass moved to the shared [`fieldcad_mass_sources`] component so that a body
+/// Mass moved to the shared [`fieldcad_sources`] component so that a body
 /// can be massive without being a catalog particle, and motion mode became
 /// [`fieldcad_core::WorldObject::pinned`] so that it applies to any object
 /// rather than only to particles. What is left is the question this crate is
@@ -254,19 +253,17 @@ impl Particle {
 /// so mass is what makes it a particle. Charge and catalog provenance are read
 /// if present and defaulted if not.
 pub fn collect_particles(world: &WorldSnapshot) -> Result<Vec<Particle>, ParticleError> {
-    collect_mass_sources(world)?
-        .into_iter()
-        .map(|source| particle_from_mass_source(world, source))
+    world
+        .objects_with(&inertial_mass_component_id())
+        .map(|(object, _properties)| particle_from_object(world, object))
         .collect()
 }
 
-fn particle_from_mass_source(
-    world: &WorldSnapshot,
-    source: MassSource,
+fn particle_from_object(
+    _world: &WorldSnapshot,
+    object: &fieldcad_core::WorldObject,
 ) -> Result<Particle, ParticleError> {
-    let object = world
-        .object(source.object)
-        .ok_or_else(|| ParticleError::InvalidMass(source.object.to_string()))?;
+    let mass_kg = inertial_mass_of(object)?;
     if object.velocity.angular != DVec3::ZERO {
         return Err(ParticleError::AngularVelocity(object.name.clone()));
     }
@@ -275,28 +272,22 @@ fn particle_from_mass_source(
         .get(&charge_component_id())
         .and_then(|charge| charge.scalar(&charge_property_id()))
         .unwrap_or(0.0);
-    // Provenance is a claim about where these numbers came from, and it is
-    // checked rather than trusted. Now that mass and charge are edited through a
-    // generic property editor, nothing stops a user from changing a value while
-    // the catalog label stays attached; ADR 0019 requires that such an object
-    // stop claiming the catalog value, so the claim is verified against the
-    // authored numbers here instead of relying on an editor to reset it.
     let template = object
         .components
         .get(&particle_component_id())
         .and_then(|provenance| provenance.get(&template_property_id()))
         .and_then(choice_value)
         .and_then(ParticleTemplate::parse)
-        .filter(|template| template.matches(source.inertial_mass_kg, charge_coulombs))
+        .filter(|template| template.matches(mass_kg, charge_coulombs))
         .unwrap_or(ParticleTemplate::Custom);
     Ok(Particle {
-        object: source.object,
-        mass_kg: source.inertial_mass_kg,
+        object: object.id,
+        mass_kg,
         charge_coulombs,
-        pinned: source.pinned,
+        pinned: object.pinned,
         template,
-        position: source.position,
-        velocity: source.velocity.linear,
+        position: object.transform.translation,
+        velocity: object.velocity.linear,
     })
 }
 
@@ -314,7 +305,7 @@ pub enum ParticleError {
     #[error(transparent)]
     Quantity(#[from] QuantityError),
     #[error(transparent)]
-    MassSource(#[from] MassSourceError),
+    Source(#[from] SourceError),
     #[error("the Custom particle template requires explicit mass and charge values")]
     CustomTemplateNeedsValues,
     #[error("particle '{0}' must have a finite positive mass")]
@@ -326,7 +317,7 @@ pub enum ParticleError {
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{ObjectSpec, World, WorldCommand};
-    use fieldcad_mass_sources::mass_component_schemas;
+    use fieldcad_sources::mass_component_schemas;
 
     use super::*;
 

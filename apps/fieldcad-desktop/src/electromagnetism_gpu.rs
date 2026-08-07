@@ -704,9 +704,9 @@ mod tests {
         ElectromagnetismPlugin, MAGNETIC_DIVERGENCE_HANDLE, MAGNETIC_FIELD_HANDLE, courant_limit,
         prescribed_plane_wave_configuration,
     };
-    use fieldcad_mass_sources::mass_component_schemas;
     use fieldcad_particles::{ParticleTemplate, particle_component_schema, template_particle_spec};
     use fieldcad_plugin_api::{EquationSystemPlugin, SolverContext};
+    use fieldcad_sources::mass_component_schemas;
     use glam::UVec3;
 
     use super::*;

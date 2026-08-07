@@ -890,10 +890,10 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-gravity",
- "fieldcad-mass-sources",
  "fieldcad-newtonian-gravity",
  "fieldcad-plugin-api",
  "fieldcad-simulation",
+ "fieldcad-sources",
  "glam",
  "serde",
  "serde_json",
@@ -923,12 +923,12 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-gravity",
- "fieldcad-mass-sources",
  "fieldcad-mcp",
  "fieldcad-particles",
  "fieldcad-plugin-api",
  "fieldcad-server",
  "fieldcad-simulation",
+ "fieldcad-sources",
  "fieldcad-test-field",
  "glam",
  "naga",
@@ -947,8 +947,8 @@ name = "fieldcad-dynamics"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
- "fieldcad-mass-sources",
  "fieldcad-plugin-api",
+ "fieldcad-sources",
  "glam",
  "thiserror 2.0.19",
 ]
@@ -969,9 +969,9 @@ dependencies = [
  "fieldcad-core",
  "fieldcad-electromagnetic-sources",
  "fieldcad-electrostatics",
- "fieldcad-mass-sources",
  "fieldcad-particles",
  "fieldcad-plugin-api",
+ "fieldcad-sources",
  "glam",
 ]
 
@@ -991,19 +991,10 @@ name = "fieldcad-gravity"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
- "fieldcad-mass-sources",
  "fieldcad-newtonian-gravity",
  "fieldcad-plugin-api",
+ "fieldcad-sources",
  "glam",
-]
-
-[[package]]
-name = "fieldcad-mass-sources"
-version = "0.1.0"
-dependencies = [
- "fieldcad-core",
- "glam",
- "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -1037,7 +1028,7 @@ name = "fieldcad-newtonian-gravity"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
- "fieldcad-mass-sources",
+ "fieldcad-sources",
  "fieldcad-superposition",
  "glam",
 ]
@@ -1048,7 +1039,7 @@ version = "0.1.0"
 dependencies = [
  "fieldcad-core",
  "fieldcad-electromagnetic-sources",
- "fieldcad-mass-sources",
+ "fieldcad-sources",
  "glam",
  "thiserror 2.0.19",
 ]
@@ -1071,8 +1062,8 @@ dependencies = [
  "fieldcad-electromagnetic-sources",
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
- "fieldcad-mass-sources",
  "fieldcad-simulation",
+ "fieldcad-sources",
  "glam",
  "thiserror 2.0.19",
  "tokio",
@@ -1089,12 +1080,21 @@ dependencies = [
  "fieldcad-electromagnetic-sources",
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
- "fieldcad-mass-sources",
  "fieldcad-particles",
  "fieldcad-plugin-api",
+ "fieldcad-sources",
  "fieldcad-test-field",
  "glam",
  "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "fieldcad-sources"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "glam",
  "thiserror 2.0.19",
 ]
 

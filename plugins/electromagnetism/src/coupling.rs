@@ -63,7 +63,7 @@ impl ParticleCoupling {
             .map(|particle| particle.object)
             .collect();
         let particle_energy_joules = particle_kinetic_energy(&particles);
-        let total_charge_coulombs = sources.iter().map(|source| source.charge_coulombs).sum();
+        let total_charge_coulombs = sources.iter().map(|source| source.coupling_value).sum();
         Ok(Self {
             authored_motion: particles
                 .iter()
@@ -103,7 +103,7 @@ impl ParticleCoupling {
             .filter(|particle| particle.needs_kinematic_authority())
             .map(|particle| particle.object)
             .collect();
-        self.total_charge_coulombs = sources.iter().map(|source| source.charge_coulombs).sum();
+        self.total_charge_coulombs = sources.iter().map(|source| source.coupling_value).sum();
         self.neutralizing_background_coulombs = -self.total_charge_coulombs;
         self.particle_energy_joules = particle_kinetic_energy(&self.particles);
         self.authored_motion = self
@@ -292,7 +292,7 @@ pub fn periodic_charge_initial_state(
 pub fn deposit_source_charge(domain: Domain, sources: &[ChargeSource]) -> Vec<f64> {
     let mut rho = zero_scalar_grid(domain);
     for source in sources {
-        deposit_cic_scalar(domain, source.position, source.charge_coulombs, &mut rho);
+        deposit_cic_scalar(domain, source.position, source.coupling_value, &mut rho);
     }
     rho
 }
@@ -710,7 +710,8 @@ fn axpy(target: &mut [f64], scale: f64, value: &[f64]) {
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{
-        BoundaryCondition, BoundaryConditions, DomainBounds, Precision, Resolution,
+        BoundaryCondition, BoundaryConditions, ChargeDistribution, DomainBounds, Precision,
+        Resolution,
     };
 
     use super::*;
@@ -803,15 +804,15 @@ mod tests {
     #[test]
     fn periodic_poisson_initialization_satisfies_discrete_gauss_law() {
         let domain = domain();
-        let source = ChargeSource {
-            object: ObjectId::new(7),
-            position: DVec3::new(0.43, 0.71, 1.2),
-            velocity: Velocity::default(),
-            charge_coulombs: 2.0e-12,
-            distribution: fieldcad_electromagnetic_sources::ChargeDistribution::Point {
+        let source = ChargeSource::new(
+            ObjectId::new(7),
+            DVec3::new(0.43, 0.71, 1.2),
+            Velocity::default(),
+            2.0e-12,
+            ChargeDistribution::Point {
                 exclusion_radius: 0.01,
             },
-        };
+        );
         let state = periodic_charge_initial_state(domain, &[source]).unwrap();
         let rho = deposit_source_charge(domain, &[source]);
         let mean = rho.iter().sum::<f64>() / rho.len() as f64;

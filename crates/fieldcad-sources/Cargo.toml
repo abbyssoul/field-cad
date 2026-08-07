@@ -1,5 +1,5 @@
 [package]
-name = "fieldcad-mass-sources"
+name = "fieldcad-sources"
 version = "0.1.0"
 edition = "2024"
 

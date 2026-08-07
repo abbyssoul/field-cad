@@ -3,11 +3,10 @@
 use std::sync::Arc;
 
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, DiagnosticSeverity, Dimension, Domain, FieldColumn,
-    FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry, SolverDiagnostic,
-    WorldSnapshot,
+    ChannelId, ChannelSchema, ComponentSchema, CoupledSource, DiagnosticSeverity, Dimension,
+    Domain, FieldColumn, FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry,
+    SolverDiagnostic, WorldSnapshot,
 };
-use fieldcad_mass_sources::{MassSource, collect_gravity_sources, mass_component_schemas};
 use fieldcad_newtonian_gravity::{
     NewtonianSample, evaluate_acceleration_excluding, evaluate_geometry,
 };
@@ -15,6 +14,7 @@ use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
     PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
 };
+use fieldcad_sources::{collect_gravity_sources, mass_component_schemas};
 use glam::DVec3;
 
 pub const PLUGIN_ID: &str = "fieldcad.gravity";
@@ -91,13 +91,13 @@ impl EquationSystemPlugin for NewtonianGravityPlugin {
     }
 }
 
-fn sources(world: &WorldSnapshot) -> Result<Vec<MassSource>, PluginError> {
+fn sources(world: &WorldSnapshot) -> Result<Vec<CoupledSource<f64>>, PluginError> {
     collect_gravity_sources(world).map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
 }
 
 struct NewtonianGravitySolver {
     domain: Domain,
-    sources: Vec<MassSource>,
+    sources: Vec<CoupledSource<f64>>,
     world_revision: fieldcad_core::WorldRevision,
     cache: SampleCache<NewtonianSample>,
 }
@@ -143,15 +143,11 @@ impl EquationSystemSolver for NewtonianGravitySolver {
                     .sources
                     .iter()
                     .find(|source| source.object == body.object)
-                    .and_then(|source| source.gravitational_mass_kg)
+                    .map(|source| source.coupling_value)
                     .unwrap_or(0.0);
                 if mass == 0.0 {
                     return Ok(DVec3::ZERO);
                 }
-                // A nearby, unrelated body grazing its own exclusion
-                // radius must not zero out the force from every other
-                // source too — only that one source's contribution is
-                // skipped, not the whole sample.
                 let acceleration = evaluate_acceleration_excluding(
                     self.sources
                         .iter()
@@ -213,7 +209,7 @@ mod tests {
     use fieldcad_core::{
         ObjectShape, ObjectSpec, ProbeId, StepContext, TimeStep, Transform, World, WorldCommand,
     };
-    use fieldcad_mass_sources::{
+    use fieldcad_sources::{
         gravitational_mass_component_id, inertial_mass_component_id, inertial_mass_properties,
         linked_gravitational_mass_properties,
     };

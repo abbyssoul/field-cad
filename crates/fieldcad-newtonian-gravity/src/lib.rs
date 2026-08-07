@@ -10,8 +10,7 @@
 //! different coupling constant and an opposite sign. This crate is the thin,
 //! gravity-specific adapter over it: `MassSource` in, `NewtonianSample` out.
 
-use fieldcad_core::{SampleGeometry, SampleValidity};
-use fieldcad_mass_sources::MassSource;
+use fieldcad_core::{CoupledSource, SampleGeometry, SampleValidity};
 use fieldcad_superposition::InverseSquareSource;
 use glam::DVec3;
 
@@ -26,20 +25,18 @@ pub struct NewtonianSample {
     pub validity: SampleValidity,
 }
 
-/// `None` for a body with inertia but no gravitational mass (the
-/// gravitational equivalent of an uncharged body) or with zero
-/// gravitational mass — neither sources a field.
-fn inverse_square_source(source: &MassSource) -> Option<InverseSquareSource> {
-    let mass = source.gravitational_mass_kg?;
+/// `None` for a source with zero coupling value.
+fn inverse_square_source(source: &CoupledSource<f64>) -> Option<InverseSquareSource> {
+    let mass = source.coupling_value;
     (mass != 0.0).then_some(InverseSquareSource {
         position: source.position,
         strength: mass,
-        distribution: source.distribution.into(),
+        distribution: source.distribution,
     })
 }
 
 /// Evaluate the superposed Newtonian field and potential in SI units.
-pub fn evaluate_sources(sources: &[MassSource], position: DVec3) -> NewtonianSample {
+pub fn evaluate_sources(sources: &[CoupledSource<f64>], position: DVec3) -> NewtonianSample {
     let sample = fieldcad_superposition::evaluate_sources(
         -GRAVITATIONAL_CONSTANT,
         sources.iter().filter_map(inverse_square_source),
@@ -53,15 +50,9 @@ pub fn evaluate_sources(sources: &[MassSource], position: DVec3) -> NewtonianSam
 }
 
 /// Superposed acceleration at `position`, skipping only whichever source's
-/// own exclusion geometry contains it rather than voiding the whole sample —
-/// the analytic point field is undefined near that source specifically, not
-/// near an unrelated, perfectly well-defined one. Unlike [`evaluate_sources`],
-/// which the display grid needs a single well-defined-or-not sample from, a
-/// force calculation needs the well-defined sources summed regardless of
-/// what a nearby, unrelated one is doing. `None` if the summed acceleration
-/// overflowed to a non-finite value.
+/// own exclusion geometry contains it rather than voiding the whole sample.
 pub fn evaluate_acceleration_excluding<'a>(
-    sources: impl IntoIterator<Item = &'a MassSource>,
+    sources: impl IntoIterator<Item = &'a CoupledSource<f64>>,
     position: DVec3,
 ) -> Option<DVec3> {
     fieldcad_superposition::field_excluding(
@@ -73,7 +64,7 @@ pub fn evaluate_acceleration_excluding<'a>(
 
 /// Evaluate one complete geometry through the canonical source law.
 pub fn evaluate_geometry(
-    sources: &[MassSource],
+    sources: &[CoupledSource<f64>],
     geometry: &SampleGeometry,
 ) -> Vec<NewtonianSample> {
     geometry
@@ -85,21 +76,18 @@ pub fn evaluate_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fieldcad_core::{ObjectId, Velocity};
-    use fieldcad_mass_sources::MassDistribution;
+    use fieldcad_core::{ChargeDistribution, ObjectId, Velocity};
 
-    fn point(mass: f64) -> MassSource {
-        MassSource {
-            object: ObjectId::new(0),
-            position: DVec3::ZERO,
-            velocity: Velocity::default(),
-            inertial_mass_kg: mass,
-            gravitational_mass_kg: Some(mass),
-            pinned: true,
-            distribution: MassDistribution::Point {
+    fn point(mass: f64) -> CoupledSource<f64> {
+        CoupledSource::new(
+            ObjectId::new(0),
+            DVec3::ZERO,
+            Velocity::default(),
+            mass,
+            ChargeDistribution::Point {
                 exclusion_radius: 0.0,
             },
-        }
+        )
     }
 
     #[test]
@@ -113,8 +101,8 @@ mod tests {
 
     #[test]
     fn a_uniform_sphere_is_finite_at_its_centre() {
-        let source = MassSource {
-            distribution: MassDistribution::UniformSphere { radius: 2.0 },
+        let source = CoupledSource {
+            distribution: ChargeDistribution::UniformSphere { radius: 2.0 },
             ..point(3.0)
         };
         let sample = evaluate_sources(&[source], DVec3::ZERO);

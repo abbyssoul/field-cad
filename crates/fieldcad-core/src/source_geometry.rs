@@ -19,7 +19,7 @@ pub struct CoupledSource<T = f64> {
     pub position: DVec3,
     pub velocity: Velocity,
     pub coupling_value: T,
-    pub distribution: PointOrSphere,
+    pub distribution: ChargeDistribution,
 }
 
 impl<T> CoupledSource<T> {
@@ -28,7 +28,7 @@ impl<T> CoupledSource<T> {
         position: DVec3,
         velocity: Velocity,
         coupling_value: T,
-        distribution: PointOrSphere,
+        distribution: ChargeDistribution,
     ) -> Self {
         Self {
             object,
@@ -56,7 +56,7 @@ impl CoupledSource<f64> {
 /// a valid physics-source geometry, so this only covers the subset of
 /// shapes a superposed source resolves to.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PointOrSphere {
+pub enum ChargeDistribution {
     /// A point source with a declared radius inside which the analytic
     /// field is undefined rather than merely large.
     Point { exclusion_radius: f64 },
@@ -65,7 +65,7 @@ pub enum PointOrSphere {
     UniformSphere { radius: f64 },
 }
 
-impl PointOrSphere {
+impl ChargeDistribution {
     /// Maps an authored object's shape to its physics-source geometry — the
     /// mapping every coupling module needs. A shapeless object is a
     /// legitimate point source at `default_point_radius` (so composing an
@@ -112,8 +112,8 @@ mod tests {
     #[test]
     fn a_shapeless_object_is_a_point_at_the_default_radius() {
         assert_eq!(
-            PointOrSphere::from_shape(None, 0.25).unwrap(),
-            PointOrSphere::Point {
+            ChargeDistribution::from_shape(None, 0.25).unwrap(),
+            ChargeDistribution::Point {
                 exclusion_radius: 0.25
             }
         );
@@ -122,8 +122,8 @@ mod tests {
     #[test]
     fn a_point_shape_keeps_its_own_radius() {
         assert_eq!(
-            PointOrSphere::from_shape(Some(ObjectShape::point(0.1).unwrap()), 0.25).unwrap(),
-            PointOrSphere::Point {
+            ChargeDistribution::from_shape(Some(ObjectShape::point(0.1).unwrap()), 0.25).unwrap(),
+            ChargeDistribution::Point {
                 exclusion_radius: 0.1
             }
         );
@@ -132,15 +132,15 @@ mod tests {
     #[test]
     fn a_positive_radius_sphere_becomes_a_uniform_sphere() {
         assert_eq!(
-            PointOrSphere::from_shape(Some(ObjectShape::sphere(2.0).unwrap()), 0.25).unwrap(),
-            PointOrSphere::UniformSphere { radius: 2.0 }
+            ChargeDistribution::from_shape(Some(ObjectShape::sphere(2.0).unwrap()), 0.25).unwrap(),
+            ChargeDistribution::UniformSphere { radius: 2.0 }
         );
     }
 
     #[test]
     fn a_non_positive_radius_sphere_is_rejected() {
         assert_eq!(
-            PointOrSphere::from_shape(Some(ObjectShape::sphere(0.0).unwrap()), 0.25),
+            ChargeDistribution::from_shape(Some(ObjectShape::sphere(0.0).unwrap()), 0.25),
             Err(PointOrSphereError::NonPositiveSphere)
         );
     }
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn a_box_has_no_physics_source_geometry() {
         assert_eq!(
-            PointOrSphere::from_shape(Some(ObjectShape::boxed(DVec3::ONE).unwrap()), 0.25),
+            ChargeDistribution::from_shape(Some(ObjectShape::boxed(DVec3::ONE).unwrap()), 0.25),
             Err(PointOrSphereError::UnsupportedShape)
         );
     }
