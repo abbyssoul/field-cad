@@ -202,6 +202,85 @@ impl Quantity {
     }
 }
 
+// --- From impls: typed uom quantities → runtime Quantity --------------------
+
+macro_rules! impl_quantity_from {
+    ($uom_ty:ty, $dim:expr) => {
+        impl From<$uom_ty> for Quantity {
+            fn from(value: $uom_ty) -> Self {
+                Self::new(value.value, $dim).expect("uom value is always finite")
+            }
+        }
+    };
+}
+
+impl_quantity_from!(crate::quantities::MassKg, Dimension::MASS);
+impl_quantity_from!(crate::quantities::LengthMetres, Dimension::LENGTH);
+impl_quantity_from!(crate::quantities::TimeQuantity, Dimension::TIME);
+impl_quantity_from!(crate::quantities::ChargeCoulombs, Dimension::CHARGE);
+impl_quantity_from!(crate::quantities::VelocityMps, Dimension::VELOCITY);
+impl_quantity_from!(crate::quantities::AccelMps2, Dimension::ACCELERATION);
+impl_quantity_from!(crate::quantities::ForceNewtons, Dimension::MASS);
+impl_quantity_from!(crate::quantities::EnergyJoules, Dimension::MASS);
+
+// --- From impls: typed vector quantities → runtime VectorQuantity ----------
+
+macro_rules! impl_vector_quantity_from {
+    ($vec_ty:ty, $dim:expr) => {
+        impl From<$vec_ty> for VectorQuantity {
+            fn from(value: $vec_ty) -> Self {
+                Self::new(value.to_dvec3(), $dim).expect("uom vector value is always finite")
+            }
+        }
+    };
+}
+
+impl_vector_quantity_from!(
+    crate::quantities::ElectricFieldVector,
+    Dimension::ELECTRIC_FIELD
+);
+impl_vector_quantity_from!(
+    crate::quantities::MagneticFieldVector,
+    Dimension::MAGNETIC_FLUX_DENSITY
+);
+impl_vector_quantity_from!(crate::quantities::ForceVector, Dimension::MASS);
+impl_vector_quantity_from!(crate::quantities::VelocityVector, Dimension::VELOCITY);
+
+// --- Try-into helpers: runtime Quantity → typed uom quantity ----------------
+
+impl Quantity {
+    pub fn try_into_mass(self) -> Option<crate::quantities::MassKg> {
+        (self.dimension == Dimension::MASS)
+            .then(|| crate::quantities::MassKg::new::<crate::quantities::kilogram>(self.si_value))
+    }
+
+    pub fn try_into_length(self) -> Option<crate::quantities::LengthMetres> {
+        (self.dimension == Dimension::LENGTH).then(|| {
+            crate::quantities::LengthMetres::new::<crate::quantities::meter>(self.si_value)
+        })
+    }
+
+    pub fn try_into_time(self) -> Option<crate::quantities::TimeQuantity> {
+        (self.dimension == Dimension::TIME).then(|| {
+            crate::quantities::TimeQuantity::new::<crate::quantities::second>(self.si_value)
+        })
+    }
+
+    pub fn try_into_charge(self) -> Option<crate::quantities::ChargeCoulombs> {
+        (self.dimension == Dimension::CHARGE).then(|| {
+            crate::quantities::ChargeCoulombs::new::<crate::quantities::coulomb>(self.si_value)
+        })
+    }
+
+    pub fn try_into_velocity(self) -> Option<crate::quantities::VelocityMps> {
+        (self.dimension == Dimension::VELOCITY).then(|| {
+            crate::quantities::VelocityMps::new::<crate::quantities::meter_per_second>(
+                self.si_value,
+            )
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorQuantity {
     si_value: DVec3,

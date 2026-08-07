@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use std::str::FromStr;
 
+use crate::quantities::{TimeQuantity, second};
+
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 pub enum TimeStepError {
     #[error("simulation time step must be finite and greater than zero, received {seconds}")]
@@ -18,19 +20,28 @@ pub enum TimeStepParseError {
     InvalidValue(#[from] TimeStepError),
 }
 
+/// A validated, positive simulation time step.
+///
+/// Internally wraps a [`TimeQuantity`] so that the type system records
+/// this as a time value rather than a bare `f64`.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct TimeStep(f64);
+pub struct TimeStep(TimeQuantity);
 
 impl TimeStep {
     pub fn from_seconds(seconds: f64) -> Result<Self, TimeStepError> {
         if !seconds.is_finite() || seconds <= 0.0 {
             return Err(TimeStepError::Invalid { seconds });
         }
-        Ok(Self(seconds))
+        Ok(Self(TimeQuantity::new::<second>(seconds)))
     }
 
-    pub const fn seconds(self) -> f64 {
+    pub fn seconds(self) -> f64 {
+        self.0.get::<second>()
+    }
+
+    /// The typed time quantity this step wraps.
+    pub const fn quantity(self) -> TimeQuantity {
         self.0
     }
 }

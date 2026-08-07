@@ -6,6 +6,7 @@
 
 pub mod domain;
 pub mod ids;
+pub mod quantities;
 pub mod sampling;
 pub mod schema;
 pub mod snapshot;

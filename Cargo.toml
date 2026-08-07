@@ -60,6 +60,7 @@ tokio-util = "0.7"
 tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uom = { version = "0.38", default-features = false, features = ["si", "f64", "autoconvert", "serde", "std"] }
 uuid = "1"
 wgpu = "29"
 winit = "0.30.13"
