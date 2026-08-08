@@ -761,7 +761,7 @@ impl SessionCore {
                 self.pacer.reset();
             }
             CommandPayload::ReconfigureDomain(domain) => {
-                if self.runtime.status().mode() == SimulationMode::Running {
+                if self.should_queue_mutation() {
                     let record = CommandRecord::queued(
                         id,
                         kind,
@@ -809,7 +809,7 @@ impl SessionCore {
                 self.runtime.apply_field_brush_stroke(stroke)?;
             }
             CommandPayload::CommitWorld(commands) => {
-                if self.runtime.status().mode() == SimulationMode::Running {
+                if self.should_queue_mutation() {
                     let record = CommandRecord::queued(
                         id,
                         kind,
@@ -843,6 +843,17 @@ impl SessionCore {
             }
             CommandPayload::ResumeQueue => {
                 self.queue_paused = false;
+                // `Running` leaves this to the next tick boundary (ADR 0011):
+                // `advance` already flushes as soon as it sees the queue is
+                // no longer paused, and doing it here too would apply a
+                // mutation off the tick it is supposed to be atomic with.
+                // `Paused` has no boundary to wait for — a mutation held here
+                // only because the queue was paused (not because the sim
+                // was) is due immediately once that reason is gone, same as
+                // any other edit submitted while paused.
+                if self.runtime.status().mode() != SimulationMode::Running {
+                    self.flush_pending_mutations();
+                }
             }
             CommandPayload::CancelQueuedCommand(target) => {
                 let Some(index) = self
@@ -864,6 +875,20 @@ impl SessionCore {
         let created =
             created.unwrap_or_else(|| CommitReport::empty(self.runtime.status().world_revision));
         Ok(self.receipt(id, CommandDisposition::Applied, created))
+    }
+
+    /// Whether a scene/domain mutation must wait rather than land immediately:
+    /// either there is a tick boundary it needs to be atomic with
+    /// (`Running`, per ADR 0011), or the mutation queue is explicitly paused
+    /// and holding *everything* is exactly what was asked for, boundary or
+    /// not. Without the second half, a mutation submitted while genuinely
+    /// paused would always apply on the spot — true per ADR 0011 on its own,
+    /// but it defeats "paused" as a promise the queue makes: a user who
+    /// paused it to hold a slow-solving edit for cancellation, or simply to
+    /// keep the queue's contents predictable, would see it apply anyway the
+    /// moment the drag that produced it released.
+    fn should_queue_mutation(&self) -> bool {
+        self.runtime.status().mode() == SimulationMode::Running || self.queue_paused
     }
 
     /// `Pause`/`Step`/`Undo`/`Redo` must not silently flush a paused queue.

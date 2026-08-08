@@ -337,6 +337,26 @@ impl SlicePlaneSpec {
         self
     }
 
+    /// Read back what a builder chain (or a deserialized command) settled
+    /// on — needed by a consumer that only has the `WorldCommand` this spec
+    /// travelled in, not the entity it will replace (a not-yet-applied
+    /// preview, for instance).
+    pub fn origin(&self) -> DVec3 {
+        self.origin
+    }
+
+    pub fn normal(&self) -> DVec3 {
+        self.normal
+    }
+
+    pub fn u_axis(&self) -> DVec3 {
+        self.u_axis
+    }
+
+    pub fn half_extent(&self) -> DVec2 {
+        self.half_extent
+    }
+
     pub fn from_plane(plane: &SlicePlane) -> Self {
         Self {
             name: plane.name.clone(),
@@ -499,6 +519,20 @@ impl FieldBoxSpec {
         self
     }
 
+    /// Read back what a builder chain (or a deserialized command) settled
+    /// on — see [`SlicePlaneSpec::origin`].
+    pub fn origin(&self) -> DVec3 {
+        self.origin
+    }
+
+    pub fn rotation(&self) -> DQuat {
+        self.rotation
+    }
+
+    pub fn half_extent(&self) -> DVec3 {
+        self.half_extent
+    }
+
     pub fn from_box(field_box: &FieldBox) -> Self {
         Self {
             name: field_box.name.clone(),
@@ -617,6 +651,16 @@ impl FieldSphereSpec {
     pub fn hidden(mut self) -> Self {
         self.visible = false;
         self
+    }
+
+    /// Read back what a builder chain (or a deserialized command) settled
+    /// on — see [`SlicePlaneSpec::origin`].
+    pub fn origin(&self) -> DVec3 {
+        self.origin
+    }
+
+    pub fn radius(&self) -> f64 {
+        self.radius
     }
 
     pub fn from_sphere(sphere: &FieldSphere) -> Self {

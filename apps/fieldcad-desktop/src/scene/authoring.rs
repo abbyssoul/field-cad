@@ -3,12 +3,15 @@
 //! Planes and probes have no rendered body of their own, so they need one to be
 //! visible and selectable — independently of whether any field layer is on.
 
-use fieldcad_core::{DomainBounds, FieldBox, FieldSphere, SceneScale, SlicePlane, WorldSnapshot};
-use glam::{Quat, Vec3, Vec4};
+use fieldcad_core::{
+    DEFAULT_PROXY_RADIUS, DomainBounds, FieldBox, FieldSphere, ProbePosition, SceneScale,
+    SlicePlane, WorldCommand, WorldSnapshot,
+};
+use glam::{DVec3, Quat, Vec3, Vec4};
 
 use super::{
-    FieldGeometry, SceneSelection, push_circle, push_line, push_quad, push_quad_outline,
-    quat_from_dquat,
+    FieldGeometry, SceneSelection, push_circle, push_dashed_line, push_line, push_quad,
+    push_quad_outline, quat_from_dquat,
 };
 
 /// Which classes of thing the viewport is currently drawing.
@@ -126,6 +129,146 @@ pub fn append_authoring_geometry(
                 position + axis * size,
                 color,
             );
+        }
+    }
+}
+
+/// A translucent stand-in for a scene edit the mutation queue is holding
+/// while paused (BE-16): the entity hasn't actually moved yet — whatever
+/// draws its real body elsewhere still shows it at its current pose — so
+/// this draws a dimmed proxy at the pose the edit will land at, plus a
+/// dashed line back to the entity's current position, tinted to match the
+/// Queue panel's own "paused" indicator so the two read as the same fact.
+///
+/// Reuses each entity's own translucent-proxy visual (`append_box_visual`,
+/// `append_sphere_visual`, the plane quad, the probe cross marker) rather
+/// than inventing a second look for "not the real thing yet" — this app
+/// already has one.
+pub fn append_pending_edit_ghosts(
+    geometry: &mut FieldGeometry,
+    world: &WorldSnapshot,
+    edits: &[&WorldCommand],
+    scene_scale: SceneScale,
+) {
+    const GHOST_BODY: Vec4 = Vec4::new(0.92, 0.75, 0.29, 0.16);
+    const GHOST_OUTLINE: Vec4 = Vec4::new(0.92, 0.75, 0.29, 0.85);
+    const LINK_COLOR: Vec4 = Vec4::new(0.92, 0.75, 0.29, 0.8);
+
+    let link = |geometry: &mut FieldGeometry, current: Vec3, pending: Vec3| {
+        push_dashed_line(
+            &mut geometry.vector_lines,
+            current,
+            pending,
+            LINK_COLOR,
+            0.08,
+            0.05,
+        );
+    };
+
+    for edit in edits {
+        match edit {
+            WorldCommand::SetTransform { object, transform } => {
+                let Some(current) = world.object(*object) else {
+                    continue;
+                };
+                let half_extent = scene_scale.to_render_vec3(
+                    current
+                        .shape
+                        .map_or(DVec3::splat(DEFAULT_PROXY_RADIUS), |shape| {
+                            shape.half_extent()
+                        }),
+                );
+                let pending_origin = scene_scale.to_render_vec3(transform.translation);
+                append_box_visual(
+                    geometry,
+                    pending_origin,
+                    quat_from_dquat(transform.rotation),
+                    half_extent,
+                    GHOST_BODY,
+                    GHOST_OUTLINE,
+                );
+                link(
+                    geometry,
+                    scene_scale.to_render_vec3(current.transform.translation),
+                    pending_origin,
+                );
+            }
+            WorldCommand::SetPlane { plane, spec } => {
+                let Some(current) = world.planes().get(plane) else {
+                    continue;
+                };
+                let origin = scene_scale.to_render_vec3(spec.origin());
+                let normal = spec.normal().as_vec3();
+                let u = spec.u_axis().as_vec3();
+                let v = normal.cross(u);
+                let half = scene_scale.to_render_vec2(spec.half_extent());
+                let corners = [
+                    origin - u * half.x - v * half.y,
+                    origin + u * half.x - v * half.y,
+                    origin + u * half.x + v * half.y,
+                    origin - u * half.x + v * half.y,
+                ];
+                push_quad(&mut geometry.surface_triangles, corners, GHOST_BODY);
+                push_quad_outline(&mut geometry.vector_lines, corners, GHOST_OUTLINE);
+                link(geometry, scene_scale.to_render_vec3(current.origin), origin);
+            }
+            WorldCommand::SetBox { region, spec } => {
+                let Some(current) = world.boxes().get(region) else {
+                    continue;
+                };
+                let origin = scene_scale.to_render_vec3(spec.origin());
+                append_box_visual(
+                    geometry,
+                    origin,
+                    quat_from_dquat(spec.rotation()),
+                    scene_scale.to_render_vec3(spec.half_extent()),
+                    GHOST_BODY,
+                    GHOST_OUTLINE,
+                );
+                link(geometry, scene_scale.to_render_vec3(current.origin), origin);
+            }
+            WorldCommand::SetSphere { sphere, spec } => {
+                let Some(current) = world.spheres().get(sphere) else {
+                    continue;
+                };
+                let origin = scene_scale.to_render_vec3(spec.origin());
+                let radius = scene_scale.to_render(spec.radius());
+                append_sphere_visual(geometry, origin, radius, GHOST_BODY, GHOST_OUTLINE);
+                link(geometry, scene_scale.to_render_vec3(current.origin), origin);
+            }
+            WorldCommand::SetProbePosition { probe, position } => {
+                let Some(current) = world.probe(*probe) else {
+                    continue;
+                };
+                let Ok(current_position) = world.resolve_probe_position(current) else {
+                    continue;
+                };
+                let pending_position = match position {
+                    ProbePosition::World(position) => *position,
+                    ProbePosition::Attached { object, offset } => {
+                        let Some(parent) = world.object(*object) else {
+                            continue;
+                        };
+                        parent.transform.apply(*offset)
+                    }
+                };
+                let origin = scene_scale.to_render_vec3(pending_position);
+                let size = 0.09;
+                for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                    push_line(
+                        &mut geometry.vector_lines,
+                        origin - axis * size,
+                        origin + axis * size,
+                        GHOST_OUTLINE,
+                    );
+                }
+                link(
+                    geometry,
+                    scene_scale.to_render_vec3(current_position),
+                    origin,
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -292,6 +435,16 @@ fn append_sphere_proxy(
         Vec4::new(1.0, 1.0, 1.0, 0.85)
     };
 
+    append_sphere_visual(geometry, origin, radius, body, outline);
+}
+
+fn append_sphere_visual(
+    geometry: &mut FieldGeometry,
+    origin: Vec3,
+    radius: f32,
+    body: Vec4,
+    outline: Vec4,
+) {
     for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
         push_circle(&mut geometry.vector_lines, origin, a, b, radius, outline);
     }

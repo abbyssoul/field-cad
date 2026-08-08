@@ -1585,6 +1585,53 @@ mod tests {
         assert_eq!(commit_history[1].state, CommandLifecycle::Applied);
     }
 
+    /// ADR 0011 says an edit submitted while `Paused` is immediate — true
+    /// with an idle queue, but a mutation queue the user has explicitly
+    /// paused is a stronger promise than "no tick boundary to wait for".
+    /// Regression for the desktop's viewport-drag deferral: a plain-object
+    /// move released while both the simulation and the queue are paused
+    /// must sit exactly like a `Running` one would, not slip through the
+    /// mode check and apply on the spot.
+    #[test]
+    fn pausing_the_queue_holds_a_paused_simulations_edit_too() {
+        let mut source = LocalDataSource::new(runtime());
+        assert_eq!(source.simulation_status().mode(), SimulationMode::Paused);
+
+        source.execute(command(CommandPayload::PauseQueue)).unwrap();
+        let receipt = source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("held while paused")),
+            ])))
+            .unwrap();
+        assert_eq!(receipt.disposition, CommandDisposition::Queued);
+        assert!(source.world().objects().is_empty());
+        assert_eq!(source.get_queue().pending.len(), 1);
+    }
+
+    /// Unlike the `Running` case (where a resumed queue waits for the next
+    /// tick boundary — see `resuming_a_paused_queue_applies_pending_edits_in_submission_order`),
+    /// a `Paused` simulation has no boundary to wait for, so its held edit
+    /// applies the instant the queue stops being the only reason it was
+    /// held — resuming must not leave it stranded until some unrelated
+    /// command happens to flush it.
+    #[test]
+    fn resuming_the_queue_immediately_applies_a_paused_simulations_held_edit() {
+        let mut source = LocalDataSource::new(runtime());
+        source.execute(command(CommandPayload::PauseQueue)).unwrap();
+        source
+            .execute(command(CommandPayload::CommitWorld(vec![
+                WorldCommand::CreateObject(ObjectSpec::new("held while paused")),
+            ])))
+            .unwrap();
+
+        source
+            .execute(command(CommandPayload::ResumeQueue))
+            .unwrap();
+
+        assert!(source.get_queue().pending.is_empty());
+        assert_eq!(source.world().objects().len(), 1);
+    }
+
     #[test]
     fn cancelling_a_queued_command_prevents_its_application() {
         let mut sequencer = CommandSequencer::default();

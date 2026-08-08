@@ -1,14 +1,15 @@
 # Field CAD workload package v1
 
-Status: **accepted standard for Field CAD and proposed shared standard for
-Orishu**.  
+Status: **accepted shared standard for Field CAD and Orishu**.
 Date: 2026-08-06.
 
 This document freezes the package boundary for a workload that can run locally
 in Field CAD or through Orishu. It does not define a second solver API. The
 workload lifecycle is Orishu's existing `wl_init`, `wl_load_partition`,
 `wl_restore_checkpoint`, `wl_step`, `wl_checkpoint`, `wl_query_state`, and
-`wl_drop_partition` contract.
+`wl_drop_partition` contract. The shared component world is
+`orishu:workload/lifecycle@1`: it is owned by the execution-engine contract,
+not by the Field CAD desktop application.
 
 ## Package identity
 
@@ -38,10 +39,10 @@ version:            semantic version
 component:
   path:             "component.wasm"
   sha256:           lowercase SHA-256 hex
-  world:            "fieldcad:workload/lifecycle@1"
+  world:            "orishu:workload/lifecycle@1"
 execution:
   engines:          ["wasm-component"]
-  abi:              "orishu.workload/v1"
+  lifecycle:        "orishu.workload/v1"
   determinism:      "bitwise" | "tolerance"
   tolerance:        required only for "tolerance"
   limits:
@@ -61,7 +62,7 @@ assets:             optional [{ path, sha256, mediaType, byteLength }]
 ```
 
 Unknown manifest fields are preserved by readers and ignored by V1 execution.
-Unknown required `format`, `world`, `abi`, `state.format`, or major version is a
+Unknown required `format`, `world`, `lifecycle`, `state.format`, or major version is a
 hard compatibility failure. `ChannelId`, component ID, SI dimension, state
 format, component digest, and declared execution profile are compatibility
 identities; display names and transport locations are not.

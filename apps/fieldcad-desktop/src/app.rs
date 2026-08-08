@@ -389,6 +389,19 @@ struct WindowState {
     inspector_editing: bool,
     /// The interactive edit currently in progress, if any.
     edit_gesture: Option<EditGesture>,
+    /// The latest not-yet-submitted transaction of a deferred gesture — see
+    /// [`EditGesture::deferred`]. Replaced every frame the gesture continues
+    /// (a viewport drag's pose, or a held/typed inspector control's value),
+    /// taken and submitted as the gesture's single `CommitWorld` when it
+    /// closes.
+    pending_deferred_edit: Option<Vec<WorldCommand>>,
+    /// Object moves submitted while the mutation queue was paused, not yet
+    /// known to have resolved. Rendered as ghost previews until their
+    /// `CommandEvent` (`Completed`, `Failed`, or `Cancelled`) arrives in
+    /// [`Self::redraw`]'s event-draining loop — the same signal that already
+    /// distinguishes those three outcomes for every other command, so this
+    /// needs no separate "did it apply" tracking of its own.
+    deferred_edits: Vec<DeferredEdit>,
     frame_stats: FrameStats,
     step_compute_stats: StepComputeStats,
     /// When the next frame is due. Drives the event loop's control flow.
@@ -497,6 +510,8 @@ impl WindowState {
             active_field_brush: None,
             inspector_editing: false,
             edit_gesture: None,
+            pending_deferred_edit: None,
+            deferred_edits: Vec::new(),
             frame_stats: FrameStats::default(),
             step_compute_stats: StepComputeStats::default(),
             next_redraw: Instant::now(),
@@ -664,6 +679,8 @@ impl WindowState {
                             disposition = ?receipt.disposition,
                             "compute command completed"
                         );
+                        self.deferred_edits
+                            .retain(|edit| edit.command != receipt.command);
                     }
                     CommandEvent::Failed { command, error } => {
                         self.ui_model.command_error = Some(error.to_string());
@@ -671,9 +688,11 @@ impl WindowState {
                         if let Some(gesture) = &mut self.edit_gesture {
                             gesture.pause_rejected(command);
                         }
+                        self.deferred_edits.retain(|edit| edit.command != command);
                     }
                     CommandEvent::Cancelled(command) => {
                         tracing::debug!(command = command.get(), "queued command cancelled");
+                        self.deferred_edits.retain(|edit| edit.command != command);
                     }
                 }
             }
@@ -781,11 +800,12 @@ impl WindowState {
         // control submits an edit every frame, and the pause has to precede the
         // first of them rather than arrive a frame late.
         self.inspector_editing = ui_frame.scene_edit_in_progress;
-        self.synchronize_edit_gesture(compute.mode)?;
+        self.synchronize_edit_gesture(compute.mode, compute.queue.paused)?;
         self.apply_viewport_gesture(
             ui_frame.viewport_gesture,
             pixels_per_point,
             compute.mode,
+            compute.queue.paused,
             compute.scene_scale,
         )?;
 
@@ -795,8 +815,21 @@ impl WindowState {
         // one MCP tool calls use — rather than a private per-window
         // sequencer, so two transports sharing this model can never mint the
         // same `CommandId`.
+        //
+        // A `CommitWorld` from a *deferred* gesture (see `EditGesture::deferred`)
+        // is stashed instead of submitted here, same as a deferred viewport
+        // drag's own `submit_world_manipulation` — a held/typed inspector
+        // control resubmits every frame exactly like a drag resubmits every
+        // pointer-moved frame, and would flood a paused queue the same way
+        // if it went straight through.
         if !ui_frame.commands.is_empty() {
             for payload in std::mem::take(&mut ui_frame.commands) {
+                if self.edit_gesture.is_some_and(|gesture| gesture.deferred)
+                    && let CommandPayload::CommitWorld(commands) = payload
+                {
+                    self.pending_deferred_edit = Some(commands);
+                    continue;
+                }
                 self.model()
                     .submit(payload)
                     .map_err(|error| format!("simulation command failed: {error}"))?;
@@ -855,6 +888,15 @@ impl WindowState {
         );
         if self.ui_model.view.compute_bounds {
             scene::append_compute_bounds(&mut field, compute.domain.bounds(), scene_scale);
+        }
+        if !self.deferred_edits.is_empty() || self.pending_deferred_edit.is_some() {
+            let edits: Vec<&WorldCommand> = self
+                .deferred_edits
+                .iter()
+                .flat_map(|edit| edit.world_commands.iter())
+                .chain(self.pending_deferred_edit.iter().flatten())
+                .collect();
+            scene::append_pending_edit_ghosts(&mut field, &self.world, &edits, scene_scale);
         }
         // Kept for next frame's `ComputeView::build` to reuse whatever is
         // still current — every other use of `compute` above is a borrow, so
@@ -1044,6 +1086,7 @@ impl WindowState {
         gesture: ViewportGesture,
         pixels_per_point: f32,
         mode: SimulationMode,
+        queue_paused: bool,
         scene_scale: fieldcad_core::SceneScale,
     ) -> Result<(), String> {
         let drag_delta = Vec2::new(gesture.drag_delta.x, gesture.drag_delta.y);
@@ -1171,7 +1214,7 @@ impl WindowState {
                 });
                 // Immediately, not at the end of the frame: the same frame that
                 // starts the drag can already submit its first move.
-                self.synchronize_edit_gesture(mode)?;
+                self.synchronize_edit_gesture(mode, queue_paused)?;
             }
         }
 
@@ -1250,7 +1293,7 @@ impl WindowState {
         if gesture.primary_released {
             self.active_transform = None;
         }
-        self.synchronize_edit_gesture(mode)
+        self.synchronize_edit_gesture(mode, queue_paused)
     }
 
     fn field_brush_sample(
@@ -1566,11 +1609,21 @@ impl WindowState {
         )
     }
 
+    /// While the current gesture is deferred (see [`EditGesture::deferred`]),
+    /// this frame's pose is stashed rather than sent — nothing reaches the
+    /// authoritative side until the gesture closes and submits exactly one
+    /// `CommitWorld` (see `synchronize_edit_gesture`). Shared by
+    /// `translate_selection`, `drag_plane_normal`, and `drag_box_rotation`,
+    /// so every entity type and drag constraint gets the same treatment.
     fn submit_world_manipulation(
         &mut self,
         world_command: WorldCommand,
         operation: &str,
     ) -> Result<(), String> {
+        if self.edit_gesture.is_some_and(|gesture| gesture.deferred) {
+            self.pending_deferred_edit = Some(vec![world_command]);
+            return Ok(());
+        }
         self.submit(
             fieldcad_simulation::CommandPayload::CommitWorld(vec![world_command]),
             operation,
@@ -1623,9 +1676,42 @@ impl WindowState {
     /// can change: the gesture's boundaries have to be exact, because the pause
     /// must land before the first edit it brackets and the resume after the
     /// last.
-    fn synchronize_edit_gesture(&mut self, mode: SimulationMode) -> Result<(), String> {
-        let (mut next, commands) =
-            EditGesture::transition(self.edit_gesture, self.scene_is_being_edited(), mode);
+    ///
+    /// `queue_paused` decides, only at the moment a gesture *opens*, whether
+    /// it runs deferred (see [`EditGesture::deferred`]) — any gesture
+    /// [`Self::scene_is_being_edited`] reports while the mutation queue is
+    /// explicitly paused, whatever the simulation's own mode: a viewport
+    /// drag (object, box, sphere, plane, or probe) resubmits every
+    /// pointer-moved frame, and a held or typed inspector control resubmits
+    /// every frame it changes — either would flood a paused queue with
+    /// per-frame commits alike, so both defer alike. The gesture's one
+    /// deferred `CommitWorld` lands in `pending_mutations` and sits there
+    /// until the queue resumes (`SessionCore::should_queue_mutation` in
+    /// `fieldcad-simulation` holds a mutation for either reason — a
+    /// `Running` tick boundary or an explicitly paused queue — not just the
+    /// first), rather than the per-frame flood of *immediately applied*
+    /// commits a live edit would otherwise submit while paused: the actual
+    /// cost this exists to avoid, since a slow solver turns that flood into
+    /// an unbounded, uncancellable backlog of in-flight solves. Closing a
+    /// deferred gesture submits its one stashed
+    /// [`WindowState::pending_deferred_edit`] here, since
+    /// `EditGesture::transition` itself emits no commands for that case —
+    /// the viewport-drag call sites stash through `submit_world_manipulation`,
+    /// the inspector's through the `ui_frame.commands` loop in
+    /// [`WindowState::redraw`], and either can be what's waiting here.
+    fn synchronize_edit_gesture(
+        &mut self,
+        mode: SimulationMode,
+        queue_paused: bool,
+    ) -> Result<(), String> {
+        let deferred = queue_paused && self.scene_is_being_edited();
+        let was_deferred = self.edit_gesture.is_some_and(|gesture| gesture.deferred);
+        let (mut next, commands) = EditGesture::transition(
+            self.edit_gesture,
+            self.scene_is_being_edited(),
+            mode,
+            deferred,
+        );
         for payload in commands {
             // `AsyncLocalDataSource` never blocks: this always reports
             // `Submitted`, whatever the command's eventual outcome. A
@@ -1641,6 +1727,19 @@ impl WindowState {
             if is_pause && let Some(gesture) = &mut next {
                 gesture.pause_command = Some(receipt.command);
             }
+        }
+        if was_deferred
+            && next.is_none()
+            && let Some(world_commands) = self.pending_deferred_edit.take()
+        {
+            let receipt = self
+                .model()
+                .submit(CommandPayload::CommitWorld(world_commands.clone()))
+                .map_err(|error| format!("scene edit failed: {error}"))?;
+            self.deferred_edits.push(DeferredEdit {
+                command: receipt.command,
+                world_commands,
+            });
         }
         self.edit_gesture = next;
         Ok(())
@@ -1731,6 +1830,18 @@ struct EditGesture {
     /// `Play` on commit — the sim was never actually stopped, so there is
     /// nothing to resume.
     pause_command: Option<CommandId>,
+    /// This gesture — a viewport drag or a held/typed inspector control —
+    /// opened while the mutation queue was explicitly paused (BE-16),
+    /// whatever the simulation's own mode. The transport is never touched —
+    /// no `Pause`/`Play`, no `SetInteractiveEdit` — because nothing is
+    /// submitted per frame at all: the edit stays local, and the caller
+    /// submits exactly one `CommitWorld` on close (see
+    /// `synchronize_edit_gesture`), which the engine holds in
+    /// `pending_mutations` until the queue resumes, however many per-frame
+    /// commits a live edit would otherwise have submitted while paused.
+    /// Decided once, at open, from the queue's state at that instant — it
+    /// does not re-evaluate mid-gesture.
+    deferred: bool,
 }
 
 impl EditGesture {
@@ -1743,13 +1854,30 @@ impl EditGesture {
     /// given back exactly as it was found. `pause_command` is left unset here —
     /// the caller fills it in from the `Pause` submission's own receipt, since
     /// this function has no source to submit through.
+    ///
+    /// `deferred` short-circuits both arms to emit no commands at all: a
+    /// deferred gesture never touches the transport, so there is nothing to
+    /// bracket and nothing to hand back. The caller is responsible for
+    /// submitting the gesture's single deferred `CommitWorld` itself when it
+    /// detects the close (see `synchronize_edit_gesture`).
     fn transition(
         current: Option<Self>,
         editing: bool,
         mode: SimulationMode,
+        deferred: bool,
     ) -> (Option<Self>, Vec<CommandPayload>) {
         match (editing, current) {
             (true, None) => {
+                if deferred {
+                    return (
+                        Some(Self {
+                            resume: false,
+                            pause_command: None,
+                            deferred: true,
+                        }),
+                        Vec::new(),
+                    );
+                }
                 let resume = mode == SimulationMode::Running;
                 let mut commands = Vec::new();
                 if resume {
@@ -1760,11 +1888,15 @@ impl EditGesture {
                     Some(Self {
                         resume,
                         pause_command: None,
+                        deferred: false,
                     }),
                     commands,
                 )
             }
             (false, Some(gesture)) => {
+                if gesture.deferred {
+                    return (None, Vec::new());
+                }
                 let mut commands = vec![CommandPayload::SetInteractiveEdit(false)];
                 if gesture.resume {
                     commands.push(CommandPayload::Play);
@@ -1785,6 +1917,19 @@ impl EditGesture {
             self.pause_command = None;
         }
     }
+}
+
+/// A gesture's edit — a viewport drag's (object, box, sphere, plane, or
+/// probe) or a held/typed inspector control's — submitted while the
+/// mutation queue was paused, held in `pending_mutations` on the
+/// authoritative side until the queue resumes, whatever the simulation's
+/// own mode. Removed from [`WindowState::deferred_edits`] as soon as its
+/// `command`'s outcome arrives as a `CommandEvent` — see
+/// [`WindowState::redraw`].
+#[derive(Clone, Debug, PartialEq)]
+struct DeferredEdit {
+    command: CommandId,
+    world_commands: Vec<WorldCommand>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2172,7 +2317,8 @@ mod tests {
     /// recomputed.
     #[test]
     fn a_running_simulation_is_suspended_for_an_edit_and_resumed_when_it_commits() {
-        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Running);
+        let (opened, commands) =
+            EditGesture::transition(None, true, SimulationMode::Running, false);
 
         assert_eq!(
             commands,
@@ -2184,11 +2330,12 @@ mod tests {
 
         // Nothing further while the gesture is held, however many frames it
         // spans.
-        let (held, commands) = EditGesture::transition(opened, true, SimulationMode::Paused);
+        let (held, commands) = EditGesture::transition(opened, true, SimulationMode::Paused, false);
         assert_eq!(held, opened);
         assert!(commands.is_empty());
 
-        let (closed, commands) = EditGesture::transition(held, false, SimulationMode::Paused);
+        let (closed, commands) =
+            EditGesture::transition(held, false, SimulationMode::Paused, false);
         assert_eq!(closed, None);
         assert_eq!(
             commands,
@@ -2197,6 +2344,34 @@ mod tests {
                 CommandPayload::Play
             ]
         );
+    }
+
+    /// A plain-object drag opened while the mutation queue is paused (and
+    /// the simulation still `Running`) never touches the transport: no
+    /// `Pause`, no `SetInteractiveEdit` — the drag stays local until it
+    /// closes, and the caller submits its one deferred `CommitWorld` itself
+    /// (see `synchronize_edit_gesture`, not exercised by this pure-function
+    /// test).
+    #[test]
+    fn a_deferred_gesture_opens_and_closes_without_touching_the_transport() {
+        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Running, true);
+        assert!(commands.is_empty());
+        let opened = opened.expect("a deferred gesture still opens");
+        assert!(opened.deferred);
+        assert!(!opened.resume);
+        assert_eq!(opened.pause_command, None);
+
+        // Held across frames exactly as a live gesture would be — recomputing
+        // `deferred` mid-drag is deliberately not this function's job.
+        let (held, commands) =
+            EditGesture::transition(Some(opened), true, SimulationMode::Running, false);
+        assert_eq!(held, Some(opened));
+        assert!(commands.is_empty());
+
+        let (closed, commands) =
+            EditGesture::transition(held, false, SimulationMode::Running, false);
+        assert_eq!(closed, None);
+        assert!(commands.is_empty());
     }
 
     /// UI-2 regression: `Pause` can be rejected after a gesture has already
@@ -2208,7 +2383,8 @@ mod tests {
     /// it meant to bracket was never actually stopped.
     #[test]
     fn a_rejected_pause_does_not_resume_a_run_that_never_stopped() {
-        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Running);
+        let (opened, commands) =
+            EditGesture::transition(None, true, SimulationMode::Running, false);
         assert_eq!(
             commands,
             vec![
@@ -2224,13 +2400,15 @@ mod tests {
         assert!(!opened.resume);
 
         // Held across frames exactly as an accepted pause would be.
-        let (held, commands) = EditGesture::transition(Some(opened), true, SimulationMode::Running);
+        let (held, commands) =
+            EditGesture::transition(Some(opened), true, SimulationMode::Running, false);
         assert_eq!(held, Some(opened));
         assert!(commands.is_empty());
 
         // Closing it asks only to leave interactive-edit mode — never `Play`,
         // since the run underneath was never actually paused.
-        let (closed, commands) = EditGesture::transition(held, false, SimulationMode::Running);
+        let (closed, commands) =
+            EditGesture::transition(held, false, SimulationMode::Running, false);
         assert_eq!(closed, None);
         assert_eq!(commands, vec![CommandPayload::SetInteractiveEdit(false)]);
     }
@@ -2239,7 +2417,7 @@ mod tests {
     /// own, still-pending or already-accepted pause.
     #[test]
     fn pause_rejected_ignores_an_unrelated_command_id() {
-        let (opened, _) = EditGesture::transition(None, true, SimulationMode::Running);
+        let (opened, _) = EditGesture::transition(None, true, SimulationMode::Running, false);
         let mut opened = opened.unwrap();
         opened.pause_command = Some(CommandId::new(1));
 
@@ -2254,11 +2432,12 @@ mod tests {
     /// simulation.
     #[test]
     fn editing_an_already_paused_simulation_leaves_it_paused() {
-        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Paused);
+        let (opened, commands) = EditGesture::transition(None, true, SimulationMode::Paused, false);
 
         assert_eq!(commands, vec![CommandPayload::SetInteractiveEdit(true)]);
 
-        let (closed, commands) = EditGesture::transition(opened, false, SimulationMode::Paused);
+        let (closed, commands) =
+            EditGesture::transition(opened, false, SimulationMode::Paused, false);
 
         assert_eq!(closed, None);
         assert_eq!(commands, vec![CommandPayload::SetInteractiveEdit(false)]);
@@ -2266,7 +2445,8 @@ mod tests {
 
     #[test]
     fn no_edit_in_progress_asks_nothing_of_the_source() {
-        let (gesture, commands) = EditGesture::transition(None, false, SimulationMode::Running);
+        let (gesture, commands) =
+            EditGesture::transition(None, false, SimulationMode::Running, false);
 
         assert_eq!(gesture, None);
         assert!(commands.is_empty());

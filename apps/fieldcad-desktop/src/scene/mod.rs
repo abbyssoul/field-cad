@@ -17,7 +17,9 @@ mod gizmo;
 mod interpolation;
 mod pick;
 
-pub use authoring::{SceneVisibility, append_authoring_geometry, append_compute_bounds};
+pub use authoring::{
+    SceneVisibility, append_authoring_geometry, append_compute_bounds, append_pending_edit_ghosts,
+};
 pub use field::field_geometry;
 pub use gizmo::{
     GizmoDisplay, TransformHandle, TransformPreview, append_transform_gizmo_with_display,
@@ -374,6 +376,39 @@ fn push_line(lines: &mut Vec<ColoredVertex>, from: Vec3, to: Vec3, color: Vec4) 
             color,
         },
     ]);
+}
+
+/// A dash pattern is geometric, not a shader effect: the gaps are simply
+/// absent line segments, so this reuses the existing (opaque) `line_pipeline`
+/// rather than needing a transparency-aware one. Ghost preview links (see
+/// [`authoring::append_object_ghost`]) are the only current caller.
+fn push_dashed_line(
+    lines: &mut Vec<ColoredVertex>,
+    from: Vec3,
+    to: Vec3,
+    color: Vec4,
+    dash_length: f32,
+    gap_length: f32,
+) {
+    let span = to - from;
+    let total = span.length();
+    if total <= f32::EPSILON || dash_length <= 0.0 {
+        push_line(lines, from, to, color);
+        return;
+    }
+    let direction = span / total;
+    let period = dash_length + gap_length.max(0.0);
+    let mut travelled = 0.0;
+    while travelled < total {
+        let dash_end = (travelled + dash_length).min(total);
+        push_line(
+            lines,
+            from + direction * travelled,
+            from + direction * dash_end,
+            color,
+        );
+        travelled += period;
+    }
 }
 
 /// Two triangles from four corners given in winding order.
