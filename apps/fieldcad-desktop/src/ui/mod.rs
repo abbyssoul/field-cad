@@ -297,6 +297,40 @@ impl UiModel {
         self.world_selected = true;
     }
 
+    /// Whether any flow-line layer is both visible and animated — the one
+    /// condition under which the render loop needs to keep waking up on its
+    /// own, rather than only in response to user input or a running
+    /// simulation.
+    ///
+    /// Deliberately conservative: this does not cross-check `ViewOptions`
+    /// (a plane/box/sphere could be individually hidden from the View
+    /// window while its flow-line layer still reports visible) or per-entity
+    /// visibility in the world. Redrawing slightly more than strictly
+    /// necessary is the safe direction; redrawing less would mean an
+    /// animated line silently freezing.
+    pub fn has_visible_animated_flow_lines(&self) -> bool {
+        fn animated(display: crate::scene::FlowLineDisplay) -> bool {
+            display.visible && display.animated
+        }
+
+        self.field_layers.values().any(|layer| {
+            layer.visible
+                && (animated(layer.whole_domain.flow_lines)
+                    || layer
+                        .planes
+                        .values()
+                        .any(|settings| settings.visible && animated(settings.flow_lines))
+                    || layer
+                        .boxes
+                        .values()
+                        .any(|settings| settings.visible && animated(settings.flow_lines))
+                    || layer
+                        .spheres
+                        .values()
+                        .any(|settings| settings.visible && animated(settings.flow_lines)))
+        })
+    }
+
     /// The staged domain edit, kept only while the authoritative domain it
     /// was staged against is unchanged. A staged candidate is meaningful only
     /// relative to that base, so when the domain moves out of band — an MCP
@@ -650,6 +684,56 @@ fn vector_display_controls(
     });
 }
 
+/// Density, thickness, and animation controls for one region's flow lines —
+/// the continuous-line counterpart to [`vector_display_controls`]. An
+/// independent toggle: a region can draw arrows, flow lines, both, or
+/// neither.
+fn flow_line_display_controls(
+    ui: &mut egui::Ui,
+    display: &mut crate::scene::FlowLineDisplay,
+    label: &str,
+    hover: &str,
+) {
+    ui.checkbox(&mut display.visible, label)
+        .on_hover_text(hover);
+    ui.add_enabled_ui(display.visible, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Density");
+            ui.add(
+                egui::DragValue::new(&mut display.density)
+                    .speed(0.25)
+                    .range(0..=64),
+            )
+            .on_hover_text(
+                "Streamline seeds along the longest axis. Kept lower than arrow density by \
+                 default: tracing a line is far costlier than sampling a point, especially \
+                 through a volume.",
+            );
+
+            ui.label("Thickness");
+            ui.add(
+                egui::DragValue::new(&mut display.thickness_px)
+                    .speed(0.05)
+                    .range(0.5..=24.0)
+                    .suffix(" px"),
+            )
+            .on_hover_text("Ribbon width, in screen pixels, independent of zoom.");
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut display.animated, "Animated")
+                .on_hover_text("Scroll a moving pattern along the lines to show flow direction.");
+            ui.add_enabled(
+                display.animated,
+                egui::DragValue::new(&mut display.speed)
+                    .speed(0.02)
+                    .range(0.0..=10.0)
+                    .suffix(" /s"),
+            )
+            .on_hover_text("Animation speed.");
+        });
+    });
+}
+
 /// One foldable group, in the single style both side panels use.
 ///
 /// A scene grows without bound and an inspected subject can carry more than
@@ -814,7 +898,44 @@ mod tests {
     use glam::DVec3;
 
     use super::*;
-    use crate::scene::PlaneVectorMode;
+    use crate::scene::{FlowLineDisplay, PlaneVectorMode};
+
+    #[test]
+    fn has_visible_animated_flow_lines_requires_the_layer_the_region_and_animation_all_together() {
+        let mut model = UiModel::new();
+        assert!(!model.has_visible_animated_flow_lines());
+
+        let channel = vector_channel_id();
+        let mut layer = ChannelLayerSettings {
+            visible: true,
+            ..ChannelLayerSettings::default()
+        };
+        model.field_layers.insert(channel.clone(), layer.clone());
+        assert!(
+            !model.has_visible_animated_flow_lines(),
+            "a visible channel with flow lines off everywhere is not animated"
+        );
+
+        layer.whole_domain.flow_lines = FlowLineDisplay {
+            animated: true,
+            ..FlowLineDisplay::new(true, 4)
+        };
+        model.field_layers.insert(channel.clone(), layer.clone());
+        assert!(model.has_visible_animated_flow_lines());
+
+        // Turning the flow lines invisible again, even though `animated`
+        // stays set, must turn this back off.
+        layer.whole_domain.flow_lines.visible = false;
+        model.field_layers.insert(channel.clone(), layer.clone());
+        assert!(!model.has_visible_animated_flow_lines());
+
+        // The channel's own visibility gates everything under it, the same
+        // way it gates rendering.
+        layer.whole_domain.flow_lines.visible = true;
+        layer.visible = false;
+        model.field_layers.insert(channel, layer);
+        assert!(!model.has_visible_animated_flow_lines());
+    }
 
     pub(super) fn seeded_world() -> World {
         let mut world = World::new();

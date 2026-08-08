@@ -13,7 +13,9 @@ use super::{coordinate_editor, name_editor};
 use crate::ui::compute::ComputeView;
 use crate::ui::{ChannelLayerSettings, UiFrameOutput};
 
-use crate::scene::{BoxLayerSettings, PlaneVectorMode, SphereLayerSettings, VectorDisplay};
+use crate::scene::{
+    BoxLayerSettings, FlowLineDisplay, PlaneVectorMode, SphereLayerSettings, VectorDisplay,
+};
 
 pub(super) fn plane_properties(
     ui: &mut egui::Ui,
@@ -144,6 +146,7 @@ fn hidden_everywhere_warning(ui: &mut egui::Ui) {
 trait VectorLayerSettings {
     fn visible_mut(&mut self) -> &mut bool;
     fn vectors_mut(&mut self) -> &mut VectorDisplay;
+    fn flow_lines_mut(&mut self) -> &mut FlowLineDisplay;
 }
 
 impl VectorLayerSettings for BoxLayerSettings {
@@ -152,6 +155,9 @@ impl VectorLayerSettings for BoxLayerSettings {
     }
     fn vectors_mut(&mut self) -> &mut VectorDisplay {
         &mut self.vectors
+    }
+    fn flow_lines_mut(&mut self) -> &mut FlowLineDisplay {
+        &mut self.flow_lines
     }
 }
 
@@ -162,12 +168,16 @@ impl VectorLayerSettings for SphereLayerSettings {
     fn vectors_mut(&mut self) -> &mut VectorDisplay {
         &mut self.vectors
     }
+    fn flow_lines_mut(&mut self) -> &mut FlowLineDisplay {
+        &mut self.flow_lines
+    }
 }
 
 struct VolumeFieldLayerText<'a> {
     checkbox_label: &'a str,
     checkbox_hover: &'a str,
     arrow_hover: &'a str,
+    flow_line_hover: &'a str,
 }
 
 fn volume_field_layers<Id: Ord + Copy, S: VectorLayerSettings + Default>(
@@ -195,6 +205,12 @@ fn volume_field_layers<Id: Ord + Copy, S: VectorLayerSettings + Default>(
                     settings.vectors_mut(),
                     "Vector arrows",
                     text.arrow_hover,
+                );
+                super::flow_line_display_controls(
+                    ui,
+                    settings.flow_lines_mut(),
+                    "Flow lines",
+                    text.flow_line_hover,
                 );
             });
         });
@@ -235,6 +251,16 @@ pub(super) fn plane_field_layers(
                     &mut settings.vectors,
                     "Vector arrows",
                     "Draw the field as arrows on this plane",
+                );
+                // Always the in-plane projection, regardless of `vector_mode`
+                // below: a 2D streamline cannot depict an out-of-plane
+                // component either (see `scene::flow_lines`).
+                super::flow_line_display_controls(
+                    ui,
+                    &mut settings.flow_lines,
+                    "Flow lines",
+                    "Draw the field as continuous flow lines on this plane, independent of \
+                     the arrows above",
                 );
                 ui.horizontal(|ui| {
                     ui.label("Vector component");
@@ -359,6 +385,8 @@ fn box_field_layers(
             checkbox_hover: "Whether this box draws this field. Other boxes, spheres, and \
                               planes are unaffected.",
             arrow_hover: "Draw the field as arrows inside this box",
+            flow_line_hover: "Draw the field as continuous flow lines inside this box, \
+                               independent of the arrows above",
         },
     );
 }
@@ -458,6 +486,8 @@ fn sphere_field_layers(
             checkbox_hover: "Whether this sphere draws this field. Other spheres, boxes, and \
                               planes are unaffected.",
             arrow_hover: "Draw the field as arrows inside this sphere",
+            flow_line_hover: "Draw the field as continuous flow lines inside this sphere, \
+                               independent of the arrows above",
         },
     );
 }

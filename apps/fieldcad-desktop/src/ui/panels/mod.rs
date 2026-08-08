@@ -26,7 +26,9 @@ pub use scene_tree::scene_tree;
 
 // ── Re-exports for sibling sub-modules ─────────────────────────────────────
 // Used via `super::section(...)` etc. in function-body path expressions.
-pub(super) use super::{CameraAction, section, split_add_button, vector_display_controls};
+pub(super) use super::{
+    CameraAction, flow_line_display_controls, section, split_add_button, vector_display_controls,
+};
 
 // ── Helpers used by tests ──────────────────────────────────────────────────
 // Each sub-module has its own private copy; these are here so that
@@ -404,6 +406,75 @@ mod tests {
         assert!(
             layer.visible,
             "and must leave the layer itself visible everywhere else"
+        );
+    }
+
+    /// Flow lines are offered as an independent control alongside arrows, not
+    /// a replacement for them — see `scene::FlowLineDisplay`.
+    #[test]
+    fn the_plane_inspector_offers_flow_line_controls_alongside_arrows() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreatePlane(
+                fieldcad_core::SlicePlaneSpec::new("XY field", DVec3::ZERO, DVec3::Z).unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let plane = snapshot.planes().values().next().unwrap();
+        let mut compute = ComputeView::build(&source(), &snapshot, None);
+        let channel = vector_channel_id();
+        compute.vector_channels = vec![channel.clone()];
+
+        let context = egui::Context::default();
+        context.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut layers: std::collections::BTreeMap<ChannelId, ChannelLayerSettings> =
+            std::collections::BTreeMap::new();
+        layers.insert(channel.clone(), ChannelLayerSettings::default());
+        layers.get_mut(&channel).unwrap().visible = true;
+
+        let run = |layers: &mut std::collections::BTreeMap<ChannelId, ChannelLayerSettings>,
+                   events: Vec<egui::Event>| {
+            let mut rect = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let full_output = context.run_ui(input, |ui| {
+                plane_field_layers(ui, plane, layers, &compute);
+                rect = ui.min_rect();
+            });
+            (rect, full_output)
+        };
+
+        let (rect, _) = run(&mut layers, Vec::new());
+        let header = rect.left_top() + egui::vec2(6.0, 8.0);
+        for pressed in [true, false] {
+            run(
+                &mut layers,
+                vec![
+                    egui::Event::PointerMoved(header),
+                    egui::Event::PointerButton {
+                        pos: header,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let (_, full_output) = run(&mut layers, Vec::new());
+        let mut text = String::new();
+        for clipped in &full_output.shapes {
+            painted_text(&clipped.shape, &mut text);
+        }
+
+        assert!(
+            text.contains("Vector arrows") && text.contains("Flow lines"),
+            "the plane inspector should offer both display styles: {text}"
         );
     }
 

@@ -7,7 +7,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{
     camera::{OrbitCamera, Viewport},
-    scene::{ColoredVertex, FieldGeometry, ObjectInstance, ObjectMesh},
+    scene::{ColoredVertex, FieldGeometry, FlowRibbonVertex, ObjectInstance, ObjectMesh},
 };
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -63,6 +63,10 @@ pub(crate) struct SceneFrame<'a> {
     pub axes_visible: bool,
     pub instances: &'a [ObjectInstance],
     pub field: &'a FieldGeometry,
+    /// Wall-clock seconds since the window was created, independent of
+    /// simulation time. Drives the animated flow-line shader; meaningless to
+    /// everything else this renderer draws.
+    pub time_seconds: f32,
 }
 
 /// Field order here is drop order, and it is load-bearing.
@@ -253,6 +257,8 @@ impl ViewportRenderer {
             frame.viewport.aspect_ratio(),
             frame.instances,
             frame.field,
+            frame.time_seconds,
+            [frame.viewport.width as f32, frame.viewport.height as f32],
         );
 
         let mut encoder = self
@@ -518,12 +524,71 @@ struct CameraUniform {
     view_projection: [[f32; 4]; 4],
 }
 
+/// One vertex of a flow-line ribbon quad, expanded to a constant screen-pixel
+/// width in the vertex shader from `neighbor`/`side` rather than carrying a
+/// pre-widened world-space shape — see `vs_flow_line` in `scene.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FlowLineVertex {
+    position: [f32; 3],
+    neighbor: [f32; 3],
+    side: f32,
+    arclength: f32,
+    thickness_px: f32,
+    speed: f32,
+    color: [f32; 4],
+}
+
+impl From<FlowRibbonVertex> for FlowLineVertex {
+    fn from(vertex: FlowRibbonVertex) -> Self {
+        Self {
+            position: vertex.position.to_array(),
+            neighbor: vertex.neighbor.to_array(),
+            side: vertex.side,
+            arclength: vertex.arclength,
+            thickness_px: vertex.thickness_px,
+            speed: vertex.speed,
+            color: vertex.color.to_array(),
+        }
+    }
+}
+
+impl FlowLineVertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
+        0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32, 4 => Float32, 5 => Float32,
+        6 => Float32x4
+    ];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+/// Per-frame state the flow-line shader needs beyond the shared camera:
+/// `time_seconds` drives the animated scroll, `viewport_size` (physical
+/// pixels) lets the vertex shader convert `thickness_px` into a clip-space
+/// offset that reads as a constant width regardless of viewport aspect.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FlowLineUniform {
+    time_seconds: f32,
+    _padding: f32,
+    viewport_size: [f32; 2],
+}
+
 pub(crate) struct SceneRenderer {
     line_pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
     field_surface_pipeline: wgpu::RenderPipeline,
+    flow_line_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    flow_line_uniform_buffer: wgpu::Buffer,
+    flow_line_bind_group: wgpu::BindGroup,
     grid_buffer: wgpu::Buffer,
     grid_vertex_count: u32,
     axes_buffer: wgpu::Buffer,
@@ -540,6 +605,7 @@ pub(crate) struct SceneRenderer {
     sphere_instance_count: u32,
     field_surface: DynamicVertexBuffer,
     field_lines: DynamicVertexBuffer,
+    flow_lines: DynamicFlowLineBuffer,
 }
 
 impl SceneRenderer {
@@ -582,12 +648,54 @@ impl SceneRenderer {
             source: wgpu::ShaderSource::Wgsl(SCENE_SHADER.into()),
         });
 
+        let flow_line_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Flow line uniform layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let flow_line_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Flow line uniform"),
+                contents: bytemuck::bytes_of(&FlowLineUniform {
+                    time_seconds: 0.0,
+                    _padding: 0.0,
+                    viewport_size: [1.0, 1.0],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let flow_line_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Flow line bind group"),
+            layout: &flow_line_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: flow_line_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        // Its own layout, not the shared `pipeline_layout`: this pipeline
+        // needs the extra flow-line uniform at group 1, which the other
+        // pipelines have no use for.
+        let flow_line_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Flow line pipeline layout"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&flow_line_layout)],
+                immediate_size: 0,
+            });
+
         let line_pipeline = create_pipeline(
             device,
             &pipeline_layout,
             &shader,
             color_format,
             "vs_world",
+            "fs_main",
             &[Vertex::layout()],
             wgpu::PrimitiveTopology::LineList,
             None,
@@ -599,6 +707,7 @@ impl SceneRenderer {
             &shader,
             color_format,
             "vs_instanced",
+            "fs_main",
             &[Vertex::layout(), InstanceRaw::layout()],
             wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::Face::Back),
@@ -610,8 +719,24 @@ impl SceneRenderer {
             &shader,
             color_format,
             "vs_world",
+            "fs_main",
             &[Vertex::layout()],
             wgpu::PrimitiveTopology::TriangleList,
+            None,
+            true,
+        );
+        let flow_line_pipeline = create_pipeline(
+            device,
+            &flow_line_pipeline_layout,
+            &shader,
+            color_format,
+            "vs_flow_line",
+            "fs_flow_line",
+            &[FlowLineVertex::layout()],
+            wgpu::PrimitiveTopology::TriangleList,
+            // Visible from both sides: a ribbon's winding depends on which
+            // way its streamline happened to be traced, not on a notion of
+            // "outside" the way a solid mesh has one.
             None,
             true,
         );
@@ -664,8 +789,11 @@ impl SceneRenderer {
             line_pipeline,
             mesh_pipeline,
             field_surface_pipeline,
+            flow_line_pipeline,
             camera_buffer,
             camera_bind_group,
+            flow_line_uniform_buffer,
+            flow_line_bind_group,
             grid_buffer,
             grid_vertex_count: grid_vertices.len() as u32,
             axes_buffer,
@@ -682,9 +810,11 @@ impl SceneRenderer {
             sphere_instance_count: 0,
             field_surface: DynamicVertexBuffer::new(device, "Field magnitude surface"),
             field_lines: DynamicVertexBuffer::new(device, "Field vector glyphs"),
+            flow_lines: DynamicFlowLineBuffer::new(device, "Flow line ribbons"),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update(
         &mut self,
         device: &wgpu::Device,
@@ -693,12 +823,23 @@ impl SceneRenderer {
         aspect_ratio: f32,
         instances: &[ObjectInstance],
         field: &FieldGeometry,
+        time_seconds: f32,
+        viewport_size: [f32; 2],
     ) {
         queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::bytes_of(&CameraUniform {
                 view_projection: camera.view_projection(aspect_ratio).to_cols_array_2d(),
+            }),
+        );
+        queue.write_buffer(
+            &self.flow_line_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&FlowLineUniform {
+                time_seconds,
+                _padding: 0.0,
+                viewport_size: [viewport_size[0].max(1.0), viewport_size[1].max(1.0)],
             }),
         );
 
@@ -734,6 +875,7 @@ impl SceneRenderer {
         self.field_surface
             .update(device, queue, &field.surface_triangles);
         self.field_lines.update(device, queue, &field.vector_lines);
+        self.flow_lines.update(device, queue, &field.flow_ribbons);
     }
 
     pub(crate) fn draw<'pass>(
@@ -748,6 +890,13 @@ impl SceneRenderer {
             render_pass.set_pipeline(&self.field_surface_pipeline);
             render_pass.set_vertex_buffer(0, self.field_surface.buffer.slice(..));
             render_pass.draw(0..self.field_surface.count, 0..1);
+        }
+
+        if self.flow_lines.count > 0 {
+            render_pass.set_pipeline(&self.flow_line_pipeline);
+            render_pass.set_bind_group(1, &self.flow_line_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.flow_lines.buffer.slice(..));
+            render_pass.draw(0..self.flow_lines.count, 0..1);
         }
 
         render_pass.set_pipeline(&self.line_pipeline);
@@ -790,6 +939,73 @@ impl SceneRenderer {
     }
 }
 
+/// How many `element_size`-sized elements one buffer on this device can hold
+/// at most. `capacity` must never be grown past this — including by rounding
+/// up to a power of two — or the very next allocation panics regardless of
+/// how carefully the vertex *count* was clamped.
+fn max_buffer_elements(device: &wgpu::Device, element_size: usize) -> usize {
+    max_buffer_elements_for(device.limits().max_buffer_size, element_size)
+}
+
+/// The pure arithmetic behind [`max_buffer_elements`], taking the limit as a
+/// value so it can be checked against known numbers without a GPU device.
+fn max_buffer_elements_for(max_buffer_size: u64, element_size: usize) -> usize {
+    (max_buffer_size / element_size as u64) as usize
+}
+
+/// Clamp `requested` vertices to what one `wgpu` buffer can actually hold on
+/// this device, so an unusually large glyph or streamline count degrades to a
+/// partial draw instead of a `Device::create_buffer` validation panic that
+/// takes the whole app down with it (`max_buffer_size` is commonly 256 MiB,
+/// and a dense flow-line trace over a large volume can exceed that without
+/// any single input being individually unreasonable).
+///
+/// Rounded down to a whole number of `group`-sized primitives — a triangle, a
+/// line, a ribbon quad — so truncation never leaves a partial, visibly
+/// malformed shape at the cut point.
+fn clamp_vertex_count(
+    device: &wgpu::Device,
+    requested: usize,
+    element_size: usize,
+    group: usize,
+    label: &str,
+) -> usize {
+    clamp_vertex_count_for(
+        device.limits().max_buffer_size,
+        requested,
+        element_size,
+        group,
+        label,
+    )
+}
+
+/// The pure arithmetic behind [`clamp_vertex_count`], taking the limit as a
+/// value so it can be checked against known numbers without a GPU device —
+/// in particular, against the exact 256 MiB / 56-byte-vertex numbers that
+/// crashed the app once already.
+fn clamp_vertex_count_for(
+    max_buffer_size: u64,
+    requested: usize,
+    element_size: usize,
+    group: usize,
+    label: &str,
+) -> usize {
+    let max_elements = max_buffer_elements_for(max_buffer_size, element_size);
+    let max_whole_groups = (max_elements / group) * group;
+    if requested > max_whole_groups {
+        tracing::warn!(
+            label,
+            requested,
+            limit = max_whole_groups,
+            "too much geometry for one GPU buffer this frame; drawing a truncated subset \
+             instead of crashing — lower the density/thickness settings driving this",
+        );
+        max_whole_groups
+    } else {
+        requested
+    }
+}
+
 struct DynamicVertexBuffer {
     label: &'static str,
     buffer: wgpu::Buffer,
@@ -814,12 +1030,28 @@ impl DynamicVertexBuffer {
     }
 
     fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[ColoredVertex]) {
+        // 6 is safe for either primitive type this buffer is drawn as
+        // (`LineList` needs a multiple of 2, `TriangleList` a multiple of 3).
+        let allowed = clamp_vertex_count(
+            device,
+            vertices.len(),
+            std::mem::size_of::<Vertex>(),
+            6,
+            self.label,
+        );
+        let vertices = &vertices[..allowed];
         self.count = vertices.len() as u32;
         if vertices.is_empty() {
             return;
         }
         if vertices.len() > self.capacity {
-            self.capacity = vertices.len().next_power_of_two();
+            // Never past the device limit — `next_power_of_two` alone can
+            // round straight back over it even though `vertices.len()` was
+            // already clamped under it.
+            self.capacity = vertices
+                .len()
+                .next_power_of_two()
+                .min(max_buffer_elements(device, std::mem::size_of::<Vertex>()));
             self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(self.label),
                 size: (self.capacity * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
@@ -832,6 +1064,71 @@ impl DynamicVertexBuffer {
     }
 }
 
+/// [`DynamicVertexBuffer`]'s counterpart for [`FlowLineVertex`]. A distinct,
+/// small type rather than a generic one: the two vertex formats are unlikely
+/// to grow more siblings, and a generic buffer would need a trait bound for
+/// the `From` conversion this already gets for free from being concrete.
+struct DynamicFlowLineBuffer {
+    label: &'static str,
+    buffer: wgpu::Buffer,
+    capacity: usize,
+    count: u32,
+}
+
+impl DynamicFlowLineBuffer {
+    fn new(device: &wgpu::Device, label: &'static str) -> Self {
+        let capacity = 1;
+        Self {
+            label,
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<FlowLineVertex>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity,
+            count: 0,
+        }
+    }
+
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[FlowRibbonVertex],
+    ) {
+        // 6 vertices per ribbon quad — see `build_flow_ribbon`.
+        let allowed = clamp_vertex_count(
+            device,
+            vertices.len(),
+            std::mem::size_of::<FlowLineVertex>(),
+            6,
+            self.label,
+        );
+        let vertices = &vertices[..allowed];
+        self.count = vertices.len() as u32;
+        if vertices.is_empty() {
+            return;
+        }
+        if vertices.len() > self.capacity {
+            // See the equivalent comment in `DynamicVertexBuffer::update`.
+            self.capacity = vertices.len().next_power_of_two().min(max_buffer_elements(
+                device,
+                std::mem::size_of::<FlowLineVertex>(),
+            ));
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: (self.capacity * std::mem::size_of::<FlowLineVertex>())
+                    as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        let raw: Vec<FlowLineVertex> = vertices.iter().copied().map(FlowLineVertex::from).collect();
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&raw));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_pipeline(
     device: &wgpu::Device,
@@ -839,6 +1136,7 @@ fn create_pipeline(
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
     vertex_entry: &str,
+    fragment_entry: &str,
     buffers: &[wgpu::VertexBufferLayout<'_>],
     topology: wgpu::PrimitiveTopology,
     cull_mode: Option<wgpu::Face>,
@@ -869,7 +1167,7 @@ fn create_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry),
             targets: &[Some(wgpu::ColorTargetState {
                 format: color_format,
                 blend: Some(if transparent {
@@ -1022,6 +1320,72 @@ mod tests {
 
     use super::*;
 
+    /// Regression: resizing a field box while its flow lines were enabled
+    /// once asked for a 469,762,048-byte "Flow line ribbons" buffer against a
+    /// 268,435,456-byte (256 MiB) device limit — a real `Device::create_buffer`
+    /// validation panic that crashed the whole app, not merely a slow frame.
+    /// 469,762,048 was `8_388_608.next_power_of_two()` vertices at 56 bytes
+    /// each: the *count* was never even clamped, so the exact numbers from
+    /// that crash are reproduced here.
+    #[test]
+    fn clamp_vertex_count_never_exceeds_a_256_mib_device_limit() {
+        const MAX_BUFFER_SIZE: u64 = 268_435_456;
+        const FLOW_LINE_VERTEX_SIZE: usize = 56;
+
+        let allowed = clamp_vertex_count_for(
+            MAX_BUFFER_SIZE,
+            8_388_608,
+            FLOW_LINE_VERTEX_SIZE,
+            6,
+            "Flow line ribbons",
+        );
+
+        assert!(
+            (allowed as u64) * (FLOW_LINE_VERTEX_SIZE as u64) <= MAX_BUFFER_SIZE,
+            "clamped count must fit the device's actual buffer-size limit: {allowed} vertices"
+        );
+        assert!(
+            allowed.is_multiple_of(6),
+            "must stay a whole number of ribbon quads"
+        );
+        assert!(
+            allowed < 8_388_608,
+            "the crashing request must actually be reduced"
+        );
+    }
+
+    /// The same overshoot can happen one step later, purely from
+    /// `next_power_of_two()` rounding a capacity back over the limit even
+    /// after the vertex count itself was clamped under it — this is the
+    /// off-by-one the first fix attempt missed.
+    #[test]
+    fn max_buffer_elements_rules_out_a_capacity_that_next_power_of_two_would_overshoot() {
+        const MAX_BUFFER_SIZE: u64 = 268_435_456;
+        const FLOW_LINE_VERTEX_SIZE: usize = 56;
+
+        let allowed = clamp_vertex_count_for(
+            MAX_BUFFER_SIZE,
+            8_388_608,
+            FLOW_LINE_VERTEX_SIZE,
+            6,
+            "Flow line ribbons",
+        );
+        let naive_capacity = allowed.next_power_of_two();
+        let safe_capacity = naive_capacity.min(max_buffer_elements_for(
+            MAX_BUFFER_SIZE,
+            FLOW_LINE_VERTEX_SIZE,
+        ));
+
+        assert!(
+            naive_capacity as u64 * FLOW_LINE_VERTEX_SIZE as u64 > MAX_BUFFER_SIZE,
+            "test setup: the naive rounding must actually overshoot for this case"
+        );
+        assert!(
+            safe_capacity as u64 * FLOW_LINE_VERTEX_SIZE as u64 <= MAX_BUFFER_SIZE,
+            "the capacity actually allocated must never overshoot the device limit"
+        );
+    }
+
     /// Compiles the shader on the CPU, so a broken WGSL edit fails the test run
     /// rather than the first frame on someone's machine. Requires no GPU.
     #[test]
@@ -1045,6 +1409,17 @@ mod tests {
         assert!(entry_points.contains(&"vs_world"));
         assert!(entry_points.contains(&"vs_instanced"));
         assert!(entry_points.contains(&"fs_main"));
+        assert!(entry_points.contains(&"vs_flow_line"));
+        assert!(entry_points.contains(&"fs_flow_line"));
+    }
+
+    #[test]
+    fn flow_line_vertex_attributes_are_all_distinct_locations() {
+        let locations: Vec<_> = FlowLineVertex::ATTRIBUTES
+            .iter()
+            .map(|attribute| attribute.shader_location)
+            .collect();
+        assert_eq!(locations, vec![0, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

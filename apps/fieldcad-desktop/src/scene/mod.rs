@@ -12,7 +12,9 @@
 
 mod authoring;
 mod field;
+mod flow_lines;
 mod gizmo;
+mod interpolation;
 mod pick;
 
 pub use authoring::{SceneVisibility, append_authoring_geometry, append_compute_bounds};
@@ -150,10 +152,49 @@ impl Default for VectorDisplay {
     }
 }
 
+/// How one vector field's flow lines are drawn over one region.
+///
+/// Independent of [`VectorDisplay`]: a region can show arrows, flow lines,
+/// both, or neither. Unlike arrows, flow lines are off by default everywhere
+/// — tracing is far costlier than sampling a point (a streamline is many RK4
+/// evaluations, run synchronously on the render thread), so a new, heavier
+/// display mode should not turn itself on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlowLineDisplay {
+    pub visible: bool,
+    /// Target streamline seeds along the longest axis of the region.
+    pub density: u32,
+    /// Ribbon width, in screen pixels.
+    pub thickness_px: f32,
+    pub animated: bool,
+    /// Scroll rate along the ribbon, in ribbon-lengths per second. Only
+    /// meaningful while `animated` is set.
+    pub speed: f32,
+}
+
+impl FlowLineDisplay {
+    pub const fn new(visible: bool, density: u32) -> Self {
+        Self {
+            visible,
+            density,
+            thickness_px: 1.5,
+            animated: false,
+            speed: 1.0,
+        }
+    }
+}
+
+impl Default for FlowLineDisplay {
+    fn default() -> Self {
+        Self::new(false, 12)
+    }
+}
+
 /// Whole-domain presentation for one channel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FieldLayerSettings {
     pub vectors: VectorDisplay,
+    pub flow_lines: FlowLineDisplay,
 }
 
 impl Default for FieldLayerSettings {
@@ -163,6 +204,10 @@ impl Default for FieldLayerSettings {
             // through a volume occlude each other and the scene behind them, so
             // this is opt-in and starts at a density a user can see through.
             vectors: VectorDisplay::new(false, 6),
+            // Sparser still: a traced line through a volume is far noisier than
+            // a point glyph at the same density (see the reference image this
+            // feature was modeled on, which is inherently a 2D field).
+            flow_lines: FlowLineDisplay::new(false, 4),
         }
     }
 }
@@ -192,6 +237,10 @@ pub struct PlaneLayerSettings {
     /// depict depth it has no room for, so vectors project into the plane
     /// unless asked otherwise.
     pub vector_mode: PlaneVectorMode,
+    /// A plane's flow lines always trace the in-plane projection of the
+    /// field, regardless of `vector_mode` — a 2D streamline cannot depict an
+    /// out-of-plane component either.
+    pub flow_lines: FlowLineDisplay,
 }
 
 impl Default for PlaneLayerSettings {
@@ -202,6 +251,7 @@ impl Default for PlaneLayerSettings {
             magnitude_density: 33,
             vectors: VectorDisplay::default(),
             vector_mode: PlaneVectorMode::InPlane,
+            flow_lines: FlowLineDisplay::default(),
         }
     }
 }
@@ -215,6 +265,7 @@ impl Default for PlaneLayerSettings {
 pub struct BoxLayerSettings {
     pub visible: bool,
     pub vectors: VectorDisplay,
+    pub flow_lines: FlowLineDisplay,
 }
 
 impl Default for BoxLayerSettings {
@@ -222,6 +273,7 @@ impl Default for BoxLayerSettings {
         Self {
             visible: true,
             vectors: VectorDisplay::default(),
+            flow_lines: FlowLineDisplay::default(),
         }
     }
 }
@@ -231,6 +283,7 @@ impl Default for BoxLayerSettings {
 pub struct SphereLayerSettings {
     pub visible: bool,
     pub vectors: VectorDisplay,
+    pub flow_lines: FlowLineDisplay,
 }
 
 impl Default for SphereLayerSettings {
@@ -238,14 +291,38 @@ impl Default for SphereLayerSettings {
         Self {
             visible: true,
             vectors: VectorDisplay::default(),
+            flow_lines: FlowLineDisplay::default(),
         }
     }
+}
+
+/// One vertex of a flow-line ribbon.
+///
+/// A ribbon segment is a screen-space quad expanded in the vertex shader, not
+/// a fixed-width world-space strip: `neighbor` (the segment's other endpoint)
+/// and `side` (which edge, -1 or +1) are what the shader needs to build that
+/// quad facing the camera, and `arclength` (cumulative world-space distance
+/// from the streamline's seed) is what drives the animated scroll.
+/// `thickness_px`/`speed` are baked in per-vertex from the layer's
+/// [`FlowLineDisplay`] rather than carried in a uniform, so streamlines from
+/// differently configured layers can share one buffer, pipeline, and draw
+/// call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlowRibbonVertex {
+    pub position: Vec3,
+    pub neighbor: Vec3,
+    pub side: f32,
+    pub arclength: f32,
+    pub thickness_px: f32,
+    pub speed: f32,
+    pub color: Vec4,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FieldGeometry {
     pub surface_triangles: Vec<ColoredVertex>,
     pub vector_lines: Vec<ColoredVertex>,
+    pub flow_ribbons: Vec<FlowRibbonVertex>,
 }
 
 /// One channel's per-region layer settings, borrowed from its owner (the

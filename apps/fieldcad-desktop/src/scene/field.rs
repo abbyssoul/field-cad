@@ -10,6 +10,14 @@ use fieldcad_core::{
 };
 use glam::{DVec3, Vec3};
 
+use super::flow_lines::{
+    trace_box_streamlines, trace_domain_streamlines, trace_plane_streamlines,
+    trace_sphere_streamlines,
+};
+use super::interpolation::{
+    MagnitudeScale, box_interpolation, grid_interpolation, lattice_normal, plane_interpolation,
+    uniform_axis, uniform_box_spacing, uniform_domain_spacing, uniform_glyph_spacing,
+};
 use super::{
     ColoredVertex, FieldGeometry, FieldLayerSettings, PlaneVectorMode, RegionLayers,
     SceneVisibility, VectorDisplay, append_arrow,
@@ -99,20 +107,47 @@ pub fn field_geometry(
                         scene_scale,
                     );
                 }
+                if plane_settings.flow_lines.visible {
+                    // Traces the same in-plane-projected values the arrows
+                    // above draw: a 2D streamline cannot depict an
+                    // out-of-plane component either.
+                    output.flow_ribbons.extend(trace_plane_streamlines(
+                        *lattice,
+                        &displayed_values,
+                        batch.validity(),
+                        scale,
+                        plane_settings.flow_lines,
+                        scene_scale,
+                    ));
+                }
             }
-            SampleGeometry::Grid(lattice) if settings.vectors.visible => {
+            SampleGeometry::Grid(lattice)
+                if settings.vectors.visible || settings.flow_lines.visible =>
+            {
                 let scale = MagnitudeScale::over(values, batch.validity());
-                let colors = scale.colors(values, batch.validity());
-                append_domain_vectors(
-                    &mut output.vector_lines,
-                    *lattice,
-                    values,
-                    batch.validity(),
-                    &colors,
-                    scale,
-                    settings.vectors,
-                    scene_scale,
-                );
+                if settings.vectors.visible {
+                    let colors = scale.colors(values, batch.validity());
+                    append_domain_vectors(
+                        &mut output.vector_lines,
+                        *lattice,
+                        values,
+                        batch.validity(),
+                        &colors,
+                        scale,
+                        settings.vectors,
+                        scene_scale,
+                    );
+                }
+                if settings.flow_lines.visible {
+                    output.flow_ribbons.extend(trace_domain_streamlines(
+                        *lattice,
+                        values,
+                        batch.validity(),
+                        scale,
+                        settings.flow_lines,
+                        scene_scale,
+                    ));
+                }
             }
             SampleGeometry::Box { region, lattice } => {
                 if !show.boxes {
@@ -126,21 +161,35 @@ pub fn field_geometry(
                     continue;
                 }
                 let box_settings = layers.boxes.get(region).copied().unwrap_or_default();
-                if !box_settings.visible || !box_settings.vectors.visible {
+                if !box_settings.visible
+                    || (!box_settings.vectors.visible && !box_settings.flow_lines.visible)
+                {
                     continue;
                 }
                 let scale = MagnitudeScale::over(values, batch.validity());
-                let colors = scale.colors(values, batch.validity());
-                append_box_vectors(
-                    &mut output.vector_lines,
-                    *lattice,
-                    values,
-                    batch.validity(),
-                    &colors,
-                    scale,
-                    box_settings.vectors,
-                    scene_scale,
-                );
+                if box_settings.vectors.visible {
+                    let colors = scale.colors(values, batch.validity());
+                    append_box_vectors(
+                        &mut output.vector_lines,
+                        *lattice,
+                        values,
+                        batch.validity(),
+                        &colors,
+                        scale,
+                        box_settings.vectors,
+                        scene_scale,
+                    );
+                }
+                if box_settings.flow_lines.visible {
+                    output.flow_ribbons.extend(trace_box_streamlines(
+                        *lattice,
+                        values,
+                        batch.validity(),
+                        scale,
+                        box_settings.flow_lines,
+                        scene_scale,
+                    ));
+                }
             }
             SampleGeometry::Sphere { region, lattice } => {
                 if !show.spheres {
@@ -154,21 +203,35 @@ pub fn field_geometry(
                     continue;
                 }
                 let sphere_settings = layers.spheres.get(region).copied().unwrap_or_default();
-                if !sphere_settings.visible || !sphere_settings.vectors.visible {
+                if !sphere_settings.visible
+                    || (!sphere_settings.vectors.visible && !sphere_settings.flow_lines.visible)
+                {
                     continue;
                 }
                 let scale = MagnitudeScale::over(values, batch.validity());
-                let colors = scale.colors(values, batch.validity());
-                append_sphere_vectors(
-                    &mut output.vector_lines,
-                    *lattice,
-                    values,
-                    batch.validity(),
-                    &colors,
-                    scale,
-                    sphere_settings.vectors,
-                    scene_scale,
-                );
+                if sphere_settings.vectors.visible {
+                    let colors = scale.colors(values, batch.validity());
+                    append_sphere_vectors(
+                        &mut output.vector_lines,
+                        *lattice,
+                        values,
+                        batch.validity(),
+                        &colors,
+                        scale,
+                        sphere_settings.vectors,
+                        scene_scale,
+                    );
+                }
+                if sphere_settings.flow_lines.visible {
+                    output.flow_ribbons.extend(trace_sphere_streamlines(
+                        *lattice,
+                        values,
+                        batch.validity(),
+                        scale,
+                        sphere_settings.flow_lines,
+                        scene_scale,
+                    ));
+                }
             }
             _ => {}
         }
@@ -413,445 +476,6 @@ fn append_sphere_vectors(
     }
 }
 
-/// Trilinear interpolation of the published domain lattice, mirroring
-/// [`PlaneInterpolation`] one dimension up.
-#[derive(Clone, Copy, Debug)]
-struct GridInterpolation {
-    position: Vec3,
-    indices: [usize; 8],
-    weights: [f64; 8],
-}
-
-impl GridInterpolation {
-    fn is_usable(self, validity: &[SampleValidity]) -> bool {
-        self.indices
-            .iter()
-            .all(|&index| validity[index].is_usable())
-    }
-
-    fn dvec3(self, values: &[DVec3]) -> DVec3 {
-        self.indices
-            .into_iter()
-            .zip(self.weights)
-            .map(|(index, weight)| values[index] * weight)
-            .sum()
-    }
-
-    fn vec3(self, values: &[Vec3]) -> Vec3 {
-        self.indices
-            .into_iter()
-            .zip(self.weights)
-            .map(|(index, weight)| values[index] * weight as f32)
-            .sum()
-    }
-}
-
-fn grid_interpolation(
-    lattice: GridLattice,
-    x: f64,
-    y: f64,
-    z: f64,
-    scene_scale: SceneScale,
-) -> Option<GridInterpolation> {
-    let counts = lattice.counts();
-    let axis = |value: f64, count: u32| {
-        let value = value.clamp(0.0, f64::from(count.saturating_sub(1)));
-        let low = value.floor();
-        (low as usize, value.ceil() as usize, value - low)
-    };
-    let (x0, x1, fx) = axis(x, counts.x);
-    let (y0, y1, fy) = axis(y, counts.y);
-    let (z0, z1, fz) = axis(z, counts.z);
-    let width = counts.x as usize;
-    let height = counts.y as usize;
-    let at = |x: usize, y: usize, z: usize| x + width * (y + height * z);
-    let indices = [
-        at(x0, y0, z0),
-        at(x1, y0, z0),
-        at(x0, y1, z0),
-        at(x1, y1, z0),
-        at(x0, y0, z1),
-        at(x1, y0, z1),
-        at(x0, y1, z1),
-        at(x1, y1, z1),
-    ];
-    let weights = [
-        (1.0 - fx) * (1.0 - fy) * (1.0 - fz),
-        fx * (1.0 - fy) * (1.0 - fz),
-        (1.0 - fx) * fy * (1.0 - fz),
-        fx * fy * (1.0 - fz),
-        (1.0 - fx) * (1.0 - fy) * fz,
-        fx * (1.0 - fy) * fz,
-        (1.0 - fx) * fy * fz,
-        fx * fy * fz,
-    ];
-    if indices.iter().any(|&index| index >= lattice.len()) {
-        return None;
-    }
-    Some(GridInterpolation {
-        position: scene_scale.to_render_vec3(grid_point(lattice, x, y, z)?),
-        indices,
-        weights,
-    })
-}
-
-/// The lattice is axis-aligned with a uniform step, so a fractional coordinate
-/// resolves without interpolating positions.
-fn grid_point(lattice: GridLattice, x: f64, y: f64, z: f64) -> Option<DVec3> {
-    Some(lattice.position(0)? + lattice.step() * DVec3::new(x, y, z))
-}
-
-fn uniform_domain_spacing(
-    lattice: GridLattice,
-    xs: &[f64],
-    ys: &[f64],
-    zs: &[f64],
-    scene_scale: SceneScale,
-) -> f32 {
-    let step = lattice.step();
-    let spacing = |axis: &[f64], step: f64| {
-        (axis.len() > 1).then(|| scene_scale.to_render(((axis[1] - axis[0]) * step).abs()))
-    };
-    [
-        spacing(xs, step.x),
-        spacing(ys, step.y),
-        spacing(zs, step.z),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|spacing| *spacing > f32::EPSILON)
-    .reduce(f32::min)
-    .unwrap_or_else(|| scene_scale.to_render(0.25))
-}
-
-/// Trilinear interpolation of an oriented [`BoxLattice`], mirroring
-/// [`GridInterpolation`] with a position built from weighted corner samples —
-/// the same technique [`PlaneInterpolation`] uses — since the lattice's u/v/w
-/// steps need not be axis-aligned.
-#[derive(Clone, Copy, Debug)]
-struct BoxInterpolation {
-    position: Vec3,
-    indices: [usize; 8],
-    weights: [f64; 8],
-}
-
-impl BoxInterpolation {
-    fn is_usable(self, validity: &[SampleValidity]) -> bool {
-        self.indices
-            .iter()
-            .all(|&index| validity[index].is_usable())
-    }
-
-    fn dvec3(self, values: &[DVec3]) -> DVec3 {
-        self.indices
-            .into_iter()
-            .zip(self.weights)
-            .map(|(index, weight)| values[index] * weight)
-            .sum()
-    }
-
-    fn vec3(self, values: &[Vec3]) -> Vec3 {
-        self.indices
-            .into_iter()
-            .zip(self.weights)
-            .map(|(index, weight)| values[index] * weight as f32)
-            .sum()
-    }
-}
-
-fn box_interpolation(
-    lattice: BoxLattice,
-    u: f64,
-    v: f64,
-    w: f64,
-    scene_scale: SceneScale,
-) -> Option<BoxInterpolation> {
-    let counts = lattice.counts();
-    let axis = |value: f64, count: u32| {
-        let value = value.clamp(0.0, f64::from(count.saturating_sub(1)));
-        let low = value.floor();
-        (low as usize, value.ceil() as usize, value - low)
-    };
-    let (u0, u1, fu) = axis(u, counts.x);
-    let (v0, v1, fv) = axis(v, counts.y);
-    let (w0, w1, fw) = axis(w, counts.z);
-    let width = counts.x as usize;
-    let height = counts.y as usize;
-    let at = |u: usize, v: usize, w: usize| u + width * (v + height * w);
-    let indices = [
-        at(u0, v0, w0),
-        at(u1, v0, w0),
-        at(u0, v1, w0),
-        at(u1, v1, w0),
-        at(u0, v0, w1),
-        at(u1, v0, w1),
-        at(u0, v1, w1),
-        at(u1, v1, w1),
-    ];
-    let weights = [
-        (1.0 - fu) * (1.0 - fv) * (1.0 - fw),
-        fu * (1.0 - fv) * (1.0 - fw),
-        (1.0 - fu) * fv * (1.0 - fw),
-        fu * fv * (1.0 - fw),
-        (1.0 - fu) * (1.0 - fv) * fw,
-        fu * (1.0 - fv) * fw,
-        (1.0 - fu) * fv * fw,
-        fu * fv * fw,
-    ];
-    if indices.iter().any(|&index| index >= lattice.len()) {
-        return None;
-    }
-    let position = indices
-        .into_iter()
-        .zip(weights)
-        .map(|(index, weight)| lattice.position(index).map(|point| point * weight))
-        .sum::<Option<DVec3>>()?;
-    Some(BoxInterpolation {
-        position: scene_scale.to_render_vec3(position),
-        indices,
-        weights,
-    })
-}
-
-/// The physical distance one full lattice-index step covers along each axis,
-/// scaled by the display axes' fractional increment — the oriented analogue
-/// of [`uniform_domain_spacing`], which can read the step directly off an
-/// axis-aligned [`GridLattice`] where this instead reads it off two adjacent
-/// lattice points.
-fn uniform_box_spacing(
-    lattice: BoxLattice,
-    xs: &[f64],
-    ys: &[f64],
-    zs: &[f64],
-    scene_scale: SceneScale,
-) -> f32 {
-    let counts = lattice.counts();
-    let width = counts.x as usize;
-    let height = counts.y as usize;
-    let Some(origin) = lattice.position(0) else {
-        return scene_scale.to_render(0.25);
-    };
-    let physical_step = |index: usize| lattice.position(index).map(|point| point.distance(origin));
-    let spacing = |axis: &[f64], step_index: usize| {
-        if axis.len() <= 1 {
-            return None;
-        }
-        physical_step(step_index)
-            .map(|step| scene_scale.to_render(((axis[1] - axis[0]) * step).abs()))
-    };
-    [
-        spacing(xs, 1),
-        spacing(ys, width),
-        spacing(zs, width * height),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|spacing| *spacing > f32::EPSILON)
-    .reduce(f32::min)
-    .unwrap_or_else(|| scene_scale.to_render(0.25))
-}
-
-/// Coordinates in snapshot-lattice space, distributed uniformly across its
-/// complete extent. Fractional coordinates deliberately support a display
-/// density above or between the published sample counts without clustering on
-/// integer sample indices.
-fn uniform_axis(count: u32, target: u32) -> Vec<f64> {
-    if target == 0 {
-        return Vec::new();
-    }
-    let extent = f64::from(count.saturating_sub(1));
-    if target == 1 {
-        return vec![extent * 0.5];
-    }
-    (0..target)
-        .map(|index| f64::from(index) * extent / f64::from(target - 1))
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PlaneInterpolation {
-    position: Vec3,
-    indices: [usize; 4],
-    weights: [f64; 4],
-}
-
-impl PlaneInterpolation {
-    fn is_usable(self, validity: &[SampleValidity]) -> bool {
-        self.indices
-            .iter()
-            .all(|&index| validity[index].is_usable())
-    }
-
-    fn dvec3(self, values: &[DVec3]) -> DVec3 {
-        self.indices
-            .into_iter()
-            .zip(self.weights)
-            .map(|(index, weight)| values[index] * weight)
-            .sum()
-    }
-
-    fn vec3(self, values: &[Vec3]) -> Vec3 {
-        self.indices
-            .into_iter()
-            .zip(self.weights)
-            .map(|(index, weight)| values[index] * weight as f32)
-            .sum()
-    }
-}
-
-fn plane_interpolation(
-    lattice: fieldcad_core::PlaneLattice,
-    u: f64,
-    v: f64,
-    scene_scale: SceneScale,
-) -> Option<PlaneInterpolation> {
-    let counts = lattice.counts();
-    let u = u.clamp(0.0, f64::from(counts.x.saturating_sub(1)));
-    let v = v.clamp(0.0, f64::from(counts.y.saturating_sub(1)));
-    let left = u.floor() as usize;
-    let right = u.ceil() as usize;
-    let lower = v.floor() as usize;
-    let upper = v.ceil() as usize;
-    let u_fraction = u - left as f64;
-    let v_fraction = v - lower as f64;
-    let width = counts.x as usize;
-    let indices = [
-        lower * width + left,
-        lower * width + right,
-        upper * width + right,
-        upper * width + left,
-    ];
-    let weights = [
-        (1.0 - u_fraction) * (1.0 - v_fraction),
-        u_fraction * (1.0 - v_fraction),
-        u_fraction * v_fraction,
-        (1.0 - u_fraction) * v_fraction,
-    ];
-    let position = indices
-        .into_iter()
-        .zip(weights)
-        .map(|(index, weight)| lattice.position(index).map(|point| point * weight))
-        .sum::<Option<DVec3>>()?;
-    Some(PlaneInterpolation {
-        position: scene_scale.to_render_vec3(position),
-        indices,
-        weights,
-    })
-}
-
-fn uniform_glyph_spacing(
-    lattice: fieldcad_core::PlaneLattice,
-    xs: &[f64],
-    ys: &[f64],
-    scene_scale: SceneScale,
-) -> f32 {
-    let mut spacings = Vec::with_capacity(2);
-    if xs.len() > 1
-        && let (Some(first), Some(second)) = (
-            plane_interpolation(lattice, xs[0], ys[0], scene_scale),
-            plane_interpolation(lattice, xs[1], ys[0], scene_scale),
-        )
-    {
-        spacings.push(first.position.distance(second.position));
-    }
-    if ys.len() > 1
-        && let (Some(first), Some(second)) = (
-            plane_interpolation(lattice, xs[0], ys[0], scene_scale),
-            plane_interpolation(lattice, xs[0], ys[1], scene_scale),
-        )
-    {
-        spacings.push(first.position.distance(second.position));
-    }
-    spacings
-        .into_iter()
-        .filter(|spacing| *spacing > f32::EPSILON)
-        .reduce(f32::min)
-        .unwrap_or_else(|| scene_scale.to_render(0.25))
-}
-
-fn lattice_normal(lattice: fieldcad_core::PlaneLattice) -> Vec3 {
-    let origin = lattice.position(0).unwrap_or_default();
-    let u = lattice.position(1).unwrap_or(origin + glam::DVec3::X) - origin;
-    let v_index = lattice.counts().x as usize;
-    let v = lattice.position(v_index).unwrap_or(origin + glam::DVec3::Y) - origin;
-    u.cross(v).normalize_or_zero().as_vec3()
-}
-
-/// The logarithmic magnitude normalization for one batch.
-///
-/// Computed once per batch rather than once per glyph. The previous per-glyph
-/// scan was O(glyphs × samples), and both factors are user-editable densities on
-/// the same axis, so the cost of raising a density slider grew quadratically.
-///
-/// Colour and glyph length share this value deliberately: normalizing them
-/// against different maxima would let a plugin that reports a large finite
-/// number alongside `Undefined` validity make an arrow's length disagree with
-/// its own colour.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MagnitudeScale {
-    maximum: f64,
-}
-
-impl MagnitudeScale {
-    /// Over usable samples only. An undefined sample's placeholder is not a
-    /// measurement and must not set the scale for the ones that are.
-    fn over(values: &[DVec3], validity: &[SampleValidity]) -> Self {
-        Self {
-            maximum: values
-                .iter()
-                .zip(validity)
-                .filter(|(_, validity)| validity.is_usable())
-                .map(|(value, _)| value.length())
-                .fold(0.0_f64, f64::max),
-        }
-    }
-
-    /// Position of `magnitude` on a log ramp between the scale's noise floor and
-    /// its maximum, in `0..=1`.
-    fn normalized(self, magnitude: f64) -> f32 {
-        if magnitude <= 0.0 || self.maximum <= 0.0 {
-            return 0.0;
-        }
-        let floor = (self.maximum * 1.0e-4).max(f64::MIN_POSITIVE);
-        ((magnitude.max(floor).ln() - floor.ln()) / (self.maximum.ln() - floor.ln()).max(1.0e-12))
-            .clamp(0.0, 1.0) as f32
-    }
-
-    fn colors(self, values: &[DVec3], validity: &[SampleValidity]) -> Vec<Vec3> {
-        values
-            .iter()
-            .zip(validity)
-            .map(|(value, validity)| {
-                if validity.is_usable() {
-                    field_color(self.normalized(value.length()))
-                } else {
-                    Vec3::ZERO
-                }
-            })
-            .collect()
-    }
-
-    /// Arrow length as a fraction of the glyph spacing. The floor keeps a weak
-    /// but defined sample visible as a direction rather than a dot.
-    fn glyph_length(self, magnitude: f32) -> f32 {
-        0.18 + self.normalized(f64::from(magnitude)) * 0.62
-    }
-}
-
-fn field_color(value: f32) -> Vec3 {
-    let deep_blue = Vec3::new(0.02, 0.10, 0.42);
-    let cyan = Vec3::new(0.02, 0.82, 0.88);
-    let yellow = Vec3::new(1.0, 0.84, 0.12);
-    let red = Vec3::new(0.95, 0.12, 0.04);
-    if value < 0.4 {
-        deep_blue.lerp(cyan, value / 0.4)
-    } else if value < 0.75 {
-        cyan.lerp(yellow, (value - 0.4) / 0.35)
-    } else {
-        yellow.lerp(red, (value - 0.75) / 0.25)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -860,7 +484,7 @@ mod tests {
     use glam::{DVec3, UVec2, UVec3};
 
     use super::*;
-    use crate::scene::PlaneLayerSettings;
+    use crate::scene::{FlowLineDisplay, PlaneLayerSettings};
 
     /// A uniform batch of unit +X vectors, every sample exact.
     fn uniform_plane_field<'a>(
@@ -1605,5 +1229,142 @@ mod tests {
         // A dense sampling of a 5x5x5 cube has corners outside the sphere, so
         // strictly fewer arrows are drawn than the cube holds samples.
         assert!(origins.len() < 5 * 5 * 5);
+    }
+
+    /// Flow lines and arrows are independent controls: a region can draw
+    /// either, both, or neither, and one being off must not silence the
+    /// other.
+    #[test]
+    fn domain_flow_lines_are_independent_of_arrow_visibility() {
+        let (lattice, values, validity, _colors) = uniform_domain(5);
+        let scale = MagnitudeScale::over(&values, &validity);
+        // `visible` is a caller-side gate, the same convention arrows already
+        // follow (`append_domain_vectors` does not itself re-check
+        // `VectorDisplay::visible` either) — checked at the `field_geometry`
+        // level below, not inside the tracer.
+        let ribbons = trace_domain_streamlines(
+            lattice,
+            &values,
+            &validity,
+            scale,
+            FlowLineDisplay::new(true, 3),
+            SceneScale::metre(),
+        );
+        assert!(
+            !ribbons.is_empty(),
+            "a uniform field seeds and traces at least one streamline"
+        );
+        assert!(
+            ribbons.len().is_multiple_of(6),
+            "ribbons are built from whole quads"
+        );
+
+        // The same field_geometry() entry point draws flow lines with arrows
+        // switched off, and vice versa.
+        let (snapshot, channel) = single_vector_channel_snapshot(vec![
+            fieldcad_core::FieldBatch::exact(
+                SampleGeometry::Grid(lattice),
+                FieldColumn::vectors(values.clone()),
+            )
+            .unwrap(),
+        ]);
+        let world = fieldcad_core::World::new();
+        let geometry = |settings: FieldLayerSettings| {
+            field_geometry(
+                &snapshot,
+                &channel,
+                settings,
+                RegionLayers {
+                    planes: &BTreeMap::new(),
+                    boxes: &BTreeMap::new(),
+                    spheres: &BTreeMap::new(),
+                },
+                SceneVisibility::ALL,
+                &world.snapshot(),
+                SceneScale::metre(),
+            )
+        };
+
+        let flow_only = geometry(FieldLayerSettings {
+            vectors: VectorDisplay::new(false, 0),
+            flow_lines: FlowLineDisplay::new(true, 3),
+        });
+        assert!(flow_only.vector_lines.is_empty());
+        assert!(!flow_only.flow_ribbons.is_empty());
+
+        let arrows_only = geometry(FieldLayerSettings {
+            vectors: VectorDisplay::new(true, 3),
+            flow_lines: FlowLineDisplay::new(false, 3),
+        });
+        assert!(!arrows_only.vector_lines.is_empty());
+        assert!(arrows_only.flow_ribbons.is_empty());
+    }
+
+    /// A plane's flow lines trace the in-plane projection even when its
+    /// arrows are configured to show the full 3D vector — a 2D streamline
+    /// cannot depict an out-of-plane component either.
+    #[test]
+    fn plane_flow_lines_trace_the_in_plane_projection_regardless_of_vector_mode() {
+        let lattice = PlaneLattice::new(
+            DVec3::new(-2.0, -2.0, 0.0),
+            DVec3::new(0.5, 0.0, 0.0),
+            DVec3::new(0.0, 0.5, 0.0),
+            UVec2::splat(9),
+        );
+        // A field with a large out-of-plane component: if flow lines ever
+        // saw the raw value instead of the projection, tracing would leave
+        // the plane immediately and produce no visible line.
+        let values = vec![DVec3::new(1.0, 0.0, 50.0); lattice.len()];
+        let validity = vec![SampleValidity::Exact; lattice.len()];
+
+        let (world, planes) = {
+            let mut world = fieldcad_core::World::new();
+            let report = world
+                .commit([fieldcad_core::WorldCommand::CreatePlane(
+                    fieldcad_core::SlicePlaneSpec::new("XY field", DVec3::ZERO, DVec3::Z).unwrap(),
+                )])
+                .unwrap();
+            (world, [report.created_planes[0]])
+        };
+        let (snapshot, channel) = single_vector_channel_snapshot(vec![
+            fieldcad_core::FieldBatch::new(
+                SampleGeometry::Plane {
+                    plane: planes[0],
+                    lattice,
+                },
+                FieldColumn::vectors(values),
+                validity,
+            )
+            .unwrap(),
+        ]);
+
+        let mut layers = BTreeMap::new();
+        layers.insert(
+            planes[0],
+            PlaneLayerSettings {
+                vector_mode: PlaneVectorMode::Full3d,
+                flow_lines: FlowLineDisplay::new(true, 5),
+                ..PlaneLayerSettings::default()
+            },
+        );
+        let geometry = field_geometry(
+            &snapshot,
+            &channel,
+            FieldLayerSettings::default(),
+            RegionLayers {
+                planes: &layers,
+                boxes: &BTreeMap::new(),
+                spheres: &BTreeMap::new(),
+            },
+            SceneVisibility::ALL,
+            &world.snapshot(),
+            SceneScale::metre(),
+        );
+
+        assert!(
+            !geometry.flow_ribbons.is_empty(),
+            "the in-plane component (1, 0, 0) is enough to trace a line even \
+             though the raw value points mostly out of the plane"
+        );
     }
 }

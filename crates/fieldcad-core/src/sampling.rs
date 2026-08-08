@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use glam::{DVec3, UVec2, UVec3};
+use glam::{DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -112,6 +112,22 @@ impl PlaneLattice {
         let v = (index / width) as f64;
         Some(self.origin + self.u_step * u + self.v_step * v)
     }
+
+    /// Inverse of [`Self::position`]: the fractional in-plane index a world
+    /// point projects onto.
+    ///
+    /// `u_step`/`v_step` are mutually orthogonal by construction
+    /// (`SlicePlane::lattice` builds them from an orthonormal in-plane
+    /// basis), so each axis's index is recovered independently by
+    /// projection, and any out-of-plane component of `point` is ignored
+    /// rather than folded into the result.
+    pub fn fractional_coordinates(self, point: DVec3) -> DVec2 {
+        let offset = point - self.origin;
+        DVec2::new(
+            offset.dot(self.u_step) / self.u_step.length_squared(),
+            offset.dot(self.v_step) / self.v_step.length_squared(),
+        )
+    }
 }
 
 /// A regular three-dimensional lattice of samples. Index order is x fastest.
@@ -157,6 +173,13 @@ impl GridLattice {
         let y = ((index / width) % height) as f64;
         let z = (index / (width * height)) as f64;
         Some(self.origin + self.step * DVec3::new(x, y, z))
+    }
+
+    /// Inverse of [`Self::position`]: the fractional index a world point
+    /// corresponds to. Exact, since the lattice is axis-aligned with a
+    /// uniform step per axis.
+    pub fn fractional_coordinates(self, point: DVec3) -> DVec3 {
+        (point - self.origin) / self.step
     }
 }
 
@@ -209,6 +232,20 @@ impl BoxLattice {
         let v = ((index / width) % height) as f64;
         let w = (index / (width * height)) as f64;
         Some(self.origin + self.u_step * u + self.v_step * v + self.w_step * w)
+    }
+
+    /// Inverse of [`Self::position`]: the fractional index a world point
+    /// projects onto. `u_step`/`v_step`/`w_step` are mutually orthogonal by
+    /// construction (`FieldBox::lattice` scales a rotated orthonormal basis
+    /// independently per axis), so each axis's index is recovered
+    /// independently by projection.
+    pub fn fractional_coordinates(self, point: DVec3) -> DVec3 {
+        let offset = point - self.origin;
+        DVec3::new(
+            offset.dot(self.u_step) / self.u_step.length_squared(),
+            offset.dot(self.v_step) / self.v_step.length_squared(),
+            offset.dot(self.w_step) / self.w_step.length_squared(),
+        )
     }
 }
 
@@ -526,12 +563,69 @@ mod tests {
     }
 
     #[test]
+    fn grid_lattice_fractional_coordinates_inverts_position() {
+        let lattice = GridLattice::new(
+            DVec3::new(-2.0, 3.0, 0.5),
+            DVec3::new(0.5, 1.5, 2.0),
+            UVec3::new(4, 3, 2),
+        );
+
+        for index in [0usize, 1, 5, 23] {
+            let point = lattice.position(index).unwrap();
+            let recovered = lattice.fractional_coordinates(point);
+            let width = lattice.counts().x as usize;
+            let height = lattice.counts().y as usize;
+            let expected = DVec3::new(
+                (index % width) as f64,
+                ((index / width) % height) as f64,
+                (index / (width * height)) as f64,
+            );
+            assert!((recovered - expected).length() < 1.0e-9);
+        }
+
+        // A fractional (non-integer) query round-trips too, since a tracer
+        // asks about arbitrary points, not just published lattice cells.
+        let midpoint = lattice.position(0).unwrap() + DVec3::new(0.25, 0.75, 1.0);
+        let recovered = lattice.fractional_coordinates(midpoint);
+        assert!((recovered - DVec3::new(0.5, 0.5, 0.5)).length() < 1.0e-9);
+    }
+
+    #[test]
     fn plane_lattice_walks_u_before_v() {
         let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::new(3, 2));
 
         assert_eq!(lattice.len(), 6);
         assert_eq!(lattice.position(2).unwrap(), DVec3::new(2.0, 0.0, 0.0));
         assert_eq!(lattice.position(3).unwrap(), DVec3::new(0.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn plane_lattice_fractional_coordinates_inverts_position_and_ignores_out_of_plane_offset() {
+        let lattice = PlaneLattice::new(
+            DVec3::new(-1.0, -1.0, 5.0),
+            DVec3::new(0.5, 0.0, 0.0),
+            DVec3::new(0.0, 0.25, 0.0),
+            UVec2::splat(9),
+        );
+
+        for index in [0usize, 3, 8, 40] {
+            let point = lattice.position(index).unwrap();
+            let recovered = lattice.fractional_coordinates(point);
+            let width = lattice.counts().x as usize;
+            let expected = DVec2::new((index % width) as f64, (index / width) as f64);
+            assert!((recovered - expected).length() < 1.0e-9);
+        }
+
+        // A point offset out of the plane still resolves the same in-plane
+        // coordinate: the tracer that calls this projects the field, not the
+        // point, into the plane.
+        let on_plane = lattice.position(10).unwrap();
+        let off_plane = on_plane + DVec3::new(0.0, 0.0, 42.0);
+        assert!(
+            (lattice.fractional_coordinates(off_plane) - lattice.fractional_coordinates(on_plane))
+                .length()
+                < 1.0e-9
+        );
     }
 
     #[test]
@@ -647,6 +741,32 @@ mod tests {
 
         assert_eq!(lattice.position(1).unwrap(), DVec3::Y);
         assert_eq!(lattice.position(2).unwrap(), DVec3::NEG_X);
+    }
+
+    #[test]
+    fn box_lattice_fractional_coordinates_inverts_position_even_when_not_axis_aligned() {
+        // The same 90-degree-about-Z rotated basis as
+        // `box_lattice_need_not_be_axis_aligned`.
+        let lattice = BoxLattice::new(
+            DVec3::splat(1.0),
+            DVec3::Y,
+            DVec3::NEG_X,
+            DVec3::Z,
+            UVec3::new(3, 2, 2),
+        );
+
+        for index in [0usize, 2, 5, 11] {
+            let point = lattice.position(index).unwrap();
+            let recovered = lattice.fractional_coordinates(point);
+            let width = lattice.counts().x as usize;
+            let height = lattice.counts().y as usize;
+            let expected = DVec3::new(
+                (index % width) as f64,
+                ((index / width) % height) as f64,
+                (index / (width * height)) as f64,
+            );
+            assert!((recovered - expected).length() < 1.0e-9);
+        }
     }
 
     #[test]

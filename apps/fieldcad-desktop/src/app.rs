@@ -331,6 +331,7 @@ fn compute_field_layer_geometry(
                 .surface_triangles
                 .extend(layer_geometry.surface_triangles);
             geometry.vector_lines.extend(layer_geometry.vector_lines);
+            geometry.flow_ribbons.extend(layer_geometry.flow_ribbons);
         }
     }
     let new_cache = FieldGeometryCache {
@@ -392,6 +393,11 @@ struct WindowState {
     step_compute_stats: StepComputeStats,
     /// When the next frame is due. Drives the event loop's control flow.
     next_redraw: Instant,
+    /// Set once at window creation. Drives animated flow lines, independent
+    /// of the simulation clock — the flowing look should run whether or not
+    /// the simulation itself is paused, since it is a display effect on a
+    /// possibly-static field.
+    animation_clock: Instant,
     /// Set from `WindowEvent::Occluded`; suppresses rendering entirely.
     occluded: bool,
     /// Whether an embedded MCP server is running against `data_source`, and
@@ -494,6 +500,7 @@ impl WindowState {
             frame_stats: FrameStats::default(),
             step_compute_stats: StepComputeStats::default(),
             next_redraw: Instant::now(),
+            animation_clock: Instant::now(),
             occluded: false,
             mcp,
         })
@@ -807,6 +814,7 @@ impl WindowState {
             .map_or(MAX_IDLE_INTERVAL, |viewport| viewport.repaint_delay);
         let next_frame_delay = if compute.mode == fieldcad_core::SimulationMode::Running
             || self.model().pending_command_count() > 0
+            || self.ui_model.has_visible_animated_flow_lines()
         {
             RUNNING_FRAME_INTERVAL.min(ui_repaint_delay)
         } else {
@@ -879,6 +887,7 @@ impl WindowState {
                 axes_visible: self.ui_model.view.axes,
                 instances: &instances,
                 field: &field,
+                time_seconds: self.animation_clock.elapsed().as_secs_f32(),
             },
             GuiPaint {
                 primitives: &primitives,
@@ -2446,6 +2455,42 @@ mod tests {
             assert!(
                 new_cache.is_some(),
                 "a changed input must rebuild the cache"
+            );
+        }
+
+        /// Regression: `scene::field_geometry` is called once per channel and
+        /// its three output fields — surface triangles, arrow lines, and flow
+        /// ribbons — are merged into one `FieldGeometry` across channels.
+        /// Adding `flow_ribbons` to that struct is easy to do without also
+        /// updating the merge, which silently drops every traced streamline
+        /// while arrows keep working — exactly what shipped once already.
+        #[test]
+        fn flow_ribbons_survive_the_per_channel_merge() {
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
+            let mut layers = visible_layers(&channel);
+            layers.get_mut(&channel).unwrap().planes.insert(
+                plane,
+                scene::PlaneLayerSettings {
+                    flow_lines: scene::FlowLineDisplay::new(true, 5),
+                    ..scene::PlaneLayerSettings::default()
+                },
+            );
+
+            let (geometry, _) = compute_field_layer_geometry(
+                None,
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                scene::SceneVisibility::ALL,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+
+            assert!(
+                !geometry.flow_ribbons.is_empty(),
+                "a visible flow-line layer must reach the merged geometry, not just \
+                 scene::field_geometry's own per-channel output"
             );
         }
 

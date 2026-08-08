@@ -185,7 +185,16 @@ pub async fn smoke_test(config: GpuConfig, frames: u32) -> Result<SmokeTestRepor
     let field = crate::scene::FieldGeometry::default();
 
     for _ in 0..frames {
-        scene.update(&device, &queue, &camera, 1.0, &instances, &field);
+        scene.update(
+            &device,
+            &queue,
+            &camera,
+            1.0,
+            &instances,
+            &field,
+            0.0,
+            [SIZE as f32, SIZE as f32],
+        );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Smoke-test encoder"),
         });

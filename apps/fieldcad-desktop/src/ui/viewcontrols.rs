@@ -387,6 +387,13 @@ fn field_layers(ui: &mut egui::Ui, model: &mut UiModel, compute: &ComputeView) {
                     "Through the domain",
                     "Sparse glyphs through the whole domain, in 3D",
                 );
+                super::flow_line_display_controls(
+                    ui,
+                    &mut layer.whole_domain.flow_lines,
+                    "Flow lines",
+                    "Continuous flow lines through the whole domain, independent of the \
+                     arrows above",
+                );
             });
         });
     }
