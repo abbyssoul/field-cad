@@ -911,4 +911,35 @@ mod tests {
                 .is_none()
         );
     }
+
+    /// The literal bug `SceneScale` fixes: `MIN_DISTANCE`/`MAX_DISTANCE` are
+    /// fixed constants with no notion of a scene's physical scale. A
+    /// nanometre-scale object's radius, cast straight into `focus()` without
+    /// going through `SceneScale::to_render`, collapses to ~1e-9 and clamps
+    /// to `MIN_DISTANCE` — the camera cannot approach any closer, regardless
+    /// of how far a user scrolls in. Converting the same radius through the
+    /// render-space boundary first brings it to unit magnitude, and `focus()`
+    /// lands well clear of the clamp.
+    #[test]
+    fn nanometre_scale_focus_does_not_collapse_to_the_minimum_distance() {
+        let radius_metres = 2.0e-9;
+        let mut camera = OrbitCamera::default();
+
+        // The old, unscaled behaviour: a bare cast pins the camera to the
+        // floor it can never dolly past.
+        camera.focus(Vec3::ZERO, radius_metres as f32);
+        assert_eq!(camera.distance(), MIN_DISTANCE);
+
+        // Through `SceneScale::nanometre`, the same physical object renders
+        // at unit magnitude, and `focus` places the camera comfortably
+        // inside its distance window instead of pinned to the floor.
+        let scale = fieldcad_core::SceneScale::nanometre();
+        camera.focus(Vec3::ZERO, scale.to_render(radius_metres));
+        assert!(
+            camera.distance() > MIN_DISTANCE * 10.0,
+            "expected the camera to clear the minimum-distance floor, got {}",
+            camera.distance()
+        );
+        assert!(camera.distance() < MAX_DISTANCE);
+    }
 }

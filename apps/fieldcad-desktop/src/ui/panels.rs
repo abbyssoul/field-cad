@@ -17,8 +17,8 @@ use fieldcad_sources::{inertial_mass_component_id, mass_property_id};
 use glam::{DQuat, DVec2, DVec3};
 
 use super::compute::{
-    ComputeView, WorkbenchState, format_simulation_time, format_time_step, parse_playback_speed,
-    time_step_drag_speed, validity_note,
+    ComputeView, WorkbenchState, format_engineering, format_simulation_time, format_time_step,
+    parse_playback_speed, time_step_drag_speed, validity_note,
 };
 use super::plot::{history_plot, probe_history_plots};
 use super::{
@@ -1912,18 +1912,6 @@ fn scalar_editor(
 }
 
 /// Readable across the range physical constants actually occupy.
-fn format_engineering(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_owned();
-    }
-    let magnitude = value.abs();
-    if (1.0e-3..1.0e6).contains(&magnitude) {
-        format!("{value:.4}")
-    } else {
-        format!("{value:.6e}")
-    }
-}
-
 /// An inspector name edit is staged locally until the user explicitly accepts
 /// it. That keeps Escape a genuine cancel even though the inspector is rebuilt
 /// from an immutable world snapshot every frame.

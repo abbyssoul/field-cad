@@ -225,6 +225,10 @@ struct FieldGeometryKey {
     field_layers: BTreeMap<ChannelId, ui::ChannelLayerSettings>,
     show: scene::SceneVisibility,
     entity_visibility: EntityVisibility,
+    /// A scale change alone moves every position and length this geometry
+    /// contains, with no snapshot or world-visibility change to invalidate
+    /// the cache otherwise.
+    scene_scale: fieldcad_core::SceneScale,
 }
 
 /// Which measurement entities were visible when the cached geometry was
@@ -281,6 +285,7 @@ impl EntityVisibility {
 ///
 /// Free rather than a `WindowState` method so the caching decision is
 /// testable without a window or a GPU device.
+#[allow(clippy::too_many_arguments)]
 fn compute_field_layer_geometry(
     cache: Option<&FieldGeometryCache>,
     field_snapshot: Option<&fieldcad_core::FieldSnapshot>,
@@ -288,6 +293,7 @@ fn compute_field_layer_geometry(
     field_layers: &BTreeMap<ChannelId, ui::ChannelLayerSettings>,
     show: scene::SceneVisibility,
     vector_channels: &[ChannelId],
+    scene_scale: fieldcad_core::SceneScale,
 ) -> (scene::FieldGeometry, Option<FieldGeometryCache>) {
     let snapshot_identity =
         field_snapshot.map(|snapshot| (snapshot.identity.session, snapshot.identity.sequence));
@@ -297,6 +303,7 @@ fn compute_field_layer_geometry(
         && cache.key.show == show
         && cache.key.field_layers == *field_layers
         && cache.key.entity_visibility == entity_visibility
+        && cache.key.scene_scale == scene_scale
     {
         return (cache.geometry.clone(), None);
     }
@@ -318,6 +325,7 @@ fn compute_field_layer_geometry(
                 },
                 show,
                 world,
+                scene_scale,
             );
             geometry
                 .surface_triangles
@@ -331,6 +339,7 @@ fn compute_field_layer_geometry(
             field_layers: field_layers.clone(),
             show,
             entity_visibility,
+            scene_scale,
         },
         geometry: geometry.clone(),
     };
@@ -510,11 +519,23 @@ impl WindowState {
     /// than a snapshot). Thin wrapper around [`compute_field_layer_geometry`]
     /// that owns the cache across frames — split out so the caching decision
     /// itself is testable without a window or a GPU device.
+    /// The scale to render at, for a caller that runs outside the per-frame
+    /// closure and so has no local `ComputeView` in scope. Falls back to the
+    /// default (metre) scale before the first frame has ever built one.
+    fn scene_scale(&self) -> fieldcad_core::SceneScale {
+        self.compute
+            .as_ref()
+            .map_or_else(fieldcad_core::SceneScale::default, |compute| {
+                compute.scene_scale
+            })
+    }
+
     fn field_layer_geometry(
         &mut self,
         field_snapshot: Option<&fieldcad_core::FieldSnapshot>,
         show: scene::SceneVisibility,
         vector_channels: &[ChannelId],
+        scene_scale: fieldcad_core::SceneScale,
     ) -> scene::FieldGeometry {
         let (geometry, new_cache) = compute_field_layer_geometry(
             self.field_geometry_cache.as_ref(),
@@ -523,6 +544,7 @@ impl WindowState {
             &self.ui_model.field_layers,
             show,
             vector_channels,
+            scene_scale,
         );
         if let Some(new_cache) = new_cache {
             self.field_geometry_cache = Some(new_cache);
@@ -663,7 +685,9 @@ impl WindowState {
             .observe(compute.tick, compute.step_compute_ms);
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let pixels_per_point_before_frame = self.egui_context.pixels_per_point().max(0.01);
-        let transform_preview = self.active_transform.map(ActiveTransformDrag::preview);
+        let transform_preview = self
+            .active_transform
+            .map(|drag| drag.preview(compute.scene_scale));
         let plane_normal_label = self
             .ui_model
             .scene_selection()
@@ -676,6 +700,7 @@ impl WindowState {
                     transform_preview,
                     self.ui_model.view.gizmo_display,
                     pixels_per_point_before_frame,
+                    compute.scene_scale,
                 )
             })
             .map(|position| {
@@ -746,7 +771,12 @@ impl WindowState {
         // first of them rather than arrive a frame late.
         self.inspector_editing = ui_frame.scene_edit_in_progress;
         self.synchronize_edit_gesture(compute.mode)?;
-        self.apply_viewport_gesture(ui_frame.viewport_gesture, pixels_per_point, compute.mode)?;
+        self.apply_viewport_gesture(
+            ui_frame.viewport_gesture,
+            pixels_per_point,
+            compute.mode,
+            compute.scene_scale,
+        )?;
 
         // In submission order, which is also the order queued edits are applied
         // in at a tick boundary (ADR 0011). Goes through the shared model's
@@ -793,20 +823,26 @@ impl WindowState {
         );
         let primitives = self.egui_context.tessellate(shapes, pixels_per_point);
         let show = self.scene_visibility();
-        let instances = scene::instances(&self.world, self.ui_model.selection, show);
+        let scene_scale = compute.scene_scale;
+        let instances = scene::instances(&self.world, self.ui_model.selection, show, scene_scale);
         // Every visible layer names a channel declared by the snapshot. Several
         // channels (for example Maxwell E and B) can be drawn independently.
         let field_snapshot = self.model().latest_snapshot();
-        let mut field =
-            self.field_layer_geometry(field_snapshot.as_deref(), show, &compute.vector_channels);
+        let mut field = self.field_layer_geometry(
+            field_snapshot.as_deref(),
+            show,
+            &compute.vector_channels,
+            scene_scale,
+        );
         scene::append_authoring_geometry(
             &mut field,
             &self.world,
             self.ui_model.scene_selection(),
             show,
+            scene_scale,
         );
         if self.ui_model.view.compute_bounds {
-            scene::append_compute_bounds(&mut field, compute.domain.bounds());
+            scene::append_compute_bounds(&mut field, compute.domain.bounds(), scene_scale);
         }
         // Kept for next frame's `ComputeView::build` to reuse whatever is
         // still current — every other use of `compute` above is a borrow, so
@@ -827,6 +863,7 @@ impl WindowState {
                 transform_preview,
                 self.ui_model.view.gizmo_display,
                 pixels_per_point,
+                scene_scale,
             );
         }
 
@@ -932,10 +969,10 @@ impl WindowState {
         // never reused, so deleted probes would accumulate for the session.
         self.probe_history
             .retain_probes(|probe| self.world.probe(probe).is_some());
-        if self
-            .active_transform
-            .is_some_and(|drag| scene::selection_origin(&self.world, drag.target).is_none())
-        {
+        let scene_scale = self.scene_scale();
+        if self.active_transform.is_some_and(|drag| {
+            scene::selection_origin(&self.world, drag.target, scene_scale).is_none()
+        }) {
             self.active_transform = None;
         }
     }
@@ -957,6 +994,7 @@ impl WindowState {
         gesture: ViewportGesture,
         pixels_per_point: f32,
         mode: SimulationMode,
+        scene_scale: fieldcad_core::SceneScale,
     ) -> Result<(), String> {
         let drag_delta = Vec2::new(gesture.drag_delta.x, gesture.drag_delta.y);
         if gesture.middle_dragged {
@@ -978,7 +1016,7 @@ impl WindowState {
         if self.ui_model.viewport_tool == ViewportTool::FieldBrush && mode == SimulationMode::Paused
         {
             if gesture.primary_pressed
-                && let Some((plane, sample)) = self.field_brush_sample(pointer)
+                && let Some((plane, sample)) = self.field_brush_sample(pointer, scene_scale)
             {
                 self.active_field_brush = Some(ActiveFieldBrushDrag {
                     plane,
@@ -986,7 +1024,7 @@ impl WindowState {
                 });
             }
             if gesture.primary_dragged
-                && let Some((plane, sample)) = self.field_brush_sample(pointer)
+                && let Some((plane, sample)) = self.field_brush_sample(pointer, scene_scale)
                 && let Some(active) = self.active_field_brush.as_mut()
                 && active.plane == plane
                 && active.samples.last().is_none_or(|last| {
@@ -1021,7 +1059,7 @@ impl WindowState {
         if self.ui_model.viewport_tool == ViewportTool::Transform
             && gesture.primary_pressed
             && let (Some(selection), Some(pointer)) = (self.visible_selection(), pointer)
-            && let Some(origin) = scene::selection_origin(&self.world, selection)
+            && let Some(origin) = scene::selection_origin(&self.world, selection, scene_scale)
         {
             let picked_handle = scene::pick_transform_handle_with_display(
                 &self.world,
@@ -1031,6 +1069,7 @@ impl WindowState {
                 pointer,
                 self.ui_model.view.gizmo_display,
                 pixels_per_point,
+                scene_scale,
             );
             let constraint = match picked_handle {
                 Some(TransformHandle::PlaneNormal) => Some(ManipulationConstraint::PlaneNormal),
@@ -1048,6 +1087,7 @@ impl WindowState {
                     &self.camera,
                     self.viewport,
                     pointer,
+                    scene_scale,
                 ) == Some(selection) =>
                 {
                     Some(ManipulationConstraint::ViewPlane)
@@ -1075,7 +1115,7 @@ impl WindowState {
                 self.active_transform = Some(ActiveTransformDrag {
                     target: selection,
                     constraint,
-                    origin: origin.as_dvec3(),
+                    origin: scene_scale.to_world_vec3(origin),
                     plane_frame,
                     box_frame,
                 });
@@ -1091,7 +1131,7 @@ impl WindowState {
         {
             match active.constraint {
                 ManipulationConstraint::PlaneNormal => {
-                    self.drag_plane_normal(active, pointer, pixels_per_point)?;
+                    self.drag_plane_normal(active, pointer, pixels_per_point, scene_scale)?;
                 }
                 ManipulationConstraint::Rotate(handle) => {
                     self.drag_box_rotation(
@@ -1100,6 +1140,7 @@ impl WindowState {
                         pointer,
                         pointer_delta,
                         pixels_per_point,
+                        scene_scale,
                     )?;
                 }
                 ManipulationConstraint::Handle(handle) => {
@@ -1110,6 +1151,7 @@ impl WindowState {
                         active.target,
                         self.ui_model.view.gizmo_display,
                         pixels_per_point,
+                        scene_scale,
                     )
                     .ok_or_else(|| "selected entity no longer has a transform gizmo".to_owned())?;
                     if let Some(translation) = scene::constrained_translation(
@@ -1118,11 +1160,11 @@ impl WindowState {
                         self.viewport,
                         pointer,
                         pointer_delta,
-                        active.origin.as_vec3(),
+                        scene_scale.to_render_vec3(active.origin),
                         length,
                     ) && translation.length_squared() > 0.0
                     {
-                        self.translate_selection(active, translation.as_dvec3())?;
+                        self.translate_selection(active, scene_scale.to_world_vec3(translation))?;
                     }
                 }
                 ManipulationConstraint::ViewPlane => {
@@ -1131,10 +1173,10 @@ impl WindowState {
                         self.viewport,
                         pointer,
                         pointer_delta,
-                        active.origin.as_vec3(),
+                        scene_scale.to_render_vec3(active.origin),
                     ) && translation.length_squared() > 0.0
                     {
-                        self.translate_selection(active, translation.as_dvec3())?;
+                        self.translate_selection(active, scene_scale.to_world_vec3(translation))?;
                     }
                 }
             }
@@ -1152,6 +1194,7 @@ impl WindowState {
                 &self.camera,
                 self.viewport,
                 pointer,
+                scene_scale,
             ));
         }
         if gesture.primary_released {
@@ -1160,22 +1203,28 @@ impl WindowState {
         self.synchronize_edit_gesture(mode)
     }
 
-    fn field_brush_sample(&self, pointer: Option<Vec2>) -> Option<(fieldcad_core::PlaneId, DVec2)> {
+    fn field_brush_sample(
+        &self,
+        pointer: Option<Vec2>,
+        scene_scale: fieldcad_core::SceneScale,
+    ) -> Option<(fieldcad_core::PlaneId, DVec2)> {
         let scene::SceneSelection::Plane(plane_id) = self.ui_model.scene_selection()? else {
             return None;
         };
         let plane = self.world.planes().get(&plane_id)?;
         let ray = self.camera.ray_from_viewport(pointer?, self.viewport)?;
+        // A direction, not a length — cast as-is, never scale-converted.
         let normal = plane.normal.as_vec3();
         let denominator = ray.direction.dot(normal);
         if denominator.abs() < 1.0e-6 {
             return None;
         }
-        let distance = (plane.origin.as_vec3() - ray.origin).dot(normal) / denominator;
+        let render_origin = scene_scale.to_render_vec3(plane.origin);
+        let distance = (render_origin - ray.origin).dot(normal) / denominator;
         if distance < 0.0 {
             return None;
         }
-        let hit = (ray.origin + ray.direction * distance).as_dvec3() - plane.origin;
+        let hit = scene_scale.to_world_vec3(ray.origin + ray.direction * distance) - plane.origin;
         let (u, v) = plane.basis();
         Some((plane_id, DVec2::new(hit.dot(u), hit.dot(v))))
     }
@@ -1313,6 +1362,7 @@ impl WindowState {
         active: ActiveTransformDrag,
         pointer: Vec2,
         pixels_per_point: f32,
+        scene_scale: fieldcad_core::SceneScale,
     ) -> Result<(), String> {
         let scene::SceneSelection::Plane(plane_id) = active.target else {
             return Ok(());
@@ -1330,17 +1380,19 @@ impl WindowState {
             &self.camera,
             self.viewport,
             active.target,
-            Some(active.preview()),
+            Some(active.preview(scene_scale)),
             self.ui_model.view.gizmo_display,
             pixels_per_point,
+            scene_scale,
         )
         .ok_or_else(|| "selected plane no longer has a normal handle".to_owned())?;
-        let radius = tip.distance(active.origin.as_vec3());
+        let render_origin = scene_scale.to_render_vec3(active.origin);
+        let radius = tip.distance(render_origin);
         let Some(normal) = scene::dragged_plane_normal(
             &self.camera,
             self.viewport,
             pointer,
-            active.origin.as_vec3(),
+            render_origin,
             radius,
             frame.normal.as_vec3(),
         ) else {
@@ -1369,6 +1421,7 @@ impl WindowState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn drag_box_rotation(
         &mut self,
         active: ActiveTransformDrag,
@@ -1376,6 +1429,7 @@ impl WindowState {
         pointer: Vec2,
         pointer_delta: Vec2,
         pixels_per_point: f32,
+        scene_scale: fieldcad_core::SceneScale,
     ) -> Result<(), String> {
         let scene::SceneSelection::Box(region_id) = active.target else {
             return Ok(());
@@ -1389,7 +1443,7 @@ impl WindowState {
             .get(&region_id)
             .ok_or_else(|| format!("field box {region_id} no longer exists"))?;
         let current_rotation = scene::quat_from_dquat(frame.rotation);
-        let origin = active.origin.as_vec3();
+        let origin = scene_scale.to_render_vec3(active.origin);
         let rotated = match handle {
             TransformHandle::RotateX | TransformHandle::RotateY | TransformHandle::RotateZ => {
                 let Some(local_axis) = handle.rotation_axis() else {
@@ -1421,6 +1475,7 @@ impl WindowState {
                     active.target,
                     self.ui_model.view.gizmo_display,
                     pixels_per_point,
+                    scene_scale,
                 ) else {
                     return Ok(());
                 };
@@ -1545,27 +1600,33 @@ impl WindowState {
         let Some(selection) = self.ui_model.scene_selection() else {
             return;
         };
+        let scene_scale = self.scene_scale();
         match selection {
             scene::SceneSelection::Object(id) => {
                 let Some(object) = self.world.object(id) else {
                     return;
                 };
                 let (centre, radius) = object.bounding_sphere();
-                self.camera.focus(centre.as_vec3(), radius as f32);
+                self.camera.focus(
+                    scene_scale.to_render_vec3(centre),
+                    scene_scale.to_render(radius),
+                );
             }
             scene::SceneSelection::Plane(id) => {
                 let Some(plane) = self.world.planes().get(&id) else {
                     return;
                 };
-                self.camera
-                    .focus(plane.origin.as_vec3(), plane.half_extent.length() as f32);
+                self.camera.focus(
+                    scene_scale.to_render_vec3(plane.origin),
+                    scene_scale.to_render(plane.half_extent.length()),
+                );
             }
             scene::SceneSelection::Probe(id) => {
                 let Some(probe) = self.world.probe(id) else {
                     return;
                 };
                 if let Ok(position) = self.world.resolve_probe_position(probe) {
-                    self.camera.focus(position.as_vec3(), 0.2);
+                    self.camera.focus(scene_scale.to_render_vec3(position), 0.2);
                 }
             }
             scene::SceneSelection::Box(id) => {
@@ -1573,16 +1634,18 @@ impl WindowState {
                     return;
                 };
                 self.camera.focus(
-                    field_box.origin.as_vec3(),
-                    field_box.half_extent.length() as f32,
+                    scene_scale.to_render_vec3(field_box.origin),
+                    scene_scale.to_render(field_box.half_extent.length()),
                 );
             }
             scene::SceneSelection::Sphere(id) => {
                 let Some(sphere) = self.world.spheres().get(&id) else {
                     return;
                 };
-                self.camera
-                    .focus(sphere.origin.as_vec3(), sphere.radius as f32);
+                self.camera.focus(
+                    scene_scale.to_render_vec3(sphere.origin),
+                    scene_scale.to_render(sphere.radius),
+                );
             }
         };
     }
@@ -1694,9 +1757,9 @@ struct ActiveFieldBrushDrag {
 }
 
 impl ActiveTransformDrag {
-    fn preview(self) -> scene::TransformPreview {
+    fn preview(self, scene_scale: fieldcad_core::SceneScale) -> scene::TransformPreview {
         scene::TransformPreview {
-            origin: self.origin.as_vec3(),
+            origin: scene_scale.to_render_vec3(self.origin),
             plane_normal: self.plane_frame.map(|frame| frame.normal.as_vec3()),
             rotation: self
                 .box_frame
@@ -2290,6 +2353,7 @@ mod tests {
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             assert!(
                 !baseline.vector_lines.is_empty(),
@@ -2313,6 +2377,7 @@ mod tests {
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             assert_eq!(reused.vector_lines.len(), poisoned_len);
             assert!(
@@ -2330,6 +2395,7 @@ mod tests {
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             assert_eq!(
                 rebuilt.vector_lines.len(),
@@ -2359,6 +2425,7 @@ mod tests {
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             let mut cache = new_cache.unwrap();
             cache.geometry.vector_lines.push(scene::ColoredVertex {
@@ -2380,6 +2447,7 @@ mod tests {
                 &hidden_layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             assert!(
                 rebuilt.vector_lines.is_empty(),
@@ -2398,6 +2466,7 @@ mod tests {
                 &BTreeMap::new(),
                 scene::SceneVisibility::ALL,
                 &[],
+                fieldcad_core::SceneScale::metre(),
             );
             assert!(geometry.surface_triangles.is_empty());
             assert!(geometry.vector_lines.is_empty());
@@ -2422,6 +2491,7 @@ mod tests {
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             assert!(
                 !baseline.vector_lines.is_empty(),
@@ -2442,6 +2512,7 @@ mod tests {
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             assert_eq!(reused.vector_lines.len(), poisoned_len);
             assert!(new_cache.is_none());
@@ -2463,6 +2534,7 @@ mod tests {
                 &layers,
                 show,
                 std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
             );
             assert!(
                 rebuilt.vector_lines.is_empty(),

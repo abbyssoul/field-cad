@@ -6,7 +6,7 @@
 
 use fieldcad_core::{
     BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GridLattice, SampleGeometry, SampleValidity,
-    SphereLattice, WorldSnapshot,
+    SceneScale, SphereLattice, WorldSnapshot,
 };
 use glam::{DVec3, Vec3};
 
@@ -35,6 +35,7 @@ pub fn field_geometry(
     layers: RegionLayers<'_>,
     show: SceneVisibility,
     world: &WorldSnapshot,
+    scene_scale: SceneScale,
 ) -> FieldGeometry {
     let Some(channel) = snapshot.channel(channel) else {
         return FieldGeometry::default();
@@ -84,6 +85,7 @@ pub fn field_geometry(
                         &field,
                         offset,
                         plane_settings.magnitude_density,
+                        scene_scale,
                     );
                 }
                 if plane_settings.vectors.visible {
@@ -94,6 +96,7 @@ pub fn field_geometry(
                         &field,
                         offset + normal * 0.008,
                         plane_settings.vectors,
+                        scene_scale,
                     );
                 }
             }
@@ -108,6 +111,7 @@ pub fn field_geometry(
                     &colors,
                     scale,
                     settings.vectors,
+                    scene_scale,
                 );
             }
             SampleGeometry::Box { region, lattice } => {
@@ -135,6 +139,7 @@ pub fn field_geometry(
                     &colors,
                     scale,
                     box_settings.vectors,
+                    scene_scale,
                 );
             }
             SampleGeometry::Sphere { region, lattice } => {
@@ -162,6 +167,7 @@ pub fn field_geometry(
                     &colors,
                     scale,
                     sphere_settings.vectors,
+                    scene_scale,
                 );
             }
             _ => {}
@@ -195,6 +201,7 @@ fn append_plane_surface(
     field: &PlaneField<'_>,
     offset: Vec3,
     density: u32,
+    scene_scale: SceneScale,
 ) {
     let PlaneField {
         lattice,
@@ -208,7 +215,7 @@ fn append_plane_surface(
     for y_pair in ys.windows(2) {
         for x_pair in xs.windows(2) {
             let sample = |u, v| {
-                let interpolation = plane_interpolation(lattice, u, v)?;
+                let interpolation = plane_interpolation(lattice, u, v, scene_scale)?;
                 interpolation.is_usable(validity).then_some(ColoredVertex {
                     position: interpolation.position + offset,
                     color: interpolation.vec3(colors).extend(0.78),
@@ -239,6 +246,7 @@ fn append_plane_vectors(
     field: &PlaneField<'_>,
     offset: Vec3,
     display: VectorDisplay,
+    scene_scale: SceneScale,
 ) {
     let PlaneField {
         lattice,
@@ -250,10 +258,10 @@ fn append_plane_vectors(
     let counts = lattice.counts();
     let xs = uniform_axis(counts.x, display.density);
     let ys = uniform_axis(counts.y, display.density);
-    let step_length = uniform_glyph_spacing(lattice, &xs, &ys);
+    let step_length = uniform_glyph_spacing(lattice, &xs, &ys, scene_scale);
     for &y in &ys {
         for &x in &xs {
-            let Some(interpolation) = plane_interpolation(lattice, x, y) else {
+            let Some(interpolation) = plane_interpolation(lattice, x, y, scene_scale) else {
                 continue;
             };
             if !interpolation.is_usable(validity) {
@@ -277,6 +285,7 @@ fn append_plane_vectors(
 /// published point: the transport stride and the display density answer
 /// different questions, and tying them together means a user who wants a
 /// legible volume has to ask the solver for fewer samples to get it.
+#[allow(clippy::too_many_arguments)]
 fn append_domain_vectors(
     lines: &mut Vec<ColoredVertex>,
     lattice: GridLattice,
@@ -285,16 +294,17 @@ fn append_domain_vectors(
     colors: &[Vec3],
     scale: MagnitudeScale,
     display: VectorDisplay,
+    scene_scale: SceneScale,
 ) {
     let counts = lattice.counts();
     let xs = uniform_axis(counts.x, display.density);
     let ys = uniform_axis(counts.y, display.density);
     let zs = uniform_axis(counts.z, display.density);
-    let step_length = uniform_domain_spacing(lattice, &xs, &ys, &zs);
+    let step_length = uniform_domain_spacing(lattice, &xs, &ys, &zs, scene_scale);
     for &z in &zs {
         for &y in &ys {
             for &x in &xs {
-                let Some(interpolation) = grid_interpolation(lattice, x, y, z) else {
+                let Some(interpolation) = grid_interpolation(lattice, x, y, z, scene_scale) else {
                     continue;
                 };
                 if !interpolation.is_usable(validity) {
@@ -315,6 +325,7 @@ fn append_domain_vectors(
 
 /// Sparse glyphs distributed uniformly through an oriented field box, resampled
 /// from the published lattice the same way a plane or the whole domain is.
+#[allow(clippy::too_many_arguments)]
 fn append_box_vectors(
     lines: &mut Vec<ColoredVertex>,
     lattice: BoxLattice,
@@ -323,16 +334,17 @@ fn append_box_vectors(
     colors: &[Vec3],
     scale: MagnitudeScale,
     display: VectorDisplay,
+    scene_scale: SceneScale,
 ) {
     let counts = lattice.counts();
     let xs = uniform_axis(counts.x, display.density);
     let ys = uniform_axis(counts.y, display.density);
     let zs = uniform_axis(counts.z, display.density);
-    let step_length = uniform_box_spacing(lattice, &xs, &ys, &zs);
+    let step_length = uniform_box_spacing(lattice, &xs, &ys, &zs, scene_scale);
     for &z in &zs {
         for &y in &ys {
             for &x in &xs {
-                let Some(interpolation) = box_interpolation(lattice, x, y, z) else {
+                let Some(interpolation) = box_interpolation(lattice, x, y, z, scene_scale) else {
                     continue;
                 };
                 if !interpolation.is_usable(validity) {
@@ -356,6 +368,7 @@ fn append_box_vectors(
 /// evaluated the whole cube (see [`SphereLattice`]), but only the samples
 /// actually inside the sphere are drawn, which is what makes the arrows fill
 /// a ball rather than a box.
+#[allow(clippy::too_many_arguments)]
 fn append_sphere_vectors(
     lines: &mut Vec<ColoredVertex>,
     lattice: SphereLattice,
@@ -364,20 +377,24 @@ fn append_sphere_vectors(
     colors: &[Vec3],
     scale: MagnitudeScale,
     display: VectorDisplay,
+    scene_scale: SceneScale,
 ) {
     let grid = lattice.grid();
     let counts = grid.counts();
     let xs = uniform_axis(counts.x, display.density);
     let ys = uniform_axis(counts.y, display.density);
     let zs = uniform_axis(counts.z, display.density);
-    let step_length = uniform_domain_spacing(grid, &xs, &ys, &zs);
+    let step_length = uniform_domain_spacing(grid, &xs, &ys, &zs, scene_scale);
     for &z in &zs {
         for &y in &ys {
             for &x in &xs {
-                let Some(interpolation) = grid_interpolation(grid, x, y, z) else {
+                let Some(interpolation) = grid_interpolation(grid, x, y, z, scene_scale) else {
                     continue;
                 };
-                if !lattice.contains(interpolation.position.as_dvec3()) {
+                // `interpolation.position` is render-space; the sphere lattice's
+                // own containment test is defined in world (SI-metre) space, so
+                // it needs the inverse conversion, not a bare widening cast.
+                if !lattice.contains(scene_scale.to_world_vec3(interpolation.position)) {
                     continue;
                 }
                 if !interpolation.is_usable(validity) {
@@ -429,7 +446,13 @@ impl GridInterpolation {
     }
 }
 
-fn grid_interpolation(lattice: GridLattice, x: f64, y: f64, z: f64) -> Option<GridInterpolation> {
+fn grid_interpolation(
+    lattice: GridLattice,
+    x: f64,
+    y: f64,
+    z: f64,
+    scene_scale: SceneScale,
+) -> Option<GridInterpolation> {
     let counts = lattice.counts();
     let axis = |value: f64, count: u32| {
         let value = value.clamp(0.0, f64::from(count.saturating_sub(1)));
@@ -466,7 +489,7 @@ fn grid_interpolation(lattice: GridLattice, x: f64, y: f64, z: f64) -> Option<Gr
         return None;
     }
     Some(GridInterpolation {
-        position: grid_point(lattice, x, y, z)?.as_vec3(),
+        position: scene_scale.to_render_vec3(grid_point(lattice, x, y, z)?),
         indices,
         weights,
     })
@@ -478,10 +501,16 @@ fn grid_point(lattice: GridLattice, x: f64, y: f64, z: f64) -> Option<DVec3> {
     Some(lattice.position(0)? + lattice.step() * DVec3::new(x, y, z))
 }
 
-fn uniform_domain_spacing(lattice: GridLattice, xs: &[f64], ys: &[f64], zs: &[f64]) -> f32 {
+fn uniform_domain_spacing(
+    lattice: GridLattice,
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    scene_scale: SceneScale,
+) -> f32 {
     let step = lattice.step();
     let spacing = |axis: &[f64], step: f64| {
-        (axis.len() > 1).then(|| ((axis[1] - axis[0]) * step).abs() as f32)
+        (axis.len() > 1).then(|| scene_scale.to_render(((axis[1] - axis[0]) * step).abs()))
     };
     [
         spacing(xs, step.x),
@@ -492,7 +521,7 @@ fn uniform_domain_spacing(lattice: GridLattice, xs: &[f64], ys: &[f64], zs: &[f6
     .flatten()
     .filter(|spacing| *spacing > f32::EPSILON)
     .reduce(f32::min)
-    .unwrap_or(0.25)
+    .unwrap_or_else(|| scene_scale.to_render(0.25))
 }
 
 /// Trilinear interpolation of an oriented [`BoxLattice`], mirroring
@@ -530,7 +559,13 @@ impl BoxInterpolation {
     }
 }
 
-fn box_interpolation(lattice: BoxLattice, u: f64, v: f64, w: f64) -> Option<BoxInterpolation> {
+fn box_interpolation(
+    lattice: BoxLattice,
+    u: f64,
+    v: f64,
+    w: f64,
+    scene_scale: SceneScale,
+) -> Option<BoxInterpolation> {
     let counts = lattice.counts();
     let axis = |value: f64, count: u32| {
         let value = value.clamp(0.0, f64::from(count.saturating_sub(1)));
@@ -570,10 +605,9 @@ fn box_interpolation(lattice: BoxLattice, u: f64, v: f64, w: f64) -> Option<BoxI
         .into_iter()
         .zip(weights)
         .map(|(index, weight)| lattice.position(index).map(|point| point * weight))
-        .sum::<Option<DVec3>>()?
-        .as_vec3();
+        .sum::<Option<DVec3>>()?;
     Some(BoxInterpolation {
-        position,
+        position: scene_scale.to_render_vec3(position),
         indices,
         weights,
     })
@@ -584,19 +618,26 @@ fn box_interpolation(lattice: BoxLattice, u: f64, v: f64, w: f64) -> Option<BoxI
 /// of [`uniform_domain_spacing`], which can read the step directly off an
 /// axis-aligned [`GridLattice`] where this instead reads it off two adjacent
 /// lattice points.
-fn uniform_box_spacing(lattice: BoxLattice, xs: &[f64], ys: &[f64], zs: &[f64]) -> f32 {
+fn uniform_box_spacing(
+    lattice: BoxLattice,
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    scene_scale: SceneScale,
+) -> f32 {
     let counts = lattice.counts();
     let width = counts.x as usize;
     let height = counts.y as usize;
     let Some(origin) = lattice.position(0) else {
-        return 0.25;
+        return scene_scale.to_render(0.25);
     };
     let physical_step = |index: usize| lattice.position(index).map(|point| point.distance(origin));
     let spacing = |axis: &[f64], step_index: usize| {
         if axis.len() <= 1 {
             return None;
         }
-        physical_step(step_index).map(|step| ((axis[1] - axis[0]) * step).abs() as f32)
+        physical_step(step_index)
+            .map(|step| scene_scale.to_render(((axis[1] - axis[0]) * step).abs()))
     };
     [
         spacing(xs, 1),
@@ -607,7 +648,7 @@ fn uniform_box_spacing(lattice: BoxLattice, xs: &[f64], ys: &[f64], zs: &[f64]) 
     .flatten()
     .filter(|spacing| *spacing > f32::EPSILON)
     .reduce(f32::min)
-    .unwrap_or(0.25)
+    .unwrap_or_else(|| scene_scale.to_render(0.25))
 }
 
 /// Coordinates in snapshot-lattice space, distributed uniformly across its
@@ -662,6 +703,7 @@ fn plane_interpolation(
     lattice: fieldcad_core::PlaneLattice,
     u: f64,
     v: f64,
+    scene_scale: SceneScale,
 ) -> Option<PlaneInterpolation> {
     let counts = lattice.counts();
     let u = u.clamp(0.0, f64::from(counts.x.saturating_sub(1)));
@@ -689,29 +731,33 @@ fn plane_interpolation(
         .into_iter()
         .zip(weights)
         .map(|(index, weight)| lattice.position(index).map(|point| point * weight))
-        .sum::<Option<DVec3>>()?
-        .as_vec3();
+        .sum::<Option<DVec3>>()?;
     Some(PlaneInterpolation {
-        position,
+        position: scene_scale.to_render_vec3(position),
         indices,
         weights,
     })
 }
 
-fn uniform_glyph_spacing(lattice: fieldcad_core::PlaneLattice, xs: &[f64], ys: &[f64]) -> f32 {
+fn uniform_glyph_spacing(
+    lattice: fieldcad_core::PlaneLattice,
+    xs: &[f64],
+    ys: &[f64],
+    scene_scale: SceneScale,
+) -> f32 {
     let mut spacings = Vec::with_capacity(2);
     if xs.len() > 1
         && let (Some(first), Some(second)) = (
-            plane_interpolation(lattice, xs[0], ys[0]),
-            plane_interpolation(lattice, xs[1], ys[0]),
+            plane_interpolation(lattice, xs[0], ys[0], scene_scale),
+            plane_interpolation(lattice, xs[1], ys[0], scene_scale),
         )
     {
         spacings.push(first.position.distance(second.position));
     }
     if ys.len() > 1
         && let (Some(first), Some(second)) = (
-            plane_interpolation(lattice, xs[0], ys[0]),
-            plane_interpolation(lattice, xs[0], ys[1]),
+            plane_interpolation(lattice, xs[0], ys[0], scene_scale),
+            plane_interpolation(lattice, xs[0], ys[1], scene_scale),
         )
     {
         spacings.push(first.position.distance(second.position));
@@ -720,7 +766,7 @@ fn uniform_glyph_spacing(lattice: fieldcad_core::PlaneLattice, xs: &[f64], ys: &
         .into_iter()
         .filter(|spacing| *spacing > f32::EPSILON)
         .reduce(f32::min)
-        .unwrap_or(0.25)
+        .unwrap_or_else(|| scene_scale.to_render(0.25))
 }
 
 fn lattice_normal(lattice: fieldcad_core::PlaneLattice) -> Vec3 {
@@ -850,6 +896,7 @@ mod tests {
             &uniform_plane_field(lattice, &values, &validity, &colors),
             Vec3::ZERO,
             2,
+            SceneScale::metre(),
         );
 
         assert!(triangles.is_empty());
@@ -868,6 +915,7 @@ mod tests {
             &uniform_plane_field(lattice, &values, &validity, &colors),
             Vec3::ZERO,
             2,
+            SceneScale::metre(),
         );
 
         assert_eq!(triangles.len(), 6);
@@ -888,6 +936,7 @@ mod tests {
             &uniform_plane_field(lattice, &values, &validity, &colors),
             Vec3::ZERO,
             3,
+            SceneScale::metre(),
         );
 
         assert_eq!(triangles.len(), 4 * 6);
@@ -911,6 +960,7 @@ mod tests {
             &uniform_plane_field(lattice, &values, &validity, &colors),
             Vec3::ZERO,
             VectorDisplay::new(true, 25),
+            SceneScale::metre(),
         );
 
         let origins: Vec<_> = lines
@@ -935,10 +985,22 @@ mod tests {
         let mut lines = Vec::new();
         let field = uniform_plane_field(lattice, &values, &validity, &colors);
 
-        append_plane_vectors(&mut lines, &field, Vec3::ZERO, VectorDisplay::new(true, 0));
+        append_plane_vectors(
+            &mut lines,
+            &field,
+            Vec3::ZERO,
+            VectorDisplay::new(true, 0),
+            SceneScale::metre(),
+        );
         assert!(lines.is_empty());
 
-        append_plane_vectors(&mut lines, &field, Vec3::ZERO, VectorDisplay::new(true, 8));
+        append_plane_vectors(
+            &mut lines,
+            &field,
+            Vec3::ZERO,
+            VectorDisplay::new(true, 8),
+            SceneScale::metre(),
+        );
         assert_eq!(lines.len() / 6, 8 * 8);
     }
 
@@ -1042,6 +1104,7 @@ mod tests {
                 },
                 SceneVisibility::ALL,
                 &world.snapshot(),
+                SceneScale::metre(),
             )
             .vector_lines
             .len()
@@ -1088,6 +1151,7 @@ mod tests {
                 ..SceneVisibility::ALL
             },
             &world.snapshot(),
+            SceneScale::metre(),
         );
 
         assert!(geometry.surface_triangles.is_empty());
@@ -1116,6 +1180,7 @@ mod tests {
                 },
                 SceneVisibility::ALL,
                 &world.snapshot(),
+                SceneScale::metre(),
             )
             .vector_lines
             .len()
@@ -1184,6 +1249,7 @@ mod tests {
                 },
                 SceneVisibility::ALL,
                 &world.snapshot(),
+                SceneScale::metre(),
             )
             .vector_lines
             .len()
@@ -1238,6 +1304,7 @@ mod tests {
                 },
                 SceneVisibility::ALL,
                 &world.snapshot(),
+                SceneScale::metre(),
             )
             .vector_lines
             .len()
@@ -1277,6 +1344,7 @@ mod tests {
             &colors,
             MagnitudeScale::over(&values, &validity),
             display,
+            SceneScale::metre(),
         );
         lines
     }
@@ -1352,6 +1420,7 @@ mod tests {
                     scale,
                     ..VectorDisplay::new(true, 3)
                 },
+                SceneScale::metre(),
             );
             lines[1].position.distance(lines[0].position)
         };
@@ -1420,6 +1489,7 @@ mod tests {
             &colors,
             MagnitudeScale::over(&values, &validity),
             display,
+            SceneScale::metre(),
         );
         lines
     }
@@ -1476,6 +1546,7 @@ mod tests {
             &colors,
             MagnitudeScale::over(&values, &validity),
             VectorDisplay::new(true, 2),
+            SceneScale::metre(),
         );
 
         let origins: Vec<_> = lines
@@ -1518,6 +1589,7 @@ mod tests {
             &colors,
             MagnitudeScale::over(&values, &validity),
             VectorDisplay::new(true, 5),
+            SceneScale::metre(),
         );
 
         let origins: Vec<_> = lines

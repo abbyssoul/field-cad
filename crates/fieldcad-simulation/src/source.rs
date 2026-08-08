@@ -13,8 +13,8 @@ use std::{
 };
 
 use fieldcad_core::{
-    ChannelId, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, SimulationMode, TimeStep,
-    WorldCommand, WorldRevision, WorldSnapshot,
+    ChannelId, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, SceneScale, SimulationMode,
+    TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
 };
 use fieldcad_plugin_api::FieldBrushStroke;
 use glam::DVec3;
@@ -81,6 +81,15 @@ pub enum CommandPayload {
     /// rather than a local setting because a remote session must renew its
     /// subscriptions after a reconnect.
     SetSubscription(Subscription),
+    /// How many metres one render/camera unit represents, for the desktop
+    /// viewport's camera range and gizmo/proxy sizing.
+    ///
+    /// Purely a presentation concern, exactly like `SetSubscription`: it
+    /// changes nothing a solver reads or any stored `Transform`, so it does
+    /// not advance the world revision. It is a command rather than a local
+    /// UI setting so a remote MCP client can discover and drive the working
+    /// scale the same way the desktop app does.
+    SetSceneScale(SceneScale),
     /// Activate or deactivate one equation system in this scene. Its declared
     /// object-component schemas remain registered either way.
     SetFieldSystemEnabled {
@@ -152,6 +161,7 @@ impl CommandPayload {
             Self::ReconfigureDomain(_) => CommandKind::ReconfigureDomain,
             Self::SetPlaybackSpeed(_) => CommandKind::SetPlaybackSpeed,
             Self::SetSubscription(_) => CommandKind::SetSubscription,
+            Self::SetSceneScale(_) => CommandKind::SetSceneScale,
             Self::SetFieldSystemEnabled { .. } => CommandKind::SetFieldSystemEnabled,
             Self::SetFieldSystemRealtime { .. } => CommandKind::SetFieldSystemRealtime,
             Self::SetFieldModel { .. } => CommandKind::SetFieldModel,
@@ -186,6 +196,7 @@ pub enum CommandKind {
     ReconfigureDomain,
     SetPlaybackSpeed,
     SetSubscription,
+    SetSceneScale,
     SetFieldSystemEnabled,
     SetFieldSystemRealtime,
     SetFieldModel,
@@ -211,6 +222,7 @@ impl CommandKind {
             Self::ReconfigureDomain => "Reconfigure domain",
             Self::SetPlaybackSpeed => "Set playback speed",
             Self::SetSubscription => "Set subscription",
+            Self::SetSceneScale => "Set scene scale",
             Self::SetFieldSystemEnabled => "Set field system enabled",
             Self::SetFieldSystemRealtime => "Set field system realtime",
             Self::SetFieldModel => "Set field model",
@@ -468,6 +480,11 @@ pub trait FieldDataSource: Send {
     /// What the source is currently asked to publish. Acknowledged, not hoped
     /// for: it reflects the last accepted [`CommandPayload::SetSubscription`].
     fn subscription(&self) -> Subscription;
+    /// How many metres one render/camera unit represents. Acknowledged, not
+    /// hoped for: it reflects the last accepted
+    /// [`CommandPayload::SetSceneScale`]. Defaults to
+    /// [`SceneScale::metre`], matching the desktop app's original behaviour.
+    fn scene_scale(&self) -> SceneScale;
     /// Equation systems composed into the scene, including inactive systems
     /// that consequently have no channels in the latest snapshot.
     fn field_systems(&self) -> Vec<FieldSystemStatus>;
@@ -769,6 +786,12 @@ impl SessionCore {
                 // Never queued: it cannot change a computed value, so there is
                 // no boundary for it to be atomic with.
                 self.runtime.set_subscription(subscription)?;
+            }
+            CommandPayload::SetSceneScale(scale) => {
+                // Never queued, like `SetSubscription`: it is a presentation
+                // setting, not a computed value, so there is no tick boundary
+                // for it to be atomic with.
+                self.runtime.set_scene_scale(scale);
             }
             CommandPayload::SetFieldSystemEnabled { plugin, enabled } => {
                 self.runtime.set_field_system_enabled(&plugin, enabled)?;
@@ -1084,6 +1107,10 @@ impl FieldDataSource for LocalDataSource {
         self.core.runtime.subscription()
     }
 
+    fn scene_scale(&self) -> SceneScale {
+        self.core.runtime.scene_scale()
+    }
+
     fn field_systems(&self) -> Vec<FieldSystemStatus> {
         self.core.runtime.field_systems()
     }
@@ -1265,6 +1292,10 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn subscription(&self) -> Subscription {
         self.core.runtime.subscription()
+    }
+
+    fn scene_scale(&self) -> SceneScale {
+        self.core.runtime.scene_scale()
     }
 
     fn field_systems(&self) -> Vec<FieldSystemStatus> {

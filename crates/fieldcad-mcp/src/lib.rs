@@ -33,8 +33,8 @@ use std::{
 
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, Domain, DomainBounds,
-    PluginId, PluginProvenance, Precision, Resolution, SnapshotCompleteness, SnapshotIdentity,
-    SolverDiagnostic, TimeStep, WorldCommand,
+    PluginId, PluginProvenance, Precision, Resolution, SceneScale, SnapshotCompleteness,
+    SnapshotIdentity, SolverDiagnostic, TimeStep, WorldCommand,
 };
 use fieldcad_server::{HeadlessServer, SessionEvent, WatchEvent};
 use fieldcad_simulation::{
@@ -226,6 +226,15 @@ struct SetPlaybackSpeedParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetSceneScaleParams {
+    /// How many metres one render/camera unit represents. Must be finite and
+    /// positive. Defaults to 1.0 (metre scale); use e.g. 1e-9 for a
+    /// nanometre-scale scene or 1.495978707e11 for an astronomical-unit
+    /// scale.
+    metres_per_unit: f64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SetSubscriptionParams {
     /// Sample every probe that requested each channel.
     probes: bool,
@@ -389,6 +398,11 @@ struct CancelQueuedCommandParams {
 struct SessionStatusResource {
     source: DataSourceStatus,
     simulation: SimulationStatus,
+    domain: Domain,
+    /// How many metres one render/camera unit represents. A presentation
+    /// setting for a viewport driving this session — never affects the
+    /// authored world or solver results. See `set_scene_scale`.
+    scene_scale: SceneScale,
 }
 
 const SESSION_STATUS_URI: &str = "fieldcad://session/status";
@@ -406,8 +420,9 @@ const SESSION_RESOURCE_URIS: [&str; 4] = [
 fn session_resources() -> Vec<Resource> {
     vec![
         Resource::new(SESSION_STATUS_URI, "session-status").with_description(
-            "Authoritative source/simulation status: connecting/ready/disconnected/failed, and \
-             run mode/tick/time/time-step/world-revision.",
+            "Authoritative source/simulation status: connecting/ready/disconnected/failed, \
+             run mode/tick/time/time-step/world-revision, the numerical domain, and the scene \
+             scale (metres per render/camera unit).",
         ),
         Resource::new(SESSION_SNAPSHOT_URI, "session-snapshot").with_description(
             "The latest complete field snapshot, unfiltered: every published channel, revision, \
@@ -733,6 +748,22 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Set how many metres one render/camera unit represents. Purely a presentation setting for a viewport's camera range and gizmo/proxy sizing — never changes any stored object position, size, or physical constant. Defaults to 1.0 (metre scale). Use e.g. 1e-9 for a nanometre-scale scene or 1.495978707e11 for an astronomical-unit scale. Read back via the session-status resource."
+    )]
+    async fn set_scene_scale(
+        &self,
+        Parameters(params): Parameters<SetSceneScaleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Ok(scale) = SceneScale::from_metres(params.metres_per_unit) else {
+            return tool_error("scene scale must be finite and greater than zero");
+        };
+        match submit_and_wait(&self.model, CommandPayload::SetSceneScale(scale)).await {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
         description = "Replace the numerical domain: bounds in metres, solver-cell resolution, one boundary condition per axis, and precision. The authority validates the full candidate, queues it at the next tick boundary if running, rebuilds solver state, and resets to paused t=0. If the existing dt is unsafe for the new lattice, it chooses 80% of the strictest active solver limit."
     )]
     async fn reconfigure_domain(
@@ -957,6 +988,8 @@ impl McpServer {
                 let resource = SessionStatusResource {
                     source: server.status(),
                     simulation: server.simulation_status(),
+                    domain: server.domain(),
+                    scene_scale: server.scene_scale(),
                 };
                 drop(server);
                 resource_text(uri, &resource)
@@ -1803,6 +1836,52 @@ mod tests {
 
         let unknown = server.read_resource_content("fieldcad://session/nonexistent");
         assert!(unknown.is_err(), "an unknown resource URI must be refused");
+    }
+
+    #[tokio::test]
+    async fn set_scene_scale_is_reflected_in_session_status() {
+        let server = server();
+
+        let ReadResourceResponse::Complete(before) =
+            server.read_resource_content(SESSION_STATUS_URI).unwrap()
+        else {
+            panic!("expected a complete resource read");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &before.contents[0] else {
+            panic!("expected text resource contents");
+        };
+        let before_json: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            before_json["scene_scale"], 1.0,
+            "default scale is 1 metre per unit"
+        );
+
+        let result = server
+            .set_scene_scale(Parameters(SetSceneScaleParams {
+                metres_per_unit: 1.0e-9,
+            }))
+            .await
+            .unwrap();
+        json_of(&result);
+
+        let ReadResourceResponse::Complete(after) =
+            server.read_resource_content(SESSION_STATUS_URI).unwrap()
+        else {
+            panic!("expected a complete resource read");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &after.contents[0] else {
+            panic!("expected text resource contents");
+        };
+        let after_json: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(after_json["scene_scale"], 1.0e-9);
+
+        let rejected = server
+            .set_scene_scale(Parameters(SetSceneScaleParams {
+                metres_per_unit: 0.0,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(rejected.is_error, Some(true));
     }
 
     #[test]

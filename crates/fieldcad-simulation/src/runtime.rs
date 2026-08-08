@@ -13,9 +13,10 @@ use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelId, ChannelSchema, ChannelSnapshot, ClockSnapshot, CommitReport, ComponentSchema,
     ComponentTypeId, DiagnosticSeverity, Domain, FieldBatch, ObjectId, PluginId, PluginProvenance,
-    PropertyBag, SampleGeometry, SamplingError, SchemaError, SessionId, SimulationClock,
-    SimulationMode, SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, StepContext,
-    TimeStep, World, WorldCheckpoint, WorldCommand, WorldError, WorldRevision, WorldSnapshot,
+    PropertyBag, SampleGeometry, SamplingError, SceneScale, SchemaError, SessionId,
+    SimulationClock, SimulationMode, SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic,
+    StepContext, TimeStep, World, WorldCheckpoint, WorldCommand, WorldError, WorldRevision,
+    WorldSnapshot,
 };
 use fieldcad_dynamics::{self as dynamics, DynamicsError};
 use fieldcad_plugin_api::{
@@ -455,6 +456,10 @@ pub struct SimulationRuntime {
     world: World,
     clock: SimulationClock,
     domain: Domain,
+    /// How many metres one render/camera unit represents. Purely a
+    /// presentation concern for the desktop viewport — see
+    /// [`CommandPayload::SetSceneScale`](crate::source::CommandPayload::SetSceneScale).
+    scene_scale: SceneScale,
     subscription: Subscription,
     sampling_budget: SamplingBudget,
     session: SessionId,
@@ -504,6 +509,9 @@ pub struct RuntimeConfig {
     pub time_step: TimeStep,
     pub session: SessionId,
     pub subscription: Subscription,
+    /// How many metres one render/camera unit represents. Defaults to
+    /// [`SceneScale::metre`].
+    pub scene_scale: SceneScale,
     pub sampling_budget: SamplingBudget,
     pub plugins: Vec<PluginRegistration>,
     /// How many authored edits can be stepped back through.
@@ -522,6 +530,7 @@ impl RuntimeConfig {
             time_step,
             session,
             subscription: Subscription::default(),
+            scene_scale: SceneScale::default(),
             sampling_budget: SamplingBudget::default(),
             plugins: Vec::new(),
             undo_depth: DEFAULT_UNDO_DEPTH,
@@ -540,6 +549,11 @@ impl RuntimeConfig {
 
     pub fn with_subscription(mut self, subscription: Subscription) -> Self {
         self.subscription = subscription;
+        self
+    }
+
+    pub const fn with_scene_scale(mut self, scene_scale: SceneScale) -> Self {
+        self.scene_scale = scene_scale;
         self
     }
 
@@ -568,6 +582,7 @@ impl SimulationRuntime {
             time_step,
             session,
             subscription,
+            scene_scale,
             sampling_budget,
             plugins,
             undo_depth,
@@ -686,6 +701,7 @@ impl SimulationRuntime {
             world,
             clock,
             domain,
+            scene_scale,
             subscription,
             sampling_budget,
             session,
@@ -719,6 +735,17 @@ impl SimulationRuntime {
 
     pub const fn domain(&self) -> &Domain {
         &self.domain
+    }
+
+    pub const fn scene_scale(&self) -> SceneScale {
+        self.scene_scale
+    }
+
+    /// Adopt a new render/camera scale. Purely a presentation setting: it
+    /// never touches `world`, `domain`, or solver state, and does not enter
+    /// undo history.
+    pub const fn set_scene_scale(&mut self, scene_scale: SceneScale) {
+        self.scene_scale = scene_scale;
     }
 
     pub const fn run_generation(&self) -> u64 {
@@ -2541,5 +2568,31 @@ mod tests {
             })
             .expect("a visible sphere publishes its own geometry");
         assert_eq!(sphere_geometry.len(), 27);
+    }
+
+    /// A presentation setting, like `Subscription`: adopting it must not
+    /// touch the domain, rebuild solver state, or advance the world.
+    #[test]
+    fn set_scene_scale_updates_only_its_own_accessor() {
+        let domain = Domain::centred_cube(2.0, 4).unwrap();
+        let mut runtime = SimulationRuntime::new(RuntimeConfig::new(
+            domain,
+            TimeStep::from_seconds(0.25).unwrap(),
+            SessionId::from_u128(0x9),
+        ))
+        .unwrap();
+
+        assert_eq!(runtime.scene_scale(), fieldcad_core::SceneScale::metre());
+        let revision_before = runtime.world_snapshot().revision();
+        let domain_before = *runtime.domain();
+
+        runtime.set_scene_scale(fieldcad_core::SceneScale::nanometre());
+
+        assert_eq!(
+            runtime.scene_scale(),
+            fieldcad_core::SceneScale::nanometre()
+        );
+        assert_eq!(*runtime.domain(), domain_before);
+        assert_eq!(runtime.world_snapshot().revision(), revision_before);
     }
 }

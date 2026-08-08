@@ -3,7 +3,7 @@
 //! Rays are cast through the same `Viewport` the frame was rendered with, so a
 //! click lands on the object the user actually sees.
 
-use fieldcad_core::{FieldBox, ObjectId, SlicePlane, WorldSnapshot};
+use fieldcad_core::{FieldBox, ObjectId, SceneScale, SlicePlane, WorldSnapshot};
 use glam::{Vec2, Vec3};
 
 use super::{ObjectMesh, SceneSelection, SceneVisibility, instances, quat_from_dquat};
@@ -16,9 +16,10 @@ pub fn pick_scene(
     camera: &OrbitCamera,
     viewport: Viewport,
     pointer: Vec2,
+    scene_scale: SceneScale,
 ) -> Option<SceneSelection> {
     let ray = camera.ray_from_viewport(pointer, viewport)?;
-    let mut nearest = nearest_object_hit(world, show, ray)
+    let mut nearest = nearest_object_hit(world, show, ray, scene_scale)
         .map(|(distance, object)| (distance, SceneSelection::Object(object)));
 
     for plane in world
@@ -26,7 +27,7 @@ pub fn pick_scene(
         .values()
         .filter(|plane| plane.visible && show.planes)
     {
-        let Some(distance) = ray_plane_hit(ray, plane) else {
+        let Some(distance) = ray_plane_hit(ray, plane, scene_scale) else {
             continue;
         };
         if nearest.is_none_or(|(best, _)| distance < best) {
@@ -39,7 +40,7 @@ pub fn pick_scene(
         .values()
         .filter(|region| region.visible && show.boxes)
     {
-        let Some(distance) = ray_box_hit(ray, field_box) else {
+        let Some(distance) = ray_box_hit(ray, field_box, scene_scale) else {
             continue;
         };
         if nearest.is_none_or(|(best, _)| distance < best) {
@@ -52,8 +53,10 @@ pub fn pick_scene(
         .values()
         .filter(|sphere| sphere.visible && show.spheres)
     {
-        if let Some(distance) = ray.hit_sphere(sphere.origin.as_vec3(), sphere.radius as f32)
-            && nearest.is_none_or(|(best, _)| distance < best)
+        if let Some(distance) = ray.hit_sphere(
+            scene_scale.to_render_vec3(sphere.origin),
+            scene_scale.to_render(sphere.radius),
+        ) && nearest.is_none_or(|(best, _)| distance < best)
         {
             nearest = Some((distance, SceneSelection::Sphere(sphere.id)));
         }
@@ -67,7 +70,7 @@ pub fn pick_scene(
         let Ok(position) = world.resolve_probe_position(probe) else {
             continue;
         };
-        if let Some(distance) = ray.hit_sphere(position.as_vec3(), 0.13)
+        if let Some(distance) = ray.hit_sphere(scene_scale.to_render_vec3(position), 0.13)
             && nearest.is_none_or(|(best, _)| distance < best)
         {
             nearest = Some((distance, SceneSelection::Probe(probe.id)));
@@ -77,18 +80,20 @@ pub fn pick_scene(
     nearest.map(|(_, selection)| selection)
 }
 
-fn ray_box_hit(ray: crate::camera::Ray, field_box: &FieldBox) -> Option<f32> {
+fn ray_box_hit(
+    ray: crate::camera::Ray,
+    field_box: &FieldBox,
+    scene_scale: SceneScale,
+) -> Option<f32> {
     let rotation = quat_from_dquat(field_box.rotation);
     let inverse_rotation = rotation.inverse();
-    let origin = field_box.origin.as_vec3();
+    let origin = scene_scale.to_render_vec3(field_box.origin);
+    let half_extent = scene_scale.to_render_vec3(field_box.half_extent);
     let local = crate::camera::Ray {
         origin: inverse_rotation * (ray.origin - origin),
         direction: inverse_rotation * ray.direction,
     };
-    local.hit_aabb(
-        -field_box.half_extent.as_vec3(),
-        field_box.half_extent.as_vec3(),
-    )
+    local.hit_aabb(-half_extent, half_extent)
 }
 
 /// The nearest visible object proxy under a pointer. This intentionally ignores
@@ -107,20 +112,22 @@ fn pick_object(
     camera: &OrbitCamera,
     viewport: Viewport,
     pointer: Vec2,
+    scene_scale: SceneScale,
 ) -> Option<ObjectId> {
     let ray = camera.ray_from_viewport(pointer, viewport)?;
-    nearest_object_hit(world, show, ray).map(|(_, object)| object)
+    nearest_object_hit(world, show, ray, scene_scale).map(|(_, object)| object)
 }
 
 fn nearest_object_hit(
     world: &WorldSnapshot,
     show: SceneVisibility,
     ray: crate::camera::Ray,
+    scene_scale: SceneScale,
 ) -> Option<(f32, ObjectId)> {
     let mut nearest = None;
     // `instances` is already empty when objects are hidden, so the hit-test
     // inherits the renderer's answer rather than deciding again.
-    for instance in instances(world, None, show) {
+    for instance in instances(world, None, show, scene_scale) {
         let inverse = instance.model.inverse();
         if !inverse.is_finite() {
             continue;
@@ -147,21 +154,28 @@ fn nearest_object_hit(
     nearest
 }
 
-fn ray_plane_hit(ray: crate::camera::Ray, plane: &SlicePlane) -> Option<f32> {
+fn ray_plane_hit(
+    ray: crate::camera::Ray,
+    plane: &SlicePlane,
+    scene_scale: SceneScale,
+) -> Option<f32> {
+    // `normal`, `u`, and `v` are unit directions, not lengths — they are cast
+    // as-is, never run through the world/render length conversion.
     let normal = plane.normal.as_vec3();
     let denominator = ray.direction.dot(normal);
     if denominator.abs() < 1.0e-6 {
         return None;
     }
-    let distance = (plane.origin.as_vec3() - ray.origin).dot(normal) / denominator;
+    let origin = scene_scale.to_render_vec3(plane.origin);
+    let distance = (origin - ray.origin).dot(normal) / denominator;
     if distance < 0.0 {
         return None;
     }
-    let hit = ray.origin + ray.direction * distance - plane.origin.as_vec3();
+    let hit = ray.origin + ray.direction * distance - origin;
     let (u, v) = plane.basis();
-    (hit.dot(u.as_vec3()).abs() <= plane.half_extent.x as f32
-        && hit.dot(v.as_vec3()).abs() <= plane.half_extent.y as f32)
-        .then_some(distance)
+    (hit.dot(u.as_vec3()).abs() <= scene_scale.to_render(plane.half_extent.x)
+        && hit.dot(v.as_vec3()).abs() <= scene_scale.to_render(plane.half_extent.y))
+    .then_some(distance)
 }
 
 pub(super) fn ray_plane_point(ray: crate::camera::Ray, origin: Vec3, normal: Vec3) -> Option<Vec3> {
@@ -237,7 +251,14 @@ mod tests {
         camera.set_axis_view(AxisView::PositiveY);
 
         let centre = Vec2::new(400.0, 300.0);
-        let picked = pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre);
+        let picked = pick_scene(
+            &snapshot,
+            SceneVisibility::ALL,
+            &camera,
+            viewport,
+            centre,
+            SceneScale::metre(),
+        );
 
         // From +Y looking back at the origin, the box at y = +3 is nearer.
         assert_eq!(picked, Some(SceneSelection::Object(ObjectId::new(1))));
@@ -268,17 +289,39 @@ mod tests {
         };
 
         assert!(
-            pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre).is_some(),
+            pick_scene(
+                &snapshot,
+                SceneVisibility::ALL,
+                &camera,
+                viewport,
+                centre,
+                SceneScale::metre()
+            )
+            .is_some(),
             "the fixture must be pickable when shown, or this proves nothing"
         );
         assert_eq!(
-            pick_scene(&snapshot, hidden, &camera, viewport, centre),
+            pick_scene(
+                &snapshot,
+                hidden,
+                &camera,
+                viewport,
+                centre,
+                SceneScale::metre()
+            ),
             None
         );
         // The free-drag hit test is a separate entry point and was equally
         // affected.
         assert_eq!(
-            pick_object(&snapshot, hidden, &camera, viewport, centre),
+            pick_object(
+                &snapshot,
+                hidden,
+                &camera,
+                viewport,
+                centre,
+                SceneScale::metre()
+            ),
             None
         );
     }
@@ -306,7 +349,17 @@ mod tests {
         camera.set_axis_view(AxisView::PositiveZ);
         let centre = Vec2::new(400.0, 300.0);
 
-        assert!(pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre).is_some());
+        assert!(
+            pick_scene(
+                &snapshot,
+                SceneVisibility::ALL,
+                &camera,
+                viewport,
+                centre,
+                SceneScale::metre()
+            )
+            .is_some()
+        );
         assert_eq!(
             pick_scene(
                 &snapshot,
@@ -316,7 +369,8 @@ mod tests {
                 },
                 &camera,
                 viewport,
-                centre
+                centre,
+                SceneScale::metre()
             ),
             None
         );
@@ -343,7 +397,17 @@ mod tests {
         camera.focus(Vec3::ZERO, 0.5);
         let centre = Vec2::new(400.0, 300.0);
 
-        assert!(pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre).is_some());
+        assert!(
+            pick_scene(
+                &snapshot,
+                SceneVisibility::ALL,
+                &camera,
+                viewport,
+                centre,
+                SceneScale::metre()
+            )
+            .is_some()
+        );
         assert_eq!(
             pick_scene(
                 &snapshot,
@@ -353,7 +417,8 @@ mod tests {
                 },
                 &camera,
                 viewport,
-                centre
+                centre,
+                SceneScale::metre()
             ),
             None
         );
@@ -392,6 +457,7 @@ mod tests {
                 &OrbitCamera::default(),
                 viewport,
                 Vec2::new(400.0, 300.0),
+                SceneScale::metre(),
             ),
             Some(SceneSelection::Object(object))
         );
@@ -414,7 +480,8 @@ mod tests {
                 SceneVisibility::ALL,
                 &OrbitCamera::default(),
                 viewport,
-                corner
+                corner,
+                SceneScale::metre()
             ),
             None
         );
@@ -448,7 +515,8 @@ mod tests {
                 SceneVisibility::ALL,
                 &camera,
                 viewport,
-                Vec2::new(400.0, 300.0)
+                Vec2::new(400.0, 300.0),
+                SceneScale::metre()
             ),
             Some(SceneSelection::Plane(plane))
         );
@@ -479,6 +547,7 @@ mod tests {
                 &OrbitCamera::default(),
                 viewport,
                 Vec2::new(400.0, 300.0),
+                SceneScale::metre(),
             ),
             Some(object)
         );
@@ -489,6 +558,7 @@ mod tests {
                 &OrbitCamera::default(),
                 viewport,
                 Vec2::new(2.0, 2.0),
+                SceneScale::metre(),
             ),
             None
         );
@@ -512,7 +582,7 @@ mod tests {
             )])
             .unwrap();
         let snapshot = world.snapshot();
-        let instance = instances(&snapshot, None, SceneVisibility::ALL)[0];
+        let instance = instances(&snapshot, None, SceneVisibility::ALL, SceneScale::metre())[0];
 
         // A ray along +Y at x = 3 misses the unrotated slab but hits the rotated
         // one, which now extends along X.
@@ -557,7 +627,14 @@ mod tests {
         let centre = Vec2::new(400.0, 300.0);
 
         assert_eq!(
-            pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, centre),
+            pick_scene(
+                &snapshot,
+                SceneVisibility::ALL,
+                &camera,
+                viewport,
+                centre,
+                SceneScale::metre()
+            ),
             Some(SceneSelection::Box(
                 *snapshot.boxes().keys().next().unwrap()
             ))
@@ -571,7 +648,8 @@ mod tests {
                 },
                 &camera,
                 viewport,
-                centre
+                centre,
+                SceneScale::metre()
             ),
             None
         );
@@ -608,7 +686,14 @@ mod tests {
         let pointer = project_to_viewport(&camera, viewport, Vec3::new(3.0, 0.0, 0.0)).unwrap();
 
         assert_eq!(
-            pick_scene(&snapshot, SceneVisibility::ALL, &camera, viewport, pointer),
+            pick_scene(
+                &snapshot,
+                SceneVisibility::ALL,
+                &camera,
+                viewport,
+                pointer,
+                SceneScale::metre()
+            ),
             Some(SceneSelection::Box(
                 *snapshot.boxes().keys().next().unwrap()
             ))
@@ -642,7 +727,8 @@ mod tests {
                 SceneVisibility::ALL,
                 &camera,
                 viewport,
-                Vec2::new(400.0, 300.0)
+                Vec2::new(400.0, 300.0),
+                SceneScale::metre()
             ),
             Some(SceneSelection::Sphere(sphere))
         );

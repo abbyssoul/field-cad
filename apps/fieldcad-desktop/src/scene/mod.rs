@@ -27,9 +27,10 @@ pub use gizmo::{
 pub use pick::pick_scene;
 
 use fieldcad_core::{
-    BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SphereId, WorldObject, WorldSnapshot,
+    BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SceneScale, SphereId, WorldObject,
+    WorldSnapshot,
 };
-use glam::{DQuat, Mat4, Quat, Vec3, Vec4};
+use glam::{DQuat, DVec3, Mat4, Quat, Vec3, Vec4};
 
 /// One world object prepared for drawing.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,12 +45,15 @@ pub struct ObjectInstance {
 }
 
 impl ObjectInstance {
-    fn from_object(object: &WorldObject, selected: bool) -> Self {
-        let half_extent = object.shape.map_or(
-            Vec3::splat(fieldcad_core::DEFAULT_PROXY_RADIUS as f32),
-            |shape| shape.half_extent().as_vec3(),
+    fn from_object(object: &WorldObject, selected: bool, scene_scale: SceneScale) -> Self {
+        let half_extent = scene_scale.to_render_vec3(
+            object
+                .shape
+                .map_or(DVec3::splat(fieldcad_core::DEFAULT_PROXY_RADIUS), |shape| {
+                    shape.half_extent()
+                }),
         );
-        let translation = object.transform.translation.as_vec3();
+        let translation = scene_scale.to_render_vec3(object.transform.translation);
         let rotation = Quat::from_xyzw(
             object.transform.rotation.x as f32,
             object.transform.rotation.y as f32,
@@ -492,6 +496,7 @@ pub fn instances(
     world: &WorldSnapshot,
     selection: Option<ObjectId>,
     show: SceneVisibility,
+    scene_scale: SceneScale,
 ) -> Vec<ObjectInstance> {
     if !show.objects {
         return Vec::new();
@@ -500,7 +505,9 @@ pub fn instances(
         .objects()
         .values()
         .filter(|object| object.visible)
-        .map(|object| ObjectInstance::from_object(object, selection == Some(object.id)))
+        .map(|object| {
+            ObjectInstance::from_object(object, selection == Some(object.id), scene_scale)
+        })
         .collect()
 }
 
@@ -535,7 +542,12 @@ mod tests {
         let world = world_with_two_boxes();
         let snapshot = world.snapshot();
 
-        let built = instances(&snapshot, Some(ObjectId::new(1)), SceneVisibility::ALL);
+        let built = instances(
+            &snapshot,
+            Some(ObjectId::new(1)),
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+        );
 
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].id, ObjectId::new(0));
@@ -551,7 +563,12 @@ mod tests {
             .commit([WorldCommand::CreateObject(ObjectSpec::new("bare"))])
             .unwrap();
 
-        let built = instances(&world.snapshot(), None, SceneVisibility::ALL);
+        let built = instances(
+            &world.snapshot(),
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+        );
 
         assert_eq!(built.len(), 1);
         assert!(built[0].half_extent.min_element() > 0.0);
@@ -576,7 +593,12 @@ mod tests {
             ])
             .unwrap();
 
-        let built = instances(&world.snapshot(), None, SceneVisibility::ALL);
+        let built = instances(
+            &world.snapshot(),
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+        );
 
         assert_eq!(built.len(), 2);
         assert!(
@@ -589,7 +611,12 @@ mod tests {
     #[test]
     fn instance_bounding_spheres_frame_the_drawn_geometry() {
         let world = world_with_two_boxes();
-        let built = instances(&world.snapshot(), None, SceneVisibility::ALL);
+        let built = instances(
+            &world.snapshot(),
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+        );
         let (centre, radius) = built[0].bounding_sphere();
 
         assert_eq!(centre, Vec3::new(0.0, -3.0, 0.0));

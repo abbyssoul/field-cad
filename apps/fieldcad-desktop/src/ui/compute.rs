@@ -11,7 +11,7 @@ use std::{
 
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, DiagnosticSeverity, Domain, FieldSnapshot,
-    FieldValue, FieldValueKind, ObjectId, PluginId, SampleValidity, SimulationMode,
+    FieldValue, FieldValueKind, ObjectId, PluginId, SampleValidity, SceneScale, SimulationMode,
     SnapshotFreshness, UndefinedReason, WorldRevision, WorldSnapshot,
 };
 use fieldcad_simulation::{
@@ -29,6 +29,10 @@ pub struct ComputeView {
     pub description: String,
     pub status: DataSourceStatus,
     pub domain: Domain,
+    /// How many metres one render/camera unit represents. Drives the
+    /// desktop viewport's world-to-render conversion — see
+    /// [`fieldcad_core::SceneScale`].
+    pub scene_scale: SceneScale,
     pub mode: SimulationMode,
     pub tick: u64,
     pub time_seconds: f64,
@@ -149,6 +153,7 @@ impl ComputeView {
             description: source.description().to_owned(),
             status: source.status(),
             domain,
+            scene_scale: source.scene_scale(),
             mode: simulation.mode(),
             tick: simulation.tick(),
             time_seconds: simulation.time_seconds(),
@@ -539,6 +544,23 @@ pub(super) fn format_time_step(seconds: f64) -> String {
 
 pub(super) fn parse_playback_speed(text: &str) -> Option<f64> {
     text.trim().trim_end_matches(['x', '×']).trim().parse().ok()
+}
+
+/// A general-purpose numeric display for values that can range over many
+/// orders of magnitude (particle masses, scene scale, …): plain decimal
+/// within a normal-looking range, scientific notation outside it — so a
+/// value like `1.0` or `2.0` reads as `1.0000`/`2.0000` rather than the
+/// unconditional `1e0`/`2e0` a bare `{:e}` format would produce.
+pub(super) fn format_engineering(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let magnitude = value.abs();
+    if (1.0e-3..1.0e6).contains(&magnitude) {
+        format!("{value:.4}")
+    } else {
+        format!("{value:.6e}")
+    }
 }
 
 #[cfg(test)]

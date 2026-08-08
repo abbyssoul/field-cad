@@ -17,7 +17,7 @@
 use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration};
 
 use fieldcad_core::{
-    Domain, FieldSnapshot, ObjectId, SessionId, TimeStep, TimeStepError, WorldSnapshot,
+    Domain, FieldSnapshot, ObjectId, SceneScale, SessionId, TimeStep, TimeStepError, WorldSnapshot,
 };
 use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
@@ -254,6 +254,10 @@ impl HeadlessServer {
     pub fn subscription(&self) -> Subscription {
         self.source.subscription()
     }
+
+    pub fn scene_scale(&self) -> SceneScale {
+        self.source.scene_scale()
+    }
 }
 
 impl FieldDataSource for HeadlessServer {
@@ -291,6 +295,10 @@ impl FieldDataSource for HeadlessServer {
 
     fn subscription(&self) -> Subscription {
         self.source.subscription()
+    }
+
+    fn scene_scale(&self) -> SceneScale {
+        self.source.scene_scale()
     }
 
     fn field_systems(&self) -> Vec<FieldSystemStatus> {

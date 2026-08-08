@@ -3,7 +3,7 @@
 //! Planes and probes have no rendered body of their own, so they need one to be
 //! visible and selectable — independently of whether any field layer is on.
 
-use fieldcad_core::{DomainBounds, FieldBox, FieldSphere, SlicePlane, WorldSnapshot};
+use fieldcad_core::{DomainBounds, FieldBox, FieldSphere, SceneScale, SlicePlane, WorldSnapshot};
 use glam::{Quat, Vec3, Vec4};
 
 use super::{
@@ -73,6 +73,7 @@ pub fn append_authoring_geometry(
     world: &WorldSnapshot,
     selection: Option<SceneSelection>,
     show: SceneVisibility,
+    scene_scale: SceneScale,
 ) {
     if show.planes {
         for plane in world.planes().values().filter(|plane| plane.visible) {
@@ -80,6 +81,7 @@ pub fn append_authoring_geometry(
                 geometry,
                 plane,
                 selection == Some(SceneSelection::Plane(plane.id)),
+                scene_scale,
             );
         }
     }
@@ -89,6 +91,7 @@ pub fn append_authoring_geometry(
                 geometry,
                 field_box,
                 selection == Some(SceneSelection::Box(field_box.id)),
+                scene_scale,
             );
         }
     }
@@ -98,6 +101,7 @@ pub fn append_authoring_geometry(
                 geometry,
                 sphere,
                 selection == Some(SceneSelection::Sphere(sphere.id)),
+                scene_scale,
             );
         }
     }
@@ -108,7 +112,7 @@ pub fn append_authoring_geometry(
         let Ok(position) = world.resolve_probe_position(probe) else {
             continue;
         };
-        let position = position.as_vec3();
+        let position = scene_scale.to_render_vec3(position);
         let size = 0.09;
         let color = if selection == Some(SceneSelection::Probe(probe.id)) {
             Vec4::new(1.0, 0.55, 0.08, 1.0)
@@ -126,13 +130,19 @@ pub fn append_authoring_geometry(
     }
 }
 
-fn append_plane_proxy(geometry: &mut FieldGeometry, plane: &SlicePlane, selected: bool) {
+fn append_plane_proxy(
+    geometry: &mut FieldGeometry,
+    plane: &SlicePlane,
+    selected: bool,
+    scene_scale: SceneScale,
+) {
+    // `u`, `v`, and `normal` are unit directions, not lengths — cast as-is.
     let (u, v) = plane.basis();
     let u = u.as_vec3();
     let v = v.as_vec3();
-    let origin = plane.origin.as_vec3();
+    let origin = scene_scale.to_render_vec3(plane.origin);
     let normal = plane.normal.as_vec3();
-    let half = plane.half_extent.as_vec2();
+    let half = scene_scale.to_render_vec2(plane.half_extent);
     let offset = normal * 0.002;
     let corners = [
         origin - u * half.x - v * half.y + offset,
@@ -185,7 +195,12 @@ fn box_corners(origin: Vec3, rotation: Quat, half_extent: Vec3) -> [Vec3; 8] {
 /// A translucent volume with a white outline: the box's rights are the same
 /// as a slice plane's — selectable, draggable, deletable — but its body has
 /// no field-independent purpose beyond marking where it is.
-fn append_box_proxy(geometry: &mut FieldGeometry, field_box: &FieldBox, selected: bool) {
+fn append_box_proxy(
+    geometry: &mut FieldGeometry,
+    field_box: &FieldBox,
+    selected: bool,
+    scene_scale: SceneScale,
+) {
     let body = if selected {
         Vec4::new(1.0, 0.48, 0.08, 0.10)
     } else {
@@ -198,9 +213,9 @@ fn append_box_proxy(geometry: &mut FieldGeometry, field_box: &FieldBox, selected
     };
     append_box_visual(
         geometry,
-        field_box.origin.as_vec3(),
+        scene_scale.to_render_vec3(field_box.origin),
         quat_from_dquat(field_box.rotation),
-        field_box.half_extent.as_vec3(),
+        scene_scale.to_render_vec3(field_box.half_extent),
         body,
         outline,
     );
@@ -209,12 +224,16 @@ fn append_box_proxy(geometry: &mut FieldGeometry, field_box: &FieldBox, selected
 /// Draw the active computation's spatial extent separately from authored field
 /// boxes. The entry point deliberately accepts the domain's bounds rather than
 /// a scene object, leaving room for other domain-shape renderers later.
-pub fn append_compute_bounds(geometry: &mut FieldGeometry, bounds: DomainBounds) {
+pub fn append_compute_bounds(
+    geometry: &mut FieldGeometry,
+    bounds: DomainBounds,
+    scene_scale: SceneScale,
+) {
     append_box_visual(
         geometry,
-        bounds.centre().as_vec3(),
+        scene_scale.to_render_vec3(bounds.centre()),
         Quat::IDENTITY,
-        (bounds.size() * 0.5).as_vec3(),
+        scene_scale.to_render_vec3(bounds.size() * 0.5),
         Vec4::new(0.25, 0.75, 1.0, 0.035),
         Vec4::new(0.25, 0.75, 1.0, 0.9),
     );
@@ -254,9 +273,14 @@ fn append_box_visual(
 /// A translucent "crystal ball" shell with a white wireframe: three great
 /// circles plus a low-poly latitude/longitude mesh, reusing [`push_circle`]
 /// for the wireframe the same way the selection origin marker does.
-fn append_sphere_proxy(geometry: &mut FieldGeometry, sphere: &FieldSphere, selected: bool) {
-    let origin = sphere.origin.as_vec3();
-    let radius = sphere.radius as f32;
+fn append_sphere_proxy(
+    geometry: &mut FieldGeometry,
+    sphere: &FieldSphere,
+    selected: bool,
+    scene_scale: SceneScale,
+) {
+    let origin = scene_scale.to_render_vec3(sphere.origin);
+    let radius = scene_scale.to_render(sphere.radius);
     let body = if selected {
         Vec4::new(1.0, 0.48, 0.08, 0.10)
     } else {
@@ -361,7 +385,13 @@ mod tests {
         let snapshot = world.snapshot();
 
         let mut geometry = FieldGeometry::default();
-        append_authoring_geometry(&mut geometry, &snapshot, None, SceneVisibility::ALL);
+        append_authoring_geometry(
+            &mut geometry,
+            &snapshot,
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+        );
         assert!(!geometry.surface_triangles.is_empty());
         assert!(!geometry.vector_lines.is_empty());
 
@@ -375,6 +405,7 @@ mod tests {
                 spheres: false,
                 ..SceneVisibility::ALL
             },
+            SceneScale::metre(),
         );
         assert!(hidden.surface_triangles.is_empty());
         assert!(hidden.vector_lines.is_empty());
@@ -386,6 +417,7 @@ mod tests {
         append_compute_bounds(
             &mut geometry,
             fieldcad_core::DomainBounds::centred_cube(2.0).unwrap(),
+            SceneScale::metre(),
         );
 
         assert!(!geometry.surface_triangles.is_empty());

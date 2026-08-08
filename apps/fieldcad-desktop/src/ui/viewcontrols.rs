@@ -10,9 +10,12 @@
 //! presented, which is why hiding a probe cannot alter a recording and choosing
 //! a viewpoint cannot alter a field.
 
+use fieldcad_core::SceneScale;
+use fieldcad_simulation::CommandPayload;
+
 use crate::camera::{AxisView, Projection};
 
-use super::compute::ComputeView;
+use super::compute::{ComputeView, format_engineering};
 use super::{CameraAction, FrameContext, UiFrameOutput, UiModel, ViewOptions};
 
 /// Inset from the viewport's top-left corner.
@@ -81,6 +84,9 @@ fn camera_controls(
     });
     ui.add_space(4.0);
 
+    scene_scale_controls(ui, frame.compute, output);
+    ui.add_space(4.0);
+
     // Two rows of three keeps each axis's pair adjacent, so +X and −X read as
     // opposites rather than as six unrelated buttons.
     egui::Grid::new("view_axis_buttons")
@@ -118,6 +124,87 @@ fn camera_controls(
             .clicked()
         {
             output.camera_action = Some(CameraAction::Reset);
+        }
+    });
+}
+
+/// A named preset offered by the scale picker: its label, and the constructor
+/// it selects.
+type ScenePresetEntry = (&'static str, fn() -> SceneScale);
+
+/// Named presets offered by the scale picker, in order from smallest to
+/// largest. A value that does not match any of these (typed directly into
+/// the metres field) shows as "Custom".
+const SCENE_SCALE_PRESETS: &[ScenePresetEntry] = &[
+    ("Nanometre", SceneScale::nanometre),
+    ("Micrometre", SceneScale::micrometre),
+    ("Millimetre", SceneScale::millimetre),
+    ("Metre (default)", SceneScale::metre),
+    ("Kilometre", SceneScale::kilometre),
+    ("Astronomical unit", SceneScale::astronomical_unit),
+    ("Light-year", SceneScale::light_year),
+];
+
+fn scene_scale_label(scale: SceneScale) -> &'static str {
+    SCENE_SCALE_PRESETS
+        .iter()
+        .find(|(_, preset)| preset() == scale)
+        .map_or("Custom", |(label, _)| label)
+}
+
+/// How many metres one render/camera unit represents — a camera setting, not
+/// a simulation one: it never changes a stored object position, size, or
+/// physical constant, only how the viewport's distance/near/far numbers map
+/// onto real space. That is also why it lives here rather than in the
+/// inspector's "Numerical domain" section. Unlike a domain change, this never
+/// fails validation in a way worth staging and has no destructive effect on
+/// solver state, so each change submits immediately rather than waiting on
+/// an explicit apply.
+fn scene_scale_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
+    let live = compute.accepts_commands();
+    let current = compute.scene_scale;
+
+    ui.horizontal(|ui| {
+        ui.label("Scale").on_hover_text(
+            "How many metres one render/camera unit represents. Sets the \
+             viewport's camera range and default object sizing — never \
+             changes a stored object position, size, or physical constant.",
+        );
+        egui::ComboBox::from_id_salt("scene_scale_preset")
+            .selected_text(scene_scale_label(current))
+            .show_ui(ui, |ui| {
+                for (label, preset) in SCENE_SCALE_PRESETS {
+                    let preset = preset();
+                    if ui.selectable_label(current == preset, *label).clicked() && current != preset
+                    {
+                        output.submit(CommandPayload::SetSceneScale(preset));
+                    }
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("metres / unit");
+        let mut metres = current.metres();
+        let drag_speed = (metres * 0.01).max(f64::from_bits(1));
+        let response = ui
+            .add_enabled(
+                live,
+                egui::DragValue::new(&mut metres)
+                    .speed(drag_speed)
+                    .range(f64::from_bits(1)..=f64::MAX)
+                    .custom_formatter(|metres, _| format_engineering(metres))
+                    .custom_parser(|text| text.trim().parse().ok())
+                    .update_while_editing(false),
+            )
+            .on_hover_text(
+                "Drag to adjust, or click to enter a value, e.g. 1e-9 for nanometre scale",
+            );
+        if response.changed()
+            && let Ok(scale) = SceneScale::from_metres(metres)
+            && scale != current
+        {
+            output.submit(CommandPayload::SetSceneScale(scale));
         }
     });
 }
