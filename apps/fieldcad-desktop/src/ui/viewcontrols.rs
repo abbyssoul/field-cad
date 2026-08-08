@@ -126,6 +126,94 @@ fn camera_controls(
             output.camera_action = Some(CameraAction::Reset);
         }
     });
+
+    if model.following.is_some() {
+        ui.add_space(4.0);
+        follow_controls(ui, model, frame, output);
+    }
+}
+
+/// Status, stop control, and precise distance/angle fields for the camera's
+/// follow lock (see `CameraAction::ToggleFollow`, started from the object
+/// inspector's "Follow" button). Only shown while following: with nothing
+/// locked, distance and angle are just the ordinary dolly/orbit state, and
+/// showing these fields unconditionally would suggest they mean something
+/// they do not.
+///
+/// The fields duplicate what dolly and orbit already adjust with the mouse —
+/// they exist for a value a user wants set exactly (matching a previous
+/// shot, or a round number) rather than by eye, and stay in sync with mouse
+/// input either way since both write the same camera state.
+fn follow_controls(
+    ui: &mut egui::Ui,
+    model: &UiModel,
+    frame: &FrameContext<'_>,
+    output: &mut UiFrameOutput,
+) {
+    let Some(id) = model.following else {
+        return;
+    };
+    let name = frame
+        .world
+        .object(id)
+        .map_or("(deleted)", |object| object.name.as_str());
+
+    ui.horizontal(|ui| {
+        ui.label(format!("Following: {name}"))
+            .on_hover_text("The camera is locked onto this object; it appears motionless while the rest of the scene moves around it.");
+        if ui.small_button("Stop").clicked() {
+            output.camera_action = Some(CameraAction::ToggleFollow(id));
+        }
+    });
+
+    egui::Grid::new("follow_distance_angle")
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Distance");
+            let mut distance = frame.camera_distance;
+            let distance_speed = (distance * 0.02).max(0.001);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut distance)
+                        .speed(distance_speed)
+                        .range(0.001..=f32::MAX),
+                )
+                .changed()
+            {
+                output.camera_action = Some(CameraAction::SetDistance(distance));
+            }
+            ui.end_row();
+
+            ui.label("Yaw");
+            let mut yaw_degrees = frame.camera_yaw.to_degrees();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut yaw_degrees)
+                        .speed(1.0)
+                        .suffix("°"),
+                )
+                .changed()
+            {
+                output.camera_action = Some(CameraAction::SetYaw(yaw_degrees.to_radians()));
+            }
+            ui.end_row();
+
+            ui.label("Pitch");
+            let mut pitch_degrees = frame.camera_pitch.to_degrees();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut pitch_degrees)
+                        .speed(1.0)
+                        .range(-89.0..=89.0)
+                        .suffix("°"),
+                )
+                .changed()
+            {
+                output.camera_action = Some(CameraAction::SetPitch(pitch_degrees.to_radians()));
+            }
+            ui.end_row();
+        });
 }
 
 /// A named preset offered by the scale picker: its label, and the constructor

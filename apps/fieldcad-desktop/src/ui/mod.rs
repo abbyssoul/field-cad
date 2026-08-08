@@ -42,12 +42,24 @@ use crate::{
     },
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CameraAction {
     Axis(AxisView),
     FocusSelection,
     Reset,
     SetProjection(Projection),
+    /// Lock the camera onto this object's live position, or release it if it
+    /// is already the followed object — a toggle, so the same control both
+    /// starts and stops following.
+    ToggleFollow(ObjectId),
+    /// Set the orbit distance directly, in render-space units — the same
+    /// quantity `dolly` adjusts by a scroll delta. Used by the View window's
+    /// follow-distance field for a precise, typed value alongside the mouse.
+    SetDistance(f32),
+    /// Set the orbit yaw directly, in radians. See `SetDistance`.
+    SetYaw(f32),
+    /// Set the orbit pitch directly, in radians. See `SetDistance`.
+    SetPitch(f32),
 }
 
 /// What a primary-button gesture in the viewport means.
@@ -243,6 +255,11 @@ pub struct UiModel {
     /// `mcp_panel_open`: an empty queue is the common case and shouldn't
     /// demand screen space by default.
     pub queue_panel_open: bool,
+    /// The object the camera is locked onto, if any — independent of
+    /// `selection`, so following one object while inspecting another is
+    /// possible. `App::apply_camera_follow` re-targets the camera to this
+    /// object's live position every frame; see `CameraAction::ToggleFollow`.
+    pub following: Option<ObjectId>,
 }
 
 impl UiModel {
@@ -270,6 +287,7 @@ impl UiModel {
             domain_draft: None,
             mcp_panel_open: false,
             queue_panel_open: false,
+            following: None,
         }
     }
 
@@ -533,6 +551,14 @@ pub struct FrameContext<'a> {
     /// How the camera is currently mapping the scene to the screen, so the
     /// control that changes it can show which is in force.
     pub projection: Projection,
+    /// The orbit camera's current framing, in render-space units and
+    /// radians — read-only here, the way `projection` is; the View window's
+    /// follow-distance/angle fields show and adjust these via
+    /// `CameraAction::SetDistance`/`SetYaw`/`SetPitch`, converting to and
+    /// from degrees at the UI boundary.
+    pub camera_distance: f32,
+    pub camera_yaw: f32,
+    pub camera_pitch: f32,
     /// The embedded MCP server's current state, read-only from here — the
     /// panel renders it and emits an `McpAction` to change it, the way any
     /// other control emits a command rather than mutating state directly.
@@ -871,6 +897,9 @@ mod tests {
                     paused_for_edit,
                     edit_in_progress: false,
                     projection: Projection::default(),
+                    camera_distance: 12.0,
+                    camera_yaw: 0.0,
+                    camera_pitch: 0.0,
                     mcp: &McpSession::Disabled,
                     frame_history: &[],
                     frame_min_ms: 0.0,
@@ -940,6 +969,9 @@ mod tests {
                     paused_for_edit: false,
                     edit_in_progress: false,
                     projection: Projection::default(),
+                    camera_distance: 12.0,
+                    camera_yaw: 0.0,
+                    camera_pitch: 0.0,
                     mcp: &McpSession::Disabled,
                     frame_history: &[],
                     frame_min_ms: 0.0,

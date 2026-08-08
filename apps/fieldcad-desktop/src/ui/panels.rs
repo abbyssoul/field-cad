@@ -775,7 +775,14 @@ pub(super) fn inspector(
                     {
                         ui.heading("Object");
                         ui.separator();
-                        object_properties(ui, frame.world, frame.compute, object, output);
+                        object_properties(
+                            ui,
+                            frame.world,
+                            frame.compute,
+                            object,
+                            model.following,
+                            output,
+                        );
                     } else if let Some(plane) = model
                         .plane_selection
                         .and_then(|id| frame.world.planes().get(&id))
@@ -1352,6 +1359,7 @@ fn object_properties(
     world: &WorldSnapshot,
     compute: &ComputeView,
     object: &WorldObject,
+    following: Option<ObjectId>,
     output: &mut UiFrameOutput,
 ) {
     if let Some(name) = name_editor(ui, ("object_name", object.id), &object.name) {
@@ -1376,9 +1384,29 @@ fn object_properties(
     // group of its properties, and folding them away would hide the only way to
     // delete an object from the inspector.
     ui.add_space(10.0);
-    if ui.button("Focus selection  [F]").clicked() {
-        output.camera_action = Some(CameraAction::FocusSelection);
-    }
+    ui.horizontal(|ui| {
+        if ui.button("Focus selection  [F]").clicked() {
+            output.camera_action = Some(CameraAction::FocusSelection);
+        }
+        let following_this = following == Some(object.id);
+        let follow_label = if following_this {
+            "Stop following"
+        } else {
+            "Follow"
+        };
+        if ui
+            .selectable_label(following_this, follow_label)
+            .on_hover_text(
+                "Lock the camera onto this object so it appears motionless \
+                 while the rest of the scene moves around it. Distance and \
+                 angle stay adjustable with the mouse, or from the View \
+                 window, while following.",
+            )
+            .clicked()
+        {
+            output.camera_action = Some(CameraAction::ToggleFollow(object.id));
+        }
+    });
     if ui.button("Remove object").clicked() {
         output.edit(vec![WorldCommand::RemoveObject(object.id)]);
     }
@@ -3514,6 +3542,9 @@ mod tests {
                             paused_for_edit: false,
                             edit_in_progress,
                             projection: crate::camera::Projection::default(),
+                            camera_distance: 12.0,
+                            camera_yaw: 0.0,
+                            camera_pitch: 0.0,
                             mcp: &McpSession::Disabled,
                             frame_history: &[],
                             frame_min_ms: 0.0,

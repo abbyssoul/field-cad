@@ -284,8 +284,38 @@ impl OrbitCamera {
         self.target
     }
 
+    /// Move the orbit's centre without touching distance, yaw, or pitch —
+    /// unlike [`Self::focus`], which reframes all three from a bounding
+    /// radius. This is the follow-camera primitive: retargeting every frame
+    /// to a moving object's current position, with the eye offset held
+    /// fixed, is what makes the object sit still on screen while the world
+    /// moves around it.
+    pub fn set_target(&mut self, target: Vec3) {
+        self.target = target;
+    }
+
     pub fn distance(&self) -> f32 {
         self.distance
+    }
+
+    pub fn set_distance(&mut self, distance: f32) {
+        self.distance = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    pub fn set_yaw(&mut self, yaw: f32) {
+        self.yaw = yaw;
+    }
+
+    pub fn pitch(&self) -> f32 {
+        self.pitch
+    }
+
+    pub fn set_pitch(&mut self, pitch: f32) {
+        self.pitch = pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
     pub fn eye(&self) -> Vec3 {
@@ -941,5 +971,45 @@ mod tests {
             camera.distance()
         );
         assert!(camera.distance() < MAX_DISTANCE);
+    }
+
+    /// The follow-camera primitive: retargeting must never perturb distance,
+    /// yaw, or pitch, or a followed object would drift on screen as it moves
+    /// rather than sitting still.
+    #[test]
+    fn set_target_moves_the_target_without_touching_the_rest_of_the_frame() {
+        let mut camera = OrbitCamera::default();
+        camera.orbit(Vec2::new(40.0, -20.0));
+        camera.dolly(-500.0);
+        let (distance, yaw, pitch) = (camera.distance(), camera.yaw(), camera.pitch());
+
+        camera.set_target(Vec3::new(3.0, -1.0, 7.0));
+
+        assert_eq!(camera.target(), Vec3::new(3.0, -1.0, 7.0));
+        assert_eq!(camera.distance(), distance);
+        assert_eq!(camera.yaw(), yaw);
+        assert_eq!(camera.pitch(), pitch);
+    }
+
+    #[test]
+    fn set_distance_and_set_pitch_clamp_to_the_same_bounds_as_dolly_and_orbit() {
+        let mut camera = OrbitCamera::default();
+
+        camera.set_distance(f32::MAX);
+        assert_eq!(camera.distance(), MAX_DISTANCE);
+        camera.set_distance(-5.0);
+        assert_eq!(camera.distance(), MIN_DISTANCE);
+
+        camera.set_pitch(std::f32::consts::PI);
+        assert_eq!(camera.pitch(), PITCH_LIMIT);
+        camera.set_pitch(-std::f32::consts::PI);
+        assert_eq!(camera.pitch(), -PITCH_LIMIT);
+    }
+
+    #[test]
+    fn set_yaw_is_unclamped_since_orbit_wraps_freely() {
+        let mut camera = OrbitCamera::default();
+        camera.set_yaw(12.5);
+        assert_eq!(camera.yaw(), 12.5);
     }
 }

@@ -747,6 +747,9 @@ impl WindowState {
                     paused_for_edit: self.edit_gesture.is_some_and(|gesture| gesture.resume),
                     edit_in_progress: self.edit_gesture.is_some(),
                     projection: self.camera.projection(),
+                    camera_distance: self.camera.distance(),
+                    camera_yaw: self.camera.yaw(),
+                    camera_pitch: self.camera.pitch(),
                     mcp: &self.mcp,
                 },
             );
@@ -763,6 +766,7 @@ impl WindowState {
         }
 
         self.apply_camera_action(ui_frame.camera_action);
+        self.apply_camera_follow(compute.scene_scale);
         if let Some(action) = ui_frame.mcp_action {
             self.apply_mcp_action(action);
         }
@@ -954,6 +958,16 @@ impl WindowState {
         {
             self.ui_model.probe_selection = None;
         }
+        // A followed object that no longer exists must not leave the camera
+        // pinned to a stale target, and the View panel's "Following: …"
+        // indicator must not linger for something that is gone.
+        if self
+            .ui_model
+            .following
+            .is_some_and(|id| self.world.object(id).is_none())
+        {
+            self.ui_model.following = None;
+        }
         for layer in self.ui_model.field_layers.values_mut() {
             layer
                 .planes
@@ -985,8 +999,35 @@ impl WindowState {
             Some(CameraAction::SetProjection(projection)) => {
                 self.camera.set_projection(projection);
             }
+            Some(CameraAction::ToggleFollow(id)) => {
+                self.ui_model.following = if self.ui_model.following == Some(id) {
+                    None
+                } else {
+                    Some(id)
+                };
+            }
+            Some(CameraAction::SetDistance(distance)) => self.camera.set_distance(distance),
+            Some(CameraAction::SetYaw(yaw)) => self.camera.set_yaw(yaw),
+            Some(CameraAction::SetPitch(pitch)) => self.camera.set_pitch(pitch),
             None => {}
         }
+    }
+
+    /// Keep the camera's target locked onto the followed object's current
+    /// position, every frame — so the object appears motionless in view
+    /// while the rest of the world moves around it. Distance, yaw, and pitch
+    /// are left untouched: orbiting or dollying while following adjusts the
+    /// followed framing itself rather than being overridden by it.
+    fn apply_camera_follow(&mut self, scene_scale: fieldcad_core::SceneScale) {
+        let Some(id) = self.ui_model.following else {
+            return;
+        };
+        let Some(object) = self.world.object(id) else {
+            self.ui_model.following = None;
+            return;
+        };
+        self.camera
+            .set_target(scene_scale.to_render_vec3(object.transform.translation));
     }
 
     fn apply_viewport_gesture(
