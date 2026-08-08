@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use fieldcad_core::quantities::{ChargeCoulombs, LengthMetres, SiScalar};
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, Domain, DomainBounds, FieldBoxSpec,
     FieldSphereSpec, ObjectShape, ObjectSpec, Precision, ProbePosition, ProbeSpec, Resolution,
@@ -1004,7 +1005,9 @@ impl WindowState {
                         channel,
                         plane: active.plane,
                         samples: active.samples,
-                        radius_metres: self.ui_model.field_brush.radius_metres,
+                        radius_metres: LengthMetres::from_si(
+                            self.ui_model.field_brush.radius_metres,
+                        ),
                         strength,
                         falloff: FieldBrushFalloff::SmoothCompact,
                     }),
@@ -1813,7 +1816,8 @@ fn create_local_data_source(
                     .with_shape(ObjectShape::point(0.15).map_err(|error| error.to_string())?)
                     .with_component(
                         charge_component_id(),
-                        charge_properties(1.0e-9).map_err(|error| error.to_string())?,
+                        charge_properties(ChargeCoulombs::from_si(1.0e-9))
+                            .map_err(|error| error.to_string())?,
                     ),
             ),
             WorldCommand::CreateProbe(ProbeSpec::at(

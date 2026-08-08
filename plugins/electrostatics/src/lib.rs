@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, ObjectId, PluginId,
     PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic, WorldSnapshot,
@@ -103,7 +104,7 @@ impl ElectrostaticBatchEvaluator for CpuBatchEvaluator {
 fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
     InverseSquareSource {
         position: source.position,
-        strength: source.coupling_value,
+        strength: source.coupling_value.into_si(),
         distribution: source.distribution,
     }
 }
@@ -266,7 +267,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
                 self.sources
                     .iter()
                     .find(|source| source.object == body.object)
-                    .map_or(0.0, |source| source.coupling_value)
+                    .map_or(0.0, |source| source.coupling_value.into_si())
             })
             .collect();
 
@@ -346,6 +347,7 @@ impl ElectrostaticsSolver {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use fieldcad_core::quantities::{ChargeCoulombs, MassKg, SiScalar, coulomb, kilogram};
     use fieldcad_core::{
         BoundaryConditions, ChargeDistribution, DomainBounds, ObjectId, ObjectShape, ObjectSpec,
         PlaneLattice, Resolution, Transform, UndefinedReason, Velocity, World, WorldCommand,
@@ -367,7 +369,7 @@ mod tests {
             ObjectId::new(0),
             position,
             Velocity::default(),
-            charge_coulombs,
+            ChargeCoulombs::new::<coulomb>(charge_coulombs),
             ChargeDistribution::Point {
                 exclusion_radius: radius,
             },
@@ -434,13 +436,14 @@ mod tests {
 
     #[test]
     fn uniformly_charged_sphere_is_finite_and_continuous_at_its_surface() {
-        let charge = 2.0e-9;
+        let charge_q = ChargeCoulombs::new::<coulomb>(2.0e-9);
+        let charge = charge_q.into_si();
         let radius = 0.5;
         let source = ChargeSource::new(
             ObjectId::new(0),
             DVec3::ZERO,
             Velocity::default(),
-            charge,
+            charge_q,
             ChargeDistribution::UniformSphere { radius },
         );
         let centre = evaluate_sources(&[source], DVec3::ZERO);
@@ -472,7 +475,10 @@ mod tests {
         let mut world = World::new();
         let mut spec = ObjectSpec::new("charged")
             .with_transform(Transform::at(DVec3::ZERO).unwrap())
-            .with_component(charge_component_id(), charge_properties(1.0).unwrap());
+            .with_component(
+                charge_component_id(),
+                charge_properties(ChargeCoulombs::new::<coulomb>(1.0)).unwrap(),
+            );
         if let Some(shape) = shape {
             spec = spec.with_shape(shape);
         }
@@ -536,13 +542,19 @@ mod tests {
                     ObjectSpec::new("sphere")
                         .with_transform(Transform::at(DVec3::ZERO).unwrap())
                         .with_shape(ObjectShape::sphere(1.0).unwrap())
-                        .with_component(charge_component_id(), charge_properties(2.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(2.0e-9)).unwrap(),
+                        ),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("probe charge")
                         .with_transform(Transform::at(DVec3::X * 0.4).unwrap())
                         .with_shape(ObjectShape::point(0.01).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
             ])
             .unwrap();
@@ -567,7 +579,7 @@ mod tests {
         let forces = solver
             .forces(&[DynamicBody {
                 object: probe_id,
-                inertial_mass_kg: 1.0,
+                inertial_mass_kg: MassKg::new::<kilogram>(1.0),
                 position: DVec3::X * 0.4,
                 velocity: DVec3::ZERO,
             }])

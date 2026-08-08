@@ -37,6 +37,7 @@ mod tests {
         ObjectSpec, Precision, ProbeSpec, Resolution, SampleGeometry, SampleValidity, SessionId,
         SimulationMode, SlicePlaneSpec, SnapshotCompleteness, TimeStep, Transform, UndefinedReason,
         World, WorldCommand,
+        quantities::{ChargeCoulombs, MassKg, coulomb, kilogram},
     };
     use fieldcad_electromagnetic_sources::{
         charge_component_id, charge_properties, charge_property_id,
@@ -459,7 +460,10 @@ mod tests {
             .commit_world_commands(vec![WorldCommand::CreateObject(
                 ObjectSpec::new("unfinished charged object")
                     .with_shape(ObjectShape::boxed(glam::DVec3::ONE).unwrap())
-                    .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                    .with_component(
+                        charge_component_id(),
+                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                    ),
             )])
             .unwrap();
         let object = report.created_objects[0];
@@ -641,7 +645,8 @@ mod tests {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-6).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                         WorldCommand::CreateObject(
@@ -650,11 +655,13 @@ mod tests {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-9).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9))
+                                        .unwrap(),
                                 )
                                 .with_component(
                                     inertial_mass_component_id(),
-                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                    inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                     ])
@@ -705,7 +712,8 @@ mod tests {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-6).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                         WorldCommand::CreateObject(
@@ -714,11 +722,13 @@ mod tests {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-9).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9))
+                                        .unwrap(),
                                 )
                                 .with_component(
                                     inertial_mass_component_id(),
-                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                    inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                     ])
@@ -769,7 +779,8 @@ mod tests {
                                     .with_shape(ObjectShape::point(0.05).unwrap())
                                     .with_component(
                                         charge_component_id(),
-                                        charge_properties(1.0e-6).unwrap(),
+                                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6))
+                                            .unwrap(),
                                     ),
                             ),
                             WorldCommand::CreateObject(
@@ -780,11 +791,13 @@ mod tests {
                                     .with_shape(ObjectShape::point(0.05).unwrap())
                                     .with_component(
                                         charge_component_id(),
-                                        charge_properties(1.0e-9).unwrap(),
+                                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9))
+                                            .unwrap(),
                                     )
                                     .with_component(
                                         inertial_mass_component_id(),
-                                        inertial_mass_properties(mass_kg).unwrap(),
+                                        inertial_mass_properties(MassKg::new::<kilogram>(mass_kg))
+                                            .unwrap(),
                                     ),
                             ),
                         ])
@@ -824,13 +837,19 @@ mod tests {
                 WorldCommand::CreateObject(
                     ObjectSpec::new("source")
                         .with_shape(ObjectShape::point(0.05).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-6).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6)).unwrap(),
+                        ),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("massless")
                         .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
                         .with_shape(ObjectShape::point(0.05).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
             ])
             .unwrap();
@@ -864,7 +883,10 @@ mod tests {
                 WorldCommand::CreateObject(
                     ObjectSpec::new("charge")
                         .with_shape(ObjectShape::point(0.1).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
                 WorldCommand::CreateProbe(ProbeSpec::at(
                     "Maxwell E",
@@ -1255,7 +1277,8 @@ mod tests {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-6).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                         WorldCommand::CreateObject(
@@ -1264,11 +1287,13 @@ mod tests {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-9).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9))
+                                        .unwrap(),
                                 )
                                 .with_component(
                                     inertial_mass_component_id(),
-                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                    inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                     ])
@@ -2112,7 +2137,10 @@ mod tests {
                     ObjectSpec::new("positive point charge")
                         .with_transform(Transform::at(DVec3::ZERO).unwrap())
                         .with_shape(ObjectShape::point(0.1).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
                 WorldCommand::CreateProbe(ProbeSpec::at(
                     "one metre on x",
@@ -2328,7 +2356,10 @@ mod tests {
                 WorldCommand::CreateObject(
                     ObjectSpec::new("charge")
                         .with_shape(ObjectShape::point(0.1).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
                 // Both fields are recorded from the start. A probe names
                 // channels, not systems, so it keeps asking for the magnetic
@@ -2732,16 +2763,22 @@ mod tests {
                     ObjectSpec::new("source")
                         .with_pinned(true)
                         .with_shape(ObjectShape::point(0.05).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-6).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6)).unwrap(),
+                        ),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("free")
                         .with_transform(Transform::at(DVec3::X).unwrap())
                         .with_shape(ObjectShape::point(0.05).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap())
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        )
                         .with_component(
                             inertial_mass_component_id(),
-                            inertial_mass_properties(1.0e-6).unwrap(),
+                            inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6)).unwrap(),
                         ),
                 ),
             ])

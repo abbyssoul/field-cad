@@ -16,6 +16,7 @@ use std::{
     },
 };
 
+use fieldcad_core::quantities::{LengthMetres, MassKg};
 use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, Domain, FieldColumn, ObjectId, PlaneId, PluginId,
     PluginVersion, PropertyBag, PropertySchema, Quantity, SampleGeometry, SampleValidity,
@@ -133,7 +134,7 @@ pub struct FieldBrushStroke {
     pub plane: PlaneId,
     /// Plane-local `(u, v)` centres, in metres, sampled along one drag.
     pub samples: Vec<DVec2>,
-    pub radius_metres: f64,
+    pub radius_metres: LengthMetres,
     pub strength: Quantity,
     pub falloff: FieldBrushFalloff,
 }
@@ -166,7 +167,7 @@ pub struct SampledColumn {
 pub struct DynamicBody {
     pub object: ObjectId,
     /// The inertia a total force will be divided by. Always finite and positive.
-    pub inertial_mass_kg: f64,
+    pub inertial_mass_kg: MassKg,
     pub position: glam::DVec3,
     pub velocity: glam::DVec3,
 }

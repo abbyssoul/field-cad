@@ -5,6 +5,7 @@
 //! them; the geometry question itself is the same one, so it is answered
 //! once here rather than once per coupling.
 
+use crate::quantities::{ChargeCoulombs, MassKg};
 use crate::{ObjectId, ObjectShape, Velocity};
 use glam::DVec3;
 
@@ -46,6 +47,18 @@ impl CoupledSource<f64> {
     }
 
     pub fn gravitational_mass_kg(&self) -> f64 {
+        self.coupling_value
+    }
+}
+
+impl CoupledSource<MassKg> {
+    pub fn mass_kg(self) -> MassKg {
+        self.coupling_value
+    }
+}
+
+impl CoupledSource<ChargeCoulombs> {
+    pub fn charge_coulombs(self) -> ChargeCoulombs {
         self.coupling_value
     }
 }

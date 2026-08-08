@@ -11,6 +11,7 @@ use std::{
 };
 
 use bytemuck::{Pod, Zeroable};
+use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     DiagnosticSeverity, Domain, Precision, SampleGeometry, SolverDiagnostic, StepContext, TimeStep,
     WorldSnapshot,
@@ -421,7 +422,8 @@ impl EquationSystemSolver for GpuMaxwellSolver {
         let domain = self.core.domain();
         let counts = domain.resolution().cells();
         let spacing = domain.cell_size();
-        let radius_squared = stroke.stroke.radius_metres * stroke.stroke.radius_metres;
+        let radius_squared =
+            stroke.stroke.radius_metres.into_si() * stroke.stroke.radius_metres.into_si();
         let amount = stroke.direction * stroke.stroke.strength.si_value();
         for z in 0..counts.z {
             for y in 0..counts.y {
@@ -691,6 +693,7 @@ fn finite_f32(value: f64, label: &str) -> Result<f32, String> {
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_core::quantities::ChargeCoulombs;
     use fieldcad_core::{
         BoundaryCondition, BoundaryConditions, DomainBounds, FieldColumn, GridLattice, ObjectShape,
         ObjectSpec, Precision, ProbeId, Resolution, SampleGeometry, SimulationClock, Transform,
@@ -832,7 +835,7 @@ mod tests {
                             .with_shape(ObjectShape::point(0.15).unwrap())
                             .with_component(
                                 charge_component_id(),
-                                charge_properties(1.0e-9).unwrap(),
+                                charge_properties(ChargeCoulombs::from_si(1.0e-9)).unwrap(),
                             ),
                     ),
                 ])

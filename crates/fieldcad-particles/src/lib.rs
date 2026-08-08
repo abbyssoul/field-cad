@@ -13,6 +13,7 @@
 //! pose, velocity, and whether the user pinned the object; a familiar name never
 //! activates hidden forces.
 
+use fieldcad_core::quantities::{ChargeCoulombs, MassKg, coulomb, kilogram};
 use fieldcad_core::{
     ComponentSchema, ComponentTypeId, ObjectId, ObjectShape, ObjectSpec, PluginId, PropertyBag,
     PropertyId, PropertyKind, PropertySchema, PropertyValue, QuantityError, Transform, Velocity,
@@ -36,6 +37,20 @@ pub const ELEMENTARY_CHARGE_COULOMBS: f64 = 1.602_176_634e-19;
 pub const ELECTRON_MASS_KG: f64 = 9.109_383_713_9e-31;
 pub const PROTON_MASS_KG: f64 = 1.672_621_925_95e-27;
 pub const NEUTRON_MASS_KG: f64 = 1.674_927_500_56e-27;
+
+/// Typed public wrappers for particle constants.
+pub fn elementary_charge_coulombs() -> ChargeCoulombs {
+    ChargeCoulombs::new::<coulomb>(ELEMENTARY_CHARGE_COULOMBS)
+}
+pub fn electron_mass_kg() -> MassKg {
+    MassKg::new::<kilogram>(ELECTRON_MASS_KG)
+}
+pub fn proton_mass_kg() -> MassKg {
+    MassKg::new::<kilogram>(PROTON_MASS_KG)
+}
+pub fn neutron_mass_kg() -> MassKg {
+    MassKg::new::<kilogram>(NEUTRON_MASS_KG)
+}
 
 pub fn schema_namespace_id() -> PluginId {
     PluginId::new(SCHEMA_NAMESPACE).expect("static schema namespace is valid")
@@ -127,17 +142,20 @@ impl ParticleTemplate {
         catalog_entry(label).map(|entry| Self::Catalog(entry.name))
     }
 
-    pub fn mass_kg(self) -> Option<f64> {
+    pub fn mass_kg(self) -> Option<MassKg> {
         match self {
             Self::Custom => None,
-            Self::Catalog(name) => catalog_entry(name).map(|entry| entry.mass_kg),
+            Self::Catalog(name) => {
+                catalog_entry(name).map(|entry| MassKg::new::<kilogram>(entry.mass_kg))
+            }
         }
     }
 
-    pub fn charge_coulombs(self) -> Option<f64> {
+    pub fn charge_coulombs(self) -> Option<ChargeCoulombs> {
         match self {
             Self::Custom => None,
-            Self::Catalog(name) => catalog_entry(name).map(|entry| entry.charge_coulombs),
+            Self::Catalog(name) => catalog_entry(name)
+                .map(|entry| ChargeCoulombs::new::<coulomb>(entry.charge_coulombs)),
         }
     }
 
@@ -146,7 +164,7 @@ impl ParticleTemplate {
     /// Exact equality is the right test: these are the literal constants this
     /// crate wrote into the object, so any difference at all means a user
     /// changed them and the catalog claim no longer holds.
-    pub fn matches(self, mass_kg: f64, charge_coulombs: f64) -> bool {
+    pub fn matches(self, mass_kg: MassKg, charge_coulombs: ChargeCoulombs) -> bool {
         self.mass_kg() == Some(mass_kg) && self.charge_coulombs() == Some(charge_coulombs)
     }
 }
@@ -221,10 +239,10 @@ pub fn template_particle_spec(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Particle {
     pub object: ObjectId,
-    pub mass_kg: f64,
+    pub mass_kg: MassKg,
     /// Zero for an uncharged body. Absence of a charge component means neutral,
     /// which is a physical state rather than a missing input.
-    pub charge_coulombs: f64,
+    pub charge_coulombs: ChargeCoulombs,
     /// Whether the user, rather than a solver, decides this body's motion.
     ///
     /// A pinned body still moves if it has authored velocity — it simply moves
@@ -270,8 +288,8 @@ fn particle_from_object(
     let charge_coulombs = object
         .components
         .get(&charge_component_id())
-        .and_then(|charge| charge.scalar(&charge_property_id()))
-        .unwrap_or(0.0);
+        .and_then(|charge| charge.typed_charge(&charge_property_id()))
+        .unwrap_or(ChargeCoulombs::new::<coulomb>(0.0));
     let template = object
         .components
         .get(&particle_component_id())
@@ -316,6 +334,7 @@ pub enum ParticleError {
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_core::quantities::{coulomb, kilogram};
     use fieldcad_core::{ObjectSpec, World, WorldCommand};
     use fieldcad_sources::mass_component_schemas;
 
@@ -361,10 +380,13 @@ mod tests {
     #[test]
     fn anti_proton_has_proton_mass_and_opposite_charge() {
         let anti_proton = ParticleTemplate::Catalog("Anti-proton");
-        assert_eq!(anti_proton.mass_kg(), Some(PROTON_MASS_KG));
+        assert_eq!(
+            anti_proton.mass_kg(),
+            Some(MassKg::new::<kilogram>(PROTON_MASS_KG))
+        );
         assert_eq!(
             anti_proton.charge_coulombs(),
-            Some(-ELEMENTARY_CHARGE_COULOMBS)
+            Some(ChargeCoulombs::new::<coulomb>(-ELEMENTARY_CHARGE_COULOMBS))
         );
     }
 
@@ -373,7 +395,10 @@ mod tests {
         let unknown = ParticleTemplate::Catalog("Muon");
         assert_eq!(unknown.mass_kg(), None);
         assert_eq!(unknown.charge_coulombs(), None);
-        assert!(!unknown.matches(0.0, 0.0));
+        assert!(!unknown.matches(
+            MassKg::new::<kilogram>(0.0),
+            ChargeCoulombs::new::<coulomb>(0.0)
+        ));
     }
 
     #[test]
@@ -389,8 +414,11 @@ mod tests {
 
         let particle = collect_particles(&world.snapshot()).unwrap()[0];
         assert_eq!(particle.template, ParticleTemplate::Catalog("Electron"));
-        assert_eq!(particle.mass_kg, ELECTRON_MASS_KG);
-        assert_eq!(particle.charge_coulombs, -ELEMENTARY_CHARGE_COULOMBS);
+        assert_eq!(particle.mass_kg, MassKg::new::<kilogram>(ELECTRON_MASS_KG));
+        assert_eq!(
+            particle.charge_coulombs,
+            ChargeCoulombs::new::<coulomb>(-ELEMENTARY_CHARGE_COULOMBS)
+        );
         assert_eq!(particle.position, DVec3::X);
         assert_eq!(particle.velocity, DVec3::Y);
         assert!(!particle.pinned);
@@ -419,12 +447,18 @@ mod tests {
             .commit([WorldCommand::AttachComponent {
                 object,
                 component: inertial_mass_component_id(),
-                properties: inertial_mass_properties(ELECTRON_MASS_KG * 2.0).unwrap(),
+                properties: inertial_mass_properties(MassKg::new::<kilogram>(
+                    ELECTRON_MASS_KG * 2.0,
+                ))
+                .unwrap(),
             }])
             .unwrap();
 
         let particle = collect_particles(&world.snapshot()).unwrap()[0];
-        assert_eq!(particle.mass_kg, ELECTRON_MASS_KG * 2.0);
+        assert_eq!(
+            particle.mass_kg,
+            MassKg::new::<kilogram>(ELECTRON_MASS_KG * 2.0)
+        );
         assert_eq!(particle.template, ParticleTemplate::Custom);
     }
 
@@ -434,14 +468,17 @@ mod tests {
         // No charge, no catalog identity, no motion mode.
         let world = world_with([ObjectSpec::new("gizmo").with_component(
             inertial_mass_component_id(),
-            inertial_mass_properties(3.0).unwrap(),
+            inertial_mass_properties(MassKg::new::<kilogram>(3.0)).unwrap(),
         )]);
 
         let particles = collect_particles(&world.snapshot()).unwrap();
 
         assert_eq!(particles.len(), 1);
-        assert_eq!(particles[0].mass_kg, 3.0);
-        assert_eq!(particles[0].charge_coulombs, 0.0);
+        assert_eq!(particles[0].mass_kg, MassKg::new::<kilogram>(3.0));
+        assert_eq!(
+            particles[0].charge_coulombs,
+            ChargeCoulombs::new::<coulomb>(0.0)
+        );
         assert_eq!(particles[0].template, ParticleTemplate::Custom);
         assert!(particles[0].needs_kinematic_authority());
     }
@@ -451,7 +488,10 @@ mod tests {
         // It is still a field source; it simply has no inertia to integrate.
         let world = world_with([ObjectSpec::new("static charge")
             .with_shape(ObjectShape::point(0.1).unwrap())
-            .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap())]);
+            .with_component(
+                charge_component_id(),
+                charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+            )]);
 
         assert!(collect_particles(&world.snapshot()).unwrap().is_empty());
     }
@@ -463,14 +503,14 @@ mod tests {
                 .with_pinned(true)
                 .with_component(
                     inertial_mass_component_id(),
-                    inertial_mass_properties(1.0).unwrap(),
+                    inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
                 ),
             ObjectSpec::new("carried along")
                 .with_pinned(true)
                 .with_velocity(Velocity::new(DVec3::X, DVec3::ZERO).unwrap())
                 .with_component(
                     inertial_mass_component_id(),
-                    inertial_mass_properties(1.0).unwrap(),
+                    inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
                 ),
         ]);
 

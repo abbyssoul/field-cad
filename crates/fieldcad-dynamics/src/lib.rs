@@ -34,6 +34,7 @@
 //! recorded trade for a coupling interface that no field is privileged in
 //! (see `docs/adr/0022-dynamics-is-a-first-party-system.md`).
 
+use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError, WorldSnapshot, relativistic_momentum,
 };
@@ -141,7 +142,7 @@ fn advance_body(
     force: DVec3,
     seconds: f64,
 ) -> Result<ObjectKinematicsUpdate, DynamicsError> {
-    let mass = body.inertial_mass_kg;
+    let mass = body.inertial_mass_kg.into_si();
     if !(mass.is_finite() && mass > 0.0) {
         return Err(DynamicsError::InvalidInertialMass {
             object: body.object,
@@ -216,7 +217,10 @@ pub enum DynamicsError {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{ObjectSpec, Transform as CoreTransform, World, WorldCommand};
+    use fieldcad_core::{
+        ObjectSpec, Transform as CoreTransform, World, WorldCommand,
+        quantities::{MassKg, kilogram},
+    };
     use fieldcad_sources::{
         inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
     };
@@ -226,7 +230,7 @@ mod tests {
     fn body(mass_kg: f64, velocity: DVec3) -> DynamicBody {
         DynamicBody {
             object: ObjectId::new(0),
-            inertial_mass_kg: mass_kg,
+            inertial_mass_kg: MassKg::new::<kilogram>(mass_kg),
             position: DVec3::ZERO,
             velocity,
         }
@@ -342,7 +346,7 @@ mod tests {
                     ObjectSpec::new("free")
                         .with_component(
                             inertial_mass_component_id(),
-                            inertial_mass_properties(1.0).unwrap(),
+                            inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
                         )
                         .with_transform(CoreTransform::at(DVec3::ZERO).unwrap()),
                 ),
@@ -352,13 +356,13 @@ mod tests {
                         .with_velocity(Velocity::new(DVec3::X, DVec3::ZERO).unwrap())
                         .with_component(
                             inertial_mass_component_id(),
-                            inertial_mass_properties(1.0).unwrap(),
+                            inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
                         ),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("held").with_pinned(true).with_component(
                         inertial_mass_component_id(),
-                        inertial_mass_properties(1.0).unwrap(),
+                        inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
                     ),
                 ),
             ]);

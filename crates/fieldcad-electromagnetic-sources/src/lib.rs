@@ -13,6 +13,7 @@
 //! say — stay in that plugin's own namespace, because they are diagnostics of a
 //! discretization rather than quantities the world has.
 
+use fieldcad_core::quantities::{ChargeCoulombs, SiScalar};
 use fieldcad_core::{
     ChannelId, ChannelSchema, ChargeDistribution, ComponentSchema, ComponentTypeId, Dimension,
     FieldValueKind, PluginId, PointOrSphereError, PropertyBag, PropertyId, PropertyKind,
@@ -107,10 +108,10 @@ pub fn charge_component_schema() -> ComponentSchema {
     }
 }
 
-pub fn charge_properties(coulombs: f64) -> Result<PropertyBag, QuantityError> {
+pub fn charge_properties(coulombs: ChargeCoulombs) -> Result<PropertyBag, QuantityError> {
     Ok([(
         charge_property_id(),
-        PropertyValue::Scalar(Quantity::new(coulombs, Dimension::CHARGE)?),
+        PropertyValue::Scalar(Quantity::new(coulombs.into_si(), Dimension::CHARGE)?),
     )]
     .into_iter()
     .collect())
@@ -121,7 +122,7 @@ pub use fieldcad_core::CoupledSource;
 /// The exclusion radius given to a charged object with no authored shape.
 pub const DEFAULT_POINT_RADIUS: f64 = fieldcad_core::DEFAULT_PROXY_RADIUS;
 
-pub type ChargeSource = CoupledSource<f64>;
+pub type ChargeSource = CoupledSource<ChargeCoulombs>;
 
 /// Extract every supported authored charge in deterministic object-ID order.
 pub fn collect_charge_sources(
@@ -137,11 +138,11 @@ fn source_from_object(
     object: &WorldObject,
     properties: &PropertyBag,
 ) -> Result<ChargeSource, ChargeSourceError> {
-    let charge_coulombs = properties.scalar(&charge_property_id()).ok_or_else(|| {
-        ChargeSourceError::InvalidCharge {
+    let charge_coulombs = properties
+        .typed_charge(&charge_property_id())
+        .ok_or_else(|| ChargeSourceError::InvalidCharge {
             object: object.name.clone(),
-        }
-    })?;
+        })?;
     let distribution =
         ChargeDistribution::from_shape(object.shape, DEFAULT_POINT_RADIUS).map_err(|error| {
             match error {
@@ -174,6 +175,7 @@ pub enum ChargeSourceError {
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_core::quantities::coulomb;
     use fieldcad_core::{ObjectShape, ObjectSpec, Transform, World, WorldCommand};
     use glam::DVec3;
 
@@ -189,14 +191,20 @@ mod tests {
                     ObjectSpec::new("p1")
                         .with_transform(Transform::at(DVec3::X).unwrap())
                         .with_shape(ObjectShape::point(0.1).unwrap())
-                        .with_component(charge_component_id(), charge_properties(2.0).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(2.0)).unwrap(),
+                        ),
                 ),
             ])
             .unwrap();
 
         let sources = collect_charge_sources(&world.snapshot()).unwrap();
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].coupling_value, 2.0);
+        assert_eq!(
+            sources[0].coupling_value,
+            ChargeCoulombs::new::<coulomb>(2.0)
+        );
         assert_eq!(sources[0].position, DVec3::X);
     }
 
@@ -206,10 +214,10 @@ mod tests {
         world
             .commit([
                 WorldCommand::RegisterComponentSchema(charge_component_schema()),
-                WorldCommand::CreateObject(
-                    ObjectSpec::new("gizmo")
-                        .with_component(charge_component_id(), charge_properties(1.0).unwrap()),
-                ),
+                WorldCommand::CreateObject(ObjectSpec::new("gizmo").with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0)).unwrap(),
+                )),
             ])
             .unwrap();
 
@@ -232,7 +240,10 @@ mod tests {
                 WorldCommand::CreateObject(
                     ObjectSpec::new("box")
                         .with_shape(ObjectShape::boxed(DVec3::ONE).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0)).unwrap(),
+                        ),
                 ),
             ])
             .unwrap();

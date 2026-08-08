@@ -17,6 +17,7 @@ pub use coupling::{
 
 use std::sync::Arc;
 
+use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     BoundaryCondition, ChannelId, ChannelSchema, ChargeDistribution, ComponentSchema,
     DiagnosticSeverity, Dimension, Domain, FieldColumn, FieldValueKind, InterpolationMethod,
@@ -640,8 +641,9 @@ pub fn static_charge_state_from_sources(domain: Domain, sources: &[ChargeSource]
 fn regularized_potential(sources: &[ChargeSource], position: DVec3, minimum_radius: f64) -> f64 {
     sources
         .iter()
-        .filter(|source| source.coupling_value != 0.0)
+        .filter(|source| source.coupling_value.into_si() != 0.0)
         .map(|source| {
+            let coupling_value = source.coupling_value.into_si();
             let distance_squared = (position - source.position).length_squared();
             let declared_radius = match source.distribution {
                 ChargeDistribution::Point { exclusion_radius } => exclusion_radius,
@@ -653,10 +655,10 @@ fn regularized_potential(sources: &[ChargeSource], position: DVec3, minimum_radi
                 minimum_radius
             };
             if distance_squared < radius * radius {
-                COULOMB_CONSTANT * source.coupling_value / (2.0 * radius)
+                COULOMB_CONSTANT * coupling_value / (2.0 * radius)
                     * (3.0 - distance_squared / (radius * radius))
             } else {
-                COULOMB_CONSTANT * source.coupling_value / distance_squared.sqrt()
+                COULOMB_CONSTANT * coupling_value / distance_squared.sqrt()
             }
         })
         .sum()
@@ -1356,7 +1358,8 @@ impl EquationSystemSolver for MaxwellSolver {
                 ));
             }
         };
-        let radius_squared = stroke.stroke.radius_metres * stroke.stroke.radius_metres;
+        let radius_metres = stroke.stroke.radius_metres.into_si();
+        let radius_squared = radius_metres * radius_metres;
         let amount = stroke.direction * stroke.stroke.strength.si_value();
         let bounds = self.core.domain().bounds();
         for z in 0..self.counts.z {
@@ -1538,6 +1541,7 @@ fn interpolation_cell(domain: Domain, position: DVec3) -> (IVec3, DVec3) {
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_core::quantities::{ChargeCoulombs, MassKg, coulomb, kilogram};
     use fieldcad_core::{
         BoundaryConditions, DomainBounds, FieldColumn, ProbeId, Resolution, World,
     };
@@ -1618,7 +1622,10 @@ mod tests {
                     ObjectSpec::new("static charge")
                         .with_transform(Transform::at(position).unwrap())
                         .with_shape(ObjectShape::point(0.15).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
             ])
             .unwrap();
@@ -1771,7 +1778,10 @@ mod tests {
                     ObjectSpec::new("static charge")
                         .with_transform(Transform::at(DVec3::ZERO).unwrap())
                         .with_shape(ObjectShape::point(0.15).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
             ])
             .unwrap();
@@ -1977,7 +1987,10 @@ mod tests {
                     ObjectSpec::new("degenerate point charge")
                         .with_transform(Transform::at(DVec3::ZERO).unwrap())
                         .with_shape(ObjectShape::point(0.0).unwrap())
-                        .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
                 ),
             ])
             .unwrap();
@@ -2159,10 +2172,13 @@ mod tests {
                 ObjectSpec::new("charge")
                     .with_transform(Transform::at(DVec3::ZERO).unwrap())
                     .with_shape(ObjectShape::point(0.15).unwrap())
-                    .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap())
+                    .with_component(
+                        charge_component_id(),
+                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                    )
                     .with_component(
                         inertial_mass_component_id(),
-                        inertial_mass_properties(1.0e-6).unwrap(),
+                        inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6)).unwrap(),
                     ),
             )])
             .unwrap();
@@ -2228,7 +2244,10 @@ mod tests {
                 ObjectSpec::new("charge")
                     .with_transform(Transform::at(DVec3::ZERO).unwrap())
                     .with_shape(ObjectShape::point(0.15).unwrap())
-                    .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                    .with_component(
+                        charge_component_id(),
+                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                    ),
             )])
             .unwrap();
         let plugin = ElectromagnetismPlugin::new();
@@ -2267,10 +2286,13 @@ mod tests {
                 ObjectSpec::new("extreme charge")
                     .with_transform(Transform::at(DVec3::ZERO).unwrap())
                     .with_shape(ObjectShape::point(0.15).unwrap())
-                    .with_component(charge_component_id(), charge_properties(1.0e200).unwrap())
+                    .with_component(
+                        charge_component_id(),
+                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e200)).unwrap(),
+                    )
                     .with_component(
                         inertial_mass_component_id(),
-                        inertial_mass_properties(1.0e-6).unwrap(),
+                        inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6)).unwrap(),
                     ),
             )])
             .unwrap();

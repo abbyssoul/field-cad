@@ -7,7 +7,10 @@
 
 use std::time::{Duration, Instant};
 
-use fieldcad_core::{ObjectShape, ObjectSpec, Transform, WorldCommand};
+use fieldcad_core::{
+    ObjectShape, ObjectSpec, Transform, WorldCommand,
+    quantities::{ChargeCoulombs, MassKg, coulomb, kilogram},
+};
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
 use fieldcad_server::HeadlessServer;
@@ -63,7 +66,8 @@ fn body_forces_reach_the_trait_object_not_just_the_inherent_method() {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-6).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                         WorldCommand::CreateObject(
@@ -72,11 +76,13 @@ fn body_forces_reach_the_trait_object_not_just_the_inherent_method() {
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
-                                    charge_properties(1.0e-9).unwrap(),
+                                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9))
+                                        .unwrap(),
                                 )
                                 .with_component(
                                     inertial_mass_component_id(),
-                                    inertial_mass_properties(1.0e-6).unwrap(),
+                                    inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6))
+                                        .unwrap(),
                                 ),
                         ),
                     ])

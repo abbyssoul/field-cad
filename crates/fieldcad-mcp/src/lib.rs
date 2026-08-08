@@ -1081,6 +1081,7 @@ mod tests {
 
     use fieldcad_core::{
         FieldSnapshot, ObjectShape, ObjectSpec, ProbeSpec, Transform, WorldCommand, WorldSnapshot,
+        quantities::{ChargeCoulombs, coulomb},
     };
     use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
     use fieldcad_electrostatics::{
@@ -1148,7 +1149,10 @@ mod tests {
                 ObjectSpec::new("Point charge")
                     .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
                     .with_shape(ObjectShape::point(0.1).unwrap())
-                    .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                    .with_component(
+                        charge_component_id(),
+                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                    ),
             ),
             WorldCommand::CreateProbe(ProbeSpec::at(
                 "Field probe",

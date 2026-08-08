@@ -8,6 +8,7 @@
 //! Scenes are built deterministically from a seed-free rule so a sweep is
 //! reproducible and two runs on the same machine compare directly.
 
+use fieldcad_core::quantities::{ChargeCoulombs, coulomb};
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, Domain, DomainBounds, ObjectShape, ObjectSpec,
     Precision, ProbeSpec, Resolution, SlicePlaneSpec, Transform, World, WorldCommand,
@@ -15,6 +16,7 @@ use fieldcad_core::{
 use fieldcad_electromagnetic_sources::{
     charge_component_id, charge_component_schema, charge_properties,
 };
+
 use fieldcad_electromagnetism::{
     electric_field_channel_id as maxwell_electric_channel_id, magnetic_field_channel_id,
 };
@@ -207,7 +209,8 @@ impl Scene {
                     .with_shape(ObjectShape::point(0.15).expect("source radius is positive"))
                     .with_component(
                         charge_component_id(),
-                        charge_properties(1.0e-9).expect("charge is a valid quantity"),
+                        charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9))
+                            .expect("charge is a valid quantity"),
                     ),
             ));
         }

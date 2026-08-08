@@ -10,6 +10,7 @@
 //! different coupling constant and an opposite sign. This crate is the thin,
 //! gravity-specific adapter over it: `MassSource` in, `NewtonianSample` out.
 
+use fieldcad_core::quantities::{MassKg, SiScalar};
 use fieldcad_core::{CoupledSource, SampleGeometry, SampleValidity};
 use fieldcad_superposition::InverseSquareSource;
 use glam::DVec3;
@@ -26,8 +27,8 @@ pub struct NewtonianSample {
 }
 
 /// `None` for a source with zero coupling value.
-fn inverse_square_source(source: &CoupledSource<f64>) -> Option<InverseSquareSource> {
-    let mass = source.coupling_value;
+fn inverse_square_source(source: &CoupledSource<MassKg>) -> Option<InverseSquareSource> {
+    let mass = source.coupling_value.into_si();
     (mass != 0.0).then_some(InverseSquareSource {
         position: source.position,
         strength: mass,
@@ -36,7 +37,7 @@ fn inverse_square_source(source: &CoupledSource<f64>) -> Option<InverseSquareSou
 }
 
 /// Evaluate the superposed Newtonian field and potential in SI units.
-pub fn evaluate_sources(sources: &[CoupledSource<f64>], position: DVec3) -> NewtonianSample {
+pub fn evaluate_sources(sources: &[CoupledSource<MassKg>], position: DVec3) -> NewtonianSample {
     let sample = fieldcad_superposition::evaluate_sources(
         -GRAVITATIONAL_CONSTANT,
         sources.iter().filter_map(inverse_square_source),
@@ -52,7 +53,7 @@ pub fn evaluate_sources(sources: &[CoupledSource<f64>], position: DVec3) -> Newt
 /// Superposed acceleration at `position`, skipping only whichever source's
 /// own exclusion geometry contains it rather than voiding the whole sample.
 pub fn evaluate_acceleration_excluding<'a>(
-    sources: impl IntoIterator<Item = &'a CoupledSource<f64>>,
+    sources: impl IntoIterator<Item = &'a CoupledSource<MassKg>>,
     position: DVec3,
 ) -> Option<DVec3> {
     fieldcad_superposition::field_excluding(
@@ -64,7 +65,7 @@ pub fn evaluate_acceleration_excluding<'a>(
 
 /// Evaluate one complete geometry through the canonical source law.
 pub fn evaluate_geometry(
-    sources: &[CoupledSource<f64>],
+    sources: &[CoupledSource<MassKg>],
     geometry: &SampleGeometry,
 ) -> Vec<NewtonianSample> {
     geometry
@@ -76,14 +77,15 @@ pub fn evaluate_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fieldcad_core::quantities::kilogram;
     use fieldcad_core::{ChargeDistribution, ObjectId, Velocity};
 
-    fn point(mass: f64) -> CoupledSource<f64> {
+    fn point(mass: f64) -> CoupledSource<MassKg> {
         CoupledSource::new(
             ObjectId::new(0),
             DVec3::ZERO,
             Velocity::default(),
-            mass,
+            MassKg::new::<kilogram>(mass),
             ChargeDistribution::Point {
                 exclusion_radius: 0.0,
             },

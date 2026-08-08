@@ -15,6 +15,7 @@
 //! presentation: the interpolation a visualizer's density setting asks the
 //! solver to do.
 
+use fieldcad_core::quantities::{MassKg, kilogram};
 use fieldcad_core::{
     ObjectShape, ObjectSpec, PlaneId, PlaneLattice, ProbePosition, SampleGeometry, SessionId,
     StepContext, TimeStep, Transform, World, WorldCommand,
@@ -151,7 +152,8 @@ fn gravity_world(scene: &Scene) -> World {
                 .with_shape(ObjectShape::point(0.15).expect("source radius is positive"))
                 .with_component(
                     inertial_mass_component_id(),
-                    inertial_mass_properties(mass_kg).expect("mass is a valid quantity"),
+                    inertial_mass_properties(MassKg::new::<kilogram>(mass_kg))
+                        .expect("mass is a valid quantity"),
                 )
                 .with_component(
                     gravitational_mass_component_id(),

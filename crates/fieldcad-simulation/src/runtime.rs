@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelId, ChannelSchema, ChannelSnapshot, ClockSnapshot, CommitReport, ComponentSchema,
     ComponentTypeId, DiagnosticSeverity, Domain, FieldBatch, ObjectId, PluginId, PluginProvenance,
@@ -1619,7 +1620,7 @@ impl SimulationRuntime {
         stroke: FieldBrushStroke,
     ) -> Result<(), RuntimeError> {
         if !stroke.radius_metres.is_finite()
-            || stroke.radius_metres <= 0.0
+            || stroke.radius_metres.into_si() <= 0.0
             || stroke.samples.is_empty()
         {
             return Err(RuntimeError::InvalidFieldBrush(

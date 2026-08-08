@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use fieldcad_core::quantities::{MassKg, SiScalar};
 use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, CoupledSource, DiagnosticSeverity, Dimension,
     Domain, FieldColumn, FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry,
@@ -91,13 +92,13 @@ impl EquationSystemPlugin for NewtonianGravityPlugin {
     }
 }
 
-fn sources(world: &WorldSnapshot) -> Result<Vec<CoupledSource<f64>>, PluginError> {
+fn sources(world: &WorldSnapshot) -> Result<Vec<CoupledSource<MassKg>>, PluginError> {
     collect_gravity_sources(world).map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
 }
 
 struct NewtonianGravitySolver {
     domain: Domain,
-    sources: Vec<CoupledSource<f64>>,
+    sources: Vec<CoupledSource<MassKg>>,
     world_revision: fieldcad_core::WorldRevision,
     cache: SampleCache<NewtonianSample>,
 }
@@ -143,7 +144,7 @@ impl EquationSystemSolver for NewtonianGravitySolver {
                     .sources
                     .iter()
                     .find(|source| source.object == body.object)
-                    .map(|source| source.coupling_value)
+                    .map(|source| source.coupling_value.into_si())
                     .unwrap_or(0.0);
                 if mass == 0.0 {
                     return Ok(DVec3::ZERO);
@@ -206,6 +207,7 @@ fn quantize(sample: NewtonianSample, precision: Precision) -> NewtonianSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fieldcad_core::quantities::kilogram;
     use fieldcad_core::{
         ObjectShape, ObjectSpec, ProbeId, StepContext, TimeStep, Transform, World, WorldCommand,
     };
@@ -231,7 +233,7 @@ mod tests {
                     .with_shape(ObjectShape::point(0.01).unwrap())
                     .with_component(
                         inertial_mass_component_id(),
-                        inertial_mass_properties(2.0e10).unwrap(),
+                        inertial_mass_properties(MassKg::new::<kilogram>(2.0e10)).unwrap(),
                     )
                     .with_component(
                         gravitational_mass_component_id(),
@@ -298,7 +300,7 @@ mod tests {
             .with_shape(ObjectShape::point(0.01).unwrap())
             .with_component(
                 inertial_mass_component_id(),
-                inertial_mass_properties(1.0e12).unwrap(),
+                inertial_mass_properties(MassKg::new::<kilogram>(1.0e12)).unwrap(),
             )
             .with_component(
                 gravitational_mass_component_id(),
@@ -311,7 +313,7 @@ mod tests {
             .with_shape(ObjectShape::point(2.0).unwrap())
             .with_component(
                 inertial_mass_component_id(),
-                inertial_mass_properties(1.0).unwrap(),
+                inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
             )
             .with_component(
                 gravitational_mass_component_id(),
@@ -322,7 +324,7 @@ mod tests {
             .with_shape(ObjectShape::point(0.01).unwrap())
             .with_component(
                 inertial_mass_component_id(),
-                inertial_mass_properties(1.0).unwrap(),
+                inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
             )
             .with_component(
                 gravitational_mass_component_id(),
@@ -356,7 +358,7 @@ mod tests {
         let forces = solver
             .forces(&[DynamicBody {
                 object: body_id,
-                inertial_mass_kg: 1.0,
+                inertial_mass_kg: MassKg::new::<kilogram>(1.0),
                 position: DVec3::ZERO,
                 velocity: DVec3::ZERO,
             }])

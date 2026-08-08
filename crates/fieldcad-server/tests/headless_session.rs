@@ -4,7 +4,10 @@
 
 use std::time::{Duration, Instant};
 
-use fieldcad_core::{ObjectShape, ObjectSpec, ProbeSpec, Transform, WorldCommand};
+use fieldcad_core::{
+    ObjectShape, ObjectSpec, ProbeSpec, Transform, WorldCommand,
+    quantities::{ChargeCoulombs, coulomb},
+};
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electrostatics::electric_field_channel_id;
 use fieldcad_server::HeadlessServer;
@@ -34,7 +37,10 @@ fn charge_and_probe() -> Vec<WorldCommand> {
             ObjectSpec::new("Point charge")
                 .with_transform(Transform::at(DVec3::ZERO).unwrap())
                 .with_shape(ObjectShape::point(0.1).unwrap())
-                .with_component(charge_component_id(), charge_properties(1.0e-9).unwrap()),
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                ),
         ),
         WorldCommand::CreateProbe(ProbeSpec::at(
             "Field probe",

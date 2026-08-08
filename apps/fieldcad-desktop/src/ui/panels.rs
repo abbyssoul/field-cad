@@ -3340,7 +3340,10 @@ pub(super) fn queue_window(
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{ObjectSpec, Transform, World, WorldCommand};
+    use fieldcad_core::{
+        ObjectSpec, Transform, World, WorldCommand,
+        quantities::{MassKg, kilogram},
+    };
 
     use glam::{DQuat, DVec3};
 
@@ -3991,7 +3994,9 @@ mod tests {
             "a linked gravitational mass must render as non-interactive"
         );
         assert!(
-            row_is_interactive(independent_gravitational_mass_properties(3.0).unwrap()),
+            row_is_interactive(
+                independent_gravitational_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap()
+            ),
             "unlinking must restore interaction"
         );
     }
@@ -4057,7 +4062,10 @@ mod tests {
             .commit([WorldCommand::AttachComponent {
                 object,
                 component: fieldcad_sources::inertial_mass_component_id(),
-                properties: fieldcad_sources::inertial_mass_properties(3.5).unwrap(),
+                properties: fieldcad_sources::inertial_mass_properties(MassKg::new::<kilogram>(
+                    3.5,
+                ))
+                .unwrap(),
             }])
             .unwrap();
 

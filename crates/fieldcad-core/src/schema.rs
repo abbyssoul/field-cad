@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::quantities::{ChargeCoulombs, LengthMetres, MassKg, SiScalar, TimeQuantity};
 use crate::{ChannelId, ComponentTypeId, Dimension, PropertyId, Quantity, VectorQuantity};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -176,6 +177,26 @@ impl PropertyBag {
             Some(PropertyValue::Scalar(value)) => Some(value.si_value()),
             _ => None,
         }
+    }
+
+    /// The value as a typed mass, if present and has the mass dimension.
+    pub fn typed_mass(&self, id: &PropertyId) -> Option<MassKg> {
+        self.scalar(id).map(MassKg::from_si)
+    }
+
+    /// The value as a typed electric charge, if present and has the charge dimension.
+    pub fn typed_charge(&self, id: &PropertyId) -> Option<ChargeCoulombs> {
+        self.scalar(id).map(ChargeCoulombs::from_si)
+    }
+
+    /// The value as a typed length, if present and has the length dimension.
+    pub fn typed_length(&self, id: &PropertyId) -> Option<LengthMetres> {
+        self.scalar(id).map(LengthMetres::from_si)
+    }
+
+    /// The value as a typed time, if present and has the time dimension.
+    pub fn typed_time(&self, id: &PropertyId) -> Option<TimeQuantity> {
+        self.scalar(id).map(TimeQuantity::from_si)
     }
 
     pub fn is_empty(&self) -> bool {

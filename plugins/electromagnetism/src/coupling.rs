@@ -6,6 +6,7 @@
 //! positions; every path satisfies the discrete continuity equation exactly,
 //! and their average removes a preferred coordinate ordering.
 
+use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     Domain, ObjectId, ObjectShape, Transform, Velocity, WorldSnapshot, lorentz_factor,
     relativistic_kinetic_energy,
@@ -63,7 +64,10 @@ impl ParticleCoupling {
             .map(|particle| particle.object)
             .collect();
         let particle_energy_joules = particle_kinetic_energy(&particles);
-        let total_charge_coulombs = sources.iter().map(|source| source.coupling_value).sum();
+        let total_charge_coulombs = sources
+            .iter()
+            .map(|source| source.coupling_value.into_si())
+            .sum();
         Ok(Self {
             authored_motion: particles
                 .iter()
@@ -103,7 +107,10 @@ impl ParticleCoupling {
             .filter(|particle| particle.needs_kinematic_authority())
             .map(|particle| particle.object)
             .collect();
-        self.total_charge_coulombs = sources.iter().map(|source| source.coupling_value).sum();
+        self.total_charge_coulombs = sources
+            .iter()
+            .map(|source| source.coupling_value.into_si())
+            .sum();
         self.neutralizing_background_coulombs = -self.total_charge_coulombs;
         self.particle_energy_joules = particle_kinetic_energy(&self.particles);
         self.authored_motion = self
@@ -145,8 +152,8 @@ impl ParticleCoupling {
                     interpolate_particle_fields(domain, fields, particle.position)?;
                 relativistic_boris_velocity(
                     particle.velocity,
-                    particle.charge_coulombs,
-                    particle.mass_kg,
+                    particle.charge_coulombs.into_si(),
+                    particle.mass_kg.into_si(),
                     electric,
                     magnetic,
                     seconds,
@@ -156,7 +163,7 @@ impl ParticleCoupling {
             let new_position = wrap_position(domain, unwrapped_position);
             deposit_charge_conserving_current(
                 domain,
-                particle.charge_coulombs,
+                particle.charge_coulombs.into_si(),
                 old_position,
                 unwrapped_position,
                 seconds,
@@ -292,7 +299,12 @@ pub fn periodic_charge_initial_state(
 pub fn deposit_source_charge(domain: Domain, sources: &[ChargeSource]) -> Vec<f64> {
     let mut rho = zero_scalar_grid(domain);
     for source in sources {
-        deposit_cic_scalar(domain, source.position, source.coupling_value, &mut rho);
+        deposit_cic_scalar(
+            domain,
+            source.position,
+            source.coupling_value.into_si(),
+            &mut rho,
+        );
     }
     rho
 }
@@ -303,7 +315,7 @@ pub fn deposit_particle_charge(domain: Domain, particles: &[Particle]) -> Vec<f6
         deposit_cic_scalar(
             domain,
             particle.position,
-            particle.charge_coulombs,
+            particle.charge_coulombs.into_si(),
             &mut rho,
         );
     }
@@ -650,7 +662,7 @@ fn negative_laplacian(domain: Domain, values: &[f64]) -> Vec<f64> {
 fn particle_kinetic_energy(particles: &[Particle]) -> f64 {
     particles
         .iter()
-        .map(|particle| relativistic_kinetic_energy(particle.velocity, particle.mass_kg))
+        .map(|particle| relativistic_kinetic_energy(particle.velocity, particle.mass_kg.into_si()))
         .sum()
 }
 
@@ -709,6 +721,7 @@ fn axpy(target: &mut [f64], scale: f64, value: &[f64]) {
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_core::quantities::{ChargeCoulombs, coulomb};
     use fieldcad_core::{
         BoundaryCondition, BoundaryConditions, ChargeDistribution, DomainBounds, Precision,
         Resolution,
@@ -808,7 +821,7 @@ mod tests {
             ObjectId::new(7),
             DVec3::new(0.43, 0.71, 1.2),
             Velocity::default(),
-            2.0e-12,
+            ChargeCoulombs::new::<coulomb>(2.0e-12),
             ChargeDistribution::Point {
                 exclusion_radius: 0.01,
             },

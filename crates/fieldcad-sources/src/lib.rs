@@ -21,6 +21,7 @@
 //! physical quantity, so attaching mass to an object never drags in a motion
 //! model, a catalog identity, or a charge.
 
+use fieldcad_core::quantities::{MassKg, SiScalar};
 use fieldcad_core::{
     ChargeDistribution, ComponentSchema, ComponentTypeId, Dimension, PluginId, PointOrSphereError,
     PropertyBag, PropertyCondition, PropertyId, PropertyKind, PropertySchema, PropertyValue,
@@ -63,7 +64,7 @@ pub fn follows_inertial_property_id() -> PropertyId {
 /// the nanocoulomb charges these scenes use, so an object that has just been
 /// made movable does not leap out of the domain before the user has set a real
 /// value.
-pub const DEFAULT_MASS_KG: f64 = 1.0;
+const DEFAULT_MASS_KILOGRAMS: f64 = 1.0;
 
 fn mass_property_schema() -> PropertySchema {
     PropertySchema {
@@ -73,7 +74,8 @@ fn mass_property_schema() -> PropertySchema {
         required: true,
         relevant_when: None,
         default_value: Some(PropertyValue::Scalar(
-            Quantity::new(DEFAULT_MASS_KG, Dimension::MASS).expect("static default mass is finite"),
+            Quantity::new(DEFAULT_MASS_KILOGRAMS, Dimension::MASS)
+                .expect("static default mass is finite"),
         )),
     }
 }
@@ -135,10 +137,10 @@ pub fn mass_component_schemas() -> Vec<ComponentSchema> {
     ]
 }
 
-pub fn inertial_mass_properties(kilograms: f64) -> Result<PropertyBag, QuantityError> {
+pub fn inertial_mass_properties(kilograms: MassKg) -> Result<PropertyBag, QuantityError> {
     Ok([(
         mass_property_id(),
-        PropertyValue::Scalar(Quantity::new(kilograms, Dimension::MASS)?),
+        PropertyValue::Scalar(Quantity::new(kilograms.into_si(), Dimension::MASS)?),
     )]
     .into_iter()
     .collect())
@@ -151,7 +153,8 @@ pub fn linked_gravitational_mass_properties() -> PropertyBag {
         (
             mass_property_id(),
             PropertyValue::Scalar(
-                Quantity::new(DEFAULT_MASS_KG, Dimension::MASS).expect("static mass is finite"),
+                Quantity::new(DEFAULT_MASS_KILOGRAMS, Dimension::MASS)
+                    .expect("static mass is finite"),
             ),
         ),
     ]
@@ -161,7 +164,7 @@ pub fn linked_gravitational_mass_properties() -> PropertyBag {
 
 /// A gravitational mass authored independently of the body's inertia.
 pub fn independent_gravitational_mass_properties(
-    kilograms: f64,
+    kilograms: MassKg,
 ) -> Result<PropertyBag, QuantityError> {
     Ok([
         (
@@ -170,7 +173,7 @@ pub fn independent_gravitational_mass_properties(
         ),
         (
             mass_property_id(),
-            PropertyValue::Scalar(Quantity::new(kilograms, Dimension::MASS)?),
+            PropertyValue::Scalar(Quantity::new(kilograms.into_si(), Dimension::MASS)?),
         ),
     ]
     .into_iter()
@@ -184,11 +187,11 @@ pub type MassDistribution = ChargeDistribution;
 /// The exclusion radius given to a massive body with no authored shape.
 pub const DEFAULT_POINT_RADIUS: f64 = fieldcad_core::DEFAULT_PROXY_RADIUS;
 
-/// Extract every body that gravitates as a `CoupledSource<f64>`, including those
+/// Extract every body that gravitates as a `CoupledSource<MassKg>`, including those
 /// whose inertia was never authored.
 pub fn collect_gravity_sources(
     world: &WorldSnapshot,
-) -> Result<Vec<CoupledSource<f64>>, SourceError> {
+) -> Result<Vec<CoupledSource<MassKg>>, SourceError> {
     world
         .objects()
         .values()
@@ -201,7 +204,7 @@ pub fn collect_gravity_sources(
 }
 
 /// The gravitational coupling charge of one object, resolving the link.
-pub fn gravitational_mass_of(object: &WorldObject) -> Result<Option<f64>, SourceError> {
+pub fn gravitational_mass_of(object: &WorldObject) -> Result<Option<MassKg>, SourceError> {
     let Some(properties) = object.components.get(&gravitational_mass_component_id()) else {
         return Ok(None);
     };
@@ -222,10 +225,10 @@ pub fn gravitational_mass_of(object: &WorldObject) -> Result<Option<f64>, Source
             object: object.name.clone(),
         });
     }
-    Ok(Some(mass))
+    Ok(Some(MassKg::from_si(mass)))
 }
 
-pub fn inertial_mass_of(object: &WorldObject) -> Result<f64, SourceError> {
+pub fn inertial_mass_of(object: &WorldObject) -> Result<MassKg, SourceError> {
     let mass = object
         .components
         .get(&inertial_mass_component_id())
@@ -238,13 +241,13 @@ pub fn inertial_mass_of(object: &WorldObject) -> Result<f64, SourceError> {
             object: object.name.clone(),
         });
     }
-    Ok(mass)
+    Ok(MassKg::from_si(mass))
 }
 
 fn source_from_object_for_coupling(
     object: &WorldObject,
-    coupling_value: f64,
-) -> Result<CoupledSource<f64>, SourceError> {
+    coupling_value: MassKg,
+) -> Result<CoupledSource<MassKg>, SourceError> {
     let distribution =
         ChargeDistribution::from_shape(object.shape, DEFAULT_POINT_RADIUS).map_err(|error| {
             match error {
@@ -281,6 +284,7 @@ pub type MassSourceError = SourceError;
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_core::quantities::kilogram;
     use fieldcad_core::{ObjectId, ObjectSpec, Transform, World, WorldCommand};
     use glam::DVec3;
 
@@ -299,7 +303,7 @@ mod tests {
     fn inertial(kilograms: f64) -> (ComponentTypeId, PropertyBag) {
         (
             inertial_mass_component_id(),
-            inertial_mass_properties(kilograms).unwrap(),
+            inertial_mass_properties(MassKg::new::<kilogram>(kilograms)).unwrap(),
         )
     }
 
@@ -317,7 +321,7 @@ mod tests {
         let sources = collect_gravity_sources(&world.snapshot()).unwrap();
 
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].coupling_value, 2.0);
+        assert_eq!(sources[0].coupling_value, MassKg::new::<kilogram>(2.0));
         assert_eq!(sources[0].position, DVec3::Y);
         assert_eq!(
             sources[0].distribution,
@@ -337,7 +341,7 @@ mod tests {
         assert!(sources.is_empty());
         assert_eq!(
             inertial_mass_of(world.snapshot().objects().values().next().unwrap()).unwrap(),
-            5.0
+            MassKg::new::<kilogram>(5.0)
         );
         assert_eq!(
             gravitational_mass_of(world.snapshot().objects().values().next().unwrap()).unwrap(),
@@ -356,18 +360,18 @@ mod tests {
             )]);
 
         let sources = collect_gravity_sources(&world.snapshot()).unwrap();
-        assert_eq!(sources[0].coupling_value, 3.0);
+        assert_eq!(sources[0].coupling_value, MassKg::new::<kilogram>(3.0));
 
         world
             .commit([WorldCommand::AttachComponent {
                 object: ObjectId::new(0),
                 component: inertial_mass_component_id(),
-                properties: inertial_mass_properties(11.0).unwrap(),
+                properties: inertial_mass_properties(MassKg::new::<kilogram>(11.0)).unwrap(),
             }])
             .unwrap();
 
         let sources = collect_gravity_sources(&world.snapshot()).unwrap();
-        assert_eq!(sources[0].coupling_value, 11.0);
+        assert_eq!(sources[0].coupling_value, MassKg::new::<kilogram>(11.0));
     }
 
     #[test]
@@ -381,7 +385,9 @@ mod tests {
 
         assert!(!mass.is_relevant(&linked_gravitational_mass_properties()));
         assert!(
-            mass.is_relevant(&independent_gravitational_mass_properties(2.0).unwrap()),
+            mass.is_relevant(
+                &independent_gravitational_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap(),
+            ),
             "unlinking must make the value editable again"
         );
 
@@ -410,15 +416,15 @@ mod tests {
             .with_component(component, properties)
             .with_component(
                 gravitational_mass_component_id(),
-                independent_gravitational_mass_properties(7.0).unwrap(),
+                independent_gravitational_mass_properties(MassKg::new::<kilogram>(7.0)).unwrap(),
             )]);
 
         let sources = collect_gravity_sources(&world.snapshot()).unwrap();
 
-        assert_eq!(sources[0].coupling_value, 7.0);
+        assert_eq!(sources[0].coupling_value, MassKg::new::<kilogram>(7.0));
         assert_eq!(
             inertial_mass_of(world.snapshot().objects().values().next().unwrap()).unwrap(),
-            2.0
+            MassKg::new::<kilogram>(2.0)
         );
     }
 
@@ -429,18 +435,18 @@ mod tests {
             .with_component(component, properties)
             .with_component(
                 gravitational_mass_component_id(),
-                independent_gravitational_mass_properties(0.0).unwrap(),
+                independent_gravitational_mass_properties(MassKg::new::<kilogram>(0.0)).unwrap(),
             )]);
 
         let sources = collect_gravity_sources(&world.snapshot()).unwrap();
-        assert_eq!(sources[0].coupling_value, 0.0);
+        assert_eq!(sources[0].coupling_value, MassKg::new::<kilogram>(0.0));
     }
 
     #[test]
     fn a_non_positive_inertial_mass_is_rejected_before_a_pusher_can_divide_by_it() {
         let world = world_with([ObjectSpec::new("massless").with_component(
             inertial_mass_component_id(),
-            inertial_mass_properties(0.0).unwrap(),
+            inertial_mass_properties(MassKg::new::<kilogram>(0.0)).unwrap(),
         )]);
 
         assert_eq!(
@@ -457,12 +463,12 @@ mod tests {
             .with_transform(Transform::at(DVec3::X * 10.0).unwrap())
             .with_component(
                 gravitational_mass_component_id(),
-                independent_gravitational_mass_properties(7.0).unwrap(),
+                independent_gravitational_mass_properties(MassKg::new::<kilogram>(7.0)).unwrap(),
             )]);
 
         let via_gravity = collect_gravity_sources(&world.snapshot()).unwrap();
         assert_eq!(via_gravity.len(), 1);
-        assert_eq!(via_gravity[0].coupling_value, 7.0);
+        assert_eq!(via_gravity[0].coupling_value, MassKg::new::<kilogram>(7.0));
         assert_eq!(via_gravity[0].position, DVec3::X * 10.0);
     }
 }
