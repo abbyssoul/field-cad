@@ -1,7 +1,7 @@
 //! Inspector sections for editing a probe: position, recorded channels,
 //! attachment, and history plots.
 
-use fieldcad_core::{ObjectId, ProbeId, ProbePosition, WorldCommand, WorldSnapshot};
+use fieldcad_core::{Dimension, ObjectId, ProbeId, ProbePosition, WorldCommand, WorldSnapshot};
 use glam::DVec3;
 
 use super::{coordinate_editor, name_editor};
@@ -62,9 +62,9 @@ fn probe_position_editors(
             let mut changed = false;
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "x", &mut position.x, " m", editing);
-                changed |= coordinate_editor(ui, "y", &mut position.y, " m", editing);
-                changed |= coordinate_editor(ui, "z", &mut position.z, " m", editing);
+                changed |= coordinate_editor(ui, "x", &mut position.x, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "y", &mut position.y, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "z", &mut position.z, Dimension::LENGTH, editing);
             });
             if changed {
                 output.edit(vec![WorldCommand::SetProbePosition {
@@ -82,9 +82,9 @@ fn probe_position_editors(
             let mut changed = false;
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "x", &mut offset.x, " m", editing);
-                changed |= coordinate_editor(ui, "y", &mut offset.y, " m", editing);
-                changed |= coordinate_editor(ui, "z", &mut offset.z, " m", editing);
+                changed |= coordinate_editor(ui, "x", &mut offset.x, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "y", &mut offset.y, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "z", &mut offset.z, Dimension::LENGTH, editing);
             });
             if changed {
                 output.edit(vec![WorldCommand::SetProbePosition {

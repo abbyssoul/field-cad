@@ -42,15 +42,32 @@ pub(super) fn coordinate_editor(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut f64,
-    suffix: &str,
+    dimension: fieldcad_core::Dimension,
     editing: &mut bool,
 ) -> bool {
-    let response = ui.add(
-        egui::DragValue::new(value)
-            .speed(0.02)
-            .prefix(format!("{label}: "))
-            .suffix(suffix),
-    );
+    let mut drag = egui::DragValue::new(value)
+        .speed(0.02)
+        .prefix(format!("{label}: "));
+
+    if dimension.si_prefix_root().is_some() {
+        // SI prefix supported — formatter includes the unit, no suffix.
+        drag = drag
+            .custom_formatter(move |val, _| fieldcad_core::format_si_value(val, dimension).unwrap())
+            .custom_parser(move |text| {
+                fieldcad_core::parse_si_value(text, dimension).or_else(|| text.trim().parse().ok())
+            });
+    } else {
+        // Compound dimension — just show the unit symbol as a suffix.
+        let symbol = dimension.unit_symbol();
+        let suffix = if symbol.is_empty() {
+            symbol
+        } else {
+            format!(" {symbol}")
+        };
+        drag = drag.suffix(suffix);
+    }
+
+    let response = ui.add(drag);
     note_held_edit(&response, editing)
 }
 
@@ -98,7 +115,8 @@ pub(super) fn name_editor(
 mod tests {
     use crate::ui::compute::format_engineering;
     use fieldcad_core::{
-        ChannelId, ObjectId, ObjectShape, ObjectSpec, Transform, Velocity, World, WorldCommand,
+        ChannelId, Dimension, ObjectId, ObjectShape, ObjectSpec, Transform, Velocity, World,
+        WorldCommand,
         quantities::{MassKg, kilogram},
     };
     use fieldcad_simulation::CommandPayload;
@@ -538,7 +556,7 @@ mod tests {
                 ..Default::default()
             };
             let _ = context.run_ui(input, |ui| {
-                coordinate_editor(ui, "x", &mut value, " m", &mut editing);
+                coordinate_editor(ui, "x", &mut value, Dimension::LENGTH, &mut editing);
                 rect = ui.min_rect();
             });
             (editing, rect.center())

@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    ChannelId, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec, SlicePlane, SlicePlaneSpec,
+    ChannelId, Dimension, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec, SlicePlane,
+    SlicePlaneSpec,
 };
 use glam::{DQuat, DVec2, DVec3};
 
@@ -64,26 +65,31 @@ fn plane_geometry_editors(ui: &mut egui::Ui, plane: &SlicePlane, output: &mut Ui
             ui.label("Origin");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "x", &mut origin.x, " m", editing);
-                changed |= coordinate_editor(ui, "y", &mut origin.y, " m", editing);
-                changed |= coordinate_editor(ui, "z", &mut origin.z, " m", editing);
+                changed |= coordinate_editor(ui, "x", &mut origin.x, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "y", &mut origin.y, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "z", &mut origin.z, Dimension::LENGTH, editing);
             });
             ui.end_row();
 
             ui.label("Normal");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "nx", &mut normal.x, "", editing);
-                changed |= coordinate_editor(ui, "ny", &mut normal.y, "", editing);
-                changed |= coordinate_editor(ui, "nz", &mut normal.z, "", editing);
+                changed |=
+                    coordinate_editor(ui, "nx", &mut normal.x, Dimension::DIMENSIONLESS, editing);
+                changed |=
+                    coordinate_editor(ui, "ny", &mut normal.y, Dimension::DIMENSIONLESS, editing);
+                changed |=
+                    coordinate_editor(ui, "nz", &mut normal.z, Dimension::DIMENSIONLESS, editing);
             });
             ui.end_row();
 
             ui.label("Half extent");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "u", &mut half_extent.x, " m", editing);
-                changed |= coordinate_editor(ui, "v", &mut half_extent.y, " m", editing);
+                changed |=
+                    coordinate_editor(ui, "u", &mut half_extent.x, Dimension::LENGTH, editing);
+                changed |=
+                    coordinate_editor(ui, "v", &mut half_extent.y, Dimension::LENGTH, editing);
             });
             ui.end_row();
         });
@@ -328,18 +334,21 @@ fn box_geometry_editors(ui: &mut egui::Ui, field_box: &FieldBox, output: &mut Ui
             ui.label("Origin");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "x", &mut origin.x, " m", editing);
-                changed |= coordinate_editor(ui, "y", &mut origin.y, " m", editing);
-                changed |= coordinate_editor(ui, "z", &mut origin.z, " m", editing);
+                changed |= coordinate_editor(ui, "x", &mut origin.x, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "y", &mut origin.y, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "z", &mut origin.z, Dimension::LENGTH, editing);
             });
             ui.end_row();
 
             ui.label("Half extent");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "w", &mut half_extent.x, " m", editing);
-                changed |= coordinate_editor(ui, "h", &mut half_extent.y, " m", editing);
-                changed |= coordinate_editor(ui, "d", &mut half_extent.z, " m", editing);
+                changed |=
+                    coordinate_editor(ui, "w", &mut half_extent.x, Dimension::LENGTH, editing);
+                changed |=
+                    coordinate_editor(ui, "h", &mut half_extent.y, Dimension::LENGTH, editing);
+                changed |=
+                    coordinate_editor(ui, "d", &mut half_extent.z, Dimension::LENGTH, editing);
             });
             ui.end_row();
         });
@@ -443,16 +452,16 @@ fn sphere_geometry_editors(ui: &mut egui::Ui, sphere: &FieldSphere, output: &mut
             ui.label("Origin");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "x", &mut origin.x, " m", editing);
-                changed |= coordinate_editor(ui, "y", &mut origin.y, " m", editing);
-                changed |= coordinate_editor(ui, "z", &mut origin.z, " m", editing);
+                changed |= coordinate_editor(ui, "x", &mut origin.x, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "y", &mut origin.y, Dimension::LENGTH, editing);
+                changed |= coordinate_editor(ui, "z", &mut origin.z, Dimension::LENGTH, editing);
             });
             ui.end_row();
 
             ui.label("Radius");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                changed |= coordinate_editor(ui, "r", &mut radius, " m", editing);
+                changed |= coordinate_editor(ui, "r", &mut radius, Dimension::LENGTH, editing);
             });
             ui.end_row();
         });

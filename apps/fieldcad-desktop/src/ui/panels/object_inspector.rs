@@ -79,9 +79,12 @@ fn placement_editors(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
             ui.label("Position");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                position_changed |= coordinate_editor(ui, "x", &mut position.x, " m", editing);
-                position_changed |= coordinate_editor(ui, "y", &mut position.y, " m", editing);
-                position_changed |= coordinate_editor(ui, "z", &mut position.z, " m", editing);
+                position_changed |=
+                    coordinate_editor(ui, "x", &mut position.x, Dimension::LENGTH, editing);
+                position_changed |=
+                    coordinate_editor(ui, "y", &mut position.y, Dimension::LENGTH, editing);
+                position_changed |=
+                    coordinate_editor(ui, "z", &mut position.z, Dimension::LENGTH, editing);
             });
             ui.end_row();
 
@@ -94,9 +97,12 @@ fn placement_editors(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
             ui.label("Velocity");
             ui.horizontal(|ui| {
                 let editing = &mut output.scene_edit_in_progress;
-                velocity_changed |= coordinate_editor(ui, "vx", &mut velocity.x, " m/s", editing);
-                velocity_changed |= coordinate_editor(ui, "vy", &mut velocity.y, " m/s", editing);
-                velocity_changed |= coordinate_editor(ui, "vz", &mut velocity.z, " m/s", editing);
+                velocity_changed |=
+                    coordinate_editor(ui, "vx", &mut velocity.x, Dimension::VELOCITY, editing);
+                velocity_changed |=
+                    coordinate_editor(ui, "vy", &mut velocity.y, Dimension::VELOCITY, editing);
+                velocity_changed |=
+                    coordinate_editor(ui, "vz", &mut velocity.z, Dimension::VELOCITY, editing);
             });
             ui.end_row();
             if velocity_changed
@@ -464,11 +470,10 @@ fn property_widget(
                     Some(PropertyValue::Vector(quantity)) => quantity.si_value(),
                     _ => DVec3::ZERO,
                 };
-                let suffix = format!(" {}", dimension.unit_symbol());
                 let mut vector_changed = false;
-                vector_changed |= coordinate_editor(ui, "x", &mut vector.x, &suffix, editing);
-                vector_changed |= coordinate_editor(ui, "y", &mut vector.y, &suffix, editing);
-                vector_changed |= coordinate_editor(ui, "z", &mut vector.z, &suffix, editing);
+                vector_changed |= coordinate_editor(ui, "x", &mut vector.x, *dimension, editing);
+                vector_changed |= coordinate_editor(ui, "y", &mut vector.y, *dimension, editing);
+                vector_changed |= coordinate_editor(ui, "z", &mut vector.z, *dimension, editing);
                 if vector_changed && let Ok(quantity) = VectorQuantity::new(vector, *dimension) {
                     values.insert(schema.id.clone(), PropertyValue::Vector(quantity));
                     changed = true;
@@ -522,15 +527,27 @@ fn scalar_editor(
     editing: &mut bool,
 ) -> bool {
     let speed = (value.abs() * 0.01).max(f64::MIN_POSITIVE);
-    let suffix = format!(" {}", dimension.unit_symbol());
-    let response = ui.add(
-        egui::DragValue::new(value)
-            .speed(speed)
-            .custom_formatter(|value, _| format_engineering(value))
+    let mut drag = egui::DragValue::new(value)
+        .speed(speed)
+        .update_while_editing(false);
+
+    if dimension.si_prefix_root().is_some() {
+        // SI prefix supported — formatter includes the unit, no suffix needed.
+        drag = drag
+            .custom_formatter(move |val, _| fieldcad_core::format_si_value(val, dimension).unwrap())
+            .custom_parser(move |text| {
+                fieldcad_core::parse_si_value(text, dimension).or_else(|| text.trim().parse().ok())
+            });
+    } else {
+        // Compound dimension — fall back to engineering format + unit suffix.
+        let suffix = format!(" {}", dimension.unit_symbol());
+        drag = drag
+            .custom_formatter(|val, _| format_engineering(val))
             .custom_parser(|text| text.trim().parse().ok())
-            .update_while_editing(false)
-            .suffix(suffix),
-    );
+            .suffix(suffix);
+    }
+
+    let response = ui.add(drag);
     note_held_edit(&response, editing)
 }
 

@@ -51,24 +51,9 @@ impl FromStr for TimeStep {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let input = input.trim();
-        if let Ok(seconds) = input.parse::<f64>() {
-            return Self::from_seconds(seconds).map_err(Into::into);
-        }
 
-        // SI symbols are case-sensitive. Check the longer suffixes before `s`
-        // so a value such as `1ms` is parsed as milliseconds.
-        for (suffix, seconds_per_unit) in [
-            ("min", 60.0),
-            ("ms", 1.0e-3),
-            ("us", 1.0e-6),
-            ("µs", 1.0e-6),
-            ("μs", 1.0e-6),
-            ("ns", 1.0e-9),
-            ("ps", 1.0e-12),
-            ("fs", 1.0e-15),
-            ("h", 3_600.0),
-            ("s", 1.0),
-        ] {
+        // Non-SI time units handled as a time-specific fast path.
+        for (suffix, seconds_per_unit) in [("min", 60.0), ("h", 3_600.0)] {
             let Some(number) = input.strip_suffix(suffix) else {
                 continue;
             };
@@ -76,6 +61,11 @@ impl FromStr for TimeStep {
                 continue;
             };
             return Self::from_seconds(value * seconds_per_unit).map_err(Into::into);
+        }
+
+        // All standard SI-prefixed time suffixes handled by the shared parser.
+        if let Some(seconds) = crate::units::parse_si_value(input, crate::Dimension::TIME) {
+            return Self::from_seconds(seconds).map_err(Into::into);
         }
 
         Err(TimeStepParseError::InvalidSyntax {

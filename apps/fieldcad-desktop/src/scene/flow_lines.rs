@@ -988,7 +988,10 @@ mod tests {
             SceneScale::metre(),
         );
 
-        assert!(!vertices.is_empty(), "test setup: seeds must actually trace");
+        assert!(
+            !vertices.is_empty(),
+            "test setup: seeds must actually trace"
+        );
         let z_min = vertices
             .iter()
             .map(|vertex| vertex.position.z)

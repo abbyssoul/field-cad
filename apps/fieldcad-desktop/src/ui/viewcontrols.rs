@@ -15,7 +15,7 @@ use fieldcad_simulation::CommandPayload;
 
 use crate::camera::{AxisView, Projection};
 
-use super::compute::{ComputeView, format_engineering};
+use super::compute::ComputeView;
 use super::{CameraAction, FrameContext, UiFrameOutput, UiModel, ViewOptions};
 
 /// Inset from the viewport's top-left corner.
@@ -281,12 +281,18 @@ fn scene_scale_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut U
                 egui::DragValue::new(&mut metres)
                     .speed(drag_speed)
                     .range(f64::from_bits(1)..=f64::MAX)
-                    .custom_formatter(|metres, _| format_engineering(metres))
-                    .custom_parser(|text| text.trim().parse().ok())
+                    .custom_formatter(|metres, _| {
+                        fieldcad_core::format_si_value(metres, fieldcad_core::Dimension::LENGTH)
+                            .unwrap()
+                    })
+                    .custom_parser(|text| {
+                        fieldcad_core::parse_si_value(text, fieldcad_core::Dimension::LENGTH)
+                            .or_else(|| text.trim().parse().ok())
+                    })
                     .update_while_editing(false),
             )
             .on_hover_text(
-                "Drag to adjust, or click to enter a value, e.g. 1e-9 for nanometre scale",
+                "Drag to adjust, or click to enter a value, e.g. 1nm for nanometre scale",
             );
         if response.changed()
             && let Ok(scale) = SceneScale::from_metres(metres)
