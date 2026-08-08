@@ -12,7 +12,7 @@
 use fieldcad_core::{
     BoxLattice, GridLattice, PlaneLattice, SampleValidity, SceneScale, SphereLattice,
 };
-use glam::{DVec3, Vec3};
+use glam::{DMat3, DVec3, Vec3};
 
 use super::interpolation::{
     MagnitudeScale, box_interpolation, field_color, grid_interpolation, plane_interpolation,
@@ -373,6 +373,7 @@ pub(super) fn trace_domain_streamlines(
     scale: MagnitudeScale,
     display: FlowLineDisplay,
     scene_scale: SceneScale,
+    gradient: Option<&[DMat3]>,
 ) -> Vec<FlowRibbonVertex> {
     let floor = scale.noise_floor();
     let sample = |point: DVec3| -> Option<DVec3> {
@@ -381,7 +382,7 @@ pub(super) fn trace_domain_streamlines(
         if !interpolation.is_usable(validity) {
             return None;
         }
-        let value = interpolation.dvec3(values);
+        let value = interpolation.dvec3(values, gradient);
         (value.length() >= floor).then_some(value)
     };
     let contains = |point: DVec3| {
@@ -448,6 +449,7 @@ pub(super) fn trace_box_streamlines(
     scale: MagnitudeScale,
     display: FlowLineDisplay,
     scene_scale: SceneScale,
+    gradient: Option<&[DMat3]>,
 ) -> Vec<FlowRibbonVertex> {
     let floor = scale.noise_floor();
     let sample = |point: DVec3| -> Option<DVec3> {
@@ -456,7 +458,7 @@ pub(super) fn trace_box_streamlines(
         if !interpolation.is_usable(validity) {
             return None;
         }
-        let value = interpolation.dvec3(values);
+        let value = interpolation.dvec3(values, gradient);
         (value.length() >= floor).then_some(value)
     };
     let contains = |point: DVec3| {
@@ -524,6 +526,7 @@ pub(super) fn trace_sphere_streamlines(
     scale: MagnitudeScale,
     display: FlowLineDisplay,
     scene_scale: SceneScale,
+    gradient: Option<&[DMat3]>,
 ) -> Vec<FlowRibbonVertex> {
     let grid = lattice.grid();
     let floor = scale.noise_floor();
@@ -533,7 +536,7 @@ pub(super) fn trace_sphere_streamlines(
         if !interpolation.is_usable(validity) {
             return None;
         }
-        let value = interpolation.dvec3(values);
+        let value = interpolation.dvec3(values, gradient);
         (value.length() >= floor).then_some(value)
     };
     // The sphere, not its bounding cube: this is what keeps the traced lines
@@ -604,6 +607,7 @@ pub(super) fn trace_plane_streamlines(
     scale: MagnitudeScale,
     display: FlowLineDisplay,
     scene_scale: SceneScale,
+    gradient: Option<&[DMat3]>,
 ) -> Vec<FlowRibbonVertex> {
     let floor = scale.noise_floor();
     let sample = |point: DVec3| -> Option<DVec3> {
@@ -612,7 +616,7 @@ pub(super) fn trace_plane_streamlines(
         if !interpolation.is_usable(validity) {
             return None;
         }
-        let value = interpolation.dvec3(values);
+        let value = interpolation.dvec3(values, gradient);
         (value.length() >= floor).then_some(value)
     };
     let contains = |point: DVec3| {
@@ -920,6 +924,7 @@ mod tests {
             scale,
             display,
             SceneScale::metre(),
+            None,
         );
 
         assert!(
@@ -986,6 +991,7 @@ mod tests {
             scale,
             display,
             SceneScale::metre(),
+            None,
         );
 
         assert!(

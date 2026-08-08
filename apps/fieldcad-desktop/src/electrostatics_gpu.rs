@@ -217,6 +217,10 @@ impl GpuElectrostaticEvaluator {
                     f64::from(sample.field_potential[2]),
                 ),
                 potential: f64::from(sample.field_potential[3]),
+                // The compute shader does not (yet) output a Jacobian —
+                // consumers fall back to today's plain trilinear
+                // reconstruction for batches this evaluator produces.
+                gradient: None,
                 validity: validity(sample.validity[0]),
             })
             .collect();

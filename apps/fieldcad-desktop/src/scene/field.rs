@@ -5,10 +5,10 @@
 //! whatever a plugin publishes.
 
 use fieldcad_core::{
-    BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GridLattice, SampleGeometry, SampleValidity,
-    SceneScale, SphereLattice, WorldSnapshot,
+    BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GradientColumn, GridLattice, SampleGeometry,
+    SampleValidity, SceneScale, SphereLattice, WorldSnapshot,
 };
-use glam::{DVec3, Vec3};
+use glam::{DMat3, DVec3, Vec3};
 
 use super::flow_lines::{
     trace_box_streamlines, trace_domain_streamlines, trace_plane_streamlines,
@@ -54,6 +54,14 @@ pub fn field_geometry(
         let FieldColumn::Vector(values) = batch.values() else {
             continue;
         };
+        // Extracted once per batch, not once per glyph/streamline sample:
+        // whether a batch carries a gradient is a per-batch fact, and every
+        // consumer below falls back to today's trilinear/bilinear
+        // reconstruction when it is absent.
+        let gradient: Option<&[DMat3]> = match batch.gradient() {
+            Some(GradientColumn::Vector(gradient)) => Some(gradient.as_ref()),
+            _ => None,
+        };
         match batch.geometry() {
             SampleGeometry::Plane { plane, lattice } => {
                 if !show.planes {
@@ -77,11 +85,24 @@ pub fn field_geometry(
                     .iter()
                     .map(|value| displayed_plane_vector(*value, normal, plane_settings.vector_mode))
                     .collect();
+                // The projection applied to a value is linear, so the same
+                // projection applied to its Jacobian keeps the two
+                // consistent (∇(Pv) = P∇v for a constant projection P).
+                let displayed_gradient: Option<Vec<DMat3>> = gradient.map(|gradient| {
+                    gradient
+                        .iter()
+                        .map(|matrix| {
+                            displayed_plane_gradient(*matrix, normal, plane_settings.vector_mode)
+                        })
+                        .collect()
+                });
+                let displayed_gradient = displayed_gradient.as_deref();
                 let scale = MagnitudeScale::over(&displayed_values, batch.validity());
                 let colors = scale.colors(&displayed_values, batch.validity());
                 let field = PlaneField {
                     lattice: *lattice,
                     values: &displayed_values,
+                    gradient: displayed_gradient,
                     validity: batch.validity(),
                     colors: &colors,
                     scale,
@@ -118,6 +139,7 @@ pub fn field_geometry(
                         scale,
                         plane_settings.flow_lines,
                         scene_scale,
+                        displayed_gradient,
                     ));
                 }
             }
@@ -136,6 +158,7 @@ pub fn field_geometry(
                         scale,
                         settings.vectors,
                         scene_scale,
+                        gradient,
                     );
                 }
                 if settings.flow_lines.visible {
@@ -146,6 +169,7 @@ pub fn field_geometry(
                         scale,
                         settings.flow_lines,
                         scene_scale,
+                        gradient,
                     ));
                 }
             }
@@ -178,6 +202,7 @@ pub fn field_geometry(
                         scale,
                         box_settings.vectors,
                         scene_scale,
+                        gradient,
                     );
                 }
                 if box_settings.flow_lines.visible {
@@ -188,6 +213,7 @@ pub fn field_geometry(
                         scale,
                         box_settings.flow_lines,
                         scene_scale,
+                        gradient,
                     ));
                 }
             }
@@ -220,6 +246,7 @@ pub fn field_geometry(
                         scale,
                         sphere_settings.vectors,
                         scene_scale,
+                        gradient,
                     );
                 }
                 if sphere_settings.flow_lines.visible {
@@ -230,6 +257,7 @@ pub fn field_geometry(
                         scale,
                         sphere_settings.flow_lines,
                         scene_scale,
+                        gradient,
                     ));
                 }
             }
@@ -246,6 +274,21 @@ fn displayed_plane_vector(value: DVec3, normal: Vec3, mode: PlaneVectorMode) -> 
     }
 }
 
+/// The Jacobian counterpart of [`displayed_plane_vector`]: `InPlane`
+/// projects out the normal component of the *value*, a linear operation
+/// `P = I - n⊗n`, so the consistent gradient is `P` applied to the Jacobian
+/// (`∇(Pv) = P∇v` for a constant `P`), not the raw published Jacobian.
+fn displayed_plane_gradient(gradient: DMat3, normal: Vec3, mode: PlaneVectorMode) -> DMat3 {
+    match mode {
+        PlaneVectorMode::InPlane => {
+            let n = normal.as_dvec3();
+            let projection = DMat3::IDENTITY - DMat3::from_cols(n.x * n, n.y * n, n.z * n);
+            projection * gradient
+        }
+        PlaneVectorMode::Full3d => gradient,
+    }
+}
+
 /// One plane batch prepared for drawing: where the samples are, what they are
 /// worth, and the shared normalization that colour and glyph length both use.
 ///
@@ -254,6 +297,7 @@ fn displayed_plane_vector(value: DVec3, normal: Vec3, mode: PlaneVectorMode) -> 
 struct PlaneField<'a> {
     lattice: fieldcad_core::PlaneLattice,
     values: &'a [DVec3],
+    gradient: Option<&'a [DMat3]>,
     validity: &'a [SampleValidity],
     colors: &'a [Vec3],
     scale: MagnitudeScale,
@@ -314,6 +358,7 @@ fn append_plane_vectors(
     let PlaneField {
         lattice,
         values,
+        gradient,
         validity,
         colors,
         scale,
@@ -330,7 +375,7 @@ fn append_plane_vectors(
             if !interpolation.is_usable(validity) {
                 continue;
             }
-            let vector = interpolation.dvec3(values).as_vec3();
+            let vector = interpolation.dvec3(values, gradient).as_vec3();
             append_arrow(
                 lines,
                 interpolation.position + offset,
@@ -358,6 +403,7 @@ fn append_domain_vectors(
     scale: MagnitudeScale,
     display: VectorDisplay,
     scene_scale: SceneScale,
+    gradient: Option<&[DMat3]>,
 ) {
     let counts = lattice.counts();
     let xs = uniform_axis(counts.x, display.density);
@@ -373,7 +419,7 @@ fn append_domain_vectors(
                 if !interpolation.is_usable(validity) {
                     continue;
                 }
-                let vector = interpolation.dvec3(values).as_vec3();
+                let vector = interpolation.dvec3(values, gradient).as_vec3();
                 append_arrow(
                     lines,
                     interpolation.position,
@@ -398,6 +444,7 @@ fn append_box_vectors(
     scale: MagnitudeScale,
     display: VectorDisplay,
     scene_scale: SceneScale,
+    gradient: Option<&[DMat3]>,
 ) {
     let counts = lattice.counts();
     let xs = uniform_axis(counts.x, display.density);
@@ -413,7 +460,7 @@ fn append_box_vectors(
                 if !interpolation.is_usable(validity) {
                     continue;
                 }
-                let vector = interpolation.dvec3(values).as_vec3();
+                let vector = interpolation.dvec3(values, gradient).as_vec3();
                 append_arrow(
                     lines,
                     interpolation.position,
@@ -441,6 +488,7 @@ fn append_sphere_vectors(
     scale: MagnitudeScale,
     display: VectorDisplay,
     scene_scale: SceneScale,
+    gradient: Option<&[DMat3]>,
 ) {
     let grid = lattice.grid();
     let counts = grid.counts();
@@ -463,7 +511,7 @@ fn append_sphere_vectors(
                 if !interpolation.is_usable(validity) {
                     continue;
                 }
-                let vector = interpolation.dvec3(values).as_vec3();
+                let vector = interpolation.dvec3(values, gradient).as_vec3();
                 append_arrow(
                     lines,
                     interpolation.position,
@@ -496,6 +544,7 @@ mod tests {
         PlaneField {
             lattice,
             values,
+            gradient: None,
             validity,
             colors,
             scale: MagnitudeScale::over(values, validity),
@@ -969,6 +1018,7 @@ mod tests {
             MagnitudeScale::over(&values, &validity),
             display,
             SceneScale::metre(),
+            None,
         );
         lines
     }
@@ -1114,6 +1164,7 @@ mod tests {
             MagnitudeScale::over(&values, &validity),
             display,
             SceneScale::metre(),
+            None,
         );
         lines
     }
@@ -1171,6 +1222,7 @@ mod tests {
             MagnitudeScale::over(&values, &validity),
             VectorDisplay::new(true, 2),
             SceneScale::metre(),
+            None,
         );
 
         let origins: Vec<_> = lines
@@ -1214,6 +1266,7 @@ mod tests {
             MagnitudeScale::over(&values, &validity),
             VectorDisplay::new(true, 5),
             SceneScale::metre(),
+            None,
         );
 
         let origins: Vec<_> = lines
@@ -1249,6 +1302,7 @@ mod tests {
             scale,
             FlowLineDisplay::new(true, 3),
             SceneScale::metre(),
+            None,
         );
         assert!(
             !ribbons.is_empty(),

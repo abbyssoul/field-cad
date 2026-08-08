@@ -18,10 +18,10 @@ use std::{
 
 use fieldcad_core::quantities::{LengthMetres, MassKg};
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, Domain, FieldColumn, ObjectId, PlaneId, PluginId,
-    PluginVersion, PropertyBag, PropertySchema, Quantity, SampleGeometry, SampleValidity,
-    SchemaError, SolverDiagnostic, StepContext, TimeStep, Transform, Velocity, WorldSnapshot,
-    validate_properties,
+    ChannelId, ChannelSchema, ComponentSchema, Domain, FieldColumn, GradientColumn, ObjectId,
+    PlaneId, PluginId, PluginVersion, PropertyBag, PropertySchema, Quantity, SampleGeometry,
+    SampleValidity, SchemaError, SolverDiagnostic, StepContext, TimeStep, Transform, Velocity,
+    WorldSnapshot, validate_properties,
 };
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
@@ -155,6 +155,12 @@ pub struct ResolvedFieldBrushStroke {
 pub struct SampledColumn {
     pub values: FieldColumn,
     pub validity: Vec<SampleValidity>,
+    /// The channel's spatial derivative at each sample, if this solver can
+    /// report one. Most cannot or do not bother — `None` means every
+    /// consumer falls back to today's plain trilinear/bilinear
+    /// reconstruction, the same optional-capability idiom the rest of this
+    /// trait uses (see [`EquationSystemSolver::time_step_limit`]).
+    pub gradient: Option<GradientColumn>,
 }
 
 /// One body the dynamics system will move, as a field system sees it.
@@ -197,13 +203,21 @@ pub struct SolverStepOutcome {
 
 impl SampledColumn {
     pub fn new(values: FieldColumn, validity: Vec<SampleValidity>) -> Self {
-        Self { values, validity }
+        Self {
+            values,
+            validity,
+            gradient: None,
+        }
     }
 
     /// Every value was evaluated exactly at its requested position.
     pub fn exact(values: FieldColumn) -> Self {
         let validity = vec![SampleValidity::Exact; values.len()];
-        Self { values, validity }
+        Self {
+            values,
+            validity,
+            gradient: None,
+        }
     }
 
     pub fn exact_scalars(values: Vec<f64>) -> Self {
@@ -212,6 +226,15 @@ impl SampledColumn {
 
     pub fn exact_vectors(values: Vec<glam::DVec3>) -> Self {
         Self::exact(FieldColumn::vectors(values))
+    }
+
+    /// Report a per-sample spatial derivative alongside the values already
+    /// set. Most solvers never call this; the runtime is what actually
+    /// validates it (`FieldBatch::with_gradient`), matching how this type
+    /// never validated `values`/`validity` either.
+    pub fn with_gradient(mut self, gradient: GradientColumn) -> Self {
+        self.gradient = Some(gradient);
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -465,6 +488,16 @@ mod tests {
         assert_eq!(column.len(), 3);
         assert_eq!(column.validity.len(), 3);
         assert!(column.validity.iter().all(|flag| flag.is_usable()));
+    }
+
+    #[test]
+    fn sampled_column_gradient_defaults_to_none() {
+        let column = SampledColumn::exact_scalars(vec![1.0]);
+        assert!(column.gradient.is_none());
+
+        let with_gradient = SampledColumn::exact_vectors(vec![glam::DVec3::X])
+            .with_gradient(GradientColumn::Vector(vec![glam::DMat3::IDENTITY].into()));
+        assert!(with_gradient.gradient.is_some());
     }
 
     #[test]

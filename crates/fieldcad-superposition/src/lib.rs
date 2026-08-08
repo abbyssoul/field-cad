@@ -12,7 +12,7 @@
 //! between physics kernel and plugin glue.
 
 use fieldcad_core::{ChargeDistribution, SampleValidity, UndefinedReason};
-use glam::DVec3;
+use glam::{DMat3, DVec3};
 
 /// One source of a superposed field: a position, a coupling strength
 /// (charge or mass — sign convention is the caller's, via
@@ -24,11 +24,16 @@ pub struct InverseSquareSource {
     pub distribution: ChargeDistribution,
 }
 
-/// A superposed field vector and potential at one point.
+/// A superposed field vector, potential, and Jacobian at one point.
+///
+/// `gradient` is the field's own spatial derivative (`∂field_i/∂x_j` in
+/// column `j`), not the potential's — a caller that wants `∇φ` uses `-field`
+/// directly, since `E = -∇φ` already.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InverseSquareSample {
     pub field: DVec3,
     pub potential: f64,
+    pub gradient: DMat3,
     pub validity: SampleValidity,
 }
 
@@ -37,19 +42,30 @@ impl InverseSquareSample {
         Self {
             field: DVec3::ZERO,
             potential: 0.0,
+            gradient: DMat3::ZERO,
             validity: SampleValidity::Undefined(reason),
         }
     }
 }
 
-/// One source's field/potential contribution at `position`, or `None` if
-/// `position` sits inside that source's own exclusion geometry — the
-/// analytic exterior field is undefined there, not merely large.
+/// The exterior-field Jacobian shared by a point source and a sphere source
+/// observed from outside its radius: `∇E = (k·strength / r³) · (I − 3 d̂⊗d̂)`.
+/// Symmetric (`∂E_i/∂x_j = ∂E_j/∂x_i`), which is exactly the curl-free
+/// property an electrostatic (or gravitational) field must have.
+fn point_jacobian(coupling_strength: f64, displacement: DVec3, distance: f64) -> DMat3 {
+    let d_hat = displacement / distance;
+    let outer = DMat3::from_cols(d_hat.x * d_hat, d_hat.y * d_hat, d_hat.z * d_hat);
+    (coupling_strength / distance.powi(3)) * (DMat3::IDENTITY - 3.0 * outer)
+}
+
+/// One source's field/potential/gradient contribution at `position`, or
+/// `None` if `position` sits inside that source's own exclusion geometry —
+/// the analytic exterior field is undefined there, not merely large.
 fn contribution(
     coupling_constant: f64,
     source: InverseSquareSource,
     position: DVec3,
-) -> Option<(DVec3, f64)> {
+) -> Option<(DVec3, f64, DMat3)> {
     let displacement = position - source.position;
     let distance_squared = displacement.length_squared();
     let distance = distance_squared.sqrt();
@@ -62,18 +78,27 @@ fn contribution(
             Some((
                 coupling_constant * source.strength * displacement * inverse_distance.powi(3),
                 coupling_constant * source.strength * inverse_distance,
+                point_jacobian(coupling_constant * source.strength, displacement, distance),
             ))
         }
         ChargeDistribution::UniformSphere { radius } if distance < radius => Some((
             coupling_constant * source.strength * displacement / radius.powi(3),
             coupling_constant * source.strength / (2.0 * radius)
                 * (3.0 - distance_squared / radius.powi(2)),
+            // E_i = (k·strength/R³)·d_i is linear in `d`, so its Jacobian is
+            // the constant isotropic (k·strength/R³)·I — no singularity,
+            // unlike the exterior formula, which is exactly why the interior
+            // case is handled separately here too.
+            DMat3::from_diagonal(DVec3::splat(
+                coupling_constant * source.strength / radius.powi(3),
+            )),
         )),
         ChargeDistribution::UniformSphere { .. } => {
             let inverse_distance = distance.recip();
             Some((
                 coupling_constant * source.strength * displacement * inverse_distance.powi(3),
                 coupling_constant * source.strength * inverse_distance,
+                point_jacobian(coupling_constant * source.strength, displacement, distance),
             ))
         }
     }
@@ -91,26 +116,33 @@ pub fn evaluate_sources(
 ) -> InverseSquareSample {
     let mut field = DVec3::ZERO;
     let mut potential = 0.0;
+    let mut gradient = DMat3::ZERO;
     for source in sources {
         if source.strength == 0.0 {
             continue;
         }
-        let Some((field_contribution, potential_contribution)) =
+        let Some((field_contribution, potential_contribution, gradient_contribution)) =
             contribution(coupling_constant, source, position)
         else {
             return InverseSquareSample::undefined(UndefinedReason::InsideSourceRadius);
         };
         field += field_contribution;
         potential += potential_contribution;
-        if !field.is_finite() || !potential.is_finite() {
+        gradient += gradient_contribution;
+        if !field.is_finite() || !potential.is_finite() || !matrix_is_finite(gradient) {
             return InverseSquareSample::undefined(UndefinedReason::NumericalOverflow);
         }
     }
     InverseSquareSample {
         field,
         potential,
+        gradient,
         validity: SampleValidity::Exact,
     }
+}
+
+fn matrix_is_finite(matrix: DMat3) -> bool {
+    matrix.x_axis.is_finite() && matrix.y_axis.is_finite() && matrix.z_axis.is_finite()
 }
 
 /// Field only, skipping each source whose own geometry contains `position`
@@ -134,7 +166,7 @@ pub fn field_excluding(
         if source.strength == 0.0 {
             continue;
         }
-        let Some((field_contribution, _)) = contribution(coupling_constant, source, position)
+        let Some((field_contribution, _, _)) = contribution(coupling_constant, source, position)
         else {
             continue;
         };
@@ -234,5 +266,63 @@ mod tests {
         // from centre, not the exterior's inverse-square falloff — and is
         // not simply excluded to zero.
         assert!(field.length() > 0.0);
+    }
+
+    fn matrix_close(a: DMat3, b: DMat3, tolerance: f64) -> bool {
+        (a.x_axis - b.x_axis).abs().max_element() < tolerance
+            && (a.y_axis - b.y_axis).abs().max_element() < tolerance
+            && (a.z_axis - b.z_axis).abs().max_element() < tolerance
+    }
+
+    /// A strong, direct self-consistency oracle: the closed-form Jacobian
+    /// must agree with a central difference of the very field it was
+    /// derived from.
+    #[test]
+    fn a_point_sources_jacobian_matches_a_central_difference_of_its_own_field() {
+        let source = point(2.0, DVec3::ZERO);
+        let coupling_constant = 3.0;
+        let position = DVec3::new(1.0, 0.5, -0.3);
+        let sample = evaluate_sources(coupling_constant, [source], position);
+
+        let field_at = |p: DVec3| evaluate_sources(coupling_constant, [source], p).field;
+        let h = 1.0e-5;
+        let numerical = DMat3::from_cols(
+            (field_at(position + DVec3::X * h) - field_at(position - DVec3::X * h)) / (2.0 * h),
+            (field_at(position + DVec3::Y * h) - field_at(position - DVec3::Y * h)) / (2.0 * h),
+            (field_at(position + DVec3::Z * h) - field_at(position - DVec3::Z * h)) / (2.0 * h),
+        );
+
+        assert!(
+            matrix_close(sample.gradient, numerical, 1.0e-4),
+            "closed-form {:?} vs numerical {:?}",
+            sample.gradient,
+            numerical
+        );
+    }
+
+    #[test]
+    fn jacobians_superpose_linearly_across_sources() {
+        let a = point(1.0, DVec3::new(-2.0, 0.0, 0.0));
+        let b = point(-1.5, DVec3::new(3.0, 1.0, 0.0));
+        let position = DVec3::new(0.5, 0.2, 0.1);
+
+        let combined = evaluate_sources(1.0, [a, b], position).gradient;
+        let separate = evaluate_sources(1.0, [a], position).gradient
+            + evaluate_sources(1.0, [b], position).gradient;
+
+        assert!(matrix_close(combined, separate, 1.0e-9));
+    }
+
+    #[test]
+    fn a_uniform_spheres_interior_jacobian_is_isotropic() {
+        let source = InverseSquareSource {
+            position: DVec3::ZERO,
+            strength: 3.0,
+            distribution: ChargeDistribution::UniformSphere { radius: 2.0 },
+        };
+        let sample = evaluate_sources(1.0, [source], DVec3::new(0.3, -0.1, 0.5));
+
+        let expected = DMat3::from_diagonal(DVec3::splat(3.0 / 2.0_f64.powi(3)));
+        assert!(matrix_close(sample.gradient, expected, 1.0e-9));
     }
 }

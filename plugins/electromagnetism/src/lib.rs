@@ -20,10 +20,10 @@ use std::sync::Arc;
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     BoundaryCondition, ChannelId, ChannelSchema, ChargeDistribution, ComponentSchema,
-    DiagnosticSeverity, Dimension, Domain, FieldColumn, FieldValueKind, InterpolationMethod,
-    PluginId, PluginVersion, Precision, PropertyBag, PropertyId, PropertyKind, PropertySchema,
-    PropertyValue, Quantity, SampleGeometry, SampleValidity, SolverDiagnostic, StepContext,
-    TimeStep, UndefinedReason, WorldRevision, WorldSnapshot,
+    DiagnosticSeverity, Dimension, Domain, FieldColumn, FieldValueKind, GradientColumn,
+    InterpolationMethod, PluginId, PluginVersion, Precision, PropertyBag, PropertyId, PropertyKind,
+    PropertySchema, PropertyValue, Quantity, SampleGeometry, SampleValidity, SolverDiagnostic,
+    StepContext, TimeStep, UndefinedReason, WorldRevision, WorldSnapshot, hermite::hermite_cell_3d,
 };
 use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_component_schema, collect_charge_sources,
@@ -36,7 +36,7 @@ use fieldcad_plugin_api::{
     SolverContext, SolverKind, SolverStepOutcome,
 };
 use fieldcad_sources::mass_component_schemas;
-use glam::{DVec3, IVec3, UVec3};
+use glam::{DMat3, DVec3, IVec3, UVec3};
 
 use coupling::{ParticleCoupling, collect_coupled_particles, coupling_is_requested};
 
@@ -1144,13 +1144,98 @@ impl<'a> YeeFieldView<'a> {
             + (zn.z - here.z) / self.spacing.z
     }
 
+    /// Central-difference Jacobian of a cell-centred vector field at one
+    /// node, wrapped periodically the same way [`Self::electric_divergence`]
+    /// already wraps its neighbor reads — central rather than one-sided,
+    /// since `field` (unlike the staggered raw storage divergence reads
+    /// from) is defined at every node with no staggering, so a symmetric
+    /// stencil is both available and more accurate. Column `j` is
+    /// `∂field/∂x_j`, matching [`GradientColumn::Vector`]'s convention.
+    fn gradient_of(&self, field: &[DVec3], x: u32, y: u32, z: u32) -> DMat3 {
+        let at = |values: &[DVec3], x, y, z| values[linear_index(self.counts, x, y, z)];
+        let xn = wrap_next(x, self.counts.x);
+        let xp = wrap_previous(x, self.counts.x);
+        let yn = wrap_next(y, self.counts.y);
+        let yp = wrap_previous(y, self.counts.y);
+        let zn = wrap_next(z, self.counts.z);
+        let zp = wrap_previous(z, self.counts.z);
+        DMat3::from_cols(
+            (at(field, xn, y, z) - at(field, xp, y, z)) / (2.0 * self.spacing.x),
+            (at(field, x, yn, z) - at(field, x, yp, z)) / (2.0 * self.spacing.y),
+            (at(field, x, y, zn) - at(field, x, y, zp)) / (2.0 * self.spacing.z),
+        )
+    }
+
+    fn electric_gradient(&self, x: u32, y: u32, z: u32) -> DMat3 {
+        self.gradient_of(&self.centred_electric, x, y, z)
+    }
+
+    fn magnetic_gradient(&self, x: u32, y: u32, z: u32) -> DMat3 {
+        self.gradient_of(&self.centred_magnetic, x, y, z)
+    }
+
+    /// Reconstruct a vector field at an arbitrary (possibly off-grid)
+    /// position using tensor-product cubic Hermite interpolation — value
+    /// *and* Jacobian at each of the 8 surrounding nodes, not just the
+    /// plain trilinear blend of values alone. This is what makes a probe
+    /// placed between grid nodes read the field accurately rather than
+    /// through a locally-flat approximation, exactly the class of error
+    /// that showed up as visibly wrong reconstruction near a steep field
+    /// feature elsewhere in this codebase.
+    ///
+    /// `select` picks (value, gradient) for the desired field out of the
+    /// electric/magnetic pair at one corner in one call, since both are
+    /// always computed together for that corner.
     fn interpolate_vector(
         &self,
         position: DVec3,
-        select: impl Fn((DVec3, DVec3)) -> DVec3,
+        select: impl Fn((DVec3, DVec3), (DMat3, DMat3)) -> (DVec3, DMat3),
     ) -> DVec3 {
         let (base, fraction) = self.interpolation_cell(position);
-        let mut result = DVec3::ZERO;
+        let mut values = [DVec3::ZERO; 8];
+        let mut gradients = [DMat3::ZERO; 8];
+        for dz in 0..=1 {
+            for dy in 0..=1 {
+                for dx in 0..=1 {
+                    let cell = self.wrapped_cell(base.x + dx, base.y + dy, base.z + dz);
+                    let index = linear_index(self.counts, cell.x, cell.y, cell.z);
+                    let corner = (dx + 2 * dy + 4 * dz) as usize;
+                    let (value, gradient) = select(
+                        (self.centred_electric[index], self.centred_magnetic[index]),
+                        (
+                            self.electric_gradient(cell.x, cell.y, cell.z),
+                            self.magnetic_gradient(cell.x, cell.y, cell.z),
+                        ),
+                    );
+                    values[corner] = value;
+                    gradients[corner] = gradient;
+                }
+            }
+        }
+        hermite_cell_3d(
+            values,
+            gradients,
+            fraction,
+            [
+                DVec3::X * self.spacing.x,
+                DVec3::Y * self.spacing.y,
+                DVec3::Z * self.spacing.z,
+            ],
+        )
+    }
+
+    /// Trilinear blend of the 8 surrounding nodes' Jacobians — a cheap,
+    /// reasonable approximation of "the Jacobian near here" for publishing
+    /// alongside a sampled value, not itself Hermite-reconstructed (matrices
+    /// have no orthogonality constraint to preserve under plain componentwise
+    /// blending, unlike a rotation, so there is nothing finer to gain here).
+    fn interpolate_jacobian(
+        &self,
+        position: DVec3,
+        select: impl Fn((DMat3, DMat3)) -> DMat3,
+    ) -> DMat3 {
+        let (base, fraction) = self.interpolation_cell(position);
+        let mut result = DMat3::ZERO;
         for dz in 0..=1 {
             for dy in 0..=1 {
                 for dx in 0..=1 {
@@ -1158,9 +1243,10 @@ impl<'a> YeeFieldView<'a> {
                         * axis_weight(fraction.y, dy)
                         * axis_weight(fraction.z, dz);
                     let cell = self.wrapped_cell(base.x + dx, base.y + dy, base.z + dz);
-                    let index = linear_index(self.counts, cell.x, cell.y, cell.z);
-                    result += weight
-                        * select((self.centred_electric[index], self.centred_magnetic[index]));
+                    result += select((
+                        self.electric_gradient(cell.x, cell.y, cell.z),
+                        self.magnetic_gradient(cell.x, cell.y, cell.z),
+                    )) * weight;
                 }
             }
         }
@@ -1216,41 +1302,55 @@ pub fn sample_yee_fields(
 ) -> Result<SampledColumn, PluginError> {
     let field = YeeFieldView::new(domain, electric, magnetic, periodicity)?;
     let mut validity = Vec::with_capacity(geometry.len());
-    let mark = |position: DVec3, validity: &mut Vec<SampleValidity>| {
-        if !domain.bounds().contains(position) {
-            validity.push(SampleValidity::Undefined(UndefinedReason::OutsideDomain));
-            false
-        } else if field.stencil_crosses_seam(channel, position) {
-            validity.push(SampleValidity::Undefined(
-                UndefinedReason::AcrossPeriodicSeam,
-            ));
-            false
-        } else {
-            validity.push(SampleValidity::Interpolated(InterpolationMethod::Trilinear));
-            true
-        }
-    };
+    let mark =
+        |position: DVec3, method: InterpolationMethod, validity: &mut Vec<SampleValidity>| {
+            if !domain.bounds().contains(position) {
+                validity.push(SampleValidity::Undefined(UndefinedReason::OutsideDomain));
+                false
+            } else if field.stencil_crosses_seam(channel, position) {
+                validity.push(SampleValidity::Undefined(
+                    UndefinedReason::AcrossPeriodicSeam,
+                ));
+                false
+            } else {
+                validity.push(SampleValidity::Interpolated(method));
+                true
+            }
+        };
 
     match channel {
         ELECTRIC_FIELD_HANDLE | MAGNETIC_FIELD_HANDLE => {
             let mut values = Vec::with_capacity(geometry.len());
+            let mut gradients = Vec::with_capacity(geometry.len());
             for position in geometry.positions() {
-                let inside = mark(position, &mut validity);
-                let value = if !inside {
-                    DVec3::ZERO
+                let inside = mark(position, InterpolationMethod::Hermite, &mut validity);
+                let (value, gradient) = if !inside {
+                    (DVec3::ZERO, DMat3::ZERO)
                 } else if channel == ELECTRIC_FIELD_HANDLE {
-                    field.interpolate_vector(position, |(electric, _)| electric)
+                    (
+                        field.interpolate_vector(position, |(electric, _), (gradient, _)| {
+                            (electric, gradient)
+                        }),
+                        field.interpolate_jacobian(position, |(electric, _)| electric),
+                    )
                 } else {
-                    field.interpolate_vector(position, |(_, magnetic)| magnetic)
+                    (
+                        field.interpolate_vector(position, |(_, magnetic), (_, gradient)| {
+                            (magnetic, gradient)
+                        }),
+                        field.interpolate_jacobian(position, |(_, magnetic)| magnetic),
+                    )
                 };
                 values.push(value);
+                gradients.push(gradient);
             }
-            Ok(SampledColumn::new(FieldColumn::vectors(values), validity))
+            Ok(SampledColumn::new(FieldColumn::vectors(values), validity)
+                .with_gradient(GradientColumn::Vector(gradients.into())))
         }
         ENERGY_DENSITY_HANDLE | ELECTRIC_DIVERGENCE_HANDLE | MAGNETIC_DIVERGENCE_HANDLE => {
             let mut values = Vec::with_capacity(geometry.len());
             for position in geometry.positions() {
-                let inside = mark(position, &mut validity);
+                let inside = mark(position, InterpolationMethod::Trilinear, &mut validity);
                 let value = if !inside {
                     0.0
                 } else if channel == ENERGY_DENSITY_HANDLE {
@@ -1748,7 +1848,7 @@ mod tests {
         assert!(matches!(electric.values, FieldColumn::Vector(_)));
         assert_eq!(
             electric.validity[0],
-            SampleValidity::Interpolated(InterpolationMethod::Trilinear)
+            SampleValidity::Interpolated(InterpolationMethod::Hermite)
         );
         assert_eq!(
             electric.validity[1],
@@ -1905,7 +2005,7 @@ mod tests {
         for validity in &column.validity {
             assert_eq!(
                 *validity,
-                SampleValidity::Interpolated(InterpolationMethod::Trilinear)
+                SampleValidity::Interpolated(InterpolationMethod::Hermite)
             );
         }
     }
@@ -1930,6 +2030,109 @@ mod tests {
 
         assert_eq!(inside_base, outside_base);
         assert!((inside_fraction - outside_fraction).length() < 1.0e-9);
+    }
+
+    /// Regression: `gradient_of`'s central difference must wrap correctly
+    /// at the domain's periodic seam, not just at interior indices — the
+    /// same class of bug PH-17 already fixed once for `interpolation_cell`.
+    #[test]
+    fn electric_gradient_matches_a_planted_periodic_profile_including_at_the_wrap() {
+        let x_cells = 8;
+        let domain = periodic_domain(x_cells);
+        let counts = domain.resolution().cells();
+        let spacing = domain.cell_size();
+        let profile =
+            |x: u32| (2.0 * std::f64::consts::PI * f64::from(x) / f64::from(x_cells)).sin();
+
+        let mut electric = vec![DVec3::ZERO; domain.resolution().cell_count() as usize];
+        for x in 0..counts.x {
+            for y in 0..counts.y {
+                for z in 0..counts.z {
+                    electric[linear_index(counts, x, y, z)] = DVec3::new(profile(x), 0.0, 0.0);
+                }
+            }
+        }
+        let magnetic = vec![DVec3::ZERO; electric.len()];
+        let field =
+            YeeFieldView::new(domain, &electric, &magnetic, LatticePeriodicity::Periodic).unwrap();
+
+        for x in 0..counts.x {
+            let next = wrap_next(x, counts.x);
+            let previous = wrap_previous(x, counts.x);
+            let expected_dx = (profile(next) - profile(previous)) / (2.0 * spacing.x);
+
+            let gradient = field.electric_gradient(x, 1, 1);
+            assert!(
+                (gradient.x_axis.x - expected_dx).abs() < 1.0e-9,
+                "x={x}: expected {expected_dx}, got {}",
+                gradient.x_axis.x
+            );
+            assert!(
+                gradient.y_axis.x.abs() < 1.0e-9,
+                "the planted field does not vary with y"
+            );
+            assert!(
+                gradient.z_axis.x.abs() < 1.0e-9,
+                "the planted field does not vary with z"
+            );
+        }
+    }
+
+    /// Regression for the "curves near a small feature" class of bug
+    /// already fixed once at the scene layer for a coarse box near a point
+    /// charge: Hermite reconstruction using value *and* Jacobian must
+    /// reproduce a genuinely curved field far more accurately than a plain
+    /// value-only blend would, at an off-grid query point on a coarse
+    /// lattice.
+    #[test]
+    fn interpolate_vector_reconstructs_a_curved_field_far_more_accurately_than_trilinear_would() {
+        let x_cells = 8;
+        let domain = periodic_domain(x_cells);
+        let counts = domain.resolution().cells();
+        let spacing = domain.cell_size();
+        let origin = domain.bounds().min();
+        let world_x = |x: u32| origin.x + spacing.x * (f64::from(x) + 0.5);
+        let profile = |world_x: f64| world_x * world_x;
+
+        let mut electric = vec![DVec3::ZERO; domain.resolution().cell_count() as usize];
+        for x in 0..counts.x {
+            for y in 0..counts.y {
+                for z in 0..counts.z {
+                    electric[linear_index(counts, x, y, z)] =
+                        DVec3::new(profile(world_x(x)), 0.0, 0.0);
+                }
+            }
+        }
+        let magnetic = vec![DVec3::ZERO; electric.len()];
+        let field =
+            YeeFieldView::new(domain, &electric, &magnetic, LatticePeriodicity::Periodic).unwrap();
+
+        // Well inside the domain, away from the (non-periodic) profile's
+        // wrap discontinuity.
+        let query = DVec3::new(0.5, 0.5, 0.5);
+        let hermite =
+            field.interpolate_vector(query, |(electric, _), (gradient, _)| (electric, gradient));
+        let expected = profile(query.x);
+        let hermite_error = (hermite.x - expected).abs();
+
+        // Plain trilinear blend of the two nearest cell-centre values along
+        // x, for comparison (y/z are uniform, so they contribute nothing).
+        let (base, fraction) = interpolation_cell(domain, query);
+        let low = wrapped_cell(counts, base.x, base.y, base.z);
+        let high = wrapped_cell(counts, base.x + 1, base.y, base.z);
+        let trilinear =
+            (1.0 - fraction.x) * profile(world_x(low.x)) + fraction.x * profile(world_x(high.x));
+        let trilinear_error = (trilinear - expected).abs();
+
+        assert!(
+            hermite_error < 1.0e-9,
+            "Hermite should reconstruct a quadratic exactly, error {hermite_error}"
+        );
+        assert!(
+            trilinear_error > hermite_error * 100.0,
+            "trilinear should visibly miss the curvature: hermite_error={hermite_error}, \
+             trilinear_error={trilinear_error}"
+        );
     }
 
     /// The interior is what the desktop's default plane shows, and it is the

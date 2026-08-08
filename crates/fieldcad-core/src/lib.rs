@@ -5,6 +5,7 @@
 //! window, or graphics crate, and it must remain testable without a GPU.
 
 pub mod domain;
+pub mod hermite;
 pub mod ids;
 pub mod quantities;
 pub mod sampling;
@@ -17,6 +18,7 @@ pub mod units;
 pub mod world;
 
 pub use domain::*;
+pub use hermite::*;
 pub use ids::*;
 pub use sampling::*;
 pub use scene_scale::*;

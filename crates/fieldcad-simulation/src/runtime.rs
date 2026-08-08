@@ -1849,7 +1849,11 @@ impl SimulationRuntime {
                         }
                         .into());
                     }
-                    batches.push(FieldBatch::new(geometry, column.values, column.validity)?);
+                    let mut batch = FieldBatch::new(geometry, column.values, column.validity)?;
+                    if let Some(gradient) = column.gradient {
+                        batch = batch.with_gradient(gradient)?;
+                    }
+                    batches.push(batch);
                 }
                 if batches.is_empty() {
                     continue;
@@ -2170,6 +2174,70 @@ mod tests {
         }
     }
 
+    /// A single-channel plugin publishing a constant scalar field, optionally
+    /// with a constant gradient — just enough to exercise `publish_snapshot`'s
+    /// gradient plumbing without a real solver's complexity.
+    struct FieldPlugin {
+        id: PluginId,
+        channel: ChannelId,
+        report_gradient: bool,
+    }
+
+    impl EquationSystemPlugin for FieldPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: self.id.clone(),
+                version: PluginVersion::new(0, 1, 0),
+                display_name: "Field test".to_owned(),
+                description: "Exercises gradient publishing".to_owned(),
+            }
+        }
+
+        fn channels(&self) -> Vec<ChannelSchema> {
+            vec![ChannelSchema {
+                id: self.channel.clone(),
+                display_name: "Test field".to_owned(),
+                value_kind: fieldcad_core::FieldValueKind::Scalar(
+                    fieldcad_core::Dimension::DIMENSIONLESS,
+                ),
+            }]
+        }
+
+        fn create_solver(
+            &self,
+            _context: SolverContext<'_>,
+        ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
+            Ok(Box::new(FieldSolver {
+                report_gradient: self.report_gradient,
+            }))
+        }
+    }
+
+    struct FieldSolver {
+        report_gradient: bool,
+    }
+
+    impl EquationSystemSolver for FieldSolver {
+        fn on_world_changed(&mut self, _world: &WorldSnapshot) -> Result<(), PluginError> {
+            Ok(())
+        }
+
+        fn sample(
+            &self,
+            _channel: ChannelHandle,
+            geometry: &SampleGeometry,
+        ) -> Result<SampledColumn, PluginError> {
+            let column = SampledColumn::exact_scalars(vec![1.0; geometry.len()]);
+            Ok(if self.report_gradient {
+                column.with_gradient(fieldcad_core::GradientColumn::Scalar(
+                    vec![DVec3::X; geometry.len()].into(),
+                ))
+            } else {
+                column
+            })
+        }
+    }
+
     fn motion_runtime(
         plugins: impl IntoIterator<Item = Box<dyn EquationSystemPlugin>>,
     ) -> (SimulationRuntime, ObjectId) {
@@ -2188,6 +2256,55 @@ mod tests {
             config = config.with_plugin(plugin);
         }
         (SimulationRuntime::new(config).unwrap(), object)
+    }
+
+    /// A runtime with one [`FieldPlugin`] and a probe subscribed to its
+    /// channel, so `publish_snapshot` actually calls `sample()` once during
+    /// construction without needing plane/box/sphere setup.
+    fn field_runtime(report_gradient: bool, session: u128) -> (SimulationRuntime, ChannelId) {
+        let plugin_id = PluginId::new(format!("field-test-{session:x}")).unwrap();
+        let channel = ChannelId::new(plugin_id.clone(), "value").unwrap();
+        let plugin = FieldPlugin {
+            id: plugin_id,
+            channel: channel.clone(),
+            report_gradient,
+        };
+
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateProbe(fieldcad_core::ProbeSpec::at(
+                "probe",
+                DVec3::ZERO,
+                vec![channel.clone()],
+            ))])
+            .unwrap();
+        let config = RuntimeConfig::new(
+            Domain::centred_cube(2.0, 4).unwrap(),
+            TimeStep::from_seconds(0.25).unwrap(),
+            SessionId::from_u128(session),
+        )
+        .with_world(world)
+        .with_plugin(Box::new(plugin));
+
+        (SimulationRuntime::new(config).unwrap(), channel)
+    }
+
+    #[test]
+    fn a_solver_that_reports_a_gradient_publishes_one() {
+        let (runtime, channel) = field_runtime(true, 0x100);
+
+        let snapshot = runtime.latest_snapshot();
+        let batch = &snapshot.channels[&channel].batches[0];
+        assert!(batch.gradient().is_some());
+    }
+
+    #[test]
+    fn a_solver_that_does_not_report_a_gradient_still_publishes_fine() {
+        let (runtime, channel) = field_runtime(false, 0x101);
+
+        let snapshot = runtime.latest_snapshot();
+        let batch = &snapshot.channels[&channel].batches[0];
+        assert!(batch.gradient().is_none());
     }
 
     #[test]

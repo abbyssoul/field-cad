@@ -6,8 +6,11 @@
 //! do not fall on a published lattice cell, and must agree on what a value
 //! there looks like.
 
-use fieldcad_core::{BoxLattice, GridLattice, PlaneLattice, SampleValidity, SceneScale};
-use glam::{DVec3, Vec3};
+use fieldcad_core::{
+    BoxLattice, GridLattice, PlaneLattice, SampleValidity, SceneScale,
+    hermite::{hermite_cell_2d, hermite_cell_3d},
+};
+use glam::{DMat3, DVec2, DVec3, Vec3};
 
 /// Trilinear interpolation of the published domain lattice, mirroring
 /// [`PlaneInterpolation`] one dimension up.
@@ -16,6 +19,14 @@ pub(super) struct GridInterpolation {
     pub(super) position: Vec3,
     indices: [usize; 8],
     weights: [f64; 8],
+    /// Fractional position within the cell, `(0,0,0)` at `indices[0]` and
+    /// `(1,1,1)` at `indices[7]` — what [`hermite_cell_3d`] needs alongside
+    /// [`Self::axis_steps`] to reconstruct a gradient-aware value.
+    fraction: DVec3,
+    /// World-space step vector between adjacent samples along each local
+    /// axis, used to turn a published Jacobian into the directional
+    /// derivative the Hermite basis needs (`jacobian * axis_step`).
+    axis_steps: [DVec3; 3],
 }
 
 impl GridInterpolation {
@@ -25,12 +36,30 @@ impl GridInterpolation {
             .all(|&index| validity[index].is_usable())
     }
 
-    pub(super) fn dvec3(self, values: &[DVec3]) -> DVec3 {
+    /// Trilinear blend of the 8 corner values — the fallback used whenever
+    /// no gradient is available for this batch.
+    fn trilinear(self, values: &[DVec3]) -> DVec3 {
         self.indices
             .into_iter()
             .zip(self.weights)
             .map(|(index, weight)| values[index] * weight)
             .sum()
+    }
+
+    /// `gradient`, when present, must be indexed the same way `values` is
+    /// (both come from the same published batch). `None` — the common case
+    /// for a batch whose solver never reported one — reproduces exactly
+    /// today's trilinear blend.
+    pub(super) fn dvec3(self, values: &[DVec3], gradient: Option<&[DMat3]>) -> DVec3 {
+        let Some(gradient) = gradient else {
+            return self.trilinear(values);
+        };
+        hermite_cell_3d(
+            self.indices.map(|index| values[index]),
+            self.indices.map(|index| gradient[index]),
+            self.fraction,
+            self.axis_steps,
+        )
     }
 
     pub(super) fn vec3(self, values: &[Vec3]) -> Vec3 {
@@ -84,10 +113,13 @@ pub(super) fn grid_interpolation(
     if indices.iter().any(|&index| index >= lattice.len()) {
         return None;
     }
+    let step = lattice.step();
     Some(GridInterpolation {
         position: scene_scale.to_render_vec3(grid_point(lattice, x, y, z)?),
         indices,
         weights,
+        fraction: DVec3::new(fx, fy, fz),
+        axis_steps: [DVec3::X * step.x, DVec3::Y * step.y, DVec3::Z * step.z],
     })
 }
 
@@ -129,6 +161,8 @@ pub(super) struct BoxInterpolation {
     pub(super) position: Vec3,
     indices: [usize; 8],
     weights: [f64; 8],
+    fraction: DVec3,
+    axis_steps: [DVec3; 3],
 }
 
 impl BoxInterpolation {
@@ -138,12 +172,28 @@ impl BoxInterpolation {
             .all(|&index| validity[index].is_usable())
     }
 
-    pub(super) fn dvec3(self, values: &[DVec3]) -> DVec3 {
+    /// Trilinear blend of the 8 corner values — the fallback used whenever
+    /// no gradient is available for this batch.
+    fn trilinear(self, values: &[DVec3]) -> DVec3 {
         self.indices
             .into_iter()
             .zip(self.weights)
             .map(|(index, weight)| values[index] * weight)
             .sum()
+    }
+
+    /// `gradient`, when present, must be indexed the same way `values` is.
+    /// `None` reproduces exactly today's trilinear blend.
+    pub(super) fn dvec3(self, values: &[DVec3], gradient: Option<&[DMat3]>) -> DVec3 {
+        let Some(gradient) = gradient else {
+            return self.trilinear(values);
+        };
+        hermite_cell_3d(
+            self.indices.map(|index| values[index]),
+            self.indices.map(|index| gradient[index]),
+            self.fraction,
+            self.axis_steps,
+        )
     }
 
     pub(super) fn vec3(self, values: &[Vec3]) -> Vec3 {
@@ -206,6 +256,8 @@ pub(super) fn box_interpolation(
         position: scene_scale.to_render_vec3(position),
         indices,
         weights,
+        fraction: DVec3::new(fu, fv, fw),
+        axis_steps: [lattice.u_step(), lattice.v_step(), lattice.w_step()],
     })
 }
 
@@ -269,6 +321,8 @@ pub(super) struct PlaneInterpolation {
     pub(super) position: Vec3,
     indices: [usize; 4],
     weights: [f64; 4],
+    fraction: DVec2,
+    axis_steps: [DVec3; 2],
 }
 
 impl PlaneInterpolation {
@@ -278,12 +332,28 @@ impl PlaneInterpolation {
             .all(|&index| validity[index].is_usable())
     }
 
-    pub(super) fn dvec3(self, values: &[DVec3]) -> DVec3 {
+    /// Bilinear blend of the 4 corner values — the fallback used whenever
+    /// no gradient is available for this batch.
+    fn trilinear(self, values: &[DVec3]) -> DVec3 {
         self.indices
             .into_iter()
             .zip(self.weights)
             .map(|(index, weight)| values[index] * weight)
             .sum()
+    }
+
+    /// `gradient`, when present, must be indexed the same way `values` is.
+    /// `None` reproduces exactly today's bilinear blend.
+    pub(super) fn dvec3(self, values: &[DVec3], gradient: Option<&[DMat3]>) -> DVec3 {
+        let Some(gradient) = gradient else {
+            return self.trilinear(values);
+        };
+        hermite_cell_2d(
+            self.indices.map(|index| values[index]),
+            self.indices.map(|index| gradient[index]),
+            self.fraction,
+            self.axis_steps,
+        )
     }
 
     pub(super) fn vec3(self, values: &[Vec3]) -> Vec3 {
@@ -332,6 +402,8 @@ pub(super) fn plane_interpolation(
         position: scene_scale.to_render_vec3(position),
         indices,
         weights,
+        fraction: DVec2::new(u_fraction, v_fraction),
+        axis_steps: [lattice.u_step(), lattice.v_step()],
     })
 }
 
@@ -452,5 +524,77 @@ pub(super) fn field_color(value: f32) -> Vec3 {
         cyan.lerp(yellow, (value - 0.4) / 0.35)
     } else {
         yellow.lerp(red, (value - 0.75) / 0.25)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::UVec3;
+
+    use super::*;
+
+    /// `None` — the common case for a batch whose solver never reported a
+    /// gradient — must reproduce exactly the same trilinear blend the
+    /// interpolator has always computed.
+    #[test]
+    fn grid_interpolation_falls_back_to_trilinear_when_gradient_is_absent() {
+        let lattice = GridLattice::new(DVec3::ZERO, DVec3::ONE, UVec3::splat(2));
+        let values = [
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 0.0, 1.0),
+            DVec3::new(1.0, 0.0, 1.0),
+            DVec3::new(0.0, 1.0, 1.0),
+            DVec3::new(1.0, 1.0, 1.0),
+        ];
+        let interpolation =
+            grid_interpolation(lattice, 0.5, 0.5, 0.5, SceneScale::metre()).unwrap();
+
+        let result = interpolation.dvec3(&values, None);
+        // At the exact midpoint of a unit cell, trilinear weights are all
+        // 1/8 — the mean of the 8 corner values.
+        let expected: DVec3 = values.iter().copied().sum::<DVec3>() / 8.0;
+
+        assert!((result - expected).length() < 1.0e-9);
+    }
+
+    /// Regression/capability test for the point-charge-curving class of bug:
+    /// a per-axis-separable quadratic field is not affine, so trilinear
+    /// blending of corner values alone visibly misses it, but supplying the
+    /// exact corner gradients lets `grid_interpolation` reconstruct it
+    /// exactly, end to end through the same API `field.rs`/`flow_lines.rs`
+    /// call — not just the underlying `hermite_cell_3d` math in isolation.
+    #[test]
+    fn grid_interpolation_hermite_beats_trilinear_on_a_curved_field_at_coarse_resolution() {
+        let lattice = GridLattice::new(DVec3::ZERO, DVec3::ONE, UVec3::splat(2));
+        let mut values = [DVec3::ZERO; 8];
+        let mut gradients = [DMat3::ZERO; 8];
+        for i in 0..2 {
+            for j in 0..2 {
+                for k in 0..2 {
+                    let index = i + 2 * j + 4 * k;
+                    let (x, y, z) = (i as f64, j as f64, k as f64);
+                    values[index] = DVec3::new(x * x, y * y, z * z);
+                    gradients[index] = DMat3::from_diagonal(DVec3::new(2.0 * x, 2.0 * y, 2.0 * z));
+                }
+            }
+        }
+        let interpolation =
+            grid_interpolation(lattice, 0.5, 0.5, 0.5, SceneScale::metre()).unwrap();
+
+        let hermite = interpolation.dvec3(&values, Some(&gradients));
+        let trilinear = interpolation.dvec3(&values, None);
+        let expected = DVec3::splat(0.25); // f(0.5, 0.5, 0.5) = (0.25, 0.25, 0.25)
+
+        assert!(
+            (hermite - expected).length() < 1.0e-9,
+            "Hermite should reconstruct this field exactly: {hermite:?}"
+        );
+        assert!(
+            (trilinear - expected).length() > 0.2,
+            "trilinear should visibly miss the curvature: {trilinear:?}"
+        );
     }
 }

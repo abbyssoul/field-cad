@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use glam::{DVec2, DVec3, UVec2, UVec3};
+use glam::{DMat3, DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -46,6 +46,9 @@ pub enum InterpolationMethod {
     Nearest,
     Bilinear,
     Trilinear,
+    /// Reconstructed from published values *and* a per-sample gradient
+    /// (a tensor-product cubic Hermite blend), rather than values alone.
+    Hermite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +96,16 @@ impl PlaneLattice {
 
     pub const fn counts(self) -> UVec2 {
         self.counts
+    }
+
+    /// World-space step between adjacent samples along the plane's local u axis.
+    pub const fn u_step(self) -> DVec3 {
+        self.u_step
+    }
+
+    /// World-space step between adjacent samples along the plane's local v axis.
+    pub const fn v_step(self) -> DVec3 {
+        self.v_step
     }
 
     pub fn len(self) -> usize {
@@ -212,6 +225,21 @@ impl BoxLattice {
 
     pub const fn counts(self) -> UVec3 {
         self.counts
+    }
+
+    /// World-space step between adjacent samples along the box's local u axis.
+    pub const fn u_step(self) -> DVec3 {
+        self.u_step
+    }
+
+    /// World-space step between adjacent samples along the box's local v axis.
+    pub const fn v_step(self) -> DVec3 {
+        self.v_step
+    }
+
+    /// World-space step between adjacent samples along the box's local w axis.
+    pub const fn w_step(self) -> DVec3 {
+        self.w_step
     }
 
     pub fn len(self) -> usize {
@@ -455,12 +483,57 @@ impl FieldColumn {
     }
 }
 
+/// The spatial derivative of a channel's value, one entry per sample,
+/// shaped the same way [`FieldColumn`] is shaped: `Scalar` accompanies a
+/// scalar-valued channel (an ordinary gradient, `∇φ`) and `Vector`
+/// accompanies a vector-valued channel (a full Jacobian, `∂F_i/∂x_j`).
+///
+/// A solver reports this only when it can — most cannot or do not bother,
+/// and every consumer treats its absence as "use today's reconstruction,"
+/// the same optional-capability idiom the rest of the plugin surface uses
+/// (`EquationSystemSolver::time_step_limit`, for instance).
+///
+/// Convention for the `Vector` case: column `j` of the Jacobian is
+/// `∂F/∂x_j`, so `jacobian * step_vector` is the directional derivative of
+/// `F` along `step_vector` — exactly the operation a gradient-aware
+/// interpolator needs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GradientColumn {
+    Scalar(Arc<[DVec3]>),
+    Vector(Arc<[DMat3]>),
+}
+
+impl GradientColumn {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Scalar(values) => values.len(),
+            Self::Vector(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The first entry that cannot be represented as a physical number, for
+    /// the same reason [`FieldColumn::first_non_finite`] exists.
+    pub fn first_non_finite(&self) -> Option<usize> {
+        match self {
+            Self::Scalar(values) => values.iter().position(|value| !value.is_finite()),
+            Self::Vector(values) => values.iter().position(|value| {
+                !value.x_axis.is_finite() || !value.y_axis.is_finite() || !value.z_axis.is_finite()
+            }),
+        }
+    }
+}
+
 /// One channel's values over one geometry, with per-sample validity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FieldBatch {
     geometry: SampleGeometry,
     values: FieldColumn,
     validity: Arc<[SampleValidity]>,
+    gradient: Option<GradientColumn>,
 }
 
 impl FieldBatch {
@@ -490,6 +563,7 @@ impl FieldBatch {
             geometry,
             values,
             validity: validity.into(),
+            gradient: None,
         })
     }
 
@@ -497,6 +571,32 @@ impl FieldBatch {
     pub fn exact(geometry: SampleGeometry, values: FieldColumn) -> Result<Self, SamplingError> {
         let validity = vec![SampleValidity::Exact; geometry.len()];
         Self::new(geometry, values, validity)
+    }
+
+    /// Attach a per-sample derivative to an already-built batch.
+    ///
+    /// Optional: nothing calls this unless the solver that produced the
+    /// batch chose to report a gradient, and every consumer already treats
+    /// [`Self::gradient`] returning `None` as "use today's reconstruction."
+    pub fn with_gradient(mut self, gradient: GradientColumn) -> Result<Self, SamplingError> {
+        if gradient.len() != self.values.len() {
+            return Err(SamplingError::GradientLengthMismatch {
+                values: self.values.len(),
+                gradient: gradient.len(),
+            });
+        }
+        if !matches!(
+            (&self.values, &gradient),
+            (FieldColumn::Scalar(_), GradientColumn::Scalar(_))
+                | (FieldColumn::Vector(_), GradientColumn::Vector(_))
+        ) {
+            return Err(SamplingError::GradientShapeMismatch);
+        }
+        if let Some(index) = gradient.first_non_finite() {
+            return Err(SamplingError::NonFiniteGradient { index });
+        }
+        self.gradient = Some(gradient);
+        Ok(self)
     }
 
     pub const fn geometry(&self) -> &SampleGeometry {
@@ -509,6 +609,10 @@ impl FieldBatch {
 
     pub fn validity(&self) -> &[SampleValidity] {
         &self.validity
+    }
+
+    pub fn gradient(&self) -> Option<&GradientColumn> {
+        self.gradient.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -544,6 +648,12 @@ pub enum SamplingError {
     ValidityLengthMismatch { geometry: usize, validity: usize },
     #[error("field column contains a non-finite value at index {index}")]
     NonFiniteValue { index: usize },
+    #[error("value column has {values} samples but its gradient column has {gradient}")]
+    GradientLengthMismatch { values: usize, gradient: usize },
+    #[error("gradient column's shape does not match the value column's shape")]
+    GradientShapeMismatch,
+    #[error("gradient column contains a non-finite value at index {index}")]
+    NonFiniteGradient { index: usize },
 }
 
 #[cfg(test)]
@@ -810,5 +920,65 @@ mod tests {
         };
         assert_eq!(sphere_geometry.len(), 8);
         assert_eq!(sphere_geometry.position(0), Some(DVec3::splat(-1.0)));
+    }
+
+    #[test]
+    fn field_batch_accepts_a_gradient_column_matching_its_geometry_length() {
+        let geometry = SampleGeometry::Grid(GridLattice::new(
+            DVec3::ZERO,
+            DVec3::ONE,
+            UVec3::new(2, 1, 1),
+        ));
+        let batch = FieldBatch::exact(geometry, FieldColumn::vectors(vec![DVec3::X, DVec3::Y]))
+            .unwrap()
+            .with_gradient(GradientColumn::Vector(
+                vec![DMat3::IDENTITY, DMat3::ZERO].into(),
+            ))
+            .unwrap();
+
+        assert!(batch.gradient().is_some());
+    }
+
+    #[test]
+    fn field_batch_rejects_a_gradient_column_of_the_wrong_length() {
+        let geometry = SampleGeometry::Grid(GridLattice::new(
+            DVec3::ZERO,
+            DVec3::ONE,
+            UVec3::new(2, 1, 1),
+        ));
+        let batch =
+            FieldBatch::exact(geometry, FieldColumn::vectors(vec![DVec3::X, DVec3::Y])).unwrap();
+
+        assert_eq!(
+            batch.with_gradient(GradientColumn::Vector(vec![DMat3::IDENTITY].into())),
+            Err(SamplingError::GradientLengthMismatch {
+                values: 2,
+                gradient: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn field_batch_rejects_a_gradient_column_whose_shape_disagrees_with_the_value_column() {
+        let geometry = SampleGeometry::Grid(GridLattice::new(DVec3::ZERO, DVec3::ONE, UVec3::ONE));
+        let batch = FieldBatch::exact(geometry, FieldColumn::vectors(vec![DVec3::X])).unwrap();
+
+        assert_eq!(
+            batch.with_gradient(GradientColumn::Scalar(vec![DVec3::X].into())),
+            Err(SamplingError::GradientShapeMismatch)
+        );
+    }
+
+    #[test]
+    fn field_batch_rejects_a_non_finite_gradient() {
+        let geometry = SampleGeometry::Grid(GridLattice::new(DVec3::ZERO, DVec3::ONE, UVec3::ONE));
+        let batch = FieldBatch::exact(geometry, FieldColumn::vectors(vec![DVec3::X])).unwrap();
+
+        assert_eq!(
+            batch.with_gradient(GradientColumn::Vector(
+                vec![DMat3::from_cols(DVec3::NAN, DVec3::ZERO, DVec3::ZERO)].into()
+            )),
+            Err(SamplingError::NonFiniteGradient { index: 0 })
+        );
     }
 }

@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
-    ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, ObjectId, PluginId,
-    PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic, WorldSnapshot,
+    ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, GradientColumn,
+    ObjectId, PluginId, PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic,
+    WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_properties, charge_property_id,
@@ -23,7 +24,7 @@ use fieldcad_plugin_api::{
     PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
 };
 use fieldcad_superposition::InverseSquareSource;
-use glam::DVec3;
+use glam::{DMat3, DVec3};
 
 #[cfg(test)]
 use fieldcad_core::PropertyBag;
@@ -51,6 +52,13 @@ pub use fieldcad_electromagnetic_sources::{
 pub struct ElectrostaticSample {
     pub electric_field: DVec3,
     pub potential: f64,
+    /// The field's own Jacobian (`∂E_i/∂x_j`), if the evaluator that
+    /// produced this sample computed one. `Option`, not a bare `DMat3`: a
+    /// future non-CPU [`ElectrostaticBatchEvaluator`] (a `wgpu` compute
+    /// backend, say) that hasn't implemented the derivative math yet must
+    /// still be able to report `None` per-sample without breaking the
+    /// trait's contract.
+    pub gradient: Option<DMat3>,
     pub validity: SampleValidity,
 }
 
@@ -110,6 +118,10 @@ fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
 }
 
 /// Evaluate the superposed electrostatic field and potential in SI units.
+///
+/// The closed-form Jacobian is cheap and exact, so this reference evaluator
+/// always reports one — `gradient` only becomes `None` for a future
+/// evaluator that cannot compute it.
 pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> ElectrostaticSample {
     let sample = fieldcad_superposition::evaluate_sources(
         COULOMB_CONSTANT,
@@ -119,6 +131,7 @@ pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> Electrosta
     ElectrostaticSample {
         electric_field: sample.field,
         potential: sample.potential,
+        gradient: Some(sample.gradient),
         validity: sample.validity,
     }
 }
@@ -234,15 +247,48 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     ) -> Result<SampledColumn, PluginError> {
         let samples = self.samples_for(geometry)?;
         let validity = samples.iter().map(|sample| sample.validity).collect();
+        // A gradient is published only if *every* sample in the batch
+        // reported one — the rest of the pipeline treats "does this batch
+        // carry a gradient" as one per-batch decision, not a per-point one.
+        let gradients = samples
+            .iter()
+            .map(|sample| sample.gradient)
+            .collect::<Option<Vec<_>>>();
         match channel {
-            ELECTRIC_FIELD_HANDLE => Ok(SampledColumn::new(
-                FieldColumn::vectors(samples.iter().map(|sample| sample.electric_field).collect()),
-                validity,
-            )),
-            ELECTRIC_POTENTIAL_HANDLE => Ok(SampledColumn::new(
-                FieldColumn::scalars(samples.iter().map(|sample| sample.potential).collect()),
-                validity,
-            )),
+            ELECTRIC_FIELD_HANDLE => {
+                let column = SampledColumn::new(
+                    FieldColumn::vectors(
+                        samples.iter().map(|sample| sample.electric_field).collect(),
+                    ),
+                    validity,
+                );
+                Ok(match gradients {
+                    Some(jacobians) => {
+                        column.with_gradient(GradientColumn::Vector(jacobians.into()))
+                    }
+                    None => column,
+                })
+            }
+            ELECTRIC_POTENTIAL_HANDLE => {
+                let column = SampledColumn::new(
+                    FieldColumn::scalars(samples.iter().map(|sample| sample.potential).collect()),
+                    validity,
+                );
+                // ∇φ = −E: the potential's gradient is exactly minus the
+                // field this solver already computed, so no separate math is
+                // needed — only whether `gradients.is_some()` still gates it,
+                // to keep both channels' gradient availability consistent
+                // for the same evaluator.
+                Ok(match gradients {
+                    Some(_) => column.with_gradient(GradientColumn::Scalar(
+                        samples
+                            .iter()
+                            .map(|sample| -sample.electric_field)
+                            .collect(),
+                    )),
+                    None => column,
+                })
+            }
             other => Err(PluginError::UnknownChannel(other.index())),
         }
     }
@@ -614,6 +660,7 @@ mod tests {
                 ElectrostaticSample {
                     electric_field: DVec3::X,
                     potential: 2.0,
+                    gradient: None,
                     validity: SampleValidity::Exact,
                 };
                 geometry.len()
@@ -711,6 +758,55 @@ mod tests {
         solver.sample(ELECTRIC_POTENTIAL_HANDLE, &geometry).unwrap();
 
         assert_eq!(evaluator.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A plane offset from the origin, comfortably outside a default-radius
+    /// point charge's exclusion zone, for tests that need every sample to
+    /// come back `Exact` rather than `Undefined`.
+    fn plane_away_from_the_origin() -> SampleGeometry {
+        SampleGeometry::Plane {
+            plane: fieldcad_core::PlaneId::new(0),
+            lattice: PlaneLattice::new(
+                DVec3::new(-1.0, -1.0, 0.5),
+                DVec3::new(0.5, 0.0, 0.0),
+                DVec3::new(0.0, 0.5, 0.0),
+                UVec2::splat(3),
+            ),
+        }
+    }
+
+    #[test]
+    fn the_electric_field_channel_publishes_its_jacobian() {
+        let solver = solver_for_charged_shape(None).unwrap();
+        let geometry = plane_away_from_the_origin();
+
+        let column = solver.sample(ELECTRIC_FIELD_HANDLE, &geometry).unwrap();
+
+        match column.gradient {
+            Some(GradientColumn::Vector(jacobians)) => assert_eq!(jacobians.len(), geometry.len()),
+            other => panic!("expected a Jacobian per sample, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_potential_channel_publishes_minus_the_field_as_its_gradient() {
+        let solver = solver_for_charged_shape(None).unwrap();
+        let geometry = plane_away_from_the_origin();
+
+        let field_column = solver.sample(ELECTRIC_FIELD_HANDLE, &geometry).unwrap();
+        let potential_column = solver.sample(ELECTRIC_POTENTIAL_HANDLE, &geometry).unwrap();
+
+        let FieldColumn::Vector(fields) = field_column.values else {
+            panic!("expected a vector field column");
+        };
+        let Some(GradientColumn::Scalar(gradients)) = potential_column.gradient else {
+            panic!("expected the potential channel to publish a gradient");
+        };
+
+        assert_eq!(fields.len(), gradients.len());
+        for (field, gradient) in fields.iter().zip(gradients.iter()) {
+            assert!((*gradient - (-*field)).length() < 1.0e-12);
+        }
     }
 
     #[test]
