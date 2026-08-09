@@ -400,6 +400,13 @@ struct PluginSlot {
     /// edit. When false it keeps its last complete result for the duration of
     /// the gesture and is brought current once, at the boundary.
     realtime: bool,
+    /// The world and domain this plugin's channels in `self.latest` were
+    /// actually last sampled against — `None` until the first real sample.
+    /// Set only in `publish_snapshot`'s actual-sampling branch, never in the
+    /// copy-forward (`unchanged_by_tick`/`deferred`) branch, so it always
+    /// names the world a currently-cached batch really reflects, even across
+    /// several skipped/deferred publishes in between.
+    sampled_from: Option<(WorldSnapshot, Domain)>,
 }
 
 impl PluginSlot {
@@ -694,6 +701,7 @@ impl SimulationRuntime {
                 solver,
                 enabled: registration.enabled,
                 realtime: registration.realtime,
+                sampled_from: None,
             });
         }
 
@@ -1164,6 +1172,7 @@ impl SimulationRuntime {
             // sampling budget. Include them before activation so the command is
             // rejected rather than publishing an unexpectedly oversized frame.
             self.plugins[index].solver = Some(solver);
+            self.plugins[index].sampled_from = None;
             self.plugins[index].enabled = true;
             if let Err(error) = self.validate_subscription(self.subscription) {
                 self.plugins[index].enabled = false;
@@ -1453,6 +1462,7 @@ impl SimulationRuntime {
         self.last_forces.clear();
         for (slot, replacement) in self.plugins.iter_mut().zip(replacements.drain(..)) {
             slot.solver = replacement;
+            slot.sampled_from = None;
         }
         Ok(())
     }
@@ -1706,6 +1716,11 @@ impl SimulationRuntime {
         self.plugins[index]
             .solver_mut()
             .apply_field_brush_stroke(&resolved)?;
+        // A brush stroke mutates the solver's own field state directly,
+        // without touching `objects`/`component_schemas`/`domain` — the
+        // reuse check in `publish_snapshot` would otherwise be blind to it
+        // and silently keep serving pre-paint batches.
+        self.plugins[index].sampled_from = None;
         Ok(())
     }
 
@@ -1807,7 +1822,27 @@ impl SimulationRuntime {
         let mut diagnostics = Vec::new();
         let mut provenance = Vec::with_capacity(self.plugins.len());
 
+        // `geometries` needs a whole `&self` borrow (subscription + domain),
+        // so every channel's geometry list is resolved here, before the loop
+        // below borrows `self.plugins` mutably to record sample provenance.
+        let mut geometries_by_channel: BTreeMap<ChannelId, Vec<SampleGeometry>> = BTreeMap::new();
         for slot in self.plugins.iter().filter(|slot| slot.enabled) {
+            for schema in &slot.channels {
+                geometries_by_channel
+                    .entry(schema.id.clone())
+                    .or_insert_with(|| self.geometries(&world, &schema.id));
+            }
+        }
+
+        // Hoisted out of the mutable loop below: `is_editing` is a method
+        // call, which the borrow checker cannot split into a single-field
+        // borrow the way direct field access (`self.domain`, `self.latest`)
+        // can be, so it must be resolved before `self.plugins` is borrowed
+        // mutably.
+        let editing = self.is_editing();
+        let domain = self.domain;
+
+        for slot in self.plugins.iter_mut().filter(|slot| slot.enabled) {
             provenance.push(PluginProvenance {
                 id: slot.metadata.id.clone(),
                 version: slot.metadata.version,
@@ -1820,7 +1855,7 @@ impl SimulationRuntime {
             // its result for the duration of an interactive edit.
             let unchanged_by_tick = sampling == SamplingPolicy::TimeDependentOnly
                 && !slot.solver().kind().advances_with_time();
-            let deferred = self.is_editing() && !slot.realtime;
+            let deferred = editing && !slot.realtime;
             if deferred {
                 diagnostics.push(SolverDiagnostic {
                     plugin: slot.metadata.id.clone(),
@@ -1839,13 +1874,53 @@ impl SimulationRuntime {
                         channels.insert(schema.id.clone(), previous.clone());
                     }
                 }
+                // `sampled_from` is deliberately left untouched here: it must
+                // keep naming the world the currently-cached batches actually
+                // reflect, not the world as of this skipped publish, so a
+                // plugin resumed after several deferred/unchanged-by-tick
+                // publishes can still tell whether anything changed since its
+                // *last real sample* rather than since its last publish.
                 continue;
             }
 
+            // Region-only edits (a plane/box/sphere/probe added, moved, or
+            // toggled) never change what a solver reads — solvers only see
+            // `objects` and `component_schemas` (see `WorldSnapshot`). When
+            // neither of those, nor `domain`, moved since this plugin's data
+            // was last actually sampled, a geometry whose own `SampleGeometry`
+            // is unchanged from last time necessarily produced the same
+            // values then as it would now, so its previous `FieldBatch` can
+            // be reused verbatim instead of re-invoking the solver.
+            let reuse_from =
+                slot.sampled_from
+                    .as_ref()
+                    .filter(|(previous_world, previous_domain)| {
+                        std::ptr::eq(previous_world.objects(), world.objects())
+                            && std::ptr::eq(
+                                previous_world.component_schemas(),
+                                world.component_schemas(),
+                            )
+                            && *previous_domain == domain
+                    });
+
             for (handle, schema) in slot.handles() {
+                let previous_batches = reuse_from
+                    .and_then(|_| self.latest.channels.get(&schema.id))
+                    // Guards a `SetFieldModel` provider swap: a channel whose
+                    // provider just changed must not reuse the old provider's
+                    // batches under the new one's identity.
+                    .filter(|previous| previous.provider == slot.metadata.id)
+                    .map(|previous| previous.batches.as_ref());
+
                 let mut batches = Vec::new();
-                for geometry in self.geometries(&world, &schema.id) {
-                    let column = slot.solver().sample(handle, &geometry)?;
+                for geometry in geometries_by_channel.get(&schema.id).into_iter().flatten() {
+                    if let Some(reused) = previous_batches.and_then(|existing| {
+                        existing.iter().find(|batch| batch.geometry() == geometry)
+                    }) {
+                        batches.push(reused.clone());
+                        continue;
+                    }
+                    let column = slot.solver().sample(handle, geometry)?;
                     // Shape and length are checked once per batch here, rather
                     // than once per value at every site that reads the batch.
                     if !column.values.matches(schema.value_kind) {
@@ -1855,7 +1930,8 @@ impl SimulationRuntime {
                         }
                         .into());
                     }
-                    let mut batch = FieldBatch::new(geometry, column.values, column.validity)?;
+                    let mut batch =
+                        FieldBatch::new(geometry.clone(), column.values, column.validity)?;
                     if let Some(gradient) = column.gradient {
                         batch = batch.with_gradient(gradient)?;
                     }
@@ -1873,6 +1949,8 @@ impl SimulationRuntime {
                     },
                 );
             }
+
+            slot.sampled_from = Some((world.clone(), domain));
         }
 
         self.latest = Arc::new(fieldcad_core::FieldSnapshot {
@@ -2084,12 +2162,14 @@ impl RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use fieldcad_core::{
         BoundaryCondition, BoundaryConditions, DomainBounds, ObjectSpec, PluginVersion, Precision,
         Resolution, Transform, Velocity,
     };
     use fieldcad_plugin_api::{
-        ObjectKinematicsUpdate, SampledColumn, SolverKind, SolverStepOutcome,
+        FieldBrushFalloff, ObjectKinematicsUpdate, SampledColumn, SolverKind, SolverStepOutcome,
     };
     use glam::DVec3;
 
@@ -2311,6 +2391,328 @@ mod tests {
         let snapshot = runtime.latest_snapshot();
         let batch = &snapshot.channels[&channel].batches[0];
         assert!(batch.gradient().is_none());
+    }
+
+    /// A single-channel plugin that counts how many times its solver's
+    /// `sample()` is actually invoked — used to verify `publish_snapshot`
+    /// reuses a region's previous batch instead of resampling it when
+    /// nothing relevant changed.
+    struct CountingFieldPlugin {
+        id: PluginId,
+        channel: ChannelId,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl EquationSystemPlugin for CountingFieldPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: self.id.clone(),
+                version: PluginVersion::new(0, 1, 0),
+                display_name: "Counting field test".to_owned(),
+                description: "Counts solver sample() calls to test resample caching".to_owned(),
+            }
+        }
+
+        fn channels(&self) -> Vec<ChannelSchema> {
+            vec![ChannelSchema {
+                id: self.channel.clone(),
+                display_name: "Test field".to_owned(),
+                value_kind: fieldcad_core::FieldValueKind::Scalar(
+                    fieldcad_core::Dimension::DIMENSIONLESS,
+                ),
+            }]
+        }
+
+        fn create_solver(
+            &self,
+            _context: SolverContext<'_>,
+        ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
+            Ok(Box::new(CountingFieldSolver {
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+    }
+
+    struct CountingFieldSolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl EquationSystemSolver for CountingFieldSolver {
+        fn on_world_changed(&mut self, _world: &WorldSnapshot) -> Result<(), PluginError> {
+            Ok(())
+        }
+
+        fn sample(
+            &self,
+            _channel: ChannelHandle,
+            geometry: &SampleGeometry,
+        ) -> Result<SampledColumn, PluginError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SampledColumn::exact_scalars(vec![1.0; geometry.len()]))
+        }
+    }
+
+    /// Builds a runtime with a `CountingFieldPlugin`, two slice planes
+    /// subscribed at low density, and one object — enough surface to
+    /// exercise region-only vs. object edits against `publish_snapshot`'s
+    /// reuse logic.
+    fn resample_test_runtime(
+        session: u128,
+    ) -> (
+        SimulationRuntime,
+        Arc<AtomicUsize>,
+        ObjectId,
+        fieldcad_core::PlaneId,
+        fieldcad_core::PlaneId,
+    ) {
+        let plugin_id = PluginId::new(format!("resample-test-{session:x}")).unwrap();
+        let channel = ChannelId::new(plugin_id.clone(), "value").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let plugin = CountingFieldPlugin {
+            id: plugin_id,
+            channel,
+            calls: Arc::clone(&calls),
+        };
+
+        let mut world = World::new();
+        let report = world
+            .commit([
+                WorldCommand::CreateObject(ObjectSpec::new("particle")),
+                WorldCommand::CreatePlane(
+                    fieldcad_core::SlicePlaneSpec::new("a", DVec3::ZERO, DVec3::Z).unwrap(),
+                ),
+                WorldCommand::CreatePlane(
+                    fieldcad_core::SlicePlaneSpec::new("b", DVec3::X, DVec3::Z).unwrap(),
+                ),
+            ])
+            .unwrap();
+        let object = report.created_objects[0];
+        let plane_a = report.created_planes[0];
+        let plane_b = report.created_planes[1];
+
+        let config = RuntimeConfig::new(
+            Domain::centred_cube(2.0, 4).unwrap(),
+            TimeStep::from_seconds(0.25).unwrap(),
+            SessionId::from_u128(session),
+        )
+        .with_world(world)
+        .with_plugin(Box::new(plugin))
+        .with_subscription(Subscription::default().with_planes(UVec2::new(2, 2)));
+
+        (
+            SimulationRuntime::new(config).unwrap(),
+            calls,
+            object,
+            plane_a,
+            plane_b,
+        )
+    }
+
+    #[test]
+    fn moving_one_plane_does_not_resample_the_other() {
+        let (mut runtime, calls, _object, plane_a, _plane_b) = resample_test_runtime(0x300);
+        let baseline = calls.load(Ordering::SeqCst);
+
+        runtime
+            .commit_world_commands(vec![WorldCommand::SetPlane {
+                plane: plane_a,
+                spec: fieldcad_core::SlicePlaneSpec::new("a", DVec3::X * 0.5, DVec3::Z).unwrap(),
+            }])
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - baseline,
+            1,
+            "moving one plane must resample only that plane, not the other"
+        );
+    }
+
+    #[test]
+    fn moving_an_object_resamples_every_geometry() {
+        let (mut runtime, calls, object, _plane_a, _plane_b) = resample_test_runtime(0x301);
+        let baseline = calls.load(Ordering::SeqCst);
+
+        runtime
+            .commit_world_commands(vec![WorldCommand::SetTransform {
+                object,
+                transform: Transform::at(DVec3::X).unwrap(),
+            }])
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - baseline,
+            2,
+            "an object edit can change the field everywhere, so every geometry must resample"
+        );
+    }
+
+    #[test]
+    fn reconfiguring_the_domain_forces_a_full_resample() {
+        let (mut runtime, calls, _object, _plane_a, _plane_b) = resample_test_runtime(0x302);
+        let baseline = calls.load(Ordering::SeqCst);
+
+        runtime
+            .reconfigure_domain(Domain::centred_cube(4.0, 4).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - baseline,
+            2,
+            "a domain change rebuilds every solver; nothing sampled under the old domain may be reused"
+        );
+    }
+
+    #[test]
+    fn a_deferred_plugin_resumes_with_a_real_resample_not_a_frozen_reuse() {
+        let (mut runtime, calls, object, _plane_a, _plane_b) = resample_test_runtime(0x303);
+        let plugin_id = runtime.field_systems()[0].plugin.id.clone();
+        runtime
+            .set_field_system_realtime(&plugin_id, false)
+            .unwrap();
+
+        runtime.set_interactive_edit(true).unwrap();
+        runtime
+            .commit_world_commands(vec![WorldCommand::SetTransform {
+                object,
+                transform: Transform::at(DVec3::X).unwrap(),
+            }])
+            .unwrap();
+        // Deferred: the commit above must not have resampled anything, only
+        // copied the frozen pre-edit batches forward.
+        let during_edit = calls.load(Ordering::SeqCst);
+
+        runtime.set_interactive_edit(false).unwrap();
+        let after_edit = calls.load(Ordering::SeqCst);
+
+        assert!(
+            after_edit > during_edit,
+            "closing the gesture must trigger a real resample against the moved object, not keep \
+             reusing the batches frozen since before the deferred edit began"
+        );
+    }
+
+    /// A single-channel, paintable plugin used only to prove that
+    /// `apply_field_brush_stroke` invalidates its own plugin's cached
+    /// batches — a brush stroke mutates solver-internal state directly,
+    /// without touching `objects`/`component_schemas`/`domain`, so the
+    /// reuse check would otherwise be blind to it.
+    struct PaintablePlugin {
+        id: PluginId,
+        channel: ChannelId,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl EquationSystemPlugin for PaintablePlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: self.id.clone(),
+                version: PluginVersion::new(0, 1, 0),
+                display_name: "Paintable field test".to_owned(),
+                description: "Exercises brush-stroke cache invalidation".to_owned(),
+            }
+        }
+
+        fn channels(&self) -> Vec<ChannelSchema> {
+            vec![ChannelSchema {
+                id: self.channel.clone(),
+                display_name: "Test vector field".to_owned(),
+                value_kind: fieldcad_core::FieldValueKind::Vector(fieldcad_core::Dimension::LENGTH),
+            }]
+        }
+
+        fn create_solver(
+            &self,
+            _context: SolverContext<'_>,
+        ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
+            Ok(Box::new(PaintableSolver {
+                calls: Arc::clone(&self.calls),
+                handle: ChannelHandle::new(0),
+            }))
+        }
+    }
+
+    struct PaintableSolver {
+        calls: Arc<AtomicUsize>,
+        handle: ChannelHandle,
+    }
+
+    impl EquationSystemSolver for PaintableSolver {
+        fn on_world_changed(&mut self, _world: &WorldSnapshot) -> Result<(), PluginError> {
+            Ok(())
+        }
+
+        fn mutable_vector_channels(&self) -> &[ChannelHandle] {
+            std::slice::from_ref(&self.handle)
+        }
+
+        fn apply_field_brush_stroke(
+            &mut self,
+            _stroke: &ResolvedFieldBrushStroke,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+
+        fn sample(
+            &self,
+            _channel: ChannelHandle,
+            geometry: &SampleGeometry,
+        ) -> Result<SampledColumn, PluginError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(SampledColumn::new(
+                fieldcad_core::FieldColumn::vectors(vec![DVec3::ZERO; geometry.len()]),
+                vec![fieldcad_core::SampleValidity::Exact; geometry.len()],
+            ))
+        }
+    }
+
+    #[test]
+    fn a_field_brush_stroke_invalidates_its_plugins_cached_batches() {
+        let plugin_id = PluginId::new("paint-test").unwrap();
+        let channel = ChannelId::new(plugin_id.clone(), "value").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let plugin = PaintablePlugin {
+            id: plugin_id,
+            channel: channel.clone(),
+            calls: Arc::clone(&calls),
+        };
+
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreatePlane(
+                fieldcad_core::SlicePlaneSpec::new("a", DVec3::ZERO, DVec3::Z).unwrap(),
+            )])
+            .unwrap();
+        let plane = report.created_planes[0];
+
+        let config = RuntimeConfig::new(
+            Domain::centred_cube(2.0, 4).unwrap(),
+            TimeStep::from_seconds(0.25).unwrap(),
+            SessionId::from_u128(0x304),
+        )
+        .with_world(world)
+        .with_plugin(Box::new(plugin))
+        .with_subscription(Subscription::default().with_planes(UVec2::new(2, 2)));
+
+        let mut runtime = SimulationRuntime::new(config).unwrap();
+        let baseline = calls.load(Ordering::SeqCst);
+
+        runtime
+            .apply_field_brush_stroke(FieldBrushStroke {
+                channel,
+                plane,
+                samples: vec![DVec2::ZERO],
+                radius_metres: fieldcad_core::quantities::LengthMetres::from_si(0.5),
+                strength: fieldcad_core::Quantity::new(1.0, fieldcad_core::Dimension::LENGTH)
+                    .unwrap(),
+                falloff: FieldBrushFalloff::default(),
+            })
+            .unwrap();
+
+        assert!(
+            calls.load(Ordering::SeqCst) > baseline,
+            "a brush stroke must invalidate its plugin's cached batches, not let the next publish \
+             reuse pre-paint data"
+        );
     }
 
     #[test]
