@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use fieldcad_core::{ChannelId, FieldSnapshot, FieldValue, ProbeId, SampleValidity, WorldRevision};
+use fieldcad_core::{
+    ChannelId, DistanceProbeId, FieldSnapshot, FieldValue, ProbeId, SampleValidity, WorldRevision,
+};
 
 /// One recorded probe sample, with everything needed to say where it came from.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -129,6 +131,106 @@ impl Default for ProbeHistory {
     }
 }
 
+/// One recorded distance-probe reading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DistanceReading {
+    pub tick: u64,
+    pub time_seconds: f64,
+    pub world_revision: WorldRevision,
+    pub snapshot_sequence: u64,
+    pub distance: f64,
+}
+
+/// Bounded history for every distance probe seen so far.
+///
+/// A distance has no [`ChannelId`] — it isn't a field sample — so this
+/// mirrors [`ProbeHistory`]'s shape but keys directly on [`DistanceProbeId`]
+/// and reads `snapshot.distances` instead of `snapshot.channels`.
+#[derive(Clone, Debug)]
+pub struct DistanceHistory {
+    capacity: usize,
+    series: BTreeMap<DistanceProbeId, VecDeque<DistanceReading>>,
+}
+
+impl DistanceHistory {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            series: BTreeMap::new(),
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Record every distance reading in a snapshot.
+    ///
+    /// Recording the same snapshot twice is a no-op, so a caller that polls more
+    /// often than the source produces data does not duplicate samples.
+    pub fn record(&mut self, snapshot: &FieldSnapshot) -> usize {
+        let mut recorded = 0;
+        for &(probe, distance) in snapshot.distances.iter() {
+            let series = self.series.entry(probe).or_default();
+            if series
+                .back()
+                .is_some_and(|last| last.snapshot_sequence >= snapshot.identity.sequence)
+            {
+                continue;
+            }
+            if series.len() == self.capacity {
+                series.pop_front();
+            }
+            series.push_back(DistanceReading {
+                tick: snapshot.identity.tick,
+                time_seconds: snapshot.identity.time_seconds,
+                world_revision: snapshot.identity.world_revision,
+                snapshot_sequence: snapshot.identity.sequence,
+                distance,
+            });
+            recorded += 1;
+        }
+        recorded
+    }
+
+    pub fn readings(&self, probe: DistanceProbeId) -> impl Iterator<Item = &DistanceReading> {
+        self.series.get(&probe).into_iter().flatten()
+    }
+
+    pub fn len(&self, probe: DistanceProbeId) -> usize {
+        self.series.get(&probe).map_or(0, VecDeque::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.series.values().all(VecDeque::is_empty)
+    }
+
+    pub fn clear(&mut self) {
+        self.series.clear();
+    }
+
+    /// Drop the series of probes that no longer exist — see
+    /// [`ProbeHistory::retain_probes`] for why the set of series is
+    /// otherwise unbounded.
+    pub fn retain_probes(&mut self, live: impl Fn(DistanceProbeId) -> bool) {
+        self.series.retain(|probe, _| live(*probe));
+    }
+
+    /// Probes that have at least one reading.
+    pub fn tracked(&self) -> impl Iterator<Item = DistanceProbeId> {
+        self.series
+            .iter()
+            .filter(|(_, series)| !series.is_empty())
+            .map(|(probe, _)| *probe)
+    }
+}
+
+impl Default for DistanceHistory {
+    fn default() -> Self {
+        Self::new(fieldcad_core::DEFAULT_PROBE_HISTORY)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{
@@ -180,6 +282,7 @@ mod tests {
                 },
             )]),
             diagnostics: Arc::from([]),
+            distances: Arc::from([]),
         }
     }
 
@@ -195,6 +298,79 @@ mod tests {
 
         assert_eq!(history.len(kept, &channel_id()), 1);
         assert_eq!(history.len(removed, &channel_id()), 0);
+        assert_eq!(history.tracked().count(), 1);
+    }
+
+    fn snapshot_with_distances(
+        sequence: u64,
+        readings: &[(DistanceProbeId, f64)],
+    ) -> FieldSnapshot {
+        let mut snapshot = snapshot_with(&[]);
+        snapshot.identity.sequence = sequence;
+        snapshot.distances = Arc::from(readings.to_vec().into_boxed_slice());
+        snapshot
+    }
+
+    #[test]
+    fn distance_history_records_every_probe_in_a_snapshot() {
+        let a = DistanceProbeId::new(0);
+        let b = DistanceProbeId::new(1);
+        let mut history = DistanceHistory::new(8);
+        history.record(&snapshot_with_distances(0, &[(a, 1.5), (b, 2.5)]));
+
+        assert_eq!(history.tracked().count(), 2);
+        assert_eq!(
+            history.readings(a).next().map(|reading| reading.distance),
+            Some(1.5)
+        );
+        assert_eq!(
+            history.readings(b).next().map(|reading| reading.distance),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn distance_history_does_not_duplicate_the_same_snapshot() {
+        let probe = DistanceProbeId::new(0);
+        let mut history = DistanceHistory::new(8);
+        let snapshot = snapshot_with_distances(0, &[(probe, 1.0)]);
+        history.record(&snapshot);
+        history.record(&snapshot);
+
+        assert_eq!(history.len(probe), 1);
+    }
+
+    #[test]
+    fn distance_history_is_bounded_by_capacity() {
+        let probe = DistanceProbeId::new(0);
+        let mut history = DistanceHistory::new(2);
+        for sequence in 0..5 {
+            history.record(&snapshot_with_distances(
+                sequence,
+                &[(probe, sequence as f64)],
+            ));
+        }
+
+        assert_eq!(history.len(probe), 2);
+        let last: Vec<f64> = history
+            .readings(probe)
+            .map(|reading| reading.distance)
+            .collect();
+        assert_eq!(last, vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn deleted_distance_probes_do_not_retain_their_history_forever() {
+        let kept = DistanceProbeId::new(0);
+        let removed = DistanceProbeId::new(1);
+        let mut history = DistanceHistory::new(8);
+        history.record(&snapshot_with_distances(0, &[(kept, 1.0), (removed, 2.0)]));
+        assert_eq!(history.tracked().count(), 2);
+
+        history.retain_probes(|probe| probe == kept);
+
+        assert_eq!(history.len(kept), 1);
+        assert_eq!(history.len(removed), 0);
         assert_eq!(history.tracked().count(), 1);
     }
 }

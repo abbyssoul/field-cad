@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use fieldcad_core::{
     ChannelId, Dimension, FieldBox, FieldBoxSpec, FieldSphere, FieldSphereSpec, SlicePlane,
-    SlicePlaneSpec,
+    SlicePlaneSpec, WorldSnapshot,
 };
 use glam::{DQuat, DVec2, DVec3};
 
@@ -20,6 +20,7 @@ use crate::scene::{
 
 pub(super) fn plane_properties(
     ui: &mut egui::Ui,
+    world: &WorldSnapshot,
     plane: &SlicePlane,
     field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
     compute: &ComputeView,
@@ -34,6 +35,7 @@ pub(super) fn plane_properties(
     ui.small("Drag the dashed purple N arrow to reorient the plane; RGB arrows and squares move its origin.");
     super::section(ui, "inspector_plane_geometry", "Geometry", true, |ui| {
         plane_geometry_editors(ui, plane, output);
+        plane_attachment_picker(ui, world, plane, output);
     });
     super::section(ui, "inspector_plane_display", "Field display", true, |ui| {
         plane_field_layers(ui, plane, field_layers, compute);
@@ -108,13 +110,11 @@ fn plane_geometry_editors(ui: &mut egui::Ui, plane: &SlicePlane, output: &mut Ui
             ("YZ", DVec3::X, DVec3::Y),
         ] {
             if ui.button(label).clicked()
-                && let Ok(spec) = SlicePlaneSpec::new(&plane.name, plane.origin, normal)
-                    .and_then(|spec| spec.with_u_axis(u_axis))
-                    .and_then(|spec| spec.with_half_extent(plane.half_extent))
+                && let Ok(spec) = axis_aligned_plane_spec(plane, normal, u_axis)
             {
                 output.edit(vec![fieldcad_core::WorldCommand::SetPlane {
                     plane: plane.id,
-                    spec: spec.with_visibility(plane.visible),
+                    spec,
                 }]);
             }
         }
@@ -130,9 +130,107 @@ fn plane_spec(
     let spec = if normal == plane.normal {
         SlicePlaneSpec::from_plane(plane).with_origin(origin)?
     } else {
-        SlicePlaneSpec::new(&plane.name, origin, normal)?.with_visibility(plane.visible)
+        // Same reasoning as `axis_aligned_plane_spec`: editing the normal by
+        // hand must not silently drop an attachment.
+        attached_spec(
+            plane,
+            SlicePlaneSpec::new(&plane.name, origin, normal)?.with_visibility(plane.visible),
+        )
     };
     spec.with_half_extent(half_extent)
+}
+
+/// A plane snapped to one of the world axes — the XY/XZ/YZ quick buttons.
+/// These only ever mean "reorient", never "detach", so an attachment must
+/// survive them the same way [`plane_spec`] preserves one across a manual
+/// normal edit.
+fn axis_aligned_plane_spec(
+    plane: &SlicePlane,
+    normal: DVec3,
+    u_axis: DVec3,
+) -> Result<SlicePlaneSpec, fieldcad_core::WorldError> {
+    let spec = SlicePlaneSpec::new(&plane.name, plane.origin, normal)?
+        .with_u_axis(u_axis)?
+        .with_half_extent(plane.half_extent)?
+        .with_visibility(plane.visible);
+    Ok(attached_spec(plane, spec))
+}
+
+/// Carry `plane`'s current attachment onto a freshly built `spec` — every
+/// `SlicePlaneSpec` constructor starts detached, so any path that builds one
+/// from scratch (rather than via [`SlicePlaneSpec::from_plane`]) needs this.
+fn attached_spec(plane: &SlicePlane, spec: SlicePlaneSpec) -> SlicePlaneSpec {
+    match plane.attached_to {
+        Some(object) => spec.with_attached_to(object),
+        None => spec,
+    }
+}
+
+/// Attach this plane to a moving object, or detach it back to world space.
+/// Either transition freezes the plane's current world-space frame — the
+/// numeric origin/normal it stores changes meaning (local vs. world) but the
+/// plane never visually jumps — mirroring `probe_inspector`'s
+/// `probe_attachment_picker`/`attachment_offset`.
+fn plane_attachment_picker(
+    ui: &mut egui::Ui,
+    world: &WorldSnapshot,
+    plane: &SlicePlane,
+    output: &mut UiFrameOutput,
+) {
+    let Ok((world_origin, world_normal, world_u_axis)) = world.resolve_plane_frame(plane) else {
+        return;
+    };
+    match plane.attached_to {
+        Some(object) => {
+            let object_name = world
+                .object(object)
+                .map_or_else(|| object.to_string(), |object| object.name.clone());
+            ui.label(format!("Attached to {object_name}"));
+            if ui.button("Detach at current position").clicked()
+                && let Ok(spec) = SlicePlaneSpec::new(&plane.name, world_origin, world_normal)
+                    .and_then(|spec| spec.with_u_axis(world_u_axis))
+                    .and_then(|spec| spec.with_half_extent(plane.half_extent))
+            {
+                output.edit(vec![fieldcad_core::WorldCommand::SetPlane {
+                    plane: plane.id,
+                    spec: spec.with_visibility(plane.visible),
+                }]);
+            }
+        }
+        None => {
+            if world.objects().is_empty() {
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Attach to");
+                egui::ComboBox::from_id_salt(("plane_attachment", plane.id))
+                    .selected_text("Choose object…")
+                    .show_ui(ui, |ui| {
+                        for object in world.objects().values() {
+                            if ui.selectable_label(false, &object.name).clicked() {
+                                let inverse = object.transform.rotation.inverse();
+                                let local_origin =
+                                    inverse * (world_origin - object.transform.translation);
+                                let local_normal = inverse * world_normal;
+                                let local_u_axis = inverse * world_u_axis;
+                                if let Ok(spec) =
+                                    SlicePlaneSpec::new(&plane.name, local_origin, local_normal)
+                                        .and_then(|spec| spec.with_u_axis(local_u_axis))
+                                        .and_then(|spec| spec.with_half_extent(plane.half_extent))
+                                {
+                                    output.edit(vec![fieldcad_core::WorldCommand::SetPlane {
+                                        plane: plane.id,
+                                        spec: spec
+                                            .with_visibility(plane.visible)
+                                            .with_attached_to(object.id),
+                                    }]);
+                                }
+                            }
+                        }
+                    });
+            });
+        }
+    }
 }
 
 fn hidden_everywhere_warning(ui: &mut egui::Ui) {
@@ -290,6 +388,7 @@ pub(super) fn plane_field_layers(
 
 pub(super) fn box_properties(
     ui: &mut egui::Ui,
+    world: &WorldSnapshot,
     field_box: &FieldBox,
     field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
     compute: &ComputeView,
@@ -304,6 +403,7 @@ pub(super) fn box_properties(
     ui.small("Drag the RGB rings to reorient the box; RGB arrows and squares move its origin.");
     super::section(ui, "inspector_box_geometry", "Geometry", true, |ui| {
         box_geometry_editors(ui, field_box, output);
+        box_attachment_picker(ui, world, field_box, output);
     });
     super::section(ui, "inspector_box_display", "Field display", true, |ui| {
         box_field_layers(ui, field_box, field_layers, compute);
@@ -377,6 +477,65 @@ fn box_geometry_editors(ui: &mut egui::Ui, field_box: &FieldBox, output: &mut Ui
     }
 }
 
+/// See [`plane_attachment_picker`] for the freezing behaviour this mirrors.
+fn box_attachment_picker(
+    ui: &mut egui::Ui,
+    world: &WorldSnapshot,
+    field_box: &FieldBox,
+    output: &mut UiFrameOutput,
+) {
+    let Ok((world_origin, world_rotation)) = world.resolve_box_frame(field_box) else {
+        return;
+    };
+    match field_box.attached_to {
+        Some(object) => {
+            let object_name = world
+                .object(object)
+                .map_or_else(|| object.to_string(), |object| object.name.clone());
+            ui.label(format!("Attached to {object_name}"));
+            if ui.button("Detach at current position").clicked()
+                && let Ok(spec) = FieldBoxSpec::from_box(field_box)
+                    .with_origin(world_origin)
+                    .and_then(|spec| spec.with_rotation(world_rotation))
+            {
+                output.edit(vec![fieldcad_core::WorldCommand::SetBox {
+                    region: field_box.id,
+                    spec: spec.detached(),
+                }]);
+            }
+        }
+        None => {
+            if world.objects().is_empty() {
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Attach to");
+                egui::ComboBox::from_id_salt(("box_attachment", field_box.id))
+                    .selected_text("Choose object…")
+                    .show_ui(ui, |ui| {
+                        for object in world.objects().values() {
+                            if ui.selectable_label(false, &object.name).clicked() {
+                                let inverse = object.transform.rotation.inverse();
+                                let local_origin =
+                                    inverse * (world_origin - object.transform.translation);
+                                let local_rotation = inverse * world_rotation;
+                                if let Ok(spec) = FieldBoxSpec::from_box(field_box)
+                                    .with_origin(local_origin)
+                                    .and_then(|spec| spec.with_rotation(local_rotation))
+                                {
+                                    output.edit(vec![fieldcad_core::WorldCommand::SetBox {
+                                        region: field_box.id,
+                                        spec: spec.with_attached_to(object.id),
+                                    }]);
+                                }
+                            }
+                        }
+                    });
+            });
+        }
+    }
+}
+
 fn box_field_layers(
     ui: &mut egui::Ui,
     field_box: &FieldBox,
@@ -402,6 +561,7 @@ fn box_field_layers(
 
 pub(super) fn sphere_properties(
     ui: &mut egui::Ui,
+    world: &WorldSnapshot,
     sphere: &FieldSphere,
     field_layers: &mut BTreeMap<ChannelId, ChannelLayerSettings>,
     compute: &ComputeView,
@@ -416,6 +576,7 @@ pub(super) fn sphere_properties(
     ui.small("RGB arrows and squares move its centre; drag the radius below to resize it.");
     super::section(ui, "inspector_sphere_geometry", "Geometry", true, |ui| {
         sphere_geometry_editors(ui, sphere, output);
+        sphere_attachment_picker(ui, world, sphere, output);
     });
     super::section(
         ui,
@@ -478,6 +639,60 @@ fn sphere_geometry_editors(ui: &mut egui::Ui, sphere: &FieldSphere, output: &mut
     }
 }
 
+/// See [`plane_attachment_picker`] for the freezing behaviour this mirrors.
+fn sphere_attachment_picker(
+    ui: &mut egui::Ui,
+    world: &WorldSnapshot,
+    sphere: &FieldSphere,
+    output: &mut UiFrameOutput,
+) {
+    let Ok(world_origin) = world.resolve_sphere_origin(sphere) else {
+        return;
+    };
+    match sphere.attached_to {
+        Some(object) => {
+            let object_name = world
+                .object(object)
+                .map_or_else(|| object.to_string(), |object| object.name.clone());
+            ui.label(format!("Attached to {object_name}"));
+            if ui.button("Detach at current position").clicked()
+                && let Ok(spec) = FieldSphereSpec::from_sphere(sphere).with_origin(world_origin)
+            {
+                output.edit(vec![fieldcad_core::WorldCommand::SetSphere {
+                    sphere: sphere.id,
+                    spec: spec.detached(),
+                }]);
+            }
+        }
+        None => {
+            if world.objects().is_empty() {
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Attach to");
+                egui::ComboBox::from_id_salt(("sphere_attachment", sphere.id))
+                    .selected_text("Choose object…")
+                    .show_ui(ui, |ui| {
+                        for object in world.objects().values() {
+                            if ui.selectable_label(false, &object.name).clicked() {
+                                let local_origin = object.transform.rotation.inverse()
+                                    * (world_origin - object.transform.translation);
+                                if let Ok(spec) =
+                                    FieldSphereSpec::from_sphere(sphere).with_origin(local_origin)
+                                {
+                                    output.edit(vec![fieldcad_core::WorldCommand::SetSphere {
+                                        sphere: sphere.id,
+                                        spec: spec.with_attached_to(object.id),
+                                    }]);
+                                }
+                            }
+                        }
+                    });
+            });
+        }
+    }
+}
+
 fn sphere_field_layers(
     ui: &mut egui::Ui,
     sphere: &FieldSphere,
@@ -517,3 +732,59 @@ fn density_editor(ui: &mut egui::Ui, label: &str, density: &mut u32, enabled: bo
 }
 
 // note_held_edit, coordinate_editor, name_editor provided by super::
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fieldcad_core::PlaneId;
+
+    fn attached_plane() -> SlicePlane {
+        SlicePlane {
+            id: PlaneId::new(0),
+            name: "test".to_owned(),
+            origin: DVec3::X,
+            normal: DVec3::Z,
+            u_axis: DVec3::X,
+            half_extent: DVec2::splat(1.0),
+            visible: true,
+            attached_to: Some(fieldcad_core::ObjectId::new(7)),
+        }
+    }
+
+    #[test]
+    fn an_axis_aligned_quick_button_keeps_an_existing_attachment() {
+        let plane = attached_plane();
+        let spec = axis_aligned_plane_spec(&plane, DVec3::Y, DVec3::X).unwrap();
+        assert_eq!(spec.attached_to(), Some(fieldcad_core::ObjectId::new(7)));
+    }
+
+    #[test]
+    fn an_axis_aligned_quick_button_leaves_an_unattached_plane_unattached() {
+        let plane = SlicePlane {
+            attached_to: None,
+            ..attached_plane()
+        };
+        let spec = axis_aligned_plane_spec(&plane, DVec3::Y, DVec3::X).unwrap();
+        assert_eq!(spec.attached_to(), None);
+    }
+
+    #[test]
+    fn editing_the_normal_by_hand_keeps_an_existing_attachment() {
+        let plane = attached_plane();
+        let spec = plane_spec(&plane, plane.origin, DVec3::Y, plane.half_extent).unwrap();
+        assert_eq!(spec.attached_to(), Some(fieldcad_core::ObjectId::new(7)));
+    }
+
+    #[test]
+    fn moving_the_origin_without_changing_the_normal_keeps_an_existing_attachment() {
+        let plane = attached_plane();
+        let spec = plane_spec(
+            &plane,
+            DVec3::new(2.0, 0.0, 0.0),
+            plane.normal,
+            plane.half_extent,
+        )
+        .unwrap();
+        assert_eq!(spec.attached_to(), Some(fieldcad_core::ObjectId::new(7)));
+    }
+}

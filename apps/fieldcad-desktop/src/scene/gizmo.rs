@@ -268,12 +268,18 @@ pub fn append_transform_gizmo_with_display(
     if let SceneSelection::Plane(id) = selection
         && let Some(plane) = world.planes().get(&id)
     {
+        let normal = preview
+            .and_then(|preview| preview.plane_normal)
+            .unwrap_or_else(|| {
+                world
+                    .resolve_plane_frame(plane)
+                    .map_or(plane.normal, |(_, normal, _)| normal)
+                    .as_vec3()
+            });
         append_plane_normal(
             geometry,
             origin,
-            preview
-                .and_then(|preview| preview.plane_normal)
-                .unwrap_or(plane.normal.as_vec3()),
+            normal,
             length,
             active == Some(TransformHandle::PlaneNormal),
         );
@@ -284,7 +290,13 @@ pub fn append_transform_gizmo_with_display(
     {
         let rotation = preview
             .and_then(|preview| preview.rotation)
-            .unwrap_or_else(|| quat_from_dquat(field_box.rotation));
+            .unwrap_or_else(|| {
+                quat_from_dquat(
+                    world
+                        .resolve_box_frame(field_box)
+                        .map_or(field_box.rotation, |(_, rotation)| rotation),
+                )
+            });
         append_rotation_rings(
             geometry,
             camera,
@@ -328,7 +340,7 @@ fn selection_origin_point(
         }
         SceneSelection::Plane(id) => {
             let plane = world.planes().get(&id).filter(|plane| plane.visible)?;
-            plane.origin
+            world.resolve_plane_frame(plane).ok()?.0
         }
         SceneSelection::Probe(id) => {
             let probe = world.probe(id).filter(|probe| probe.visible)?;
@@ -336,11 +348,11 @@ fn selection_origin_point(
         }
         SceneSelection::Box(id) => {
             let field_box = world.boxes().get(&id).filter(|region| region.visible)?;
-            field_box.origin
+            world.resolve_box_frame(field_box).ok()?.0
         }
         SceneSelection::Sphere(id) => {
             let sphere = world.spheres().get(&id).filter(|sphere| sphere.visible)?;
-            sphere.origin
+            world.resolve_sphere_origin(sphere).ok()?
         }
     };
     Some(scene_scale.to_render_vec3(origin))
@@ -528,9 +540,13 @@ pub fn pick_transform_handle_with_display(
     // near its distinct dashed tip rather than steal the whole axis.
     if let SceneSelection::Plane(id) = selection {
         let plane = world.planes().get(&id)?;
+        let normal = world
+            .resolve_plane_frame(plane)
+            .map_or(plane.normal, |(_, normal, _)| normal)
+            .as_vec3();
         let normal_length = plane_normal_length(length);
-        let start = origin + plane.normal.as_vec3() * normal_length * 0.68;
-        let end = origin + plane.normal.as_vec3() * normal_length;
+        let start = origin + normal * normal_length * 0.68;
+        let end = origin + normal * normal_length;
         if let (Some(start), Some(end)) = (
             project_to_viewport(camera, viewport, start),
             project_to_viewport(camera, viewport, end),
@@ -578,7 +594,11 @@ pub fn pick_transform_handle_with_display(
         && let SceneSelection::Box(id) = selection
         && let Some(field_box) = world.boxes().get(&id)
     {
-        let rotation = quat_from_dquat(field_box.rotation);
+        let rotation = quat_from_dquat(
+            world
+                .resolve_box_frame(field_box)
+                .map_or(field_box.rotation, |(_, rotation)| rotation),
+        );
         let radius = display.rotation_radius_px() * scale;
         let mut rings: Vec<(TransformHandle, Vec3, f32)> = ROTATION_RINGS
             .into_iter()
@@ -783,7 +803,12 @@ pub fn plane_normal_tip(
     let origin = preview.map_or(world_origin, |preview| preview.origin);
     let normal = preview
         .and_then(|preview| preview.plane_normal)
-        .unwrap_or(plane.normal.as_vec3());
+        .unwrap_or_else(|| {
+            world
+                .resolve_plane_frame(plane)
+                .map_or(plane.normal, |(_, normal, _)| normal)
+                .as_vec3()
+        });
     let tip = origin + normal * plane_normal_length(gizmo_length);
     Some((origin, tip))
 }

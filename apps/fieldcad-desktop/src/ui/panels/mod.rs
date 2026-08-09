@@ -5,6 +5,7 @@
 //! multiple panel sub-modules.
 
 mod diagnostics;
+mod distance_probe_inspector;
 mod inspector;
 mod mcp;
 mod menu_bar;
@@ -129,14 +130,15 @@ mod tests {
 
     use super::super::tests::{seeded_world, source};
     use super::{
-        super::{ChannelLayerSettings, ComputeView, FrameContext, UiFrameOutput},
+        super::{ChannelLayerSettings, ComputeView, FrameContext, UiFrameOutput, UiModel},
         *,
     };
     use crate::camera::Projection;
     use crate::mcp::McpSession;
-    use fieldcad_simulation::ProbeHistory;
+    use fieldcad_simulation::{DistanceHistory, ProbeHistory};
 
     // Import test-referenced functions from sibling modules
+    use super::distance_probe_inspector::distance_probe_properties;
     use super::menu_bar::history_controls;
     use super::object_inspector::{
         format_vector, inertial_mass_kg, motion_summary, property_editor,
@@ -271,6 +273,7 @@ mod tests {
         let context = egui::Context::default();
         let world = seeded_world().snapshot();
         let history = ProbeHistory::default();
+        let distance_history = DistanceHistory::default();
 
         let run = |events: Vec<egui::Event>| {
             let mut output = UiFrameOutput::default();
@@ -291,6 +294,7 @@ mod tests {
                             compute,
                             world: &world,
                             probe_history: &history,
+                            distance_history: &distance_history,
                             adapter_name: "Test adapter",
                             frame_time_ms: 16.0,
                             active_translation: None,
@@ -497,6 +501,153 @@ mod tests {
     }
 
     #[test]
+    fn the_plane_inspector_offers_attachment_once_an_object_exists() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("anchor"))])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreatePlane(
+                fieldcad_core::SlicePlaneSpec::new("XY field", DVec3::ZERO, DVec3::Z).unwrap(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let plane = snapshot.planes().values().next().unwrap();
+        let compute = ComputeView::build(&source(), &snapshot, None);
+        let mut layers = std::collections::BTreeMap::new();
+
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let full_output = context.run_ui(input, |ui| {
+            plane_properties(
+                ui,
+                &snapshot,
+                plane,
+                &mut layers,
+                &compute,
+                &mut UiFrameOutput::default(),
+            );
+        });
+        let mut text = String::new();
+        for clipped in &full_output.shapes {
+            painted_text(&clipped.shape, &mut text);
+        }
+        assert!(
+            text.contains("Attach to"),
+            "an unattached plane with an object in the world should offer attachment: {text}"
+        );
+    }
+
+    #[test]
+    fn an_attached_plane_reports_its_parent_and_offers_detaching() {
+        let mut world = World::new();
+        let created = world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("anchor"))])
+            .unwrap();
+        let object = created.created_objects[0];
+        world
+            .commit([WorldCommand::CreatePlane(
+                fieldcad_core::SlicePlaneSpec::new("XY field", DVec3::ZERO, DVec3::Z)
+                    .unwrap()
+                    .with_attached_to(object),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let plane = snapshot.planes().values().next().unwrap();
+        let compute = ComputeView::build(&source(), &snapshot, None);
+        let mut layers = std::collections::BTreeMap::new();
+
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let full_output = context.run_ui(input, |ui| {
+            plane_properties(
+                ui,
+                &snapshot,
+                plane,
+                &mut layers,
+                &compute,
+                &mut UiFrameOutput::default(),
+            );
+        });
+        let mut text = String::new();
+        for clipped in &full_output.shapes {
+            painted_text(&clipped.shape, &mut text);
+        }
+        assert!(
+            text.contains("Attached to anchor") && text.contains("Detach at current position"),
+            "an attached plane should name its parent and offer detaching: {text}"
+        );
+    }
+
+    #[test]
+    fn the_distance_probe_inspector_shows_objects_and_the_live_reading() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("near").with_transform(Transform::at(DVec3::ZERO).unwrap()),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("far")
+                        .with_transform(Transform::at(DVec3::new(3.0, 4.0, 0.0)).unwrap()),
+                ),
+            ])
+            .unwrap();
+        let created = world
+            .commit([WorldCommand::CreateDistanceProbe(
+                fieldcad_core::DistanceProbeSpec::new("gap", ObjectId::new(0), ObjectId::new(1)),
+            )])
+            .unwrap();
+        let probe_id = created.created_distance_probes[0];
+        let snapshot = world.snapshot();
+        let probe = snapshot.distance_probe(probe_id).unwrap();
+        let history = DistanceHistory::default();
+        let mut model = UiModel::new();
+
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let full_output = context.run_ui(input, |ui| {
+            distance_probe_properties(
+                ui,
+                &mut model,
+                probe,
+                &snapshot,
+                &history,
+                &mut UiFrameOutput::default(),
+            );
+        });
+        let mut text = String::new();
+        for clipped in &full_output.shapes {
+            painted_text(&clipped.shape, &mut text);
+        }
+        assert!(
+            text.contains("near")
+                && text.contains("far")
+                && text.contains("5.0000 m")
+                && text.contains("Remove distance probe"),
+            "the distance probe inspector should name both objects and the live distance: {text}"
+        );
+    }
+
+    #[test]
     fn the_plane_inspector_separates_geometry_from_how_it_is_drawn() {
         let mut world = World::new();
         world
@@ -520,6 +671,7 @@ mod tests {
         let full_output = context.run_ui(input, |ui| {
             plane_properties(
                 ui,
+                &snapshot,
                 plane,
                 &mut layers,
                 &compute,

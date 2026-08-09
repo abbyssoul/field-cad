@@ -139,6 +139,7 @@ fn measurement_section(
     output: &mut UiFrameOutput,
 ) {
     let instruments = frame.world.probes().len()
+        + frame.world.distance_probes().len()
         + frame.world.planes().len()
         + frame.world.boxes().len()
         + frame.world.spheres().len();
@@ -166,6 +167,21 @@ fn measurement_section(
                         format!("Probe {}", frame.world.probes().len() + 1),
                         glam::DVec3::new(1.0, 0.0, 0.6),
                         channels,
+                    ),
+                )]);
+            }
+            let mut objects = frame.world.objects().values();
+            if let (Some(first), Some(second)) = (objects.next(), objects.next())
+                && ui
+                    .button("+ Distance")
+                    .on_hover_text("Measure the live distance between two objects")
+                    .clicked()
+            {
+                output.edit(vec![fieldcad_core::WorldCommand::CreateDistanceProbe(
+                    fieldcad_core::DistanceProbeSpec::new(
+                        format!("Distance {}", frame.world.distance_probes().len() + 1),
+                        first.id,
+                        second.id,
                     ),
                 )]);
             }
@@ -207,6 +223,37 @@ fn measurement_section(
                     }
                     Some(EntityRowAction::Delete) => {
                         output.edit(vec![fieldcad_core::WorldCommand::RemoveProbe(probe.id)]);
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        if !frame.world.distance_probes().is_empty() {
+            ui.add_space(8.0);
+            ui.label("Distance probes");
+            for probe in frame.world.distance_probes().values() {
+                match entity_row(
+                    ui,
+                    "↔",
+                    &probe.name,
+                    probe.visible,
+                    model.distance_probe_selection == Some(probe.id),
+                    "Delete distance probe",
+                ) {
+                    Some(EntityRowAction::ToggleVisibility) => {
+                        output.edit(vec![fieldcad_core::WorldCommand::SetDistanceProbeVisible {
+                            probe: probe.id,
+                            visible: !probe.visible,
+                        }]);
+                    }
+                    Some(EntityRowAction::Select) => {
+                        model.select_distance_probe(probe.id);
+                    }
+                    Some(EntityRowAction::Delete) => {
+                        output.edit(vec![fieldcad_core::WorldCommand::RemoveDistanceProbe(
+                            probe.id,
+                        )]);
                     }
                     None => {}
                 }

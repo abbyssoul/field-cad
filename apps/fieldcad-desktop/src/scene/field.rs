@@ -736,6 +736,7 @@ mod tests {
                 },
             )]),
             diagnostics: Arc::from([]),
+            distances: Arc::from([]),
         };
         (snapshot, channel)
     }

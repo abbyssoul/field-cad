@@ -12,11 +12,11 @@ use std::{
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelId, ChannelSchema, ChannelSnapshot, ClockSnapshot, CommitReport, ComponentSchema,
-    ComponentTypeId, DiagnosticSeverity, Domain, FieldBatch, ObjectId, PluginId, PluginProvenance,
-    PropertyBag, SampleGeometry, SamplingError, SceneScale, SchemaError, SessionId,
-    SimulationClock, SimulationMode, SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic,
-    StepContext, TimeStep, World, WorldCheckpoint, WorldCommand, WorldError, WorldRevision,
-    WorldSnapshot,
+    ComponentTypeId, DiagnosticSeverity, Domain, FieldBatch, FieldBox, FieldSphere, ObjectId,
+    PluginId, PluginProvenance, PropertyBag, SampleGeometry, SamplingError, SceneScale,
+    SchemaError, SessionId, SimulationClock, SimulationMode, SlicePlane, SnapshotCompleteness,
+    SnapshotIdentity, SolverDiagnostic, StepContext, TimeStep, World, WorldCheckpoint,
+    WorldCommand, WorldError, WorldRevision, WorldSnapshot,
 };
 use fieldcad_dynamics::{self as dynamics, DynamicsError, IntegrationScheme};
 use fieldcad_plugin_api::{
@@ -1884,10 +1884,18 @@ impl SimulationRuntime {
 
         if let Some(counts) = self.subscription.planes {
             for plane in world.planes().values().filter(|plane| plane.visible) {
-                geometries.push(SampleGeometry::Plane {
-                    plane: plane.id,
-                    lattice: plane.lattice(counts),
-                });
+                if let Ok((origin, normal, u_axis)) = world.resolve_plane_frame(plane) {
+                    let resolved = SlicePlane {
+                        origin,
+                        normal,
+                        u_axis,
+                        ..plane.clone()
+                    };
+                    geometries.push(SampleGeometry::Plane {
+                        plane: plane.id,
+                        lattice: resolved.lattice(counts),
+                    });
+                }
             }
         }
 
@@ -1897,19 +1905,32 @@ impl SimulationRuntime {
 
         if let Some(counts) = self.subscription.boxes {
             for region in world.boxes().values().filter(|region| region.visible) {
-                geometries.push(SampleGeometry::Box {
-                    region: region.id,
-                    lattice: region.lattice(counts),
-                });
+                if let Ok((origin, rotation)) = world.resolve_box_frame(region) {
+                    let resolved = FieldBox {
+                        origin,
+                        rotation,
+                        ..region.clone()
+                    };
+                    geometries.push(SampleGeometry::Box {
+                        region: region.id,
+                        lattice: resolved.lattice(counts),
+                    });
+                }
             }
         }
 
         if let Some(density) = self.subscription.spheres {
             for sphere in world.spheres().values().filter(|sphere| sphere.visible) {
-                geometries.push(SampleGeometry::Sphere {
-                    region: sphere.id,
-                    lattice: sphere.lattice(density),
-                });
+                if let Ok(origin) = world.resolve_sphere_origin(sphere) {
+                    let resolved = FieldSphere {
+                        origin,
+                        ..sphere.clone()
+                    };
+                    geometries.push(SampleGeometry::Sphere {
+                        region: sphere.id,
+                        lattice: resolved.lattice(density),
+                    });
+                }
             }
         }
 
@@ -2054,6 +2075,17 @@ impl SimulationRuntime {
             slot.sampled_from = Some((world.clone(), domain));
         }
 
+        let distances: Vec<(fieldcad_core::DistanceProbeId, f64)> = world
+            .distance_probes()
+            .values()
+            .filter_map(|probe| {
+                world
+                    .resolve_distance(probe)
+                    .ok()
+                    .map(|distance| (probe.id, distance))
+            })
+            .collect();
+
         self.latest = Arc::new(fieldcad_core::FieldSnapshot {
             identity: SnapshotIdentity {
                 session: self.session,
@@ -2068,6 +2100,7 @@ impl SimulationRuntime {
             plugins: provenance.into(),
             channels,
             diagnostics: diagnostics.into(),
+            distances: distances.into(),
         });
         self.next_sequence += 1;
         Ok(())
@@ -2101,6 +2134,7 @@ fn empty_snapshot(session: SessionId, domain: Domain) -> fieldcad_core::FieldSna
         plugins: Arc::from([]),
         channels: BTreeMap::new(),
         diagnostics: Arc::from([]),
+        distances: Arc::from([]),
     }
 }
 
@@ -2474,6 +2508,44 @@ mod tests {
         .with_plugin(Box::new(plugin));
 
         (SimulationRuntime::new(config).unwrap(), channel)
+    }
+
+    #[test]
+    fn publish_snapshot_reports_live_distance_probe_readings() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("a").with_transform(Transform::at(DVec3::ZERO).unwrap()),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("b")
+                        .with_transform(Transform::at(DVec3::new(3.0, 4.0, 0.0)).unwrap()),
+                ),
+            ])
+            .unwrap();
+        let created = world
+            .commit([WorldCommand::CreateDistanceProbe(
+                fieldcad_core::DistanceProbeSpec::new("gap", ObjectId::new(0), ObjectId::new(1)),
+            )])
+            .unwrap();
+        let probe = created.created_distance_probes[0];
+
+        let config = RuntimeConfig::new(
+            Domain::centred_cube(2.0, 4).unwrap(),
+            TimeStep::from_seconds(0.25).unwrap(),
+            SessionId::from_u128(0x200),
+        )
+        .with_world(world);
+        let runtime = SimulationRuntime::new(config).unwrap();
+
+        let snapshot = runtime.latest_snapshot();
+        let reading = snapshot
+            .distances
+            .iter()
+            .find(|(id, _)| *id == probe)
+            .map(|(_, distance)| *distance);
+        assert!((reading.unwrap() - 5.0).abs() < 1.0e-12);
     }
 
     #[test]

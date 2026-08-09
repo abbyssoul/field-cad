@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChannelId, ChannelSchema, Domain, FieldBatch, PluginId, PluginVersion, ProbeId, Sample,
-    WorldRevision,
+    ChannelId, ChannelSchema, DistanceProbeId, Domain, FieldBatch, PluginId, PluginVersion,
+    ProbeId, Sample, WorldRevision,
 };
 
 #[derive(
@@ -137,6 +137,10 @@ pub struct FieldSnapshot {
     pub plugins: Arc<[PluginProvenance]>,
     pub channels: BTreeMap<ChannelId, ChannelSnapshot>,
     pub diagnostics: Arc<[SolverDiagnostic]>,
+    /// Live distance-probe readings. Sibling to `diagnostics` rather than a
+    /// `ChannelSnapshot`: a distance is a pure geometric measurement with no
+    /// `ChannelId` or plugin behind it.
+    pub distances: Arc<[(DistanceProbeId, f64)]>,
 }
 
 impl FieldSnapshot {

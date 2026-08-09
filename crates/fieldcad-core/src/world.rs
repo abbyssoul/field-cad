@@ -4,8 +4,9 @@ use glam::{DQuat, DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BoxId, BoxLattice, ChannelId, ComponentSchema, ComponentTypeId, ObjectId, PlaneId,
-    PlaneLattice, ProbeId, PropertyBag, SchemaError, SphereId, SphereLattice, WorldRevision,
+    BoxId, BoxLattice, ChannelId, ComponentSchema, ComponentTypeId, DistanceProbeId, ObjectId,
+    PlaneId, PlaneLattice, ProbeId, PropertyBag, SchemaError, SphereId, SphereLattice,
+    WorldRevision,
 };
 
 /// A finite, non-degenerate direction. Used for plane normals and in-plane axes.
@@ -277,6 +278,7 @@ pub struct SlicePlaneSpec {
     u_axis: DVec3,
     half_extent: DVec2,
     visible: bool,
+    attached_to: Option<ObjectId>,
 }
 
 impl SlicePlaneSpec {
@@ -292,6 +294,7 @@ impl SlicePlaneSpec {
             u_axis: default_u_axis(normal),
             half_extent: DVec2::splat(1.0),
             visible: true,
+            attached_to: None,
         })
     }
 
@@ -337,6 +340,20 @@ impl SlicePlaneSpec {
         self
     }
 
+    /// Attach to `object`: `origin`/`normal`/`u_axis` are then interpreted as
+    /// local to that object's frame rather than world space.
+    pub fn with_attached_to(mut self, object: ObjectId) -> Self {
+        self.attached_to = Some(object);
+        self
+    }
+
+    /// Clear any attachment; `origin`/`normal`/`u_axis` return to being
+    /// world-space.
+    pub fn detached(mut self) -> Self {
+        self.attached_to = None;
+        self
+    }
+
     /// Read back what a builder chain (or a deserialized command) settled
     /// on — needed by a consumer that only has the `WorldCommand` this spec
     /// travelled in, not the entity it will replace (a not-yet-applied
@@ -357,6 +374,10 @@ impl SlicePlaneSpec {
         self.half_extent
     }
 
+    pub fn attached_to(&self) -> Option<ObjectId> {
+        self.attached_to
+    }
+
     pub fn from_plane(plane: &SlicePlane) -> Self {
         Self {
             name: plane.name.clone(),
@@ -365,6 +386,7 @@ impl SlicePlaneSpec {
             u_axis: plane.u_axis,
             half_extent: plane.half_extent,
             visible: plane.visible,
+            attached_to: plane.attached_to,
         }
     }
 
@@ -423,6 +445,9 @@ pub struct SlicePlane {
     pub u_axis: DVec3,
     pub half_extent: DVec2,
     pub visible: bool,
+    /// When set, `origin`/`normal`/`u_axis` are local to this object's frame
+    /// rather than world space — see [`WorldSnapshot::resolve_plane_frame`].
+    pub attached_to: Option<ObjectId>,
 }
 
 impl SlicePlane {
@@ -460,6 +485,7 @@ pub struct FieldBoxSpec {
     rotation: DQuat,
     half_extent: DVec3,
     visible: bool,
+    attached_to: Option<ObjectId>,
 }
 
 impl FieldBoxSpec {
@@ -477,6 +503,7 @@ impl FieldBoxSpec {
             rotation: DQuat::IDENTITY,
             half_extent,
             visible: true,
+            attached_to: None,
         })
     }
 
@@ -519,6 +546,19 @@ impl FieldBoxSpec {
         self
     }
 
+    /// Attach to `object`: `origin`/`rotation` are then interpreted as local
+    /// to that object's frame rather than world space.
+    pub fn with_attached_to(mut self, object: ObjectId) -> Self {
+        self.attached_to = Some(object);
+        self
+    }
+
+    /// Clear any attachment; `origin`/`rotation` return to being world-space.
+    pub fn detached(mut self) -> Self {
+        self.attached_to = None;
+        self
+    }
+
     /// Read back what a builder chain (or a deserialized command) settled
     /// on — see [`SlicePlaneSpec::origin`].
     pub fn origin(&self) -> DVec3 {
@@ -533,6 +573,10 @@ impl FieldBoxSpec {
         self.half_extent
     }
 
+    pub fn attached_to(&self) -> Option<ObjectId> {
+        self.attached_to
+    }
+
     pub fn from_box(field_box: &FieldBox) -> Self {
         Self {
             name: field_box.name.clone(),
@@ -540,6 +584,7 @@ impl FieldBoxSpec {
             rotation: field_box.rotation,
             half_extent: field_box.half_extent,
             visible: field_box.visible,
+            attached_to: field_box.attached_to,
         }
     }
 
@@ -576,6 +621,9 @@ pub struct FieldBox {
     pub rotation: DQuat,
     pub half_extent: DVec3,
     pub visible: bool,
+    /// When set, `origin`/`rotation` are local to this object's frame rather
+    /// than world space — see [`WorldSnapshot::resolve_box_frame`].
+    pub attached_to: Option<ObjectId>,
 }
 
 impl FieldBox {
@@ -607,6 +655,7 @@ pub struct FieldSphereSpec {
     origin: DVec3,
     radius: f64,
     visible: bool,
+    attached_to: Option<ObjectId>,
 }
 
 impl FieldSphereSpec {
@@ -619,6 +668,7 @@ impl FieldSphereSpec {
             origin,
             radius,
             visible: true,
+            attached_to: None,
         })
     }
 
@@ -653,6 +703,19 @@ impl FieldSphereSpec {
         self
     }
 
+    /// Attach to `object`: `origin` is then interpreted as local to that
+    /// object's frame rather than world space.
+    pub fn with_attached_to(mut self, object: ObjectId) -> Self {
+        self.attached_to = Some(object);
+        self
+    }
+
+    /// Clear any attachment; `origin` returns to being world-space.
+    pub fn detached(mut self) -> Self {
+        self.attached_to = None;
+        self
+    }
+
     /// Read back what a builder chain (or a deserialized command) settled
     /// on — see [`SlicePlaneSpec::origin`].
     pub fn origin(&self) -> DVec3 {
@@ -663,12 +726,17 @@ impl FieldSphereSpec {
         self.radius
     }
 
+    pub fn attached_to(&self) -> Option<ObjectId> {
+        self.attached_to
+    }
+
     pub fn from_sphere(sphere: &FieldSphere) -> Self {
         Self {
             name: sphere.name.clone(),
             origin: sphere.origin,
             radius: sphere.radius,
             visible: sphere.visible,
+            attached_to: sphere.attached_to,
         }
     }
 
@@ -690,6 +758,9 @@ pub struct FieldSphere {
     pub origin: DVec3,
     pub radius: f64,
     pub visible: bool,
+    /// When set, `origin` is local to this object's frame rather than world
+    /// space — see [`WorldSnapshot::resolve_sphere_origin`].
+    pub attached_to: Option<ObjectId>,
 }
 
 impl FieldSphere {
@@ -786,6 +857,68 @@ pub struct Probe {
     pub history_capacity: usize,
 }
 
+/// A pure geometric measurement — the distance between two objects' live
+/// positions. Kept separate from [`Probe`], which always means "sample field
+/// channels at a point": a distance has no [`ChannelId`] and no plugin
+/// behind it, so it doesn't fit that shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DistanceProbeSpec {
+    name: String,
+    object_a: ObjectId,
+    object_b: ObjectId,
+    visible: bool,
+}
+
+impl DistanceProbeSpec {
+    pub fn new(name: impl Into<String>, object_a: ObjectId, object_b: ObjectId) -> Self {
+        Self {
+            name: name.into(),
+            object_a,
+            object_b,
+            visible: true,
+        }
+    }
+
+    pub fn with_visibility(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    pub fn object_a(&self) -> ObjectId {
+        self.object_a
+    }
+
+    pub fn object_b(&self) -> ObjectId {
+        self.object_b
+    }
+
+    pub fn from_distance_probe(probe: &DistanceProbe) -> Self {
+        Self {
+            name: probe.name.clone(),
+            object_a: probe.object_a,
+            object_b: probe.object_b,
+            visible: probe.visible,
+        }
+    }
+
+    /// The two objects must be distinct, or this always reads zero.
+    pub(crate) fn validate(&self) -> Result<(), WorldError> {
+        if self.object_a == self.object_b {
+            return Err(WorldError::InvalidDistanceProbe);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DistanceProbe {
+    pub id: DistanceProbeId,
+    pub name: String,
+    pub object_a: ObjectId,
+    pub object_b: ObjectId,
+    pub visible: bool,
+}
+
 /// Each map is `Arc`-wrapped so `WorldState::clone()` — taken on every
 /// [`World::commit`] and [`World::restore`] — is six refcount bumps rather
 /// than a deep copy of the whole scene. A command only ever writes one map
@@ -800,6 +933,7 @@ pub struct WorldState {
     boxes: Arc<BTreeMap<BoxId, FieldBox>>,
     spheres: Arc<BTreeMap<SphereId, FieldSphere>>,
     probes: Arc<BTreeMap<ProbeId, Probe>>,
+    distance_probes: Arc<BTreeMap<DistanceProbeId, DistanceProbe>>,
     component_schemas: Arc<BTreeMap<ComponentTypeId, ComponentSchema>>,
 }
 
@@ -852,6 +986,14 @@ impl WorldSnapshot {
         self.0.probes.get(&id)
     }
 
+    pub fn distance_probes(&self) -> &BTreeMap<DistanceProbeId, DistanceProbe> {
+        &self.0.distance_probes
+    }
+
+    pub fn distance_probe(&self, id: DistanceProbeId) -> Option<&DistanceProbe> {
+        self.0.distance_probes.get(&id)
+    }
+
     pub fn component_schemas(&self) -> &BTreeMap<ComponentTypeId, ComponentSchema> {
         &self.0.component_schemas
     }
@@ -880,6 +1022,80 @@ impl WorldSnapshot {
             }
         };
         Ok(position)
+    }
+
+    /// The live distance between a [`DistanceProbe`]'s two objects.
+    pub fn resolve_distance(&self, probe: &DistanceProbe) -> Result<f64, WorldError> {
+        let a = self
+            .0
+            .objects
+            .get(&probe.object_a)
+            .ok_or(WorldError::ObjectNotFound { id: probe.object_a })?;
+        let b = self
+            .0
+            .objects
+            .get(&probe.object_b)
+            .ok_or(WorldError::ObjectNotFound { id: probe.object_b })?;
+        Ok((a.transform.translation - b.transform.translation).length())
+    }
+
+    /// A plane's world-space `(origin, normal, u_axis)`. Identity when
+    /// unattached; otherwise composed with the live transform of the object
+    /// it's attached to, so a moving object carries the plane along with it.
+    pub fn resolve_plane_frame(
+        &self,
+        plane: &SlicePlane,
+    ) -> Result<(DVec3, DVec3, DVec3), WorldError> {
+        match plane.attached_to {
+            None => Ok((plane.origin, plane.normal, plane.u_axis)),
+            Some(object) => {
+                let object = self
+                    .0
+                    .objects
+                    .get(&object)
+                    .ok_or(WorldError::ObjectNotFound { id: object })?;
+                let transform = object.transform;
+                Ok((
+                    transform.apply(plane.origin),
+                    transform.rotation * plane.normal,
+                    transform.rotation * plane.u_axis,
+                ))
+            }
+        }
+    }
+
+    /// A box's world-space `(origin, rotation)`. See [`Self::resolve_plane_frame`].
+    pub fn resolve_box_frame(&self, region: &FieldBox) -> Result<(DVec3, DQuat), WorldError> {
+        match region.attached_to {
+            None => Ok((region.origin, region.rotation)),
+            Some(object) => {
+                let object = self
+                    .0
+                    .objects
+                    .get(&object)
+                    .ok_or(WorldError::ObjectNotFound { id: object })?;
+                let transform = object.transform;
+                Ok((
+                    transform.apply(region.origin),
+                    transform.rotation * region.rotation,
+                ))
+            }
+        }
+    }
+
+    /// A sphere's world-space origin. See [`Self::resolve_plane_frame`].
+    pub fn resolve_sphere_origin(&self, sphere: &FieldSphere) -> Result<DVec3, WorldError> {
+        match sphere.attached_to {
+            None => Ok(sphere.origin),
+            Some(object) => {
+                let object = self
+                    .0
+                    .objects
+                    .get(&object)
+                    .ok_or(WorldError::ObjectNotFound { id: object })?;
+                Ok(object.transform.apply(sphere.origin))
+            }
+        }
     }
 }
 
@@ -922,6 +1138,7 @@ impl World {
                 boxes: Arc::new(BTreeMap::new()),
                 spheres: Arc::new(BTreeMap::new()),
                 probes: Arc::new(BTreeMap::new()),
+                distance_probes: Arc::new(BTreeMap::new()),
                 component_schemas: Arc::new(BTreeMap::new()),
             }),
             counters: Counters::default(),
@@ -1103,6 +1320,21 @@ pub enum WorldCommand {
         visible: bool,
     },
     RemoveProbe(ProbeId),
+    CreateDistanceProbe(DistanceProbeSpec),
+    SetDistanceProbeName {
+        probe: DistanceProbeId,
+        name: String,
+    },
+    SetDistanceProbeObjects {
+        probe: DistanceProbeId,
+        object_a: ObjectId,
+        object_b: ObjectId,
+    },
+    SetDistanceProbeVisible {
+        probe: DistanceProbeId,
+        visible: bool,
+    },
+    RemoveDistanceProbe(DistanceProbeId),
 }
 
 impl WorldCommand {
@@ -1146,6 +1378,11 @@ impl WorldCommand {
             Self::SetProbeChannels { .. } => "Change recorded channels",
             Self::SetProbeVisible { .. } => "Show or hide probe",
             Self::RemoveProbe(_) => "Remove probe",
+            Self::CreateDistanceProbe(_) => "Add distance probe",
+            Self::SetDistanceProbeName { .. } => "Rename distance probe",
+            Self::SetDistanceProbeObjects { .. } => "Change distance probe objects",
+            Self::SetDistanceProbeVisible { .. } => "Show or hide distance probe",
+            Self::RemoveDistanceProbe(_) => "Remove distance probe",
         }
     }
 
@@ -1170,6 +1407,25 @@ pub struct CommitReport {
     pub created_boxes: Vec<BoxId>,
     pub created_spheres: Vec<SphereId>,
     pub created_probes: Vec<ProbeId>,
+    pub created_distance_probes: Vec<DistanceProbeId>,
+}
+
+/// One entity a [`CommitReport`] says was created, tagged with its kind.
+///
+/// Exists so a caller that wants "the thing this commit just created" (an
+/// editor auto-selecting a new entity, say) can match one type instead of
+/// checking every `created_*` field itself. Add a variant here in the same
+/// change that adds a new `created_*` field to `CommitReport` — the two are
+/// meant to be extended together, and [`CommitReport::first_created`] is the
+/// only place that needs to know about every `created_*` field at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatedEntity {
+    Object(ObjectId),
+    Plane(PlaneId),
+    Box(BoxId),
+    Sphere(SphereId),
+    Probe(ProbeId),
+    DistanceProbe(DistanceProbeId),
 }
 
 impl CommitReport {
@@ -1181,6 +1437,7 @@ impl CommitReport {
             created_boxes: Vec::new(),
             created_spheres: Vec::new(),
             created_probes: Vec::new(),
+            created_distance_probes: Vec::new(),
         }
     }
 
@@ -1193,6 +1450,43 @@ impl CommitReport {
     pub fn empty(revision: WorldRevision) -> Self {
         Self::unchanged(revision)
     }
+
+    /// The first entity this commit created, if any, in `created_*` field
+    /// declaration order. A single `CommitWorld` transaction creates at most
+    /// one kind of entity in every caller this ships with, so "first" is
+    /// really "the one" in practice; the ordering only matters as a
+    /// tie-break should that ever change.
+    pub fn first_created(&self) -> Option<CreatedEntity> {
+        self.created_objects
+            .first()
+            .copied()
+            .map(CreatedEntity::Object)
+            .or_else(|| {
+                self.created_planes
+                    .first()
+                    .copied()
+                    .map(CreatedEntity::Plane)
+            })
+            .or_else(|| self.created_boxes.first().copied().map(CreatedEntity::Box))
+            .or_else(|| {
+                self.created_spheres
+                    .first()
+                    .copied()
+                    .map(CreatedEntity::Sphere)
+            })
+            .or_else(|| {
+                self.created_probes
+                    .first()
+                    .copied()
+                    .map(CreatedEntity::Probe)
+            })
+            .or_else(|| {
+                self.created_distance_probes
+                    .first()
+                    .copied()
+                    .map(CreatedEntity::DistanceProbe)
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1202,6 +1496,7 @@ struct Counters {
     field_box: u64,
     sphere: u64,
     probe: u64,
+    distance_probe: u64,
 }
 
 impl Counters {
@@ -1234,6 +1529,12 @@ impl Counters {
         self.probe += 1;
         id
     }
+
+    fn next_distance_probe(&mut self) -> DistanceProbeId {
+        let id = DistanceProbeId::new(self.distance_probe);
+        self.distance_probe += 1;
+        id
+    }
 }
 
 /// `Arc::make_mut`, one per map — see the note on [`WorldState`]. Every
@@ -1257,6 +1558,10 @@ fn spheres_mut(state: &mut WorldState) -> &mut BTreeMap<SphereId, FieldSphere> {
 
 fn probes_mut(state: &mut WorldState) -> &mut BTreeMap<ProbeId, Probe> {
     Arc::make_mut(&mut state.probes)
+}
+
+fn distance_probes_mut(state: &mut WorldState) -> &mut BTreeMap<DistanceProbeId, DistanceProbe> {
+    Arc::make_mut(&mut state.distance_probes)
 }
 
 fn component_schemas_mut(
@@ -1312,6 +1617,34 @@ fn apply_command(
             }) {
                 return Err(WorldError::ObjectHasAttachedProbe { id });
             }
+            if state
+                .planes
+                .values()
+                .any(|plane| plane.attached_to == Some(id))
+            {
+                return Err(WorldError::ObjectHasAttachedPlane { id });
+            }
+            if state
+                .boxes
+                .values()
+                .any(|region| region.attached_to == Some(id))
+            {
+                return Err(WorldError::ObjectHasAttachedBox { id });
+            }
+            if state
+                .spheres
+                .values()
+                .any(|sphere| sphere.attached_to == Some(id))
+            {
+                return Err(WorldError::ObjectHasAttachedSphere { id });
+            }
+            if state
+                .distance_probes
+                .values()
+                .any(|probe| probe.object_a == id || probe.object_b == id)
+            {
+                return Err(WorldError::ObjectHasAttachedDistanceProbe { id });
+            }
             objects_mut(state).remove(&id);
         }
         WorldCommand::SetObjectName { object, name } => {
@@ -1360,6 +1693,7 @@ fn apply_command(
         }
         WorldCommand::CreatePlane(spec) => {
             spec.validate()?;
+            validate_attachment(state, spec.attached_to)?;
             let spec = spec.normalized();
             let id = counters.next_plane();
             planes_mut(state).insert(
@@ -1372,6 +1706,7 @@ fn apply_command(
                     u_axis: spec.u_axis,
                     half_extent: spec.half_extent,
                     visible: spec.visible,
+                    attached_to: spec.attached_to,
                 },
             );
             report.created_planes.push(id);
@@ -1390,6 +1725,7 @@ fn apply_command(
         }
         WorldCommand::SetPlane { plane, spec } => {
             spec.validate()?;
+            validate_attachment(state, spec.attached_to)?;
             let spec = spec.normalized();
             let current = planes_mut(state)
                 .get_mut(&plane)
@@ -1402,6 +1738,7 @@ fn apply_command(
                 u_axis: spec.u_axis,
                 half_extent: spec.half_extent,
                 visible: spec.visible,
+                attached_to: spec.attached_to,
             };
         }
         WorldCommand::RemovePlane(id) => {
@@ -1411,6 +1748,7 @@ fn apply_command(
         }
         WorldCommand::CreateBox(spec) => {
             spec.validate()?;
+            validate_attachment(state, spec.attached_to)?;
             let spec = spec.normalized();
             let id = counters.next_box();
             boxes_mut(state).insert(
@@ -1422,6 +1760,7 @@ fn apply_command(
                     rotation: spec.rotation,
                     half_extent: spec.half_extent,
                     visible: spec.visible,
+                    attached_to: spec.attached_to,
                 },
             );
             report.created_boxes.push(id);
@@ -1440,6 +1779,7 @@ fn apply_command(
         }
         WorldCommand::SetBox { region, spec } => {
             spec.validate()?;
+            validate_attachment(state, spec.attached_to)?;
             let spec = spec.normalized();
             let current = boxes_mut(state)
                 .get_mut(&region)
@@ -1451,6 +1791,7 @@ fn apply_command(
                 rotation: spec.rotation,
                 half_extent: spec.half_extent,
                 visible: spec.visible,
+                attached_to: spec.attached_to,
             };
         }
         WorldCommand::RemoveBox(id) => {
@@ -1460,6 +1801,7 @@ fn apply_command(
         }
         WorldCommand::CreateSphere(spec) => {
             spec.validate()?;
+            validate_attachment(state, spec.attached_to)?;
             let id = counters.next_sphere();
             spheres_mut(state).insert(
                 id,
@@ -1469,6 +1811,7 @@ fn apply_command(
                     origin: spec.origin,
                     radius: spec.radius,
                     visible: spec.visible,
+                    attached_to: spec.attached_to,
                 },
             );
             report.created_spheres.push(id);
@@ -1487,6 +1830,7 @@ fn apply_command(
         }
         WorldCommand::SetSphere { sphere, spec } => {
             spec.validate()?;
+            validate_attachment(state, spec.attached_to)?;
             let current = spheres_mut(state)
                 .get_mut(&sphere)
                 .ok_or(WorldError::SphereNotFound { id: sphere })?;
@@ -1496,6 +1840,7 @@ fn apply_command(
                 origin: spec.origin,
                 radius: spec.radius,
                 visible: spec.visible,
+                attached_to: spec.attached_to,
             };
         }
         WorldCommand::RemoveSphere(id) => {
@@ -1556,6 +1901,54 @@ fn apply_command(
                 return Err(WorldError::ProbeNotFound { id });
             }
         }
+        WorldCommand::CreateDistanceProbe(spec) => {
+            spec.validate()?;
+            validate_distance_probe_objects(state, spec.object_a, spec.object_b)?;
+            let id = counters.next_distance_probe();
+            distance_probes_mut(state).insert(
+                id,
+                DistanceProbe {
+                    id,
+                    name: spec.name,
+                    object_a: spec.object_a,
+                    object_b: spec.object_b,
+                    visible: spec.visible,
+                },
+            );
+            report.created_distance_probes.push(id);
+        }
+        WorldCommand::SetDistanceProbeName { probe, name } => {
+            distance_probes_mut(state)
+                .get_mut(&probe)
+                .ok_or(WorldError::DistanceProbeNotFound { id: probe })?
+                .name = name;
+        }
+        WorldCommand::SetDistanceProbeObjects {
+            probe,
+            object_a,
+            object_b,
+        } => {
+            if object_a == object_b {
+                return Err(WorldError::InvalidDistanceProbe);
+            }
+            validate_distance_probe_objects(state, object_a, object_b)?;
+            let current = distance_probes_mut(state)
+                .get_mut(&probe)
+                .ok_or(WorldError::DistanceProbeNotFound { id: probe })?;
+            current.object_a = object_a;
+            current.object_b = object_b;
+        }
+        WorldCommand::SetDistanceProbeVisible { probe, visible } => {
+            distance_probes_mut(state)
+                .get_mut(&probe)
+                .ok_or(WorldError::DistanceProbeNotFound { id: probe })?
+                .visible = visible;
+        }
+        WorldCommand::RemoveDistanceProbe(id) => {
+            if distance_probes_mut(state).remove(&id).is_none() {
+                return Err(WorldError::DistanceProbeNotFound { id });
+            }
+        }
     }
     Ok(())
 }
@@ -1570,6 +1963,34 @@ fn validate_object_components(
             .get(id)
             .ok_or_else(|| WorldError::ComponentSchemaNotFound { id: id.clone() })?;
         schema.validate(properties)?;
+    }
+    Ok(())
+}
+
+/// An AUX object's attachment target, if any, must exist. Shared by
+/// planes/boxes/spheres — see `validate_probe` for the probe equivalent.
+fn validate_attachment(
+    state: &WorldState,
+    attached_to: Option<ObjectId>,
+) -> Result<(), WorldError> {
+    if let Some(object) = attached_to
+        && !state.objects.contains_key(&object)
+    {
+        return Err(WorldError::ObjectNotFound { id: object });
+    }
+    Ok(())
+}
+
+fn validate_distance_probe_objects(
+    state: &WorldState,
+    object_a: ObjectId,
+    object_b: ObjectId,
+) -> Result<(), WorldError> {
+    if !state.objects.contains_key(&object_a) {
+        return Err(WorldError::ObjectNotFound { id: object_a });
+    }
+    if !state.objects.contains_key(&object_b) {
+        return Err(WorldError::ObjectNotFound { id: object_b });
     }
     Ok(())
 }
@@ -1610,6 +2031,18 @@ pub enum WorldError {
     ObjectNotFound { id: ObjectId },
     #[error("object {id} still has an attached probe")]
     ObjectHasAttachedProbe { id: ObjectId },
+    #[error("object {id} still has an attached slice plane")]
+    ObjectHasAttachedPlane { id: ObjectId },
+    #[error("object {id} still has an attached field box")]
+    ObjectHasAttachedBox { id: ObjectId },
+    #[error("object {id} still has an attached field sphere")]
+    ObjectHasAttachedSphere { id: ObjectId },
+    #[error("object {id} still has an attached distance probe")]
+    ObjectHasAttachedDistanceProbe { id: ObjectId },
+    #[error("a distance probe requires two distinct objects")]
+    InvalidDistanceProbe,
+    #[error("distance probe {id} does not exist")]
+    DistanceProbeNotFound { id: DistanceProbeId },
     #[error("plane {id} does not exist")]
     PlaneNotFound { id: PlaneId },
     #[error("field box {id} does not exist")]
@@ -1663,6 +2096,61 @@ mod tests {
         assert_eq!(report.revision.get(), 1);
         assert_eq!(world.snapshot().objects().len(), 1);
         assert_eq!(world.snapshot().probes().len(), 1);
+    }
+
+    #[test]
+    fn first_created_reports_nothing_for_an_edit_that_creates_nothing() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("a"))])
+            .unwrap();
+        let report = world
+            .commit([WorldCommand::SetObjectName {
+                object: ObjectId::new(0),
+                name: "renamed".to_owned(),
+            }])
+            .unwrap();
+
+        assert_eq!(report.first_created(), None);
+    }
+
+    #[test]
+    fn first_created_reports_a_newly_created_distance_probe() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(ObjectSpec::new("a")),
+                WorldCommand::CreateObject(ObjectSpec::new("b")),
+            ])
+            .unwrap();
+        let report = world
+            .commit([WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                "gap",
+                ObjectId::new(0),
+                ObjectId::new(1),
+            ))])
+            .unwrap();
+
+        assert_eq!(
+            report.first_created(),
+            Some(CreatedEntity::DistanceProbe(DistanceProbeId::new(0)))
+        );
+    }
+
+    #[test]
+    fn first_created_prefers_an_object_over_a_probe_in_the_same_commit() {
+        let mut world = World::new();
+        let report = world
+            .commit([
+                WorldCommand::CreateObject(ObjectSpec::new("source")),
+                WorldCommand::CreateProbe(ProbeSpec::at("probe", DVec3::X, Vec::new())),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            report.first_created(),
+            Some(CreatedEntity::Object(ObjectId::new(0)))
+        );
     }
 
     #[test]
@@ -1884,6 +2372,7 @@ mod tests {
             u_axis: DVec3::X,
             half_extent: DVec2::splat(1.0),
             visible: true,
+            attached_to: None,
         };
 
         let coarse = plane.lattice(UVec2::new(2, 2));
@@ -2076,6 +2565,302 @@ mod tests {
         let position = snapshot.resolve_probe_position(probe).unwrap();
 
         assert!((position - DVec3::new(1.0, 1.0, 0.0)).length() < 1.0e-12);
+    }
+
+    #[test]
+    fn attaching_an_aux_object_to_a_nonexistent_object_is_rejected() {
+        let mut world = World::new();
+        assert!(
+            world
+                .commit([WorldCommand::CreatePlane(
+                    SlicePlaneSpec::new("xy", DVec3::ZERO, DVec3::Z)
+                        .unwrap()
+                        .with_attached_to(ObjectId::new(0)),
+                )])
+                .is_err()
+        );
+        assert!(
+            world
+                .commit([WorldCommand::CreateBox(
+                    FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(1.0))
+                        .unwrap()
+                        .with_attached_to(ObjectId::new(0)),
+                )])
+                .is_err()
+        );
+        assert!(
+            world
+                .commit([WorldCommand::CreateSphere(
+                    FieldSphereSpec::new("ball", DVec3::ZERO, 1.0)
+                        .unwrap()
+                        .with_attached_to(ObjectId::new(0)),
+                )])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn re_attaching_an_existing_plane_to_a_nonexistent_object_is_rejected() {
+        let mut world = World::new();
+        let created = world
+            .commit([WorldCommand::CreatePlane(
+                SlicePlaneSpec::new("xy", DVec3::ZERO, DVec3::Z).unwrap(),
+            )])
+            .unwrap();
+        let plane = created.created_planes[0];
+        assert!(
+            world
+                .commit([WorldCommand::SetPlane {
+                    plane,
+                    spec: SlicePlaneSpec::new("xy", DVec3::ZERO, DVec3::Z)
+                        .unwrap()
+                        .with_attached_to(ObjectId::new(99)),
+                }])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn removing_an_object_with_an_attached_plane_leaves_it_in_place() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("source"))])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreatePlane(
+                SlicePlaneSpec::new("xy", DVec3::ZERO, DVec3::Z)
+                    .unwrap()
+                    .with_attached_to(ObjectId::new(0)),
+            )])
+            .unwrap();
+
+        assert!(
+            world
+                .commit([WorldCommand::RemoveObject(ObjectId::new(0))])
+                .is_err()
+        );
+        assert_eq!(world.snapshot().objects().len(), 1);
+    }
+
+    #[test]
+    fn removing_an_object_with_an_attached_box_leaves_it_in_place() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("source"))])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateBox(
+                FieldBoxSpec::new("cube", DVec3::ZERO, DVec3::splat(1.0))
+                    .unwrap()
+                    .with_attached_to(ObjectId::new(0)),
+            )])
+            .unwrap();
+
+        assert!(
+            world
+                .commit([WorldCommand::RemoveObject(ObjectId::new(0))])
+                .is_err()
+        );
+        assert_eq!(world.snapshot().objects().len(), 1);
+    }
+
+    #[test]
+    fn removing_an_object_with_an_attached_sphere_leaves_it_in_place() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("source"))])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateSphere(
+                FieldSphereSpec::new("ball", DVec3::ZERO, 1.0)
+                    .unwrap()
+                    .with_attached_to(ObjectId::new(0)),
+            )])
+            .unwrap();
+
+        assert!(
+            world
+                .commit([WorldCommand::RemoveObject(ObjectId::new(0))])
+                .is_err()
+        );
+        assert_eq!(world.snapshot().objects().len(), 1);
+    }
+
+    #[test]
+    fn attached_plane_follows_object_translation_and_rotation() {
+        let mut world = World::new();
+        let rotation = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("source")
+                    .with_transform(Transform::new(DVec3::new(1.0, 0.0, 0.0), rotation).unwrap()),
+            )])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreatePlane(
+                SlicePlaneSpec::new("xy", DVec3::X, DVec3::Z)
+                    .unwrap()
+                    .with_attached_to(ObjectId::new(0)),
+            )])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let plane = snapshot.planes().values().next().unwrap();
+        let (origin, normal, u_axis) = snapshot.resolve_plane_frame(plane).unwrap();
+
+        // Local origin (1,0,0) rotated 90° about Z and translated by (1,0,0).
+        assert!((origin - DVec3::new(1.0, 1.0, 0.0)).length() < 1.0e-12);
+        // A Z-axis rotation leaves the Z normal unchanged.
+        assert!((normal - DVec3::Z).length() < 1.0e-12);
+        assert!(u_axis.dot(normal).abs() < 1.0e-12);
+        assert!((u_axis.length() - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn attached_box_follows_object_transform() {
+        let mut world = World::new();
+        let rotation = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("source")
+                    .with_transform(Transform::new(DVec3::new(1.0, 0.0, 0.0), rotation).unwrap()),
+            )])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateBox(
+                FieldBoxSpec::new("cube", DVec3::X, DVec3::splat(1.0))
+                    .unwrap()
+                    .with_attached_to(ObjectId::new(0)),
+            )])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let region = snapshot.boxes().values().next().unwrap();
+        let (origin, box_rotation) = snapshot.resolve_box_frame(region).unwrap();
+
+        assert!((origin - DVec3::new(1.0, 1.0, 0.0)).length() < 1.0e-12);
+        assert!((box_rotation * DVec3::X - DVec3::Y).length() < 1.0e-12);
+    }
+
+    #[test]
+    fn attached_sphere_follows_object_translation() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("source")
+                    .with_transform(Transform::at(DVec3::new(2.0, 0.0, 0.0)).unwrap()),
+            )])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateSphere(
+                FieldSphereSpec::new("ball", DVec3::X, 1.0)
+                    .unwrap()
+                    .with_attached_to(ObjectId::new(0)),
+            )])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let sphere = snapshot.spheres().values().next().unwrap();
+        let origin = snapshot.resolve_sphere_origin(sphere).unwrap();
+
+        assert!((origin - DVec3::new(3.0, 0.0, 0.0)).length() < 1.0e-12);
+    }
+
+    #[test]
+    fn distance_probe_reports_the_live_gap_between_two_objects() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("a").with_transform(Transform::at(DVec3::ZERO).unwrap()),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("b")
+                        .with_transform(Transform::at(DVec3::new(3.0, 4.0, 0.0)).unwrap()),
+                ),
+            ])
+            .unwrap();
+        let created = world
+            .commit([WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                "gap",
+                ObjectId::new(0),
+                ObjectId::new(1),
+            ))])
+            .unwrap();
+        let probe_id = created.created_distance_probes[0];
+
+        let snapshot = world.snapshot();
+        let probe = snapshot.distance_probe(probe_id).unwrap();
+        assert!((snapshot.resolve_distance(probe).unwrap() - 5.0).abs() < 1.0e-12);
+
+        world
+            .commit([WorldCommand::SetTransform {
+                object: ObjectId::new(1),
+                transform: Transform::at(DVec3::new(3.0, 0.0, 0.0)).unwrap(),
+            }])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let probe = snapshot.distance_probe(probe_id).unwrap();
+        assert!((snapshot.resolve_distance(probe).unwrap() - 3.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn a_distance_probe_needs_two_distinct_objects() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("a"))])
+            .unwrap();
+        assert!(
+            world
+                .commit([WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                    "gap",
+                    ObjectId::new(0),
+                    ObjectId::new(0),
+                ))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn creating_a_distance_probe_on_a_nonexistent_object_is_rejected() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("a"))])
+            .unwrap();
+        assert!(
+            world
+                .commit([WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                    "gap",
+                    ObjectId::new(0),
+                    ObjectId::new(99),
+                ))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn removing_an_object_with_a_distance_probe_leaves_it_in_place() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(ObjectSpec::new("a")),
+                WorldCommand::CreateObject(ObjectSpec::new("b")),
+            ])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                "gap",
+                ObjectId::new(0),
+                ObjectId::new(1),
+            ))])
+            .unwrap();
+
+        assert!(
+            world
+                .commit([WorldCommand::RemoveObject(ObjectId::new(0))])
+                .is_err()
+        );
+        assert_eq!(world.snapshot().objects().len(), 2);
     }
 
     #[test]

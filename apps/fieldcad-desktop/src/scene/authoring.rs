@@ -82,6 +82,7 @@ pub fn append_authoring_geometry(
         for plane in world.planes().values().filter(|plane| plane.visible) {
             append_plane_proxy(
                 geometry,
+                world,
                 plane,
                 selection == Some(SceneSelection::Plane(plane.id)),
                 scene_scale,
@@ -92,6 +93,7 @@ pub fn append_authoring_geometry(
         for field_box in world.boxes().values().filter(|region| region.visible) {
             append_box_proxy(
                 geometry,
+                world,
                 field_box,
                 selection == Some(SceneSelection::Box(field_box.id)),
                 scene_scale,
@@ -102,6 +104,7 @@ pub fn append_authoring_geometry(
         for sphere in world.spheres().values().filter(|sphere| sphere.visible) {
             append_sphere_proxy(
                 geometry,
+                world,
                 sphere,
                 selection == Some(SceneSelection::Sphere(sphere.id)),
                 scene_scale,
@@ -275,10 +278,20 @@ pub fn append_pending_edit_ghosts(
 
 fn append_plane_proxy(
     geometry: &mut FieldGeometry,
+    world: &WorldSnapshot,
     plane: &SlicePlane,
     selected: bool,
     scene_scale: SceneScale,
 ) {
+    let Ok((plane_origin, plane_normal, plane_u_axis)) = world.resolve_plane_frame(plane) else {
+        return;
+    };
+    let plane = SlicePlane {
+        origin: plane_origin,
+        normal: plane_normal,
+        u_axis: plane_u_axis,
+        ..plane.clone()
+    };
     // `u`, `v`, and `normal` are unit directions, not lengths — cast as-is.
     let (u, v) = plane.basis();
     let u = u.as_vec3();
@@ -340,10 +353,14 @@ fn box_corners(origin: Vec3, rotation: Quat, half_extent: Vec3) -> [Vec3; 8] {
 /// no field-independent purpose beyond marking where it is.
 fn append_box_proxy(
     geometry: &mut FieldGeometry,
+    world: &WorldSnapshot,
     field_box: &FieldBox,
     selected: bool,
     scene_scale: SceneScale,
 ) {
+    let Ok((box_origin, box_rotation)) = world.resolve_box_frame(field_box) else {
+        return;
+    };
     let body = if selected {
         Vec4::new(1.0, 0.48, 0.08, 0.10)
     } else {
@@ -356,8 +373,8 @@ fn append_box_proxy(
     };
     append_box_visual(
         geometry,
-        scene_scale.to_render_vec3(field_box.origin),
-        quat_from_dquat(field_box.rotation),
+        scene_scale.to_render_vec3(box_origin),
+        quat_from_dquat(box_rotation),
         scene_scale.to_render_vec3(field_box.half_extent),
         body,
         outline,
@@ -418,11 +435,15 @@ fn append_box_visual(
 /// for the wireframe the same way the selection origin marker does.
 fn append_sphere_proxy(
     geometry: &mut FieldGeometry,
+    world: &WorldSnapshot,
     sphere: &FieldSphere,
     selected: bool,
     scene_scale: SceneScale,
 ) {
-    let origin = scene_scale.to_render_vec3(sphere.origin);
+    let Ok(sphere_origin) = world.resolve_sphere_origin(sphere) else {
+        return;
+    };
+    let origin = scene_scale.to_render_vec3(sphere_origin);
     let radius = scene_scale.to_render(sphere.radius);
     let body = if selected {
         Vec4::new(1.0, 0.48, 0.08, 0.10)

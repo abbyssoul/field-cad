@@ -27,9 +27,9 @@ use fieldcad_gravity::NewtonianGravityPlugin;
 use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
-    AsyncLocalDataSource, CommandEvent, CommandId, CommandPayload, FieldDataSource,
-    LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig, SimulationRuntime,
-    Subscription,
+    AsyncLocalDataSource, CommandEvent, CommandId, CommandPayload, DistanceHistory,
+    FieldDataSource, LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig,
+    SimulationRuntime, Subscription,
 };
 use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2};
 use winit::{
@@ -418,6 +418,7 @@ struct WindowState {
     /// built from — see [`WindowState::field_layer_geometry`].
     region_geometry_cache: BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
     probe_history: ProbeHistory,
+    distance_history: DistanceHistory,
     /// The numerical run generation whose recorder data is currently held.
     /// A domain reset creates a fresh t=0 run and must not join its samples to
     /// the previous lattice's history.
@@ -544,6 +545,7 @@ impl WindowState {
             compute: None,
             region_geometry_cache: BTreeMap::new(),
             probe_history: ProbeHistory::default(),
+            distance_history: DistanceHistory::default(),
             run_generation,
             active_transform: None,
             active_field_brush: None,
@@ -718,6 +720,13 @@ impl WindowState {
                         );
                         self.deferred_edits
                             .retain(|edit| edit.command != receipt.command);
+                        // Auto-select whatever this commit created, whatever
+                        // kind it is — see `UiModel::select_created` and
+                        // `CommitReport::first_created` for where a new
+                        // entity type gets registered instead of here.
+                        if let Some(created) = receipt.created.first_created() {
+                            self.ui_model.select_created(created);
+                        }
                     }
                     CommandEvent::Failed { command, error } => {
                         self.ui_model.command_error = Some(error.to_string());
@@ -792,6 +801,7 @@ impl WindowState {
                     compute: &compute,
                     world: &world,
                     probe_history: &self.probe_history,
+                    distance_history: &self.distance_history,
                     adapter_name: &self.adapter_name,
                     frame_time_ms,
                     frame_history,
@@ -1009,10 +1019,12 @@ impl WindowState {
         let generation = model.simulation_status().run_generation;
         if generation != self.run_generation {
             self.probe_history = ProbeHistory::new(self.probe_history.capacity());
+            self.distance_history = DistanceHistory::new(self.distance_history.capacity());
             self.run_generation = generation;
         }
         if let Some(snapshot) = model.latest_snapshot() {
             self.probe_history.record(&snapshot);
+            self.distance_history.record(&snapshot);
         }
         self.world = model.world();
         drop(model);
@@ -1053,6 +1065,13 @@ impl WindowState {
         {
             self.ui_model.probe_selection = None;
         }
+        if self
+            .ui_model
+            .distance_probe_selection
+            .is_some_and(|id| self.world.distance_probe(id).is_none())
+        {
+            self.ui_model.distance_probe_selection = None;
+        }
         // A followed object that no longer exists must not leave the camera
         // pinned to a stale target, and the View panel's "Following: …"
         // indicator must not linger for something that is gone.
@@ -1078,6 +1097,14 @@ impl WindowState {
         // never reused, so deleted probes would accumulate for the session.
         self.probe_history
             .retain_probes(|probe| self.world.probe(probe).is_some());
+        self.distance_history
+            .retain_probes(|probe| self.world.distance_probe(probe).is_some());
+        self.ui_model
+            .distance_probe_plots
+            .retain(|probe| self.world.distance_probe(*probe).is_some());
+        self.ui_model
+            .distance_probe_series
+            .retain(|probe, _| self.world.distance_probe(*probe).is_some());
         let scene_scale = self.scene_scale();
         if self.active_transform.is_some_and(|drag| {
             scene::selection_origin(&self.world, drag.target, scene_scale).is_none()
@@ -1232,19 +1259,29 @@ impl WindowState {
                 None => None,
             };
             if let Some(constraint) = constraint {
+                // World-space, not the possibly-local stored fields: a
+                // rotated attachment parent means `plane.normal`/
+                // `field_box.rotation` alone would seed the drag in the
+                // wrong frame — see `translate_selection`'s attached-object
+                // handling for the same distinction.
                 let plane_frame = match selection {
                     scene::SceneSelection::Plane(id) => {
-                        self.world.planes().get(&id).map(|plane| PlaneFrame {
-                            normal: plane.normal,
-                            u_axis: plane.u_axis,
+                        self.world.planes().get(&id).and_then(|plane| {
+                            self.world
+                                .resolve_plane_frame(plane)
+                                .ok()
+                                .map(|(_, normal, u_axis)| PlaneFrame { normal, u_axis })
                         })
                     }
                     _ => None,
                 };
                 let box_frame = match selection {
                     scene::SceneSelection::Box(id) => {
-                        self.world.boxes().get(&id).map(|field_box| BoxFrame {
-                            rotation: field_box.rotation,
+                        self.world.boxes().get(&id).and_then(|field_box| {
+                            self.world
+                                .resolve_box_frame(field_box)
+                                .ok()
+                                .map(|(_, rotation)| BoxFrame { rotation })
                         })
                     }
                     _ => None,
@@ -1412,82 +1449,112 @@ impl WindowState {
         translation: DVec3,
     ) -> Result<(), String> {
         let next_origin = active.origin + translation;
-        let world_command = match active.target {
-            scene::SceneSelection::Object(object_id) => {
-                let object = self
-                    .world
-                    .object(object_id)
-                    .ok_or_else(|| format!("object {object_id} no longer exists"))?;
-                WorldCommand::SetTransform {
-                    object: object_id,
-                    transform: Transform::new(next_origin, object.transform.rotation)
-                        .map_err(|error| error.to_string())?,
-                }
-            }
-            scene::SceneSelection::Plane(plane_id) => {
-                let plane = self
-                    .world
-                    .planes()
-                    .get(&plane_id)
-                    .ok_or_else(|| format!("plane {plane_id} no longer exists"))?;
-                WorldCommand::SetPlane {
-                    plane: plane_id,
-                    spec: SlicePlaneSpec::from_plane(plane)
-                        .with_origin(next_origin)
-                        .map_err(|error| error.to_string())?,
-                }
-            }
-            scene::SceneSelection::Probe(probe_id) => {
-                let probe = self
-                    .world
-                    .probe(probe_id)
-                    .ok_or_else(|| format!("probe {probe_id} no longer exists"))?;
-                let position = match probe.position {
-                    ProbePosition::World(_) => ProbePosition::World(next_origin),
-                    ProbePosition::Attached { object, .. } => {
-                        let parent = self
-                            .world
-                            .object(object)
-                            .ok_or_else(|| format!("attached object {object} no longer exists"))?;
-                        ProbePosition::Attached {
-                            object,
-                            offset: parent.transform.rotation.inverse()
-                                * (next_origin - parent.transform.translation),
-                        }
+        let world_command =
+            match active.target {
+                scene::SceneSelection::Object(object_id) => {
+                    let object = self
+                        .world
+                        .object(object_id)
+                        .ok_or_else(|| format!("object {object_id} no longer exists"))?;
+                    WorldCommand::SetTransform {
+                        object: object_id,
+                        transform: Transform::new(next_origin, object.transform.rotation)
+                            .map_err(|error| error.to_string())?,
                     }
-                };
-                WorldCommand::SetProbePosition {
-                    probe: probe_id,
-                    position,
                 }
-            }
-            scene::SceneSelection::Box(region_id) => {
-                let field_box = self
-                    .world
-                    .boxes()
-                    .get(&region_id)
-                    .ok_or_else(|| format!("field box {region_id} no longer exists"))?;
-                WorldCommand::SetBox {
-                    region: region_id,
-                    spec: FieldBoxSpec::from_box(field_box)
-                        .with_origin(next_origin)
-                        .map_err(|error| error.to_string())?,
+                scene::SceneSelection::Plane(plane_id) => {
+                    let plane = self
+                        .world
+                        .planes()
+                        .get(&plane_id)
+                        .ok_or_else(|| format!("plane {plane_id} no longer exists"))?;
+                    let origin = match plane.attached_to {
+                        None => next_origin,
+                        Some(object) => {
+                            let parent = self.world.object(object).ok_or_else(|| {
+                                format!("attached object {object} no longer exists")
+                            })?;
+                            parent.transform.rotation.inverse()
+                                * (next_origin - parent.transform.translation)
+                        }
+                    };
+                    WorldCommand::SetPlane {
+                        plane: plane_id,
+                        spec: SlicePlaneSpec::from_plane(plane)
+                            .with_origin(origin)
+                            .map_err(|error| error.to_string())?,
+                    }
                 }
-            }
-            scene::SceneSelection::Sphere(sphere_id) => {
-                let sphere = self
-                    .world
-                    .spheres()
-                    .get(&sphere_id)
-                    .ok_or_else(|| format!("field sphere {sphere_id} no longer exists"))?;
-                WorldCommand::SetSphere {
-                    sphere: sphere_id,
-                    spec: FieldSphereSpec::from_sphere(sphere)
-                        .with_origin(next_origin)
-                        .map_err(|error| error.to_string())?,
+                scene::SceneSelection::Probe(probe_id) => {
+                    let probe = self
+                        .world
+                        .probe(probe_id)
+                        .ok_or_else(|| format!("probe {probe_id} no longer exists"))?;
+                    let position = match probe.position {
+                        ProbePosition::World(_) => ProbePosition::World(next_origin),
+                        ProbePosition::Attached { object, .. } => {
+                            let parent = self.world.object(object).ok_or_else(|| {
+                                format!("attached object {object} no longer exists")
+                            })?;
+                            ProbePosition::Attached {
+                                object,
+                                offset: parent.transform.rotation.inverse()
+                                    * (next_origin - parent.transform.translation),
+                            }
+                        }
+                    };
+                    WorldCommand::SetProbePosition {
+                        probe: probe_id,
+                        position,
+                    }
                 }
-            }
-        };
+                scene::SceneSelection::Box(region_id) => {
+                    let field_box = self
+                        .world
+                        .boxes()
+                        .get(&region_id)
+                        .ok_or_else(|| format!("field box {region_id} no longer exists"))?;
+                    let origin = match field_box.attached_to {
+                        None => next_origin,
+                        Some(object) => {
+                            let parent = self.world.object(object).ok_or_else(|| {
+                                format!("attached object {object} no longer exists")
+                            })?;
+                            parent.transform.rotation.inverse()
+                                * (next_origin - parent.transform.translation)
+                        }
+                    };
+                    WorldCommand::SetBox {
+                        region: region_id,
+                        spec: FieldBoxSpec::from_box(field_box)
+                            .with_origin(origin)
+                            .map_err(|error| error.to_string())?,
+                    }
+                }
+                scene::SceneSelection::Sphere(sphere_id) => {
+                    let sphere = self
+                        .world
+                        .spheres()
+                        .get(&sphere_id)
+                        .ok_or_else(|| format!("field sphere {sphere_id} no longer exists"))?;
+                    let origin = match sphere.attached_to {
+                        None => next_origin,
+                        Some(object) => {
+                            let parent = self.world.object(object).ok_or_else(|| {
+                                format!("attached object {object} no longer exists")
+                            })?;
+                            parent.transform.rotation.inverse()
+                                * (next_origin - parent.transform.translation)
+                        }
+                    };
+                    WorldCommand::SetSphere {
+                        sphere: sphere_id,
+                        spec: FieldSphereSpec::from_sphere(sphere)
+                            .with_origin(origin)
+                            .map_err(|error| error.to_string())?,
+                    }
+                }
+            };
         if let Some(current) = self.active_transform.as_mut() {
             current.origin = next_origin;
         }
@@ -1541,10 +1608,33 @@ impl WindowState {
         }
         let rotation = DQuat::from_rotation_arc(frame.normal, normal);
         let u_axis = (rotation * frame.u_axis).normalize();
-        let spec = SlicePlaneSpec::new(&plane.name, active.origin, normal)
+        // `active.origin`/`normal`/`u_axis` are world-space (per `plane_frame`'s
+        // drag-start seeding); an attached plane stores its frame local to the
+        // parent, so convert back before writing — same trick as
+        // `translate_selection`'s attached-object handling.
+        let (origin, normal, u_axis) = match plane.attached_to {
+            None => (active.origin, normal, u_axis),
+            Some(object) => {
+                let parent = self
+                    .world
+                    .object(object)
+                    .ok_or_else(|| format!("attached object {object} no longer exists"))?;
+                let inverse_rotation = parent.transform.rotation.inverse();
+                (
+                    inverse_rotation * (active.origin - parent.transform.translation),
+                    inverse_rotation * normal,
+                    inverse_rotation * u_axis,
+                )
+            }
+        };
+        let spec = SlicePlaneSpec::new(&plane.name, origin, normal)
             .and_then(|spec| spec.with_u_axis(u_axis))
             .and_then(|spec| spec.with_half_extent(plane.half_extent))
             .map(|spec| spec.with_visibility(plane.visible))
+            .map(|spec| match plane.attached_to {
+                Some(object) => spec.with_attached_to(object),
+                None => spec,
+            })
             .map_err(|error| error.to_string())?;
         if let Some(current) = self.active_transform.as_mut() {
             current.plane_frame = Some(PlaneFrame { normal, u_axis });
@@ -1638,6 +1728,19 @@ impl WindowState {
             rotation.w as f64,
         )
         .normalize();
+        // `rotation` is world-space (per `box_frame`'s drag-start seeding);
+        // convert back to the parent's local frame when attached, same as
+        // `drag_plane_normal`.
+        let rotation = match field_box.attached_to {
+            None => rotation,
+            Some(object) => {
+                let parent = self
+                    .world
+                    .object(object)
+                    .ok_or_else(|| format!("attached object {object} no longer exists"))?;
+                parent.transform.rotation.inverse() * rotation
+            }
+        };
         let spec = FieldBoxSpec::from_box(field_box)
             .with_rotation(rotation)
             .map_err(|error| error.to_string())?;
@@ -2612,6 +2715,7 @@ mod tests {
                     },
                 )]),
                 diagnostics: Arc::from([]),
+                distances: Arc::from([]),
             }
         }
 

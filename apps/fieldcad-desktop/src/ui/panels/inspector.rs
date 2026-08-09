@@ -48,6 +48,7 @@ pub fn inspector(
                         ui.separator();
                         super::shape_inspector::plane_properties(
                             ui,
+                            frame.world,
                             plane,
                             &mut model.field_layers,
                             frame.compute,
@@ -61,6 +62,7 @@ pub fn inspector(
                         ui.separator();
                         super::shape_inspector::box_properties(
                             ui,
+                            frame.world,
                             field_box,
                             &mut model.field_layers,
                             frame.compute,
@@ -74,6 +76,7 @@ pub fn inspector(
                         ui.separator();
                         super::shape_inspector::sphere_properties(
                             ui,
+                            frame.world,
                             sphere,
                             &mut model.field_layers,
                             frame.compute,
@@ -91,6 +94,20 @@ pub fn inspector(
                             frame.world,
                             frame.compute,
                             frame.probe_history,
+                            output,
+                        );
+                    } else if let Some(probe) = model
+                        .distance_probe_selection
+                        .and_then(|id| frame.world.distance_probe(id))
+                    {
+                        ui.heading("Distance probe");
+                        ui.separator();
+                        super::distance_probe_inspector::distance_probe_properties(
+                            ui,
+                            model,
+                            probe,
+                            frame.world,
+                            frame.distance_history,
                             output,
                         );
                     } else {

@@ -32,9 +32,9 @@ use std::{
 };
 
 use fieldcad_core::{
-    BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, Domain, DomainBounds,
-    PluginId, PluginProvenance, Precision, Resolution, SceneScale, SnapshotCompleteness,
-    SnapshotIdentity, SolverDiagnostic, TimeStep, WorldCommand,
+    BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, DistanceProbeId, Domain,
+    DomainBounds, PluginId, PluginProvenance, Precision, Resolution, SceneScale,
+    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, TimeStep, WorldCommand,
 };
 use fieldcad_server::{HeadlessServer, SessionEvent, WatchEvent};
 use fieldcad_simulation::{
@@ -496,6 +496,7 @@ struct SnapshotView<'a> {
     plugins: &'a [PluginProvenance],
     channels: BTreeMap<ChannelId, &'a ChannelSnapshot>,
     diagnostics: &'a [SolverDiagnostic],
+    distances: &'a [(DistanceProbeId, f64)],
 }
 
 /// The MCP-facing handle onto one session's model.
@@ -615,6 +616,7 @@ impl McpServer {
             plugins: &snapshot.plugins,
             channels,
             diagnostics: &snapshot.diagnostics,
+            distances: &snapshot.distances,
         })
     }
 
@@ -1008,6 +1010,7 @@ impl McpServer {
                             .map(|(id, channel)| (id.clone(), channel))
                             .collect(),
                         diagnostics: &snapshot.diagnostics,
+                        distances: &snapshot.distances,
                     },
                 ),
                 None => resource_text(uri, &Option::<()>::None),

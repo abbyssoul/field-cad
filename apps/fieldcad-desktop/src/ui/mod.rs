@@ -21,16 +21,16 @@ use panels::{
     diagnostics_window, field_brush_dialog, inspector, mcp_window, menu_bar, queue_window,
     scene_tree,
 };
-use plot::floating_probe_plots;
+use plot::{floating_distance_probe_plots, floating_probe_plots};
 use viewcontrols::view_controls;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcad_core::{
-    BoundaryConditions, BoxId, ChannelId, Domain, DomainBounds, ObjectId, PlaneId, Precision,
-    ProbeId, Resolution, SphereId, WorldCommand, WorldSnapshot,
+    BoundaryConditions, BoxId, ChannelId, DistanceProbeId, Domain, DomainBounds, ObjectId, PlaneId,
+    Precision, ProbeId, Resolution, SphereId, WorldCommand, WorldSnapshot,
 };
-use fieldcad_simulation::{CommandPayload, ProbeHistory};
+use fieldcad_simulation::{CommandPayload, DistanceHistory, ProbeHistory};
 use glam::{DVec3, UVec3};
 
 use crate::{
@@ -230,8 +230,21 @@ pub struct UiModel {
     pub box_selection: Option<BoxId>,
     pub sphere_selection: Option<SphereId>,
     pub probe_selection: Option<ProbeId>,
+    /// Not part of [`SceneSelection`]: a distance probe measures a relation
+    /// between two objects rather than living at a point of its own, so it
+    /// has no viewport gizmo or pick target — only a scene-tree row and an
+    /// inspector panel.
+    pub distance_probe_selection: Option<DistanceProbeId>,
     /// Non-modal plot windows pinned independently of scene selection.
     pub probe_plots: BTreeMap<ProbeId, ProbePlotWindow>,
+    /// Distance probes with an open floating plot window. A `BTreeSet`, not
+    /// a map like `probe_plots`: a distance probe has exactly one series, so
+    /// there is no per-window channel selection to remember.
+    pub distance_probe_plots: BTreeSet<DistanceProbeId>,
+    /// Which series (distance or rate of change) each distance probe's plot
+    /// currently shows — shared by the inline inspector plot and the
+    /// floating window. Absent means the default, [`DistanceProbeSeries::Distance`].
+    pub distance_probe_series: BTreeMap<DistanceProbeId, DistanceProbeSeries>,
     /// Independent visualization state for every published vector channel.
     pub field_layers: BTreeMap<ChannelId, ChannelLayerSettings>,
     /// Most recent asynchronous command rejection, retained until a later
@@ -281,7 +294,10 @@ impl UiModel {
             box_selection: None,
             sphere_selection: None,
             probe_selection: None,
+            distance_probe_selection: None,
             probe_plots: BTreeMap::new(),
+            distance_probe_plots: BTreeSet::new(),
+            distance_probe_series: BTreeMap::new(),
             field_layers: BTreeMap::new(),
             command_error: None,
             domain_draft: None,
@@ -358,6 +374,40 @@ impl UiModel {
             });
     }
 
+    pub fn open_distance_probe_plot(&mut self, probe: DistanceProbeId) {
+        self.distance_probe_plots.insert(probe);
+    }
+
+    /// Select a distance probe in the inspector. Separate from
+    /// [`Self::set_scene_selection`] since a distance probe isn't a
+    /// [`SceneSelection`] variant — see the field doc on
+    /// `distance_probe_selection`.
+    pub fn select_distance_probe(&mut self, id: DistanceProbeId) {
+        self.set_scene_selection(None);
+        self.distance_probe_selection = Some(id);
+    }
+
+    /// Select whatever a commit just created, regardless of kind. The one
+    /// place that needs a match arm per [`fieldcad_core::CreatedEntity`]
+    /// variant — a caller that wants "select the new thing" (`App::redraw`'s
+    /// command-completion handling, say) calls this instead of checking each
+    /// `CommitReport` field itself.
+    pub fn select_created(&mut self, created: fieldcad_core::CreatedEntity) {
+        use fieldcad_core::CreatedEntity;
+        match created {
+            CreatedEntity::Object(id) => {
+                self.set_scene_selection(Some(SceneSelection::Object(id)));
+            }
+            CreatedEntity::Plane(id) => self.set_scene_selection(Some(SceneSelection::Plane(id))),
+            CreatedEntity::Box(id) => self.set_scene_selection(Some(SceneSelection::Box(id))),
+            CreatedEntity::Sphere(id) => {
+                self.set_scene_selection(Some(SceneSelection::Sphere(id)));
+            }
+            CreatedEntity::Probe(id) => self.set_scene_selection(Some(SceneSelection::Probe(id))),
+            CreatedEntity::DistanceProbe(id) => self.select_distance_probe(id),
+        }
+    }
+
     /// Ensure every declared vector channel has presentation state, and reveal
     /// the first field a session ever sees.
     ///
@@ -397,6 +447,7 @@ impl UiModel {
         self.box_selection = None;
         self.sphere_selection = None;
         self.probe_selection = None;
+        self.distance_probe_selection = None;
         // Selecting anything in the scene — including nothing — takes the
         // inspector off the world node, so the two can never both look selected.
         self.world_selected = false;
@@ -452,6 +503,17 @@ impl DomainDraft {
 pub struct ProbePlotWindow {
     /// Channels shown as separate, unit-safe plots in this window.
     pub channels: BTreeSet<ChannelId>,
+}
+
+/// Which series a distance probe's plot currently shows — the raw distance,
+/// or its rate of change (a discrete derivative over consecutive readings).
+/// Shared between the inline inspector plot and the floating window so
+/// switching one does not desync the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DistanceProbeSeries {
+    #[default]
+    Distance,
+    RateOfChange,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -553,6 +615,7 @@ pub struct FrameContext<'a> {
     pub compute: &'a ComputeView,
     pub world: &'a WorldSnapshot,
     pub probe_history: &'a ProbeHistory,
+    pub distance_history: &'a DistanceHistory,
     pub adapter_name: &'a str,
     pub frame_time_ms: f32,
     /// Oldest first, newest last — every history slice on this context
@@ -788,6 +851,7 @@ pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -
         queue_window(&context, &frame, &mut output);
     }
     floating_probe_plots(&context, model, &frame);
+    floating_distance_probe_plots(&context, model, &frame);
     field_brush_dialog(&context, model, frame.compute);
 
     output
@@ -994,6 +1058,7 @@ mod tests {
         let snapshot = world.snapshot();
         let compute = ComputeView::build(&source(), &snapshot, None);
         let history = ProbeHistory::default();
+        let distance_history = DistanceHistory::default();
 
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1010,6 +1075,7 @@ mod tests {
                     compute: &compute,
                     world: &snapshot,
                     probe_history: &history,
+                    distance_history: &distance_history,
                     adapter_name: "Test adapter",
                     frame_time_ms: 16.0,
                     active_translation: None,
@@ -1067,6 +1133,7 @@ mod tests {
         let snapshot = world.snapshot();
         let compute = ComputeView::build(&source(), &snapshot, None);
         let history = ProbeHistory::default();
+        let distance_history = DistanceHistory::default();
         let mut output = UiFrameOutput::default();
 
         let input = egui::RawInput {
@@ -1082,6 +1149,7 @@ mod tests {
                     compute: &compute,
                     world: &snapshot,
                     probe_history: &history,
+                    distance_history: &distance_history,
                     adapter_name: "Test adapter",
                     frame_time_ms: 16.0,
                     active_translation: None,
@@ -1356,6 +1424,44 @@ mod tests {
         model.set_scene_selection(Some(SceneSelection::Probe(probe)));
         assert_eq!(model.plane_selection, None);
         assert_eq!(model.scene_selection(), Some(SceneSelection::Probe(probe)));
+    }
+
+    #[test]
+    fn selecting_a_newly_created_distance_probe_uses_its_own_selection_field() {
+        // Regression guard: a distance probe isn't a `SceneSelection`
+        // variant, so `select_created` must route it to
+        // `distance_probe_selection` rather than silently doing nothing —
+        // which is exactly what going through `set_scene_selection` alone
+        // would do.
+        let mut model = UiModel::new();
+        model.set_scene_selection(Some(SceneSelection::Object(ObjectId::new(1))));
+
+        let probe = fieldcad_core::DistanceProbeId::new(0);
+        model.select_created(fieldcad_core::CreatedEntity::DistanceProbe(probe));
+
+        assert_eq!(model.distance_probe_selection, Some(probe));
+        assert_eq!(model.selection, None);
+        assert_eq!(model.scene_selection(), None);
+    }
+
+    #[test]
+    fn select_created_dispatches_every_entity_kind_to_its_own_field() {
+        let mut model = UiModel::new();
+
+        model.select_created(fieldcad_core::CreatedEntity::Object(ObjectId::new(1)));
+        assert_eq!(model.selection, Some(ObjectId::new(1)));
+
+        model.select_created(fieldcad_core::CreatedEntity::Plane(PlaneId::new(2)));
+        assert_eq!(model.plane_selection, Some(PlaneId::new(2)));
+
+        model.select_created(fieldcad_core::CreatedEntity::Box(BoxId::new(3)));
+        assert_eq!(model.box_selection, Some(BoxId::new(3)));
+
+        model.select_created(fieldcad_core::CreatedEntity::Sphere(SphereId::new(4)));
+        assert_eq!(model.sphere_selection, Some(SphereId::new(4)));
+
+        model.select_created(fieldcad_core::CreatedEntity::Probe(ProbeId::new(5)));
+        assert_eq!(model.probe_selection, Some(ProbeId::new(5)));
     }
 
     #[test]

@@ -167,6 +167,7 @@ entity_id!(PlaneId);
 entity_id!(BoxId);
 entity_id!(SphereId);
 entity_id!(ProbeId);
+entity_id!(DistanceProbeId);
 
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,

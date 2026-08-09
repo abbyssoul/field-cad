@@ -17,7 +17,7 @@ pub use async_source::{AsyncLocalDataSource, CommandEvent};
 pub use body_history::{BodyHistory, BodySample};
 pub use fieldcad_dynamics::IntegrationScheme;
 pub use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
-pub use history::{ProbeHistory, ProbeReading};
+pub use history::{DistanceHistory, DistanceReading, ProbeHistory, ProbeReading};
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
 pub use runtime::{
     DEFAULT_UNDO_DEPTH, EditHistoryStatus, FieldSystemStatus, PluginRegistration, RuntimeConfig,

@@ -4,11 +4,11 @@
 //! the axes must state simulation time and units exactly, so the small amount of
 //! drawing here is cheaper than adapting a general-purpose plot widget.
 
-use fieldcad_core::{ChannelId, FieldValue, ProbeId, SampleValidity};
-use fieldcad_simulation::ProbeHistory;
+use fieldcad_core::{ChannelId, DistanceProbeId, FieldValue, ProbeId, SampleValidity};
+use fieldcad_simulation::{DistanceHistory, DistanceReading, ProbeHistory};
 
 use super::compute::ComputeView;
-use super::{FrameContext, UiModel};
+use super::{DistanceProbeSeries, FrameContext, UiModel};
 
 pub(super) fn probe_history_plots(
     ui: &mut egui::Ui,
@@ -116,6 +116,105 @@ fn probe_channel_plot(
     } else {
         paint_probe_plot(ui, &readings);
     }
+}
+
+/// Draw every pinned distance-probe recorder independently of current scene
+/// selection — see [`floating_probe_plots`].
+pub(super) fn floating_distance_probe_plots(
+    context: &egui::Context,
+    model: &mut UiModel,
+    frame: &FrameContext<'_>,
+) {
+    // Collected up front rather than iterated as `&model.distance_probe_plots`:
+    // each window body below also needs a mutable borrow of
+    // `model.distance_probe_series`, and an owned id list is what lets that
+    // borrow and this one coexist.
+    let probe_ids: Vec<DistanceProbeId> = model.distance_probe_plots.iter().copied().collect();
+    let mut closed = Vec::new();
+    for probe_id in probe_ids {
+        let Some(probe) = frame.world.distance_probe(probe_id) else {
+            closed.push(probe_id);
+            continue;
+        };
+        let mut open = true;
+        let series = model.distance_probe_series.entry(probe_id).or_default();
+        egui::Window::new(format!("Distance plot · {}", probe.name))
+            .id(egui::Id::new(("distance_probe_plot", probe.id)))
+            .open(&mut open)
+            .default_size(egui::vec2(460.0, 220.0))
+            .resizable(true)
+            .collapsible(true)
+            .show(context, |ui| {
+                distance_history_plot(ui, probe.id, frame.distance_history, series);
+            });
+        if !open {
+            closed.push(probe_id);
+        }
+    }
+    for probe in closed {
+        model.distance_probe_plots.remove(&probe);
+    }
+}
+
+/// A distance probe's history as a single scalar trace — see
+/// [`history_plot`], the same single-trace painter the diagnostics panel
+/// uses. A distance never carries a unit-of-measure ambiguity the way a
+/// field probe's [`FieldValue`] can, so this needs none of
+/// `probe_channel_plot`'s trace/validity machinery.
+///
+/// Draws its own distance/rate-of-change toggle and mutates `series`
+/// directly, so the inline inspector plot and the floating window share one
+/// implementation rather than two copies that could disagree.
+pub(super) fn distance_history_plot(
+    ui: &mut egui::Ui,
+    probe: DistanceProbeId,
+    history: &DistanceHistory,
+    series: &mut DistanceProbeSeries,
+) {
+    ui.small(format!("Bounded to {} samples", history.capacity()));
+    ui.horizontal(|ui| {
+        ui.selectable_value(series, DistanceProbeSeries::Distance, "Distance");
+        ui.selectable_value(series, DistanceProbeSeries::RateOfChange, "Rate of change");
+    });
+    let readings: Vec<DistanceReading> = history.readings(probe).copied().collect();
+    match series {
+        DistanceProbeSeries::Distance => {
+            if readings.is_empty() {
+                ui.weak("No samples yet");
+                return;
+            }
+            let values: Vec<f32> = readings
+                .iter()
+                .map(|reading| reading.distance as f32)
+                .collect();
+            ui.label(format!("{:.4} m", values.last().unwrap()));
+            history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75));
+        }
+        DistanceProbeSeries::RateOfChange => {
+            let rates = distance_rate_of_change(&readings);
+            if rates.is_empty() {
+                ui.weak("Not enough samples yet");
+                return;
+            }
+            ui.label(format!("{:.4} m/s", rates.last().unwrap()));
+            history_plot(ui, &rates, egui::Color32::from_rgb(100, 155, 245));
+        }
+    }
+}
+
+/// A discrete derivative of distance over time: one value per adjacent pair
+/// of readings, using each pair's actual `time_seconds` gap rather than
+/// assuming a fixed tick rate. Samples with a non-positive gap (a snapshot
+/// sequence tie, or a rewound clock) are skipped rather than producing an
+/// infinite or reversed rate.
+fn distance_rate_of_change(readings: &[DistanceReading]) -> Vec<f32> {
+    readings
+        .windows(2)
+        .filter_map(|pair| {
+            let dt = pair[1].time_seconds - pair[0].time_seconds;
+            (dt > 0.0).then(|| ((pair[1].distance - pair[0].distance) / dt) as f32)
+        })
+        .collect()
 }
 
 fn channel_label(channel: &ChannelId, compute: &ComputeView) -> String {
@@ -389,5 +488,35 @@ mod tests {
             Some((-4.0, 9.0))
         );
         assert_eq!(value_bounds([f64::NAN].into_iter()), None);
+    }
+
+    fn reading(time_seconds: f64, distance: f64) -> DistanceReading {
+        DistanceReading {
+            tick: 0,
+            time_seconds,
+            world_revision: fieldcad_core::WorldRevision::INITIAL,
+            snapshot_sequence: 0,
+            distance,
+        }
+    }
+
+    #[test]
+    fn distance_rate_of_change_uses_the_actual_time_gap_between_samples() {
+        let readings = [reading(0.0, 1.0), reading(0.5, 2.0), reading(1.5, 2.0)];
+        // (2.0 - 1.0) / 0.5 = 2.0 m/s, then (2.0 - 2.0) / 1.0 = 0.0 m/s.
+        assert_eq!(distance_rate_of_change(&readings), vec![2.0, 0.0]);
+    }
+
+    #[test]
+    fn distance_rate_of_change_skips_a_non_positive_time_gap() {
+        let readings = [reading(1.0, 1.0), reading(1.0, 5.0), reading(2.0, 7.0)];
+        // The first pair's zero gap is skipped rather than producing an
+        // infinite rate; the second pair still reports normally.
+        assert_eq!(distance_rate_of_change(&readings), vec![2.0]);
+    }
+
+    #[test]
+    fn distance_rate_of_change_is_empty_for_a_single_reading() {
+        assert!(distance_rate_of_change(&[reading(0.0, 1.0)]).is_empty());
     }
 }

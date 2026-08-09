@@ -27,7 +27,16 @@ pub fn pick_scene(
         .values()
         .filter(|plane| plane.visible && show.planes)
     {
-        let Some(distance) = ray_plane_hit(ray, plane, scene_scale) else {
+        let Ok((origin, normal, u_axis)) = world.resolve_plane_frame(plane) else {
+            continue;
+        };
+        let resolved = SlicePlane {
+            origin,
+            normal,
+            u_axis,
+            ..plane.clone()
+        };
+        let Some(distance) = ray_plane_hit(ray, &resolved, scene_scale) else {
             continue;
         };
         if nearest.is_none_or(|(best, _)| distance < best) {
@@ -40,7 +49,15 @@ pub fn pick_scene(
         .values()
         .filter(|region| region.visible && show.boxes)
     {
-        let Some(distance) = ray_box_hit(ray, field_box, scene_scale) else {
+        let Ok((origin, rotation)) = world.resolve_box_frame(field_box) else {
+            continue;
+        };
+        let resolved = FieldBox {
+            origin,
+            rotation,
+            ..field_box.clone()
+        };
+        let Some(distance) = ray_box_hit(ray, &resolved, scene_scale) else {
             continue;
         };
         if nearest.is_none_or(|(best, _)| distance < best) {
@@ -53,8 +70,11 @@ pub fn pick_scene(
         .values()
         .filter(|sphere| sphere.visible && show.spheres)
     {
+        let Ok(origin) = world.resolve_sphere_origin(sphere) else {
+            continue;
+        };
         if let Some(distance) = ray.hit_sphere(
-            scene_scale.to_render_vec3(sphere.origin),
+            scene_scale.to_render_vec3(origin),
             scene_scale.to_render(sphere.radius),
         ) && nearest.is_none_or(|(best, _)| distance < best)
         {
