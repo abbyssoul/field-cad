@@ -809,11 +809,11 @@ impl MaxwellCore {
             return Ok(None);
         };
         let advance = coupling.advance(self.domain, fields, seconds)?;
+        let particle_index = fieldcad_core::index_by_object(coupling.particles());
         for source in &mut self.sources {
-            if let Some(particle) = coupling
-                .particles()
-                .iter()
-                .find(|particle| particle.object == source.object)
+            if let Some(particle) = particle_index
+                .get(&source.object)
+                .map(|&position| &coupling.particles()[position])
             {
                 source.position = particle.position;
                 source.velocity = fieldcad_core::Velocity::new(particle.velocity, DVec3::ZERO)

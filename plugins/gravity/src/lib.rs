@@ -5,8 +5,8 @@ use std::sync::Arc;
 use fieldcad_core::quantities::{MassKg, SiScalar};
 use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, CoupledSource, DiagnosticSeverity, Dimension,
-    Domain, FieldColumn, FieldValueKind, PluginId, PluginVersion, Precision, SampleGeometry,
-    SolverDiagnostic, WorldSnapshot,
+    Domain, FieldColumn, FieldValueKind, ObjectIndex, PluginId, PluginVersion, Precision,
+    SampleGeometry, SolverDiagnostic, WorldSnapshot,
 };
 use fieldcad_newtonian_gravity::{
     NewtonianSample, evaluate_acceleration_excluding, evaluate_geometry,
@@ -92,13 +92,15 @@ impl EquationSystemPlugin for NewtonianGravityPlugin {
     }
 }
 
-fn sources(world: &WorldSnapshot) -> Result<Vec<CoupledSource<MassKg>>, PluginError> {
-    collect_gravity_sources(world).map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
+fn sources(world: &WorldSnapshot) -> Result<ObjectIndex<CoupledSource<MassKg>>, PluginError> {
+    collect_gravity_sources(world)
+        .map(ObjectIndex::new)
+        .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
 }
 
 struct NewtonianGravitySolver {
     domain: Domain,
-    sources: Vec<CoupledSource<MassKg>>,
+    sources: ObjectIndex<CoupledSource<MassKg>>,
     world_revision: fieldcad_core::WorldRevision,
     cache: SampleCache<NewtonianSample>,
 }
@@ -142,17 +144,14 @@ impl EquationSystemSolver for NewtonianGravitySolver {
             .map(|body| {
                 let mass = self
                     .sources
-                    .iter()
-                    .find(|source| source.object == body.object)
+                    .get(body.object)
                     .map(|source| source.coupling_value.into_si())
                     .unwrap_or(0.0);
                 if mass == 0.0 {
                     return Ok(DVec3::ZERO);
                 }
                 let acceleration = evaluate_acceleration_excluding(
-                    self.sources
-                        .iter()
-                        .filter(|source| source.object != body.object),
+                    self.sources.iter_excluding(body.object),
                     body.position,
                 )
                 .ok_or_else(|| {
@@ -185,7 +184,7 @@ impl NewtonianGravitySolver {
         geometry: &SampleGeometry,
     ) -> Result<Arc<[NewtonianSample]>, PluginError> {
         self.cache.get_or_try_insert_with(geometry, || {
-            Ok(evaluate_geometry(&self.sources, geometry)
+            Ok(evaluate_geometry(self.sources.as_slice(), geometry)
                 .into_iter()
                 .map(|sample| quantize(sample, self.domain.precision()))
                 .collect())

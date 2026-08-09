@@ -253,6 +253,12 @@ pub struct Particle {
     pub velocity: DVec3,
 }
 
+impl fieldcad_core::IdentifiedByObject for Particle {
+    fn object_id(&self) -> ObjectId {
+        self.object
+    }
+}
+
 impl Particle {
     /// Whether a solver must claim and advance this body's pose.
     ///

@@ -7,6 +7,7 @@
 pub mod domain;
 pub mod hermite;
 pub mod ids;
+pub mod object_index;
 pub mod quantities;
 pub mod sampling;
 pub mod scene_scale;
@@ -20,6 +21,7 @@ pub mod world;
 pub use domain::*;
 pub use hermite::*;
 pub use ids::*;
+pub use object_index::*;
 pub use sampling::*;
 pub use scene_scale::*;
 pub use schema::*;

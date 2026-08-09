@@ -9,8 +9,8 @@ use std::sync::Arc;
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, GradientColumn,
-    ObjectId, PluginId, PluginVersion, Precision, SampleGeometry, SampleValidity, SolverDiagnostic,
-    WorldSnapshot,
+    ObjectId, ObjectIndex, PluginId, PluginVersion, Precision, SampleGeometry, SampleValidity,
+    SolverDiagnostic, WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_properties, charge_property_id,
@@ -198,8 +198,10 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
         }
         Ok(Box::new(ElectrostaticsSolver {
             domain: *context.domain,
-            sources: collect_sources(context.world)
-                .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
+            sources: ObjectIndex::new(
+                collect_sources(context.world)
+                    .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
+            ),
             world_revision: context.world.revision(),
             evaluator: Arc::clone(&self.evaluator),
             cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
@@ -214,7 +216,7 @@ const SAMPLE_CACHE_CAPACITY: usize = 16;
 
 struct ElectrostaticsSolver {
     domain: Domain,
-    sources: Vec<ChargeSource>,
+    sources: ObjectIndex<ChargeSource>,
     world_revision: fieldcad_core::WorldRevision,
     evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
     /// Runtime publication asks for E and V separately. Retain the small set of
@@ -234,8 +236,10 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     }
 
     fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        self.sources = collect_sources(world)
-            .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?;
+        self.sources = ObjectIndex::new(
+            collect_sources(world)
+                .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
+        );
         self.world_revision = world.revision();
         self.cache.clear()
     }
@@ -311,8 +315,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
             .iter()
             .map(|body| {
                 self.sources
-                    .iter()
-                    .find(|source| source.object == body.object)
+                    .get(body.object)
                     .map_or(0.0, |source| source.coupling_value.into_si())
             })
             .collect();
@@ -356,8 +359,7 @@ impl ElectrostaticsSolver {
         fieldcad_superposition::field_excluding(
             COULOMB_CONSTANT,
             self.sources
-                .iter()
-                .filter(|source| source.object != object)
+                .iter_excluding(object)
                 .map(inverse_square_source),
             position,
         )
@@ -375,7 +377,7 @@ impl ElectrostaticsSolver {
         self.cache.get_or_try_insert_with(geometry, || {
             let evaluated = self
                 .evaluator
-                .evaluate(&self.sources, &self.domain, geometry)
+                .evaluate(self.sources.as_slice(), &self.domain, geometry)
                 .map_err(PluginError::Solver)?;
             if evaluated.len() != geometry.len() {
                 return Err(PluginError::Solver(format!(
