@@ -16,6 +16,7 @@ use fieldcad_core::{
     ChannelId, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, SceneScale, SimulationMode,
     TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
 };
+use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_plugin_api::FieldBrushStroke;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,15 @@ pub enum CommandPayload {
     Pause,
     Step,
     SetTimeStep(TimeStep),
+    /// Choose which numerical scheme advances a dynamic body from its summed
+    /// force (see [`fieldcad_dynamics::IntegrationScheme`]).
+    ///
+    /// A command rather than a local setting for the same reason as
+    /// `SetFieldModel`: a remote/MCP session must be able to discover and
+    /// drive it identically to the desktop app. Applied immediately, like
+    /// `SetTimeStep` — it doesn't touch stored world data, so there is no
+    /// tick boundary for it to be atomic with.
+    SetIntegrationScheme(IntegrationScheme),
     /// Replace the numerical lattice and restart from the initial boundary.
     /// When submitted during a run, adoption is queued at the next tick boundary.
     ReconfigureDomain(Domain),
@@ -158,6 +168,7 @@ impl CommandPayload {
             Self::Pause => CommandKind::Pause,
             Self::Step => CommandKind::Step,
             Self::SetTimeStep(_) => CommandKind::SetTimeStep,
+            Self::SetIntegrationScheme(_) => CommandKind::SetIntegrationScheme,
             Self::ReconfigureDomain(_) => CommandKind::ReconfigureDomain,
             Self::SetPlaybackSpeed(_) => CommandKind::SetPlaybackSpeed,
             Self::SetSubscription(_) => CommandKind::SetSubscription,
@@ -193,6 +204,7 @@ pub enum CommandKind {
     Pause,
     Step,
     SetTimeStep,
+    SetIntegrationScheme,
     ReconfigureDomain,
     SetPlaybackSpeed,
     SetSubscription,
@@ -219,6 +231,7 @@ impl CommandKind {
             Self::Pause => "Pause",
             Self::Step => "Step",
             Self::SetTimeStep => "Set time step",
+            Self::SetIntegrationScheme => "Set integration scheme",
             Self::ReconfigureDomain => "Reconfigure domain",
             Self::SetPlaybackSpeed => "Set playback speed",
             Self::SetSubscription => "Set subscription",
@@ -485,6 +498,10 @@ pub trait FieldDataSource: Send {
     /// [`CommandPayload::SetSceneScale`]. Defaults to
     /// [`SceneScale::metre`], matching the desktop app's original behaviour.
     fn scene_scale(&self) -> SceneScale;
+    /// Which numerical scheme advances a dynamic body from its summed force.
+    /// Acknowledged, not hoped for: it reflects the last accepted
+    /// [`CommandPayload::SetIntegrationScheme`].
+    fn integration_scheme(&self) -> IntegrationScheme;
     /// Equation systems composed into the scene, including inactive systems
     /// that consequently have no channels in the latest snapshot.
     fn field_systems(&self) -> Vec<FieldSystemStatus>;
@@ -770,6 +787,9 @@ impl SessionCore {
             CommandPayload::SetTimeStep(step) => {
                 self.runtime.set_time_step(step)?;
                 self.pacer.reset();
+            }
+            CommandPayload::SetIntegrationScheme(scheme) => {
+                self.runtime.set_integration_scheme(scheme);
             }
             CommandPayload::ReconfigureDomain(domain) => {
                 if self.should_queue_mutation() {
@@ -1195,6 +1215,10 @@ impl FieldDataSource for LocalDataSource {
         self.core.runtime.scene_scale()
     }
 
+    fn integration_scheme(&self) -> IntegrationScheme {
+        self.core.runtime.integration_scheme()
+    }
+
     fn field_systems(&self) -> Vec<FieldSystemStatus> {
         self.core.runtime.field_systems()
     }
@@ -1394,6 +1418,10 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn scene_scale(&self) -> SceneScale {
         self.core.runtime.scene_scale()
+    }
+
+    fn integration_scheme(&self) -> IntegrationScheme {
+        self.core.runtime.integration_scheme()
     }
 
     fn field_systems(&self) -> Vec<FieldSystemStatus> {

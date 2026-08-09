@@ -18,14 +18,16 @@ use fieldcad_core::{
     StepContext, TimeStep, World, WorldCheckpoint, WorldCommand, WorldError, WorldRevision,
     WorldSnapshot,
 };
-use fieldcad_dynamics::{self as dynamics, DynamicsError};
+use fieldcad_dynamics::{self as dynamics, DynamicsError, IntegrationScheme};
 use fieldcad_plugin_api::{
-    ChannelHandle, EquationSystemPlugin, EquationSystemSolver, FieldBrushStroke,
+    ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, FieldBrushStroke,
     PluginConfigurationSchema, PluginError, PluginMetadata, ResolvedFieldBrushStroke,
     SolverCancellation, SolverContext,
 };
 use glam::{DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
+
+use crate::body_history::{BodyHistory, BodySample};
 
 /// What the runtime should sample when it publishes a snapshot.
 ///
@@ -488,6 +490,10 @@ pub struct SimulationRuntime {
     /// the gesture changed nothing.
     interactive_edit: Option<WorldRevision>,
     history: EditHistory,
+    /// Which numerical scheme `apply_tick` uses to advance a dynamic body from
+    /// its summed force. Session-runtime state, like `domain`/`clock` — not
+    /// part of `World`, and not undo-tracked (see `set_integration_scheme`).
+    integration_scheme: IntegrationScheme,
     /// The dynamics system's summed force on every body it advanced at the
     /// most recent tick.
     ///
@@ -498,7 +504,17 @@ pub struct SimulationRuntime {
     /// solver kinematically owns (its own pusher, not summed forces — see
     /// `fieldcad_dynamics`'s module docs) and pinned/carried bodies have no
     /// entry, because neither has a force this system computed for it.
+    ///
+    /// Under `IntegrationScheme::VelocityVerlet` this is also read, not just
+    /// written: it is the previous tick's force, fed into this tick's
+    /// half-kick, which is what keeps Verlet down to one new force evaluation
+    /// per tick (see `fieldcad_dynamics`'s module docs).
     last_forces: BTreeMap<ObjectId, DVec3>,
+    /// Bounded per-object position/velocity/force samples, one push per
+    /// dynamic body per tick. The multi-sample extension of `last_forces` —
+    /// see `crate::body_history`'s module docs for why it lives here rather
+    /// than being assembled from published snapshots.
+    body_history: BodyHistory,
     /// Wall-clock time `apply_tick` took to complete its most recent tick,
     /// in milliseconds — everything a fixed step actually costs: force
     /// collection, every time-stepped solver's own advance, dynamics
@@ -523,6 +539,9 @@ pub struct RuntimeConfig {
     pub plugins: Vec<PluginRegistration>,
     /// How many authored edits can be stepped back through.
     pub undo_depth: usize,
+    /// Which numerical scheme advances a dynamic body from its summed force.
+    /// Defaults to [`IntegrationScheme::default`].
+    pub integration_scheme: IntegrationScheme,
 }
 
 /// Deep enough that a session's worth of authoring is reachable, shallow enough
@@ -541,11 +560,17 @@ impl RuntimeConfig {
             sampling_budget: SamplingBudget::default(),
             plugins: Vec::new(),
             undo_depth: DEFAULT_UNDO_DEPTH,
+            integration_scheme: IntegrationScheme::default(),
         }
     }
 
     pub const fn with_undo_depth(mut self, undo_depth: usize) -> Self {
         self.undo_depth = undo_depth;
+        self
+    }
+
+    pub const fn with_integration_scheme(mut self, integration_scheme: IntegrationScheme) -> Self {
+        self.integration_scheme = integration_scheme;
         self
     }
 
@@ -593,6 +618,7 @@ impl SimulationRuntime {
             sampling_budget,
             plugins,
             undo_depth,
+            integration_scheme,
         } = config;
 
         let mut plugin_ids = BTreeSet::new();
@@ -720,7 +746,9 @@ impl SimulationRuntime {
             latest: Arc::new(empty_snapshot(session, domain)),
             interactive_edit: None,
             history: EditHistory::new(undo_depth),
+            integration_scheme,
             last_forces: BTreeMap::new(),
+            body_history: BodyHistory::default(),
             last_tick_compute_ms: 0.0,
         };
         runtime.check_single_provider_per_field()?;
@@ -754,6 +782,23 @@ impl SimulationRuntime {
     /// undo history.
     pub const fn set_scene_scale(&mut self, scene_scale: SceneScale) {
         self.scene_scale = scene_scale;
+    }
+
+    pub const fn integration_scheme(&self) -> IntegrationScheme {
+        self.integration_scheme
+    }
+
+    /// Switch which numerical scheme `apply_tick` uses. Like `set_scene_scale`,
+    /// never touches `world` or solver state and does not enter undo history.
+    ///
+    /// Clears `last_forces`/`body_history`: a force cached under one scheme
+    /// must not be blindly half-kicked into the next tick under another, and
+    /// a history series that mixed schemes would misrepresent what actually
+    /// ran.
+    pub fn set_integration_scheme(&mut self, integration_scheme: IntegrationScheme) {
+        self.integration_scheme = integration_scheme;
+        self.last_forces.clear();
+        self.body_history.clear();
     }
 
     pub const fn run_generation(&self) -> u64 {
@@ -1348,6 +1393,12 @@ impl SimulationRuntime {
         self.last_forces.clone()
     }
 
+    /// Bounded position/velocity/force history for `object`, oldest first.
+    /// Empty for an object with no recorded ticks yet.
+    pub fn body_history(&self, object: ObjectId) -> impl Iterator<Item = &BodySample> {
+        self.body_history.readings(object)
+    }
+
     /// Wall-clock milliseconds `apply_tick` took to complete the most recent
     /// tick. Zero before the first tick runs.
     pub fn last_tick_compute_ms(&self) -> f32 {
@@ -1460,6 +1511,7 @@ impl SimulationRuntime {
         self.clock.reset(time_step);
         self.run_generation = self.run_generation.saturating_add(1);
         self.last_forces.clear();
+        self.body_history.clear();
         for (slot, replacement) in self.plugins.iter_mut().zip(replacements.drain(..)) {
             slot.solver = replacement;
             slot.sampled_from = None;
@@ -1499,6 +1551,11 @@ impl SimulationRuntime {
         // conflict after a field/particle integrator mutated its private state
         // would leave that state ahead of the authoritative world.
         let world = self.world.snapshot();
+        // Object identifiers are minted monotonically and never reused, so a
+        // deleted object's history would otherwise linger in `body_history`
+        // forever. Cheap: it's a scan of the tracked series, not the world.
+        self.body_history
+            .retain_objects(|object| world.object(object).is_some());
         let mut kinematic_owners: BTreeMap<ObjectId, PluginId> = BTreeMap::new();
         for slot in self.plugins.iter().filter(|slot| slot.enabled) {
             if !slot.solver().kind().advances_with_time() {
@@ -1532,16 +1589,61 @@ impl SimulationRuntime {
             .into_iter()
             .filter(|body| !kinematic_owners.contains_key(&body.object))
             .collect();
-        let mut contributions = Vec::new();
-        for slot in self.plugins.iter().filter(|slot| slot.enabled) {
-            contributions.push(slot.solver().forces(&bodies)?);
-        }
-        let total_forces = dynamics::accumulate_forces(bodies.len(), &contributions)?;
+
+        let seconds = context.time_step.seconds();
+        let eval_forces = |bodies: &[DynamicBody]| -> Result<Vec<DVec3>, RuntimeError> {
+            let mut contributions = Vec::new();
+            for slot in self.plugins.iter().filter(|slot| slot.enabled) {
+                contributions.push(slot.solver().forces(bodies)?);
+            }
+            Ok(dynamics::accumulate_forces(bodies.len(), &contributions)?)
+        };
+
+        // How a summed force becomes motion is a per-session choice (see
+        // `IntegrationScheme`'s module docs). Symplectic Euler costs one force
+        // evaluation at the pre-tick state; Velocity Verlet costs one at the
+        // post-half-drift state, with the previous tick's force standing in
+        // for this tick's half-kick — one new evaluation per tick either way.
+        let (dynamics_updates, new_forces): (Vec<_>, Vec<_>) = match self.integration_scheme {
+            IntegrationScheme::SymplecticEuler => {
+                let forces = eval_forces(&bodies)?;
+                let updates = dynamics::integrate(&bodies, &forces, seconds)?;
+                (updates, forces)
+            }
+            IntegrationScheme::VelocityVerlet => {
+                let cached: Vec<DVec3> = bodies
+                    .iter()
+                    .map(|body| {
+                        self.last_forces
+                            .get(&body.object)
+                            .copied()
+                            .unwrap_or(DVec3::ZERO)
+                    })
+                    .collect();
+                let half_bodies = dynamics::verlet_half_step(&bodies, &cached, seconds)?;
+                let new_forces = eval_forces(&half_bodies)?;
+                let updates = dynamics::verlet_finish_step(&half_bodies, &new_forces, seconds)?;
+                (updates, new_forces)
+            }
+        };
         self.last_forces = bodies
             .iter()
-            .zip(&total_forces)
+            .zip(&new_forces)
             .map(|(body, force)| (body.object, *force))
             .collect();
+        for ((body, update), force) in bodies.iter().zip(&dynamics_updates).zip(&new_forces) {
+            self.body_history.record(
+                body.object,
+                BodySample {
+                    tick: context.tick,
+                    time_seconds: context.time_seconds,
+                    world_revision: world.revision(),
+                    position: update.transform.translation,
+                    velocity: update.velocity.linear,
+                    force: *force,
+                },
+            );
+        }
 
         let mut kinematics = BTreeMap::new();
         for slot in self.plugins.iter_mut().filter(|slot| slot.enabled) {
@@ -1565,8 +1667,7 @@ impl SimulationRuntime {
         }
 
         // The dynamics system moves everything else: sum of forces over inertia.
-        let seconds = context.time_step.seconds();
-        for update in dynamics::integrate(&bodies, &total_forces, seconds)? {
+        for update in dynamics_updates {
             kinematics.insert(update.object, update);
         }
         // Pinned bodies with an authored velocity are carried at exactly that

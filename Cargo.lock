@@ -951,6 +951,7 @@ dependencies = [
  "fieldcad-plugin-api",
  "fieldcad-sources",
  "glam",
+ "serde",
  "thiserror 2.0.19",
 ]
 

@@ -15,8 +15,8 @@ use fieldcad_core::{
     SnapshotFreshness, UndefinedReason, WorldRevision, WorldSnapshot,
 };
 use fieldcad_simulation::{
-    DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, QueueStatus,
-    QueueSummary, Subscription,
+    DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus, IntegrationScheme,
+    QueueStatus, QueueSummary, Subscription,
 };
 use glam::DVec3;
 
@@ -33,6 +33,9 @@ pub struct ComputeView {
     /// desktop viewport's world-to-render conversion — see
     /// [`fieldcad_core::SceneScale`].
     pub scene_scale: SceneScale,
+    /// Which numerical scheme is advancing dynamic bodies, as the source
+    /// reports it — see [`fieldcad_dynamics::IntegrationScheme`].
+    pub integration_scheme: IntegrationScheme,
     pub mode: SimulationMode,
     pub tick: u64,
     pub time_seconds: f64,
@@ -161,6 +164,7 @@ impl ComputeView {
             status: source.status(),
             domain,
             scene_scale: source.scene_scale(),
+            integration_scheme: source.integration_scheme(),
             mode: simulation.mode(),
             tick: simulation.tick(),
             time_seconds: simulation.time_seconds(),

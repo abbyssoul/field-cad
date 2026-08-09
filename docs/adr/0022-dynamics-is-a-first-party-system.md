@@ -64,6 +64,13 @@ nothing at the interface and keeps the model honest at the speeds these scenes
 reach, where `F = m a` is already wrong by a percent; it also makes it
 impossible to push a body past `c`.
 
+*How* momentum turns into motion is, since the Velocity Verlet upgrade, a
+closed set a session selects from (`IntegrationScheme`) rather than one
+hard-coded scheme — this does not reopen the decision above. The set is
+compiled in, not a plugin extension point: a new scheme is added to
+`fieldcad-dynamics` itself, the same first-party module this ADR describes,
+not registered by a third party the way a field system is.
+
 **What this trade costs.** Collapsing a system's action into one force vector
 means a magnetic force arrives with its velocity-dependence already evaluated,
 so it cannot be applied as a rotation. A Boris push splits `qv×B` out and

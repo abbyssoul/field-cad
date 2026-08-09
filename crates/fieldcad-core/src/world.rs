@@ -734,6 +734,11 @@ pub struct ProbeSpec {
 /// buffers not to grow without limit during a long run.
 pub const DEFAULT_PROBE_HISTORY: usize = 2_048;
 
+/// Default bounded per-object kinematics history (see `fieldcad_simulation::
+/// BodyHistory`). Same reasoning as `DEFAULT_PROBE_HISTORY`: bounded so a long
+/// run doesn't grow a buffer without limit.
+pub const DEFAULT_BODY_HISTORY: usize = 2_048;
+
 impl ProbeSpec {
     pub fn at(name: impl Into<String>, position: DVec3, channels: Vec<ChannelId>) -> Self {
         Self {

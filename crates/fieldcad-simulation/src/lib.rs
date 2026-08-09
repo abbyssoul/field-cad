@@ -7,12 +7,15 @@
 //! driving both through the same script.
 
 pub mod async_source;
+pub mod body_history;
 pub mod history;
 pub mod recording;
 pub mod runtime;
 pub mod source;
 
 pub use async_source::{AsyncLocalDataSource, CommandEvent};
+pub use body_history::{BodyHistory, BodySample};
+pub use fieldcad_dynamics::IntegrationScheme;
 pub use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 pub use history::{ProbeHistory, ProbeReading};
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
@@ -616,23 +619,21 @@ mod tests {
         }
     }
 
-    /// The whole coupling path in one test: an electrostatic field produces a
-    /// force, the dynamics system turns it into motion, and the runtime adopts
-    /// the result — with no equation system integrating anything itself.
-    #[test]
-    fn a_field_moves_a_body_through_the_dynamics_system() {
+    /// A heavy pinned source and a light free body to its right, both
+    /// charged alike so the free body is repelled straight along +x. Shared
+    /// by every test below that needs a real, nonzero force to exercise the
+    /// dynamics coupling with.
+    fn repelling_charges_scene(scheme: IntegrationScheme) -> (SimulationRuntime, ObjectId) {
         use fieldcad_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 
         let mut runtime = SimulationRuntime::new(
             RuntimeConfig::new(domain(), time_step(), SessionId::from_u128(0x60))
-                .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+                .with_plugin(Box::new(ElectrostaticsPlugin::new()))
+                .with_integration_scheme(scheme),
         )
         .unwrap();
-
-        // A heavy pinned source, and a light free body to its right. Pinning the
-        // source keeps the test about one body's trajectory.
         let report = runtime
             .commit_world_commands(
                 mass_component_schemas()
@@ -669,6 +670,20 @@ mod tests {
             )
             .unwrap();
         let free = report.created_objects[1];
+        (runtime, free)
+    }
+
+    /// The whole coupling path in one test: an electrostatic field produces a
+    /// force, the dynamics system turns it into motion, and the runtime adopts
+    /// the result — with no equation system integrating anything itself.
+    ///
+    /// Pinned to Symplectic Euler: this test is about whether the field's
+    /// force actually reaches the body in one step, not about how many ticks
+    /// Velocity Verlet needs to warm its force cache (see
+    /// `velocity_verlet_moves_a_body_once_its_force_cache_is_warm` below).
+    #[test]
+    fn a_field_moves_a_body_through_the_dynamics_system() {
+        let (mut runtime, free) = repelling_charges_scene(IntegrationScheme::SymplecticEuler);
 
         runtime.step_once().unwrap();
         let moved = runtime.world_snapshot().object(free).unwrap().clone();
@@ -683,6 +698,59 @@ mod tests {
         assert!(moved.transform.translation.x > 1.0);
         assert!(moved.velocity.linear.y.abs() < 1.0e-15);
         assert!(moved.velocity.linear.z.abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn velocity_verlet_moves_a_body_once_its_force_cache_is_warm() {
+        // Velocity Verlet's default cold start: with no prior tick's force to
+        // half-kick with, the first tick is velocity-only (the true force
+        // still lands, evaluated at the pre-tick position). Position only
+        // starts advancing once the cache is warm, from the second tick on.
+        let (mut runtime, free) = repelling_charges_scene(IntegrationScheme::VelocityVerlet);
+        assert_eq!(
+            runtime.integration_scheme(),
+            IntegrationScheme::VelocityVerlet,
+            "Velocity Verlet is the new default"
+        );
+
+        runtime.step_once().unwrap();
+        let after_first = runtime.world_snapshot().object(free).unwrap().clone();
+        assert!(
+            after_first.velocity.linear.x > 0.0,
+            "expected repulsion, got {:?}",
+            after_first.velocity.linear
+        );
+        assert_eq!(
+            after_first.transform.translation.x, 1.0,
+            "no prior force to half-kick with yet, so position hasn't moved"
+        );
+
+        runtime.step_once().unwrap();
+        let after_second = runtime.world_snapshot().object(free).unwrap().clone();
+        assert!(
+            after_second.transform.translation.x > 1.0,
+            "the cache warmed by the first tick should now move the body"
+        );
+    }
+
+    #[test]
+    fn switching_integration_scheme_clears_cached_dynamics_state() {
+        let (mut runtime, free) = repelling_charges_scene(IntegrationScheme::VelocityVerlet);
+        runtime.step_once().unwrap();
+        assert!(runtime.body_force(free).is_some());
+        assert!(runtime.body_history(free).count() > 0);
+
+        runtime.set_integration_scheme(IntegrationScheme::SymplecticEuler);
+
+        assert_eq!(
+            runtime.integration_scheme(),
+            IntegrationScheme::SymplecticEuler
+        );
+        assert!(
+            runtime.body_force(free).is_none(),
+            "a force cached under the previous scheme must not be reused"
+        );
+        assert_eq!(runtime.body_history(free).count(), 0);
     }
 
     /// The force an inspector would show for a body is a byproduct of the same

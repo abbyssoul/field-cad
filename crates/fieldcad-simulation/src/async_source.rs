@@ -17,6 +17,7 @@ use std::{
 };
 
 use fieldcad_core::{CommitReport, Domain, FieldSnapshot, ObjectId, SceneScale, WorldSnapshot};
+use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_plugin_api::SolverCancellation;
 use glam::DVec3;
 
@@ -91,6 +92,7 @@ struct SourceState {
     queue: QueueStatus,
     subscription: Subscription,
     scene_scale: SceneScale,
+    integration_scheme: IntegrationScheme,
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
@@ -108,6 +110,7 @@ impl SourceState {
             queue: source.get_queue(),
             subscription: source.subscription(),
             scene_scale: source.scene_scale(),
+            integration_scheme: source.integration_scheme(),
             field_systems: source.field_systems(),
             edit_history: source.edit_history(),
             world: source.world(),
@@ -141,6 +144,7 @@ pub struct AsyncLocalDataSource {
     submitted_commands: BTreeMap<CommandId, (CommandKind, u64)>,
     subscription: Subscription,
     scene_scale: SceneScale,
+    integration_scheme: IntegrationScheme,
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
@@ -202,6 +206,7 @@ impl AsyncLocalDataSource {
             submission_counter: 0,
             subscription: initial.subscription,
             scene_scale: initial.scene_scale,
+            integration_scheme: initial.integration_scheme,
             field_systems: initial.field_systems,
             edit_history: initial.edit_history,
             world: initial.world,
@@ -224,6 +229,7 @@ impl AsyncLocalDataSource {
         self.worker_queue = state.queue;
         self.subscription = state.subscription;
         self.scene_scale = state.scene_scale;
+        self.integration_scheme = state.integration_scheme;
         self.field_systems = state.field_systems;
         self.edit_history = state.edit_history;
         self.world = state.world;
@@ -398,6 +404,10 @@ impl FieldDataSource for AsyncLocalDataSource {
 
     fn scene_scale(&self) -> SceneScale {
         self.scene_scale
+    }
+
+    fn integration_scheme(&self) -> IntegrationScheme {
+        self.integration_scheme
     }
 
     fn field_systems(&self) -> Vec<FieldSystemStatus> {

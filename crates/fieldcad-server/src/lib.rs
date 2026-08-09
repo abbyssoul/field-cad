@@ -24,9 +24,9 @@ use fieldcad_electrostatics::ElectrostaticsPlugin;
 use fieldcad_simulation::{
     AsyncLocalDataSource, Command, CommandDisposition, CommandEvent, CommandId, CommandPayload,
     CommandReceipt, CommandSequencer, DataSourceStatus, EditHistoryStatus, FieldDataSource,
-    FieldSystemStatus, LocalDataSource, PlaybackSpeed, PluginRegistration, PollOutcome,
-    QueueStatus, QueueSummary, RuntimeConfig, RuntimeError, SimulationRuntime, SimulationStatus,
-    SourceError, Subscription,
+    FieldSystemStatus, IntegrationScheme, LocalDataSource, PlaybackSpeed, PluginRegistration,
+    PollOutcome, QueueStatus, QueueSummary, RuntimeConfig, RuntimeError, SimulationRuntime,
+    SimulationStatus, SourceError, Subscription,
 };
 use glam::DVec3;
 use tokio::sync::oneshot;
@@ -299,6 +299,10 @@ impl FieldDataSource for HeadlessServer {
 
     fn scene_scale(&self) -> SceneScale {
         self.source.scene_scale()
+    }
+
+    fn integration_scheme(&self) -> IntegrationScheme {
+        self.source.integration_scheme()
     }
 
     fn field_systems(&self) -> Vec<FieldSystemStatus> {

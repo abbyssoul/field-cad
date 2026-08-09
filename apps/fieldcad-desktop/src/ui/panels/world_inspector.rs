@@ -2,7 +2,7 @@
 //! field systems, transport sampling, and compute status.
 
 use fieldcad_core::{BoundaryCondition, Precision, PropertyValue};
-use fieldcad_simulation::CommandPayload;
+use fieldcad_simulation::{CommandPayload, IntegrationScheme};
 
 use crate::ui::compute::{ComputeView, validity_note};
 use crate::ui::{UiFrameOutput, UiModel};
@@ -24,6 +24,9 @@ pub(super) fn world_properties(
             numerical_domain_editor(ui, model, compute, edit_in_progress, output);
         },
     );
+    super::section(ui, "inspector_dynamics", "Dynamics", true, |ui| {
+        integration_scheme_picker(ui, compute, output);
+    });
     super::section(ui, "inspector_fields", "Fields", true, |ui| {
         field_controls(ui, compute, output);
     });
@@ -196,6 +199,31 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn integration_scheme_picker(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
+    let current = compute.integration_scheme;
+    ui.horizontal(|ui| {
+        ui.label("Integration scheme");
+        ui.add_enabled_ui(compute.accepts_commands(), |ui| {
+            egui::ComboBox::from_id_salt("integration_scheme")
+                .selected_text(current.label())
+                .show_ui(ui, |ui| {
+                    for scheme in IntegrationScheme::ALL {
+                        if ui
+                            .selectable_label(current == scheme, scheme.label())
+                            .on_hover_text(scheme.description())
+                            .clicked()
+                            && scheme != current
+                        {
+                            output.submit(CommandPayload::SetIntegrationScheme(scheme));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(current.description());
+        });
+    });
 }
 
 fn field_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut UiFrameOutput) {
