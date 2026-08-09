@@ -21,6 +21,21 @@ use super::{
     interpolation_cell, linear_index, wrap_next, wrap_position, wrap_previous, wrapped_cell,
 };
 
+/// Borrowed E/B storage for the particle-coupling read path.
+///
+/// [`YeeFieldState`] is owned and shared widely (stored by value in solver
+/// setup, cached as `Arc` by the GPU backend), so giving it a lifetime would
+/// cascade a generic parameter through all of those. This type exists solely
+/// so a caller can hand particle coupling a view of its own
+/// `electric`/`magnetic` storage without cloning it first — the coupling
+/// path only ever reads these fields. Public because [`interpolate_particle_fields`]
+/// is part of this crate's public API.
+#[derive(Clone, Copy)]
+pub struct YeeFieldRef<'a> {
+    pub electric: &'a [DVec3],
+    pub magnetic: &'a [DVec3],
+}
+
 const AXIS_ORDERS: [[usize; 3]; 6] = [
     [0, 1, 2],
     [0, 2, 1],
@@ -44,6 +59,15 @@ pub(crate) struct ParticleCoupling {
     /// integrated from the fields. Such a body exchanges work with whatever is
     /// holding it, which the energy budget cannot see.
     authored_motion: bool,
+    /// Grid-sized scratch reused across ticks instead of freshly allocated —
+    /// `advance` resizes (only on a domain change) and refills these in
+    /// place every call rather than calling `zero_vector_grid`/
+    /// `deposit_particle_charge` (which each allocate a fresh grid-sized
+    /// `Vec`) from scratch. Domain size is not known until `advance` is
+    /// first called, so these start empty.
+    current_density: Vec<DVec3>,
+    old_charge: Vec<f64>,
+    new_charge: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +106,9 @@ impl ParticleCoupling {
             reference_total_energy_joules: initial_field_energy_joules + particle_energy_joules,
             continuity_residual: 0.0,
             intervention_count: 0,
+            current_density: Vec::new(),
+            old_charge: Vec::new(),
+            new_charge: Vec::new(),
         })
     }
 
@@ -128,12 +155,18 @@ impl ParticleCoupling {
     pub(crate) fn advance(
         &mut self,
         domain: Domain,
-        fields: &YeeFieldState,
+        fields: YeeFieldRef<'_>,
         seconds: f64,
     ) -> Result<CoupledAdvance, PluginError> {
-        let mut current_density = zero_vector_grid(domain);
+        let expected = domain.resolution().cell_count() as usize;
+        self.current_density.resize(expected, DVec3::ZERO);
+        self.current_density.fill(DVec3::ZERO);
+        self.old_charge.resize(expected, 0.0);
+        self.old_charge.fill(0.0);
+        self.new_charge.resize(expected, 0.0);
+        self.new_charge.fill(0.0);
         let mut updates = Vec::with_capacity(self.kinematic_objects.len());
-        let old_charge = deposit_particle_charge(domain, &self.particles);
+        deposit_particle_charge_into(domain, &self.particles, &mut self.old_charge);
 
         for particle in &mut self.particles {
             // A pinned, stationary body cannot move and deposits no current, so
@@ -167,7 +200,7 @@ impl ParticleCoupling {
                 old_position,
                 unwrapped_position,
                 seconds,
-                &mut current_density,
+                &mut self.current_density,
             )?;
             particle.position = new_position;
             particle.velocity = new_velocity;
@@ -180,13 +213,25 @@ impl ParticleCoupling {
             });
         }
 
-        let new_charge = deposit_particle_charge(domain, &self.particles);
-        self.continuity_residual =
-            continuity_residual(domain, &old_charge, &new_charge, &current_density, seconds);
+        deposit_particle_charge_into(domain, &self.particles, &mut self.new_charge);
+        self.continuity_residual = continuity_residual(
+            domain,
+            &self.old_charge,
+            &self.new_charge,
+            &self.current_density,
+            seconds,
+        );
         self.particle_energy_joules = particle_kinetic_energy(&self.particles);
 
         Ok(CoupledAdvance {
-            current_density,
+            // `current_density` is handed back to the caller and read after
+            // `MaxwellSolver::advance_magnetic`/`advance_electric` run with
+            // `&mut self` on the *outer* solver — a borrow of this scratch
+            // buffer can't stay alive across that, so it still needs to be
+            // an owned copy. The scratch buffer is what avoids reallocating
+            // it (and old_charge/new_charge) fresh every tick; this clone is
+            // the one grid-sized allocation this pass does not remove.
+            current_density: self.current_density.clone(),
             outcome: SolverStepOutcome {
                 object_kinematics: updates,
             },
@@ -311,15 +356,23 @@ pub fn deposit_source_charge(domain: Domain, sources: &[ChargeSource]) -> Vec<f6
 
 pub fn deposit_particle_charge(domain: Domain, particles: &[Particle]) -> Vec<f64> {
     let mut rho = zero_scalar_grid(domain);
+    deposit_particle_charge_into(domain, particles, &mut rho);
+    rho
+}
+
+/// Same deposition as [`deposit_particle_charge`], into a caller-owned
+/// buffer — lets a per-tick caller reuse a scratch buffer across calls
+/// instead of paying for a fresh grid-sized `Vec` every time. `rho` is not
+/// zeroed first: the caller is expected to have cleared it already.
+fn deposit_particle_charge_into(domain: Domain, particles: &[Particle], rho: &mut [f64]) {
     for particle in particles {
         deposit_cic_scalar(
             domain,
             particle.position,
             particle.charge_coulombs.into_si(),
-            &mut rho,
+            rho,
         );
     }
-    rho
 }
 
 fn deposit_cic_scalar(domain: Domain, position: DVec3, charge: f64, rho: &mut [f64]) {
@@ -499,7 +552,7 @@ pub fn continuity_residual(
 /// Trilinear interpolation of the reconstructed cell-centred Yee fields.
 pub fn interpolate_particle_fields(
     domain: Domain,
-    fields: &YeeFieldState,
+    fields: YeeFieldRef<'_>,
     position: DVec3,
 ) -> Result<(DVec3, DVec3), PluginError> {
     let expected = domain.resolution().cell_count() as usize;
@@ -521,8 +574,8 @@ pub fn interpolate_particle_fields(
                 let cell = wrapped_cell(counts, base.x + dx, base.y + dy, base.z + dz);
                 let (cell_e, cell_b) = centred_fields(
                     counts,
-                    &fields.electric,
-                    &fields.magnetic,
+                    fields.electric,
+                    fields.magnetic,
                     cell.x,
                     cell.y,
                     cell.z,
@@ -802,13 +855,16 @@ mod tests {
         let magnetic: Vec<DVec3> = (0..counts)
             .map(|index| DVec3::splat(-(index as f64) * 0.02))
             .collect();
-        let fields = YeeFieldState { electric, magnetic };
+        let fields = YeeFieldRef {
+            electric: &electric,
+            magnetic: &magnetic,
+        };
 
         let inside = DVec3::new(0.83, 1.41, 0.27);
         let outside = inside + domain.bounds().size();
 
-        let (e_inside, b_inside) = interpolate_particle_fields(domain, &fields, inside).unwrap();
-        let (e_outside, b_outside) = interpolate_particle_fields(domain, &fields, outside).unwrap();
+        let (e_inside, b_inside) = interpolate_particle_fields(domain, fields, inside).unwrap();
+        let (e_outside, b_outside) = interpolate_particle_fields(domain, fields, outside).unwrap();
 
         assert!((e_inside - e_outside).length() < 1.0e-12);
         assert!((b_inside - b_outside).length() < 1.0e-12);

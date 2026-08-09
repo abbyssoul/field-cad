@@ -209,142 +209,181 @@ fn lock_model(data_source: &Mutex<HeadlessServer>) -> MutexGuard<'_, HeadlessSer
     data_source.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// [`WindowState::field_layer_geometry`]'s memoized result, plus the inputs
-/// it was computed from.
-struct FieldGeometryCache {
-    key: FieldGeometryKey,
-    geometry: scene::FieldGeometry,
+/// One region's memoized contribution to the channel-layer geometry, plus
+/// the inputs it was built from — see [`compute_field_layer_geometry`].
+struct RegionGeometryCache {
+    inputs: RegionGeometryInputs,
+    geometry: Arc<scene::FieldGeometry>,
 }
 
-#[derive(PartialEq)]
-struct FieldGeometryKey {
-    /// `None` when there is no snapshot yet to draw from — distinct from any
-    /// real `(session, sequence)` pair, so an empty scene is never mistaken
-    /// for a match against one that has since published its first snapshot.
-    snapshot: Option<(SessionId, u64)>,
-    field_layers: BTreeMap<ChannelId, ui::ChannelLayerSettings>,
+/// Everything one region's rendered geometry depends on — verified against
+/// every `show.*`/`world.*().get(id).visible`/`layers.*.get(id)` read in
+/// [`scene::region_geometry`]'s match arms, so this covers exactly what the
+/// output can differ on, nothing more.
+///
+/// `batch` carries both this region's current sample positions (so a moved
+/// plane's own batch content differs from last frame's) and the field
+/// values sampled there (so a value-only change — a moved charge, a solver
+/// tick — is caught too) — and it is *this*, not the snapshot's
+/// `(session, sequence)` identity, that actually determines the output: a
+/// sibling region's drag bumps the sequence without touching this region's
+/// batch at all, and must not force a rebuild here. `world_visible` is kept
+/// separate because a `Set*Visible` world edit can land with no new
+/// snapshot published, so it needs to invalidate on its own.
+#[derive(Clone, PartialEq)]
+struct RegionGeometryInputs {
+    batch: fieldcad_core::FieldBatch,
+    settings: RegionSettings,
+    world_visible: bool,
     show: scene::SceneVisibility,
-    entity_visibility: EntityVisibility,
-    /// A scale change alone moves every position and length this geometry
-    /// contains, with no snapshot or world-visibility change to invalidate
-    /// the cache otherwise.
     scene_scale: fieldcad_core::SceneScale,
 }
 
-/// Which measurement entities were visible when the cached geometry was
-/// built. `scene::field_geometry` reads the believed world for this, so a
-/// visibility toggle must invalidate the cache even when it publishes no new
-/// snapshot. Vectors over `BTreeMap` iteration are in id order, so `==` is an
-/// exact comparison, not a heuristic. Deliberately not the world revision:
-/// that moves on every pointer-move of a drag, which would defeat the cache
-/// precisely while it is most needed.
-#[derive(Clone, PartialEq)]
-struct EntityVisibility {
-    planes: Vec<(fieldcad_core::PlaneId, bool)>,
-    boxes: Vec<(fieldcad_core::BoxId, bool)>,
-    spheres: Vec<(fieldcad_core::SphereId, bool)>,
+/// The one region-type-specific settings value relevant to a given
+/// [`scene::RegionId`], resolved the same way [`scene::region_geometry`]'s
+/// match arms resolve it internally — kept as an enum rather than the whole
+/// [`scene::RegionLayers`] bundle so that one plane's settings change does
+/// not appear to invalidate every other region's cache entry too.
+#[derive(Clone, Copy, PartialEq)]
+enum RegionSettings {
+    Plane(scene::PlaneLayerSettings),
+    Box(scene::BoxLayerSettings),
+    Sphere(scene::SphereLayerSettings),
+    Grid(scene::FieldLayerSettings),
 }
 
-impl EntityVisibility {
-    fn of(world: &WorldSnapshot) -> Self {
-        Self {
-            planes: world
-                .planes()
-                .iter()
-                .map(|(id, plane)| (*id, plane.visible))
-                .collect(),
-            boxes: world
-                .boxes()
-                .iter()
-                .map(|(id, region)| (*id, region.visible))
-                .collect(),
-            spheres: world
-                .spheres()
-                .iter()
-                .map(|(id, sphere)| (*id, sphere.visible))
-                .collect(),
+fn resolve_region_settings(
+    region: scene::RegionId,
+    layers: scene::RegionLayers<'_>,
+    whole_domain: scene::FieldLayerSettings,
+) -> RegionSettings {
+    match region {
+        scene::RegionId::Plane(id) => {
+            RegionSettings::Plane(layers.planes.get(&id).copied().unwrap_or_default())
         }
+        scene::RegionId::Box(id) => {
+            RegionSettings::Box(layers.boxes.get(&id).copied().unwrap_or_default())
+        }
+        scene::RegionId::Sphere(id) => {
+            RegionSettings::Sphere(layers.spheres.get(&id).copied().unwrap_or_default())
+        }
+        scene::RegionId::Grid => RegionSettings::Grid(whole_domain),
     }
 }
 
-/// A vector layer's triangles and arrows are pure functions of the snapshot
-/// it reads, the layer settings that shaped it, which scene classes are
-/// visible, and which measurement entities are — see
-/// [`scene::field_geometry`]. None of that changes between two frames of a
-/// paused, static scene, yet the interpolation this drives (trilinear per
-/// glyph, both surface and vector passes) is the most expensive thing this
-/// module does per frame. `field_snapshot` is compared by
-/// `(session, sequence)` rather than by value for the same reason
-/// [`ComputeView::build`] does: every path that changes a channel's
-/// published batches publishes a new sequence.
+/// The believed world's own visibility for a region — `true` unconditionally
+/// for [`scene::RegionId::Grid`], which names no world entity to hide (see
+/// [`scene::region_geometry`]'s `Grid` arm, which has no `world.*()` check).
+fn region_world_visible(region: scene::RegionId, world: &WorldSnapshot) -> bool {
+    match region {
+        scene::RegionId::Plane(id) => world.planes().get(&id).is_some_and(|plane| plane.visible),
+        scene::RegionId::Box(id) => world.boxes().get(&id).is_some_and(|region| region.visible),
+        scene::RegionId::Sphere(id) => world
+            .spheres()
+            .get(&id)
+            .is_some_and(|region| region.visible),
+        scene::RegionId::Grid => true,
+    }
+}
+
+/// A vector layer's triangles and arrows are pure functions of each visible
+/// region's own published batch, its own layer settings, and a few global
+/// draw-mode flags — see [`scene::region_geometry`]. None of that changes
+/// between two frames of a paused, static scene, yet the interpolation this
+/// drives (trilinear per glyph, both surface and vector passes, and RK4
+/// flow-line tracing) is the most expensive thing this module does per
+/// frame. Cached per `(channel, region)` rather than once for the whole
+/// scene: a slice-plane drag commits — and republishes a snapshot for —
+/// every pointer-move frame, and a whole-scene cache keyed on that
+/// snapshot's `(session, sequence)` would treat every visible region as
+/// stale on every one of those frames, retracing flow lines scene-wide for
+/// a single moving plane.
 ///
-/// Returns the geometry to draw this frame, and, only on a cache miss, the
-/// cache entry to replace it with — `None` on a hit means the existing cache
-/// is still current and the caller need not touch it (in particular, need
-/// not clone `field_layers` again).
+/// `cache` is taken by value (moved out of `WindowState` via `mem::take`)
+/// rather than borrowed, so a hit can move its entry into the returned map
+/// at no cost; any entry not revisited this frame — a deleted region, a
+/// hidden channel — is simply left behind and dropped, which is all the
+/// pruning a stale entry needs.
 ///
 /// Free rather than a `WindowState` method so the caching decision is
 /// testable without a window or a GPU device.
 #[allow(clippy::too_many_arguments)]
 fn compute_field_layer_geometry(
-    cache: Option<&FieldGeometryCache>,
+    mut cache: BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
     field_snapshot: Option<&fieldcad_core::FieldSnapshot>,
     world: &WorldSnapshot,
     field_layers: &BTreeMap<ChannelId, ui::ChannelLayerSettings>,
     show: scene::SceneVisibility,
     vector_channels: &[ChannelId],
     scene_scale: fieldcad_core::SceneScale,
-) -> (scene::FieldGeometry, Option<FieldGeometryCache>) {
-    let snapshot_identity =
-        field_snapshot.map(|snapshot| (snapshot.identity.session, snapshot.identity.sequence));
-    let entity_visibility = EntityVisibility::of(world);
-    if let Some(cache) = cache
-        && cache.key.snapshot == snapshot_identity
-        && cache.key.show == show
-        && cache.key.field_layers == *field_layers
-        && cache.key.entity_visibility == entity_visibility
-        && cache.key.scene_scale == scene_scale
-    {
-        return (cache.geometry.clone(), None);
-    }
-
+) -> (
+    Arc<scene::FieldGeometry>,
+    BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
+) {
+    let mut new_cache = BTreeMap::new();
     let mut geometry = scene::FieldGeometry::default();
     if let Some(field_snapshot) = field_snapshot {
-        for (channel, layer) in field_layers {
-            if !layer.visible || !vector_channels.contains(channel) {
+        for (channel_id, layer) in field_layers {
+            if !layer.visible || !vector_channels.contains(channel_id) {
                 continue;
             }
-            let layer_geometry = scene::field_geometry(
-                field_snapshot,
-                channel,
-                layer.whole_domain,
-                scene::RegionLayers {
-                    planes: &layer.planes,
-                    boxes: &layer.boxes,
-                    spheres: &layer.spheres,
-                },
-                show,
-                world,
-                scene_scale,
-            );
-            geometry
-                .surface_triangles
-                .extend(layer_geometry.surface_triangles);
-            geometry.vector_lines.extend(layer_geometry.vector_lines);
-            geometry.flow_ribbons.extend(layer_geometry.flow_ribbons);
+            let Some(channel_snapshot) = field_snapshot.channel(channel_id) else {
+                continue;
+            };
+            let layers = scene::RegionLayers {
+                planes: &layer.planes,
+                boxes: &layer.boxes,
+                spheres: &layer.spheres,
+            };
+            for batch in channel_snapshot.batches.iter() {
+                let Some(region) = scene::RegionId::of(batch.geometry()) else {
+                    continue;
+                };
+                let settings = resolve_region_settings(region, layers, layer.whole_domain);
+                let world_visible = region_world_visible(region, world);
+                let key = (channel_id.clone(), region);
+                let entry = match cache.remove(&key) {
+                    Some(entry)
+                        if entry.inputs.batch == *batch
+                            && entry.inputs.settings == settings
+                            && entry.inputs.world_visible == world_visible
+                            && entry.inputs.show == show
+                            && entry.inputs.scene_scale == scene_scale =>
+                    {
+                        entry
+                    }
+                    _ => RegionGeometryCache {
+                        inputs: RegionGeometryInputs {
+                            batch: batch.clone(),
+                            settings,
+                            world_visible,
+                            show,
+                            scene_scale,
+                        },
+                        geometry: Arc::new(scene::region_geometry(
+                            batch,
+                            layer.whole_domain,
+                            layers,
+                            show,
+                            world,
+                            scene_scale,
+                        )),
+                    },
+                };
+                geometry
+                    .surface_triangles
+                    .extend(entry.geometry.surface_triangles.iter().copied());
+                geometry
+                    .vector_lines
+                    .extend(entry.geometry.vector_lines.iter().copied());
+                geometry
+                    .flow_ribbons
+                    .extend(entry.geometry.flow_ribbons.iter().copied());
+                new_cache.insert(key, entry);
+            }
         }
     }
-    let new_cache = FieldGeometryCache {
-        key: FieldGeometryKey {
-            snapshot: snapshot_identity,
-            field_layers: field_layers.clone(),
-            show,
-            entity_visibility,
-            scene_scale,
-        },
-        geometry: geometry.clone(),
-    };
-    (geometry, Some(new_cache))
+    (Arc::new(geometry), new_cache)
 }
 
 /// Field order is drop order. `egui_state` and `renderer` both reference the
@@ -375,9 +414,9 @@ struct WindowState {
     /// queue-derived fields still match the source — see
     /// [`ComputeView::build`].
     compute: Option<ComputeView>,
-    /// The channel-layer loop's last output, plus the inputs it was built
-    /// from — see [`WindowState::field_layer_geometry`].
-    field_geometry_cache: Option<FieldGeometryCache>,
+    /// Each visible region's last-built geometry, plus the inputs it was
+    /// built from — see [`WindowState::field_layer_geometry`].
+    region_geometry_cache: BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
     probe_history: ProbeHistory,
     /// The numerical run generation whose recorder data is currently held.
     /// A domain reset creates a fresh t=0 run and must not join its samples to
@@ -503,7 +542,7 @@ impl WindowState {
             data_source,
             world,
             compute: None,
-            field_geometry_cache: None,
+            region_geometry_cache: BTreeMap::new(),
             probe_history: ProbeHistory::default(),
             run_generation,
             active_transform: None,
@@ -558,9 +597,9 @@ impl WindowState {
         show: scene::SceneVisibility,
         vector_channels: &[ChannelId],
         scene_scale: fieldcad_core::SceneScale,
-    ) -> scene::FieldGeometry {
+    ) -> Arc<scene::FieldGeometry> {
         let (geometry, new_cache) = compute_field_layer_geometry(
-            self.field_geometry_cache.as_ref(),
+            std::mem::take(&mut self.region_geometry_cache),
             field_snapshot,
             &self.world,
             &self.ui_model.field_layers,
@@ -568,9 +607,7 @@ impl WindowState {
             vector_channels,
             scene_scale,
         );
-        if let Some(new_cache) = new_cache {
-            self.field_geometry_cache = Some(new_cache);
-        }
+        self.region_geometry_cache = new_cache;
         geometry
     }
 
@@ -873,21 +910,27 @@ impl WindowState {
         // Every visible layer names a channel declared by the snapshot. Several
         // channels (for example Maxwell E and B) can be drawn independently.
         let field_snapshot = self.model().latest_snapshot();
-        let mut field = self.field_layer_geometry(
+        // The cached channel-layer geometry (`base`) is never mutated in
+        // place — everything below that depends on live drag/selection
+        // state, not on the snapshot, goes into a separate `overlay` built
+        // fresh every frame, so a cache hit above stays a refcount bump
+        // instead of a clone at the first `append_*` call.
+        let base = self.field_layer_geometry(
             field_snapshot.as_deref(),
             show,
             &compute.vector_channels,
             scene_scale,
         );
+        let mut overlay = scene::FieldGeometry::default();
         scene::append_authoring_geometry(
-            &mut field,
+            &mut overlay,
             &self.world,
             self.ui_model.scene_selection(),
             show,
             scene_scale,
         );
         if self.ui_model.view.compute_bounds {
-            scene::append_compute_bounds(&mut field, compute.domain.bounds(), scene_scale);
+            scene::append_compute_bounds(&mut overlay, compute.domain.bounds(), scene_scale);
         }
         if !self.deferred_edits.is_empty() || self.pending_deferred_edit.is_some() {
             let edits: Vec<&WorldCommand> = self
@@ -896,7 +939,7 @@ impl WindowState {
                 .flat_map(|edit| edit.world_commands.iter())
                 .chain(self.pending_deferred_edit.iter().flatten())
                 .collect();
-            scene::append_pending_edit_ghosts(&mut field, &self.world, &edits, scene_scale);
+            scene::append_pending_edit_ghosts(&mut overlay, &self.world, &edits, scene_scale);
         }
         // Kept for next frame's `ComputeView::build` to reuse whatever is
         // still current — every other use of `compute` above is a borrow, so
@@ -907,7 +950,7 @@ impl WindowState {
         // something the user cannot see.
         if self.ui_model.viewport_tool == ViewportTool::Transform {
             scene::append_transform_gizmo_with_display(
-                &mut field,
+                &mut overlay,
                 &self.world,
                 &self.camera,
                 self.viewport,
@@ -928,7 +971,8 @@ impl WindowState {
                 grid_visible: self.ui_model.view.grid,
                 axes_visible: self.ui_model.view.axes,
                 instances: &instances,
-                field: &field,
+                base: &base,
+                overlay: &overlay,
                 time_seconds: self.animation_clock.elapsed().as_secs_f32(),
             },
             GuiPaint {
@@ -2511,19 +2555,39 @@ mod tests {
             (world, report.created_planes[0])
         }
 
-        /// One vector channel publishing a single plane batch — just enough
-        /// for [`scene::field_geometry`] to produce non-empty arrows.
-        fn make_snapshot(sequence: u64, plane: PlaneId) -> (FieldSnapshot, ChannelId) {
-            let plugin = PluginId::new("test").unwrap();
-            let channel = ChannelId::new(plugin.clone(), "vector").unwrap();
-            let lattice = PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(2));
-            let batch = FieldBatch::new(
+        /// A world holding two visible slice planes.
+        fn world_with_two_planes() -> (World, PlaneId, PlaneId) {
+            let mut world = World::new();
+            let report = world
+                .commit([
+                    WorldCommand::CreatePlane(
+                        SlicePlaneSpec::new("Plane A", DVec3::ZERO, DVec3::Z).unwrap(),
+                    ),
+                    WorldCommand::CreatePlane(
+                        SlicePlaneSpec::new("Plane B", DVec3::new(5.0, 0.0, 0.0), DVec3::Z)
+                            .unwrap(),
+                    ),
+                ])
+                .unwrap();
+            (world, report.created_planes[0], report.created_planes[1])
+        }
+
+        fn plane_batch(plane: PlaneId, origin: DVec3, values: [DVec3; 4]) -> FieldBatch {
+            let lattice = PlaneLattice::new(origin, DVec3::X, DVec3::Y, UVec2::splat(2));
+            FieldBatch::new(
                 SampleGeometry::Plane { plane, lattice },
-                FieldColumn::vectors(vec![DVec3::X; 4]),
+                FieldColumn::vectors(values.to_vec()),
                 vec![SampleValidity::Exact; 4],
             )
-            .unwrap();
-            let snapshot = FieldSnapshot {
+            .unwrap()
+        }
+
+        fn snapshot_of(
+            sequence: u64,
+            channel: ChannelId,
+            batches: Vec<FieldBatch>,
+        ) -> FieldSnapshot {
+            FieldSnapshot {
                 identity: SnapshotIdentity {
                     session: SessionId::from_u128(1),
                     sequence,
@@ -2539,17 +2603,50 @@ mod tests {
                     channel.clone(),
                     ChannelSnapshot {
                         schema: Arc::new(ChannelSchema {
-                            id: channel.clone(),
+                            id: channel,
                             display_name: "Vector".to_owned(),
                             value_kind: FieldValueKind::Vector(Dimension::ELECTRIC_FIELD),
                         }),
-                        provider: plugin,
-                        batches: vec![batch].into(),
+                        provider: PluginId::new("test").unwrap(),
+                        batches: batches.into(),
                     },
                 )]),
                 diagnostics: Arc::from([]),
-            };
-            (snapshot, channel)
+            }
+        }
+
+        /// One vector channel publishing a single plane batch — just enough
+        /// for [`scene::region_geometry`] to produce non-empty arrows.
+        fn make_snapshot(sequence: u64, plane: PlaneId) -> (FieldSnapshot, ChannelId) {
+            make_snapshot_with_values(sequence, plane, [DVec3::X; 4])
+        }
+
+        fn make_snapshot_with_values(
+            sequence: u64,
+            plane: PlaneId,
+            values: [DVec3; 4],
+        ) -> (FieldSnapshot, ChannelId) {
+            let channel = ChannelId::new(PluginId::new("test").unwrap(), "vector").unwrap();
+            let batch = plane_batch(plane, DVec3::ZERO, values);
+            (snapshot_of(sequence, channel.clone(), vec![batch]), channel)
+        }
+
+        /// Two planes at different origins, publishing to the same channel —
+        /// for proving one region's change does not invalidate a sibling's
+        /// cache entry.
+        fn two_plane_snapshot(
+            sequence: u64,
+            plane_a: PlaneId,
+            origin_a: DVec3,
+            plane_b: PlaneId,
+            origin_b: DVec3,
+        ) -> (FieldSnapshot, ChannelId) {
+            let channel = ChannelId::new(PluginId::new("test").unwrap(), "vector").unwrap();
+            let batches = vec![
+                plane_batch(plane_a, origin_a, [DVec3::X; 4]),
+                plane_batch(plane_b, origin_b, [DVec3::X; 4]),
+            ];
+            (snapshot_of(sequence, channel.clone(), batches), channel)
         }
 
         fn visible_layers(channel: &ChannelId) -> BTreeMap<ChannelId, ui::ChannelLayerSettings> {
@@ -2562,22 +2659,26 @@ mod tests {
             )])
         }
 
-        /// The regression this guards: recomputing the same layer geometry
-        /// every frame regardless of whether the snapshot or its settings
-        /// changed (UI-12). Poisoning the cached geometry with a vertex a
+        /// The regression this guards: a slice-plane drag republishes a
+        /// snapshot on every pointer-move frame, but this region's own
+        /// batch content — sample positions and the values sampled there —
+        /// does not change just because the sequence number did. A cache
+        /// keyed on batch content, not on `(session, sequence)`, must treat
+        /// this as a hit. Poisoning the cached geometry with a vertex a
         /// real computation would never produce, then asserting it either
         /// survives or is discarded, tells reuse and invalidation apart in a
         /// way comparing two honest rebuilds never could — those always
         /// agree.
         #[test]
-        fn reuses_the_cache_until_the_snapshot_sequence_changes() {
+        fn identical_batch_content_across_a_sequence_bump_is_a_cache_hit() {
             let (world, plane) = world_with_plane();
             let (snapshot, channel) = make_snapshot(0, plane);
             let layers = visible_layers(&channel);
             let show = scene::SceneVisibility::ALL;
+            let key = (channel.clone(), scene::RegionId::Plane(plane));
 
-            let (baseline, new_cache) = compute_field_layer_geometry(
-                None,
+            let (baseline, mut cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -2585,24 +2686,34 @@ mod tests {
                 std::slice::from_ref(&channel),
                 fieldcad_core::SceneScale::metre(),
             );
-            assert!(
-                !baseline.vector_lines.is_empty(),
-                "test setup: expected arrows"
-            );
-            let mut cache = new_cache.expect("first call always misses");
+            let baseline_len = baseline.vector_lines.len();
+            assert!(baseline_len > 0, "test setup: expected arrows");
+            // `baseline` and the cache entry's `geometry` are the same
+            // `Arc`; drop this reference to it so the cache's copy is
+            // uniquely owned and poisonable below.
+            drop(baseline);
 
-            cache.geometry.vector_lines.push(scene::ColoredVertex {
+            Arc::get_mut(
+                &mut cache
+                    .get_mut(&key)
+                    .expect("plane has a cache entry")
+                    .geometry,
+            )
+            .expect("freshly built, uniquely owned once `baseline` is dropped")
+            .vector_lines
+            .push(scene::ColoredVertex {
                 position: glam::Vec3::splat(9_999.0),
                 color: glam::Vec4::ZERO,
             });
-            let poisoned_len = cache.geometry.vector_lines.len();
+            let poisoned_len = cache[&key].geometry.vector_lines.len();
+            let poisoned_arc = Arc::clone(&cache[&key].geometry);
 
-            // Nothing about the snapshot or settings changed: the poisoned
-            // geometry must come back verbatim, and the cache must not be
-            // rebuilt.
-            let (reused, new_cache) = compute_field_layer_geometry(
-                Some(&cache),
-                Some(&snapshot),
+            // A higher snapshot sequence, but byte-identical batch content —
+            // must still be a cache hit, not a rebuild.
+            let (next_snapshot, _) = make_snapshot(1, plane);
+            let (reused, cache) = compute_field_layer_geometry(
+                cache,
+                Some(&next_snapshot),
                 &world.snapshot(),
                 &layers,
                 show,
@@ -2611,16 +2722,40 @@ mod tests {
             );
             assert_eq!(reused.vector_lines.len(), poisoned_len);
             assert!(
-                new_cache.is_none(),
-                "an unchanged input must not rebuild the cache"
+                Arc::ptr_eq(&cache[&key].geometry, &poisoned_arc),
+                "identical batch content under a higher sequence number must reuse the \
+                 cached region instead of rebuilding it — this is the whole point of \
+                 per-region caching"
             );
+        }
 
-            // A new snapshot sequence must discard the stale cache and
-            // recompute rather than propagate it.
-            let (next_snapshot, _) = make_snapshot(1, plane);
-            let (rebuilt, new_cache) = compute_field_layer_geometry(
-                Some(&cache),
-                Some(&next_snapshot),
+        /// A batch that genuinely differs (a moved plane, or new field
+        /// values at the same position) must still force a rebuild — the
+        /// cache must not become permanently stale once it starts comparing
+        /// content instead of the snapshot sequence.
+        #[test]
+        fn a_batch_with_different_values_forces_a_rebuild() {
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+
+            let (baseline, cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+            let baseline_len = baseline.vector_lines.len();
+            assert!(baseline_len > 0, "test setup: expected arrows");
+
+            let (changed_snapshot, _) = make_snapshot_with_values(1, plane, [DVec3::Y; 4]);
+            let (rebuilt, _) = compute_field_layer_geometry(
+                cache,
+                Some(&changed_snapshot),
                 &world.snapshot(),
                 &layers,
                 show,
@@ -2629,23 +2764,80 @@ mod tests {
             );
             assert_eq!(
                 rebuilt.vector_lines.len(),
-                baseline.vector_lines.len(),
-                "a changed snapshot must discard the stale cache and recompute"
+                baseline_len,
+                "same count, different content"
             );
-            assert!(
-                new_cache.is_some(),
-                "a changed input must rebuild the cache"
+            assert_ne!(
+                rebuilt.vector_lines, baseline.vector_lines,
+                "different field values at the same position must produce different arrows, \
+                 not a stale reuse of the old direction"
             );
         }
 
-        /// Regression: `scene::field_geometry` is called once per channel and
-        /// its three output fields — surface triangles, arrow lines, and flow
-        /// ribbons — are merged into one `FieldGeometry` across channels.
-        /// Adding `flow_ribbons` to that struct is easy to do without also
+        /// The property this whole redesign exists to add: a sibling
+        /// region's own change (here, plane B moving, which also bumps the
+        /// snapshot sequence both batches share) must not invalidate plane
+        /// A's cache entry, since plane A's own batch is untouched.
+        #[test]
+        fn a_sibling_regions_own_change_does_not_invalidate_this_regions_cache() {
+            let (world, plane_a, plane_b) = world_with_two_planes();
+            let origin_a = DVec3::ZERO;
+            let (snapshot, channel) =
+                two_plane_snapshot(0, plane_a, origin_a, plane_b, DVec3::new(5.0, 0.0, 0.0));
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+            let key_a = (channel.clone(), scene::RegionId::Plane(plane_a));
+
+            let (_, cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+            let arc_a_before = Arc::clone(
+                &cache
+                    .get(&key_a)
+                    .expect("plane_a has a cache entry")
+                    .geometry,
+            );
+
+            // plane_b moves (and the shared snapshot sequence bumps);
+            // plane_a's own batch is byte-identical to before.
+            let (moved_snapshot, _) =
+                two_plane_snapshot(1, plane_a, origin_a, plane_b, DVec3::new(9.0, 0.0, 0.0));
+            let (_, cache) = compute_field_layer_geometry(
+                cache,
+                Some(&moved_snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &cache
+                        .get(&key_a)
+                        .expect("plane_a still has a cache entry")
+                        .geometry,
+                    &arc_a_before
+                ),
+                "plane_a's own batch did not change; its cached geometry must be reused \
+                 verbatim even though plane_b — and therefore the snapshot sequence — did"
+            );
+        }
+
+        /// Regression: [`scene::region_geometry`] returns three output
+        /// fields — surface triangles, arrow lines, and flow ribbons — that
+        /// are merged into one `FieldGeometry` across regions. Adding
+        /// `flow_ribbons` to that struct is easy to do without also
         /// updating the merge, which silently drops every traced streamline
         /// while arrows keep working — exactly what shipped once already.
         #[test]
-        fn flow_ribbons_survive_the_per_channel_merge() {
+        fn flow_ribbons_survive_the_per_region_merge() {
             let (world, plane) = world_with_plane();
             let (snapshot, channel) = make_snapshot(0, plane);
             let mut layers = visible_layers(&channel);
@@ -2658,7 +2850,7 @@ mod tests {
             );
 
             let (geometry, _) = compute_field_layer_geometry(
-                None,
+                BTreeMap::new(),
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -2670,11 +2862,11 @@ mod tests {
             assert!(
                 !geometry.flow_ribbons.is_empty(),
                 "a visible flow-line layer must reach the merged geometry, not just \
-                 scene::field_geometry's own per-channel output"
+                 scene::region_geometry's own per-region output"
             );
         }
 
-        /// Mirrors the snapshot-sequence case above for the layer settings:
+        /// Mirrors the batch-content case above for the layer settings:
         /// hiding a layer changes what is drawn without publishing a new
         /// snapshot, so it must invalidate the cache on its own.
         #[test]
@@ -2683,9 +2875,10 @@ mod tests {
             let (snapshot, channel) = make_snapshot(0, plane);
             let layers = visible_layers(&channel);
             let show = scene::SceneVisibility::ALL;
+            let key = (channel.clone(), scene::RegionId::Plane(plane));
 
-            let (_, new_cache) = compute_field_layer_geometry(
-                None,
+            let (_, mut cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -2693,8 +2886,15 @@ mod tests {
                 std::slice::from_ref(&channel),
                 fieldcad_core::SceneScale::metre(),
             );
-            let mut cache = new_cache.unwrap();
-            cache.geometry.vector_lines.push(scene::ColoredVertex {
+            Arc::get_mut(
+                &mut cache
+                    .get_mut(&key)
+                    .expect("plane has a cache entry")
+                    .geometry,
+            )
+            .expect("freshly built, uniquely owned by this test")
+            .vector_lines
+            .push(scene::ColoredVertex {
                 position: glam::Vec3::splat(9_999.0),
                 color: glam::Vec4::ZERO,
             });
@@ -2707,7 +2907,7 @@ mod tests {
                 },
             )]);
             let (rebuilt, new_cache) = compute_field_layer_geometry(
-                Some(&cache),
+                cache,
                 Some(&snapshot),
                 &world.snapshot(),
                 &hidden_layers,
@@ -2719,14 +2919,17 @@ mod tests {
                 rebuilt.vector_lines.is_empty(),
                 "a hidden layer must discard the stale cache and draw nothing"
             );
-            assert!(new_cache.is_some());
+            assert!(
+                !new_cache.contains_key(&key),
+                "a channel no longer visible must not keep its regions' entries around"
+            );
         }
 
         #[test]
         fn no_snapshot_and_no_cache_produces_empty_geometry_without_panicking() {
             let (world, _) = world_with_plane();
             let (geometry, new_cache) = compute_field_layer_geometry(
-                None,
+                BTreeMap::new(),
                 None,
                 &world.snapshot(),
                 &BTreeMap::new(),
@@ -2736,11 +2939,11 @@ mod tests {
             );
             assert!(geometry.surface_triangles.is_empty());
             assert!(geometry.vector_lines.is_empty());
-            assert!(new_cache.is_some());
+            assert!(new_cache.is_empty());
         }
 
         /// Mirrors the layer-settings case above for the entity's own
-        /// `visible` flag: hiding a plane changes what `field_geometry`
+        /// `visible` flag: hiding a plane changes what `region_geometry`
         /// draws, and until the toggle joins the cache key a retained
         /// snapshot keeps serving the hidden plane's arrows (UI-4).
         #[test]
@@ -2749,9 +2952,10 @@ mod tests {
             let (snapshot, channel) = make_snapshot(0, plane);
             let layers = visible_layers(&channel);
             let show = scene::SceneVisibility::ALL;
+            let key = (channel.clone(), scene::RegionId::Plane(plane));
 
-            let (baseline, new_cache) = compute_field_layer_geometry(
-                None,
+            let (baseline, mut cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -2763,16 +2967,27 @@ mod tests {
                 !baseline.vector_lines.is_empty(),
                 "test setup: expected arrows"
             );
-            let mut cache = new_cache.unwrap();
-            cache.geometry.vector_lines.push(scene::ColoredVertex {
+            // `baseline` and the cache entry's `geometry` are the same
+            // `Arc`; drop this reference to it so the cache's copy is
+            // uniquely owned and poisonable below.
+            drop(baseline);
+            Arc::get_mut(
+                &mut cache
+                    .get_mut(&key)
+                    .expect("plane has a cache entry")
+                    .geometry,
+            )
+            .expect("freshly built, uniquely owned once `baseline` is dropped")
+            .vector_lines
+            .push(scene::ColoredVertex {
                 position: glam::Vec3::splat(9_999.0),
                 color: glam::Vec4::ZERO,
             });
-            let poisoned_len = cache.geometry.vector_lines.len();
+            let poisoned_len = cache[&key].geometry.vector_lines.len();
 
             // Same snapshot, same settings, same visibility: reused verbatim.
-            let (reused, new_cache) = compute_field_layer_geometry(
-                Some(&cache),
+            let (reused, cache) = compute_field_layer_geometry(
+                cache,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -2781,7 +2996,6 @@ mod tests {
                 fieldcad_core::SceneScale::metre(),
             );
             assert_eq!(reused.vector_lines.len(), poisoned_len);
-            assert!(new_cache.is_none());
 
             // Hide the plane in the believed world. Nothing republishes — the
             // snapshot and every layer setting are unchanged — yet the cache
@@ -2793,8 +3007,8 @@ mod tests {
                     visible: false,
                 }])
                 .unwrap();
-            let (rebuilt, new_cache) = compute_field_layer_geometry(
-                Some(&cache),
+            let (rebuilt, _) = compute_field_layer_geometry(
+                cache,
                 Some(&snapshot),
                 &hidden.snapshot(),
                 &layers,
@@ -2806,7 +3020,6 @@ mod tests {
                 rebuilt.vector_lines.is_empty(),
                 "a hidden plane must discard the stale cache and draw nothing"
             );
-            assert!(new_cache.is_some());
         }
     }
 }

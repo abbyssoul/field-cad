@@ -192,6 +192,7 @@ pub async fn smoke_test(config: GpuConfig, frames: u32) -> Result<SmokeTestRepor
             1.0,
             &instances,
             &field,
+            &field,
             0.0,
             [SIZE as f32, SIZE as f32],
         );

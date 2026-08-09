@@ -6,7 +6,10 @@
 //! edit), never once per rendered frame. A later compute service can own the
 //! same kernel without changing visualization consumers.
 
-use std::{sync::mpsc, time::Duration};
+use std::{
+    sync::{Mutex, PoisonError, mpsc},
+    time::Duration,
+};
 
 use bytemuck::{Pod, Zeroable};
 use fieldcad_core::quantities::SiScalar;
@@ -16,7 +19,6 @@ use fieldcad_core::{
 use fieldcad_electromagnetic_sources::ChargeSource;
 use fieldcad_electrostatics::{ElectrostaticBatchEvaluator, ElectrostaticSample};
 use glam::DVec3;
-use wgpu::util::DeviceExt;
 
 const SHADER: &str = include_str!("electrostatics.wgsl");
 const WORKGROUP_SIZE: u32 = 64;
@@ -55,10 +57,97 @@ struct GpuOutput {
     validity: [u32; 4],
 }
 
+/// Buffers reused across `evaluate` calls instead of being created fresh
+/// every dispatch. Each dynamic buffer tracks the element capacity it was
+/// last created with; a call only recreates a buffer when its request
+/// exceeds that capacity, and otherwise just uploads new contents with
+/// `queue.write_buffer`. `params_buffer` never needs to grow (its size is
+/// fixed by `GpuParams`), so it carries no capacity field.
+struct GpuScratchBuffers {
+    params_buffer: wgpu::Buffer,
+    source_capacity: usize,
+    source_buffer: wgpu::Buffer,
+    position_capacity: usize,
+    position_buffer: wgpu::Buffer,
+    output_capacity: usize,
+    output_buffer: wgpu::Buffer,
+    staging_capacity: usize,
+    staging_buffer: wgpu::Buffer,
+}
+
+impl GpuScratchBuffers {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            params_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("electrostatics parameters"),
+                size: size_of::<GpuParams>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            source_capacity: 0,
+            source_buffer: placeholder_buffer(
+                device,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            position_capacity: 0,
+            position_buffer: placeholder_buffer(
+                device,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            output_capacity: 0,
+            output_buffer: placeholder_buffer(
+                device,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            ),
+            staging_capacity: 0,
+            staging_buffer: placeholder_buffer(
+                device,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            ),
+        }
+    }
+}
+
+/// A zero-sized buffer, standing in until the first real `ensure_capacity`
+/// call grows it — never bound as a GPU resource at this size.
+fn placeholder_buffer(device: &wgpu::Device, usage: wgpu::BufferUsages) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("electrostatics scratch placeholder"),
+        size: 0,
+        usage,
+        mapped_at_creation: false,
+    })
+}
+
+/// Grows `buffer` to hold at least `needed` elements, only when it doesn't
+/// already. A no-op recreate-free path is the common case once buffers have
+/// warmed up to the scene's usual source/sample counts.
+fn ensure_capacity(
+    device: &wgpu::Device,
+    buffer: &mut wgpu::Buffer,
+    capacity: &mut usize,
+    needed: usize,
+    element_size: usize,
+    usage: wgpu::BufferUsages,
+    label: &'static str,
+) {
+    if needed <= *capacity {
+        return;
+    }
+    *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (needed * element_size) as wgpu::BufferAddress,
+        usage,
+        mapped_at_creation: false,
+    });
+    *capacity = needed;
+}
+
 pub(crate) struct GpuElectrostaticEvaluator {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    scratch: Mutex<GpuScratchBuffers>,
 }
 
 impl GpuElectrostaticEvaluator {
@@ -75,10 +164,12 @@ impl GpuElectrostaticEvaluator {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let scratch = Mutex::new(GpuScratchBuffers::new(&device));
         Self {
             device,
             queue,
             pipeline,
+            scratch,
         }
     }
 
@@ -117,59 +208,85 @@ impl GpuElectrostaticEvaluator {
             counts: [source_count, sample_count, 0, 0],
         };
 
-        let params_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("electrostatics parameters"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let source_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("electrostatics sources"),
-                contents: bytemuck::cast_slice(&gpu_sources),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let position_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("electrostatics sample positions"),
-                contents: bytemuck::cast_slice(&positions),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        // Dereferenced once up front: taking `&mut guard.field_a` and
+        // `&mut guard.field_b` separately doesn't borrow-check through a
+        // `MutexGuard`'s `Deref` the way plain disjoint field borrows do, so
+        // `scratch` here is a plain `&mut GpuScratchBuffers` instead.
+        let mut guard = self.scratch.lock().unwrap_or_else(PoisonError::into_inner);
+        let scratch = &mut *guard;
+
+        self.queue
+            .write_buffer(&scratch.params_buffer, 0, bytemuck::bytes_of(&params));
+
+        ensure_capacity(
+            &self.device,
+            &mut scratch.source_buffer,
+            &mut scratch.source_capacity,
+            gpu_sources.len(),
+            size_of::<GpuSource>(),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "electrostatics sources",
+        );
+        self.queue.write_buffer(
+            &scratch.source_buffer,
+            0,
+            bytemuck::cast_slice(&gpu_sources),
+        );
+
+        ensure_capacity(
+            &self.device,
+            &mut scratch.position_buffer,
+            &mut scratch.position_capacity,
+            positions.len(),
+            size_of::<GpuPosition>(),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            "electrostatics sample positions",
+        );
+        self.queue.write_buffer(
+            &scratch.position_buffer,
+            0,
+            bytemuck::cast_slice(&positions),
+        );
+
         let output_size = (geometry.len() * size_of::<GpuOutput>()) as wgpu::BufferAddress;
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("electrostatics sample outputs"),
-            size: output_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("electrostatics readback"),
-            size: output_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        ensure_capacity(
+            &self.device,
+            &mut scratch.output_buffer,
+            &mut scratch.output_capacity,
+            geometry.len(),
+            size_of::<GpuOutput>(),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "electrostatics sample outputs",
+        );
+        ensure_capacity(
+            &self.device,
+            &mut scratch.staging_buffer,
+            &mut scratch.staging_capacity,
+            geometry.len(),
+            size_of::<GpuOutput>(),
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "electrostatics readback",
+        );
+
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("electrostatics compute bindings"),
             layout: &self.pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: params_buffer.as_entire_binding(),
+                    resource: scratch.params_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: source_buffer.as_entire_binding(),
+                    resource: scratch.source_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: position_buffer.as_entire_binding(),
+                    resource: scratch.position_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: output_buffer.as_entire_binding(),
+                    resource: scratch.output_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -188,13 +305,25 @@ impl GpuElectrostaticEvaluator {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(sample_count.div_ceil(WORKGROUP_SIZE), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
+        encoder.copy_buffer_to_buffer(
+            &scratch.output_buffer,
+            0,
+            &scratch.staging_buffer,
+            0,
+            output_size,
+        );
         let submission = self.queue.submit([encoder.finish()]);
 
         let (sender, receiver) = mpsc::sync_channel(1);
-        staging_buffer.map_async(wgpu::MapMode::Read, .., move |result| {
-            let _ = sender.send(result);
-        });
+        // Explicit `0..output_size` rather than `..`: the staging buffer may
+        // be larger than this call's output (it never shrinks once grown),
+        // so mapping the whole buffer would read stale bytes past what this
+        // dispatch actually wrote.
+        scratch
+            .staging_buffer
+            .map_async(wgpu::MapMode::Read, 0..output_size, move |result| {
+                let _ = sender.send(result);
+            });
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(submission),
@@ -206,7 +335,7 @@ impl GpuElectrostaticEvaluator {
             .map_err(|_| "electrostatics GPU readback callback did not arrive".to_owned())?
             .map_err(|error| format!("electrostatics GPU readback failed: {error}"))?;
 
-        let mapped = staging_buffer.get_mapped_range(..);
+        let mapped = scratch.staging_buffer.get_mapped_range(0..output_size);
         let raw: &[GpuOutput] = bytemuck::cast_slice(&mapped);
         let evaluated = raw
             .iter()
@@ -225,7 +354,7 @@ impl GpuElectrostaticEvaluator {
             })
             .collect();
         drop(mapped);
-        staging_buffer.unmap();
+        scratch.staging_buffer.unmap();
         Ok(evaluated)
     }
 }
@@ -421,5 +550,95 @@ mod tests {
             (actual - expected).abs() <= tolerance,
             "GPU {actual:e} differs from CPU {expected:e} at sample {index}; tolerance {tolerance:e}"
         );
+    }
+
+    /// The scratch buffers this evaluator now reuses across calls never
+    /// shrink — a later call with fewer samples than a previous, larger one
+    /// reuses an over-sized staging buffer. This is the code path
+    /// `evaluate_inner`'s buffer-reuse fix introduced that no call was ever
+    /// independent enough to exercise before: mapping the wrong byte range
+    /// after a shrink would silently serve bytes a larger, earlier call
+    /// wrote, rather than this call's own output.
+    #[test]
+    fn evaluate_reuses_buffers_across_growing_and_shrinking_calls() {
+        pollster::block_on(async {
+            let instance = crate::gpu::GpuConfig::from_env().instance();
+            let Ok(adapter) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+            else {
+                eprintln!("skipping GPU buffer-reuse test: no headless adapter");
+                return;
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("electrostatics buffer-reuse test device"),
+                    ..Default::default()
+                })
+                .await
+                .expect("adapter must provide a default device");
+            let evaluator = GpuElectrostaticEvaluator::new(device, queue);
+            let domain = Domain::new(
+                DomainBounds::centred_cube(3.0).unwrap(),
+                Resolution::uniform(8).unwrap(),
+                BoundaryConditions::default(),
+                Precision::F32,
+            );
+            let sources = [ChargeSource::new(
+                fieldcad_core::ObjectId::new(0),
+                DVec3::new(-0.3, 0.1, 0.2),
+                fieldcad_core::Velocity::default(),
+                ChargeCoulombs::from_si(1.2e-9),
+                ChargeDistribution::Point {
+                    exclusion_radius: 0.08,
+                },
+            )];
+
+            let probes_at = |positions: &[DVec3]| {
+                SampleGeometry::probes(
+                    (0..positions.len())
+                        .map(|index| fieldcad_core::ProbeId::new(index as u64))
+                        .collect(),
+                    positions.to_vec(),
+                )
+                .unwrap()
+            };
+
+            // Small, then large (grows every buffer), then small again
+            // (reuses the now-larger buffers) — the shrink step is what
+            // would previously have read stale bytes from the large call.
+            let small: Vec<DVec3> = vec![DVec3::new(0.4, -0.2, 0.1), DVec3::new(-0.6, 0.3, -0.1)];
+            let large: Vec<DVec3> = (0..24)
+                .map(|index| {
+                    let t = index as f64 * 0.37;
+                    DVec3::new(t.sin(), t.cos(), 0.1 * t)
+                })
+                .collect();
+
+            for positions in [&small, &large, &small] {
+                let geometry = probes_at(positions);
+                let gpu = evaluator.evaluate(&sources, &domain, &geometry).unwrap();
+                assert_eq!(gpu.len(), positions.len());
+                for (index, (gpu, position)) in gpu.iter().zip(positions.iter()).enumerate() {
+                    let cpu = evaluate_sources(&sources, *position);
+                    assert_eq!(gpu.validity, cpu.validity, "validity at sample {index}");
+                    if cpu.validity.is_usable() {
+                        for (actual, expected) in gpu
+                            .electric_field
+                            .to_array()
+                            .into_iter()
+                            .zip(cpu.electric_field.to_array())
+                        {
+                            close(actual, expected, index);
+                        }
+                        close(gpu.potential, cpu.potential, index);
+                    }
+                }
+            }
+        });
     }
 }

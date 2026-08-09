@@ -17,8 +17,8 @@
 
 use fieldcad_core::quantities::{MassKg, kilogram};
 use fieldcad_core::{
-    ObjectShape, ObjectSpec, PlaneId, PlaneLattice, ProbePosition, SampleGeometry, SessionId,
-    StepContext, TimeStep, Transform, World, WorldCommand,
+    ObjectShape, ObjectSpec, PlaneId, PlaneLattice, ProbeId, ProbePosition, SampleGeometry,
+    SessionId, StepContext, TimeStep, Transform, World, WorldCommand,
 };
 use fieldcad_electromagnetism::{
     ELECTRIC_FIELD_HANDLE as MAXWELL_ELECTRIC_HANDLE, ElectromagnetismPlugin, courant_limit,
@@ -198,6 +198,16 @@ fn plane_geometry(scene: &Scene) -> SampleGeometry {
     }
 }
 
+/// A single sample point, for benchmarks that must stay flat in cell count.
+///
+/// Not the plane density the scene requests — a probe reads one point
+/// regardless of how finely a visualizer samples anything else, so this
+/// stays fixed while [`cell_sweep`] grows the lattice around it.
+fn probe_geometry() -> SampleGeometry {
+    SampleGeometry::probes(vec![ProbeId::new(0)], vec![DVec3::new(0.05, 0.1, 0.15)])
+        .expect("one id and one position always agree in length")
+}
+
 fn runtime_for(scene: &Scene) -> SimulationRuntime {
     let plugin = ElectromagnetismPlugin::new();
     let configuration = match scene.maxwell {
@@ -277,6 +287,26 @@ fn maxwell_solver_init(scene: &Scene, config: &MeasureConfig) -> Timing {
 fn maxwell_sample_plane(scene: &Scene, config: &MeasureConfig) -> Timing {
     let world = scene.world();
     let geometry = plane_geometry(scene);
+    measure(
+        config,
+        || maxwell_solver(scene, &world),
+        |solver, _| {
+            solver
+                .sample(MAXWELL_ELECTRIC_HANDLE, &geometry)
+                .expect("the electric channel is published")
+        },
+    )
+}
+
+/// A single probe sample, at fixed cost regardless of lattice size.
+///
+/// `sample_yee_fields` used to precompute cell-centred E/B for the *entire*
+/// grid before ever looking at the requested geometry, so a one-point probe
+/// paid the same O(cells) cost as a full-domain sample. This benchmark is
+/// declared `Constant` in cells specifically to catch that regressing back.
+fn maxwell_sample_probe(scene: &Scene, config: &MeasureConfig) -> Timing {
+    let world = scene.world();
+    let geometry = probe_geometry();
     measure(
         config,
         || maxwell_solver(scene, &world),
@@ -577,6 +607,17 @@ pub fn benchmarks(quick: bool) -> Vec<Benchmark> {
             runner: maxwell_sample_plane,
         },
         Benchmark {
+            id: "maxwell/sample-probe",
+            group: "maxwell",
+            what: "trilinear reconstruction of E at a single probe point",
+            why: "must stay flat in cells; sampling one point should never pay \
+                  for reconstructing the whole lattice",
+            parameter: Parameter::Cells,
+            declared: Complexity::Constant,
+            scenes: cell_sweep(default.clone().with_name("sample-probe"), quick),
+            runner: maxwell_sample_probe,
+        },
+        Benchmark {
             id: "maxwell/diagnostics",
             group: "maxwell",
             what: "energy and divergence residuals over the whole lattice",
@@ -717,7 +758,19 @@ pub fn benchmarks(quick: bool) -> Vec<Benchmark> {
                   from publication",
             parameter: Parameter::Cells,
             declared: Complexity::Linear,
-            scenes: cell_sweep(default.with_name("probe-edit"), quick),
+            scenes: cell_sweep(default.clone().with_name("probe-edit"), quick),
+            runner: runtime_commit_probe_edit,
+        },
+        Benchmark {
+            id: "runtime/commit-probe-edit-by-objects",
+            group: "runtime",
+            what: "commit a probe move as the number of unrelated authored charges grows",
+            why: "World::commit used to deep-clone every map in WorldState on every \
+                  edit, so a probe-only edit paid for the whole scene's object count; \
+                  a per-map Arc'd WorldState should keep this flat",
+            parameter: Parameter::Charges,
+            declared: Complexity::Constant,
+            scenes: charge_sweep(default.with_name("probe-edit-by-objects"), quick),
             runner: runtime_commit_probe_edit,
         },
     ]

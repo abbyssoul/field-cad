@@ -18,8 +18,8 @@ use fieldcad_core::{
 };
 use fieldcad_electromagnetism::{
     ELECTRIC_FIELD_HANDLE, MAGNETIC_FIELD_HANDLE, MaxwellCore, MaxwellSolverBackend,
-    MaxwellSolverSetup, YeeFieldState, electric_field_channel_id, magnetic_field_channel_id,
-    plugin_id, sample_yee_fields, yee_conservation,
+    MaxwellSolverSetup, YeeFieldRef, YeeFieldState, electric_field_channel_id,
+    magnetic_field_channel_id, plugin_id, sample_yee_fields, yee_conservation,
 };
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemSolver, PluginError, ResolvedFieldBrushStroke, SampledColumn,
@@ -474,9 +474,13 @@ impl EquationSystemSolver for GpuMaxwellSolver {
         };
         self.core.accept_tick(context)?;
         let coupled = match particle_fields {
-            Some(fields) => self
-                .core
-                .advance_particles(&fields, context.time_step.seconds())?,
+            Some(fields) => self.core.advance_particles(
+                YeeFieldRef {
+                    electric: &fields.electric,
+                    magnetic: &fields.magnetic,
+                },
+                context.time_step.seconds(),
+            )?,
             None => None,
         };
         if let Some(advance) = &coupled {

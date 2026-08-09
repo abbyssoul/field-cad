@@ -781,15 +781,21 @@ pub struct Probe {
     pub history_capacity: usize,
 }
 
+/// Each map is `Arc`-wrapped so `WorldState::clone()` — taken on every
+/// [`World::commit`] and [`World::restore`] — is six refcount bumps rather
+/// than a deep copy of the whole scene. A command only ever writes one map
+/// (see `apply_command`'s `*_mut` helpers, which go through
+/// [`Arc::make_mut`]), so a commit that touches, say, only `probes` clones
+/// just that one map and shares the rest with the revision it started from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldState {
     revision: WorldRevision,
-    objects: BTreeMap<ObjectId, WorldObject>,
-    planes: BTreeMap<PlaneId, SlicePlane>,
-    boxes: BTreeMap<BoxId, FieldBox>,
-    spheres: BTreeMap<SphereId, FieldSphere>,
-    probes: BTreeMap<ProbeId, Probe>,
-    component_schemas: BTreeMap<ComponentTypeId, ComponentSchema>,
+    objects: Arc<BTreeMap<ObjectId, WorldObject>>,
+    planes: Arc<BTreeMap<PlaneId, SlicePlane>>,
+    boxes: Arc<BTreeMap<BoxId, FieldBox>>,
+    spheres: Arc<BTreeMap<SphereId, FieldSphere>>,
+    probes: Arc<BTreeMap<ProbeId, Probe>>,
+    component_schemas: Arc<BTreeMap<ComponentTypeId, ComponentSchema>>,
 }
 
 /// An immutable view of the world at one revision.
@@ -906,12 +912,12 @@ impl World {
         Self {
             state: Arc::new(WorldState {
                 revision: WorldRevision::INITIAL,
-                objects: BTreeMap::new(),
-                planes: BTreeMap::new(),
-                boxes: BTreeMap::new(),
-                spheres: BTreeMap::new(),
-                probes: BTreeMap::new(),
-                component_schemas: BTreeMap::new(),
+                objects: Arc::new(BTreeMap::new()),
+                planes: Arc::new(BTreeMap::new()),
+                boxes: Arc::new(BTreeMap::new()),
+                spheres: Arc::new(BTreeMap::new()),
+                probes: Arc::new(BTreeMap::new()),
+                component_schemas: Arc::new(BTreeMap::new()),
             }),
             counters: Counters::default(),
         }
@@ -1225,9 +1231,37 @@ impl Counters {
     }
 }
 
+/// `Arc::make_mut`, one per map — see the note on [`WorldState`]. Every
+/// write in `apply_command` goes through one of these instead of touching
+/// `state.<map>` directly, so it clones only the one map it changes.
+fn objects_mut(state: &mut WorldState) -> &mut BTreeMap<ObjectId, WorldObject> {
+    Arc::make_mut(&mut state.objects)
+}
+
+fn planes_mut(state: &mut WorldState) -> &mut BTreeMap<PlaneId, SlicePlane> {
+    Arc::make_mut(&mut state.planes)
+}
+
+fn boxes_mut(state: &mut WorldState) -> &mut BTreeMap<BoxId, FieldBox> {
+    Arc::make_mut(&mut state.boxes)
+}
+
+fn spheres_mut(state: &mut WorldState) -> &mut BTreeMap<SphereId, FieldSphere> {
+    Arc::make_mut(&mut state.spheres)
+}
+
+fn probes_mut(state: &mut WorldState) -> &mut BTreeMap<ProbeId, Probe> {
+    Arc::make_mut(&mut state.probes)
+}
+
+fn component_schemas_mut(
+    state: &mut WorldState,
+) -> &mut BTreeMap<ComponentTypeId, ComponentSchema> {
+    Arc::make_mut(&mut state.component_schemas)
+}
+
 fn object_mut(state: &mut WorldState, id: ObjectId) -> Result<&mut WorldObject, WorldError> {
-    state
-        .objects
+    objects_mut(state)
         .get_mut(&id)
         .ok_or(WorldError::ObjectNotFound { id })
 }
@@ -1243,13 +1277,13 @@ fn apply_command(
             if state.component_schemas.contains_key(&schema.id) {
                 return Err(WorldError::DuplicateComponentSchema { id: schema.id });
             }
-            state.component_schemas.insert(schema.id.clone(), schema);
+            component_schemas_mut(state).insert(schema.id.clone(), schema);
         }
         WorldCommand::CreateObject(spec) => {
             spec.validate()?;
             validate_object_components(state, &spec.components)?;
             let id = counters.next_object();
-            state.objects.insert(
+            objects_mut(state).insert(
                 id,
                 WorldObject {
                     id,
@@ -1273,7 +1307,7 @@ fn apply_command(
             }) {
                 return Err(WorldError::ObjectHasAttachedProbe { id });
             }
-            state.objects.remove(&id);
+            objects_mut(state).remove(&id);
         }
         WorldCommand::SetObjectName { object, name } => {
             object_mut(state, object)?.name = name;
@@ -1323,7 +1357,7 @@ fn apply_command(
             spec.validate()?;
             let spec = spec.normalized();
             let id = counters.next_plane();
-            state.planes.insert(
+            planes_mut(state).insert(
                 id,
                 SlicePlane {
                     id,
@@ -1338,15 +1372,13 @@ fn apply_command(
             report.created_planes.push(id);
         }
         WorldCommand::SetPlaneName { plane, name } => {
-            state
-                .planes
+            planes_mut(state)
                 .get_mut(&plane)
                 .ok_or(WorldError::PlaneNotFound { id: plane })?
                 .name = name;
         }
         WorldCommand::SetPlaneVisible { plane, visible } => {
-            state
-                .planes
+            planes_mut(state)
                 .get_mut(&plane)
                 .ok_or(WorldError::PlaneNotFound { id: plane })?
                 .visible = visible;
@@ -1354,8 +1386,7 @@ fn apply_command(
         WorldCommand::SetPlane { plane, spec } => {
             spec.validate()?;
             let spec = spec.normalized();
-            let current = state
-                .planes
+            let current = planes_mut(state)
                 .get_mut(&plane)
                 .ok_or(WorldError::PlaneNotFound { id: plane })?;
             *current = SlicePlane {
@@ -1369,7 +1400,7 @@ fn apply_command(
             };
         }
         WorldCommand::RemovePlane(id) => {
-            if state.planes.remove(&id).is_none() {
+            if planes_mut(state).remove(&id).is_none() {
                 return Err(WorldError::PlaneNotFound { id });
             }
         }
@@ -1377,7 +1408,7 @@ fn apply_command(
             spec.validate()?;
             let spec = spec.normalized();
             let id = counters.next_box();
-            state.boxes.insert(
+            boxes_mut(state).insert(
                 id,
                 FieldBox {
                     id,
@@ -1391,15 +1422,13 @@ fn apply_command(
             report.created_boxes.push(id);
         }
         WorldCommand::SetBoxName { region, name } => {
-            state
-                .boxes
+            boxes_mut(state)
                 .get_mut(&region)
                 .ok_or(WorldError::BoxNotFound { id: region })?
                 .name = name;
         }
         WorldCommand::SetBoxVisible { region, visible } => {
-            state
-                .boxes
+            boxes_mut(state)
                 .get_mut(&region)
                 .ok_or(WorldError::BoxNotFound { id: region })?
                 .visible = visible;
@@ -1407,8 +1436,7 @@ fn apply_command(
         WorldCommand::SetBox { region, spec } => {
             spec.validate()?;
             let spec = spec.normalized();
-            let current = state
-                .boxes
+            let current = boxes_mut(state)
                 .get_mut(&region)
                 .ok_or(WorldError::BoxNotFound { id: region })?;
             *current = FieldBox {
@@ -1421,14 +1449,14 @@ fn apply_command(
             };
         }
         WorldCommand::RemoveBox(id) => {
-            if state.boxes.remove(&id).is_none() {
+            if boxes_mut(state).remove(&id).is_none() {
                 return Err(WorldError::BoxNotFound { id });
             }
         }
         WorldCommand::CreateSphere(spec) => {
             spec.validate()?;
             let id = counters.next_sphere();
-            state.spheres.insert(
+            spheres_mut(state).insert(
                 id,
                 FieldSphere {
                     id,
@@ -1441,23 +1469,20 @@ fn apply_command(
             report.created_spheres.push(id);
         }
         WorldCommand::SetSphereName { sphere, name } => {
-            state
-                .spheres
+            spheres_mut(state)
                 .get_mut(&sphere)
                 .ok_or(WorldError::SphereNotFound { id: sphere })?
                 .name = name;
         }
         WorldCommand::SetSphereVisible { sphere, visible } => {
-            state
-                .spheres
+            spheres_mut(state)
                 .get_mut(&sphere)
                 .ok_or(WorldError::SphereNotFound { id: sphere })?
                 .visible = visible;
         }
         WorldCommand::SetSphere { sphere, spec } => {
             spec.validate()?;
-            let current = state
-                .spheres
+            let current = spheres_mut(state)
                 .get_mut(&sphere)
                 .ok_or(WorldError::SphereNotFound { id: sphere })?;
             *current = FieldSphere {
@@ -1469,14 +1494,14 @@ fn apply_command(
             };
         }
         WorldCommand::RemoveSphere(id) => {
-            if state.spheres.remove(&id).is_none() {
+            if spheres_mut(state).remove(&id).is_none() {
                 return Err(WorldError::SphereNotFound { id });
             }
         }
         WorldCommand::CreateProbe(spec) => {
             validate_probe(state, &spec)?;
             let id = counters.next_probe();
-            state.probes.insert(
+            probes_mut(state).insert(
                 id,
                 Probe {
                     id,
@@ -1490,8 +1515,7 @@ fn apply_command(
             report.created_probes.push(id);
         }
         WorldCommand::SetProbeName { probe, name } => {
-            state
-                .probes
+            probes_mut(state)
                 .get_mut(&probe)
                 .ok_or(WorldError::ProbeNotFound { id: probe })?
                 .name = name;
@@ -1505,28 +1529,25 @@ fn apply_command(
                 history_capacity: 1,
             };
             validate_probe(state, &probe_spec)?;
-            state
-                .probes
+            probes_mut(state)
                 .get_mut(&probe)
                 .ok_or(WorldError::ProbeNotFound { id: probe })?
                 .position = position;
         }
         WorldCommand::SetProbeChannels { probe, channels } => {
-            let probe = state
-                .probes
+            let probe = probes_mut(state)
                 .get_mut(&probe)
                 .ok_or(WorldError::ProbeNotFound { id: probe })?;
             probe.channels = channels;
         }
         WorldCommand::SetProbeVisible { probe, visible } => {
-            state
-                .probes
+            probes_mut(state)
                 .get_mut(&probe)
                 .ok_or(WorldError::ProbeNotFound { id: probe })?
                 .visible = visible;
         }
         WorldCommand::RemoveProbe(id) => {
-            if state.probes.remove(&id).is_none() {
+            if probes_mut(state).remove(&id).is_none() {
                 return Err(WorldError::ProbeNotFound { id });
             }
         }

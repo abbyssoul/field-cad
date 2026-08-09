@@ -5,8 +5,8 @@
 //! whatever a plugin publishes.
 
 use fieldcad_core::{
-    BoxLattice, ChannelId, FieldColumn, FieldSnapshot, GradientColumn, GridLattice, SampleGeometry,
-    SampleValidity, SceneScale, SphereLattice, WorldSnapshot,
+    BoxLattice, ChannelId, FieldBatch, FieldColumn, FieldSnapshot, GradientColumn, GridLattice,
+    SampleGeometry, SampleValidity, SceneScale, SphereLattice, WorldSnapshot,
 };
 use glam::{DMat3, DVec3, Vec3};
 
@@ -49,220 +49,242 @@ pub fn field_geometry(
         return FieldGeometry::default();
     };
     let mut output = FieldGeometry::default();
-
     for batch in channel.batches.iter() {
-        let FieldColumn::Vector(values) = batch.values() else {
-            continue;
-        };
-        // Extracted once per batch, not once per glyph/streamline sample:
-        // whether a batch carries a gradient is a per-batch fact, and every
-        // consumer below falls back to today's trilinear/bilinear
-        // reconstruction when it is absent.
-        let gradient: Option<&[DMat3]> = match batch.gradient() {
-            Some(GradientColumn::Vector(gradient)) => Some(gradient.as_ref()),
-            _ => None,
-        };
-        match batch.geometry() {
-            SampleGeometry::Plane { plane, lattice } => {
-                if !show.planes {
-                    continue;
-                }
-                // The entity's own visibility, from the believed world — the
-                // same gate the plane's authoring outline answers to.
-                if !world.planes().get(plane).is_some_and(|plane| plane.visible) {
-                    continue;
-                }
-                let plane_settings = layers.planes.get(plane).copied().unwrap_or_default();
-                // Whether this plane draws this field is the plane's own
-                // setting. The channel's visibility is checked by the caller,
-                // which is what keeps the two independent: hiding a field here
-                // leaves every other plane showing it.
-                if !plane_settings.visible {
-                    continue;
-                }
-                let normal = lattice_normal(*lattice);
-                let displayed_values: Vec<_> = values
+        let contribution = region_geometry(batch, settings, layers, show, world, scene_scale);
+        output
+            .surface_triangles
+            .extend(contribution.surface_triangles);
+        output.vector_lines.extend(contribution.vector_lines);
+        output.flow_ribbons.extend(contribution.flow_ribbons);
+    }
+    output
+}
+
+/// One batch's own drawable contribution — the per-region unit
+/// [`field_geometry`]'s loop already treats each batch as. Extracted so a
+/// caller that already knows only one region's batch changed (see
+/// `app.rs`'s per-region geometry cache) can rebuild just that region
+/// instead of every batch in the channel.
+pub(crate) fn region_geometry(
+    batch: &FieldBatch,
+    settings: FieldLayerSettings,
+    layers: RegionLayers<'_>,
+    show: SceneVisibility,
+    world: &WorldSnapshot,
+    scene_scale: SceneScale,
+) -> FieldGeometry {
+    let mut output = FieldGeometry::default();
+    let FieldColumn::Vector(values) = batch.values() else {
+        return output;
+    };
+    // Extracted once per batch, not once per glyph/streamline sample:
+    // whether a batch carries a gradient is a per-batch fact, and every
+    // consumer below falls back to today's trilinear/bilinear
+    // reconstruction when it is absent.
+    let gradient: Option<&[DMat3]> = match batch.gradient() {
+        Some(GradientColumn::Vector(gradient)) => Some(gradient.as_ref()),
+        _ => None,
+    };
+    match batch.geometry() {
+        SampleGeometry::Plane { plane, lattice } => {
+            if !show.planes {
+                return output;
+            }
+            // The entity's own visibility, from the believed world — the
+            // same gate the plane's authoring outline answers to.
+            if !world.planes().get(plane).is_some_and(|plane| plane.visible) {
+                return output;
+            }
+            let plane_settings = layers.planes.get(plane).copied().unwrap_or_default();
+            // Whether this plane draws this field is the plane's own
+            // setting. The channel's visibility is checked by the caller,
+            // which is what keeps the two independent: hiding a field here
+            // leaves every other plane showing it.
+            if !plane_settings.visible {
+                return output;
+            }
+            let normal = lattice_normal(*lattice);
+            let displayed_values: Vec<_> = values
+                .iter()
+                .map(|value| displayed_plane_vector(*value, normal, plane_settings.vector_mode))
+                .collect();
+            // The projection applied to a value is linear, so the same
+            // projection applied to its Jacobian keeps the two
+            // consistent (∇(Pv) = P∇v for a constant projection P).
+            let displayed_gradient: Option<Vec<DMat3>> = gradient.map(|gradient| {
+                gradient
                     .iter()
-                    .map(|value| displayed_plane_vector(*value, normal, plane_settings.vector_mode))
-                    .collect();
-                // The projection applied to a value is linear, so the same
-                // projection applied to its Jacobian keeps the two
-                // consistent (∇(Pv) = P∇v for a constant projection P).
-                let displayed_gradient: Option<Vec<DMat3>> = gradient.map(|gradient| {
-                    gradient
-                        .iter()
-                        .map(|matrix| {
-                            displayed_plane_gradient(*matrix, normal, plane_settings.vector_mode)
-                        })
-                        .collect()
-                });
-                let displayed_gradient = displayed_gradient.as_deref();
-                let scale = MagnitudeScale::over(&displayed_values, batch.validity());
-                let colors = scale.colors(&displayed_values, batch.validity());
-                let field = PlaneField {
-                    lattice: *lattice,
-                    values: &displayed_values,
-                    gradient: displayed_gradient,
-                    validity: batch.validity(),
-                    colors: &colors,
+                    .map(|matrix| {
+                        displayed_plane_gradient(*matrix, normal, plane_settings.vector_mode)
+                    })
+                    .collect()
+            });
+            let displayed_gradient = displayed_gradient.as_deref();
+            let scale = MagnitudeScale::over(&displayed_values, batch.validity());
+            let colors = scale.colors(&displayed_values, batch.validity());
+            let field = PlaneField {
+                lattice: *lattice,
+                values: &displayed_values,
+                gradient: displayed_gradient,
+                validity: batch.validity(),
+                colors: &colors,
+                scale,
+            };
+            let offset = normal * 0.006;
+            if plane_settings.magnitude_visible {
+                append_plane_surface(
+                    &mut output.surface_triangles,
+                    &field,
+                    offset,
+                    plane_settings.magnitude_density,
+                    scene_scale,
+                );
+            }
+            if plane_settings.vectors.visible {
+                // Lifted clear of the colour mesh so the arrows are not
+                // z-fighting with the surface they describe.
+                append_plane_vectors(
+                    &mut output.vector_lines,
+                    &field,
+                    offset + normal * 0.008,
+                    plane_settings.vectors,
+                    scene_scale,
+                );
+            }
+            if plane_settings.flow_lines.visible {
+                // Traces the same in-plane-projected values the arrows
+                // above draw: a 2D streamline cannot depict an
+                // out-of-plane component either.
+                output.flow_ribbons.extend(trace_plane_streamlines(
+                    *lattice,
+                    &displayed_values,
+                    batch.validity(),
                     scale,
-                };
-                let offset = normal * 0.006;
-                if plane_settings.magnitude_visible {
-                    append_plane_surface(
-                        &mut output.surface_triangles,
-                        &field,
-                        offset,
-                        plane_settings.magnitude_density,
-                        scene_scale,
-                    );
-                }
-                if plane_settings.vectors.visible {
-                    // Lifted clear of the colour mesh so the arrows are not
-                    // z-fighting with the surface they describe.
-                    append_plane_vectors(
-                        &mut output.vector_lines,
-                        &field,
-                        offset + normal * 0.008,
-                        plane_settings.vectors,
-                        scene_scale,
-                    );
-                }
-                if plane_settings.flow_lines.visible {
-                    // Traces the same in-plane-projected values the arrows
-                    // above draw: a 2D streamline cannot depict an
-                    // out-of-plane component either.
-                    output.flow_ribbons.extend(trace_plane_streamlines(
-                        *lattice,
-                        &displayed_values,
-                        batch.validity(),
-                        scale,
-                        plane_settings.flow_lines,
-                        scene_scale,
-                        displayed_gradient,
-                    ));
-                }
+                    plane_settings.flow_lines,
+                    scene_scale,
+                    displayed_gradient,
+                ));
             }
-            SampleGeometry::Grid(lattice)
-                if settings.vectors.visible || settings.flow_lines.visible =>
-            {
-                let scale = MagnitudeScale::over(values, batch.validity());
-                if settings.vectors.visible {
-                    let colors = scale.colors(values, batch.validity());
-                    append_domain_vectors(
-                        &mut output.vector_lines,
-                        *lattice,
-                        values,
-                        batch.validity(),
-                        &colors,
-                        scale,
-                        settings.vectors,
-                        scene_scale,
-                        gradient,
-                    );
-                }
-                if settings.flow_lines.visible {
-                    output.flow_ribbons.extend(trace_domain_streamlines(
-                        *lattice,
-                        values,
-                        batch.validity(),
-                        scale,
-                        settings.flow_lines,
-                        scene_scale,
-                        gradient,
-                    ));
-                }
-            }
-            SampleGeometry::Box { region, lattice } => {
-                if !show.boxes {
-                    continue;
-                }
-                if !world
-                    .boxes()
-                    .get(region)
-                    .is_some_and(|region| region.visible)
-                {
-                    continue;
-                }
-                let box_settings = layers.boxes.get(region).copied().unwrap_or_default();
-                if !box_settings.visible
-                    || (!box_settings.vectors.visible && !box_settings.flow_lines.visible)
-                {
-                    continue;
-                }
-                let scale = MagnitudeScale::over(values, batch.validity());
-                if box_settings.vectors.visible {
-                    let colors = scale.colors(values, batch.validity());
-                    append_box_vectors(
-                        &mut output.vector_lines,
-                        *lattice,
-                        values,
-                        batch.validity(),
-                        &colors,
-                        scale,
-                        box_settings.vectors,
-                        scene_scale,
-                        gradient,
-                    );
-                }
-                if box_settings.flow_lines.visible {
-                    output.flow_ribbons.extend(trace_box_streamlines(
-                        *lattice,
-                        values,
-                        batch.validity(),
-                        scale,
-                        box_settings.flow_lines,
-                        scene_scale,
-                        gradient,
-                    ));
-                }
-            }
-            SampleGeometry::Sphere { region, lattice } => {
-                if !show.spheres {
-                    continue;
-                }
-                if !world
-                    .spheres()
-                    .get(region)
-                    .is_some_and(|region| region.visible)
-                {
-                    continue;
-                }
-                let sphere_settings = layers.spheres.get(region).copied().unwrap_or_default();
-                if !sphere_settings.visible
-                    || (!sphere_settings.vectors.visible && !sphere_settings.flow_lines.visible)
-                {
-                    continue;
-                }
-                let scale = MagnitudeScale::over(values, batch.validity());
-                if sphere_settings.vectors.visible {
-                    let colors = scale.colors(values, batch.validity());
-                    append_sphere_vectors(
-                        &mut output.vector_lines,
-                        *lattice,
-                        values,
-                        batch.validity(),
-                        &colors,
-                        scale,
-                        sphere_settings.vectors,
-                        scene_scale,
-                        gradient,
-                    );
-                }
-                if sphere_settings.flow_lines.visible {
-                    output.flow_ribbons.extend(trace_sphere_streamlines(
-                        *lattice,
-                        values,
-                        batch.validity(),
-                        scale,
-                        sphere_settings.flow_lines,
-                        scene_scale,
-                        gradient,
-                    ));
-                }
-            }
-            _ => {}
         }
+        SampleGeometry::Grid(lattice)
+            if settings.vectors.visible || settings.flow_lines.visible =>
+        {
+            let scale = MagnitudeScale::over(values, batch.validity());
+            if settings.vectors.visible {
+                let colors = scale.colors(values, batch.validity());
+                append_domain_vectors(
+                    &mut output.vector_lines,
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    &colors,
+                    scale,
+                    settings.vectors,
+                    scene_scale,
+                    gradient,
+                );
+            }
+            if settings.flow_lines.visible {
+                output.flow_ribbons.extend(trace_domain_streamlines(
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    scale,
+                    settings.flow_lines,
+                    scene_scale,
+                    gradient,
+                ));
+            }
+        }
+        SampleGeometry::Box { region, lattice } => {
+            if !show.boxes {
+                return output;
+            }
+            if !world
+                .boxes()
+                .get(region)
+                .is_some_and(|region| region.visible)
+            {
+                return output;
+            }
+            let box_settings = layers.boxes.get(region).copied().unwrap_or_default();
+            if !box_settings.visible
+                || (!box_settings.vectors.visible && !box_settings.flow_lines.visible)
+            {
+                return output;
+            }
+            let scale = MagnitudeScale::over(values, batch.validity());
+            if box_settings.vectors.visible {
+                let colors = scale.colors(values, batch.validity());
+                append_box_vectors(
+                    &mut output.vector_lines,
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    &colors,
+                    scale,
+                    box_settings.vectors,
+                    scene_scale,
+                    gradient,
+                );
+            }
+            if box_settings.flow_lines.visible {
+                output.flow_ribbons.extend(trace_box_streamlines(
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    scale,
+                    box_settings.flow_lines,
+                    scene_scale,
+                    gradient,
+                ));
+            }
+        }
+        SampleGeometry::Sphere { region, lattice } => {
+            if !show.spheres {
+                return output;
+            }
+            if !world
+                .spheres()
+                .get(region)
+                .is_some_and(|region| region.visible)
+            {
+                return output;
+            }
+            let sphere_settings = layers.spheres.get(region).copied().unwrap_or_default();
+            if !sphere_settings.visible
+                || (!sphere_settings.vectors.visible && !sphere_settings.flow_lines.visible)
+            {
+                return output;
+            }
+            let scale = MagnitudeScale::over(values, batch.validity());
+            if sphere_settings.vectors.visible {
+                let colors = scale.colors(values, batch.validity());
+                append_sphere_vectors(
+                    &mut output.vector_lines,
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    &colors,
+                    scale,
+                    sphere_settings.vectors,
+                    scene_scale,
+                    gradient,
+                );
+            }
+            if sphere_settings.flow_lines.visible {
+                output.flow_ribbons.extend(trace_sphere_streamlines(
+                    *lattice,
+                    values,
+                    batch.validity(),
+                    scale,
+                    sphere_settings.flow_lines,
+                    scene_scale,
+                    gradient,
+                ));
+            }
+        }
+        _ => {}
     }
     output
 }

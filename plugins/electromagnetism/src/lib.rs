@@ -10,7 +10,7 @@
 mod coupling;
 
 pub use coupling::{
-    CoupledAdvance, continuity_residual, deposit_charge_conserving_current,
+    CoupledAdvance, YeeFieldRef, continuity_residual, deposit_charge_conserving_current,
     deposit_particle_charge, deposit_source_charge, interpolate_particle_fields,
     periodic_charge_initial_state, relativistic_boris_velocity,
 };
@@ -802,7 +802,7 @@ impl MaxwellCore {
 
     pub fn advance_particles(
         &mut self,
-        fields: &YeeFieldState,
+        fields: YeeFieldRef<'_>,
         seconds: f64,
     ) -> Result<Option<CoupledAdvance>, PluginError> {
         let Some(coupling) = &mut self.particle_coupling else {
@@ -1031,8 +1031,6 @@ struct YeeFieldView<'a> {
     electric: &'a [DVec3],
     magnetic: &'a [DVec3],
     periodicity: LatticePeriodicity,
-    centred_electric: Vec<DVec3>,
-    centred_magnetic: Vec<DVec3>,
 }
 
 impl<'a> YeeFieldView<'a> {
@@ -1051,17 +1049,6 @@ impl<'a> YeeFieldView<'a> {
             )));
         }
         let counts = domain.resolution().cells();
-        let mut centred_electric = Vec::with_capacity(expected);
-        let mut centred_magnetic = Vec::with_capacity(expected);
-        for z in 0..counts.z {
-            for y in 0..counts.y {
-                for x in 0..counts.x {
-                    let (e, m) = centred_fields(counts, electric, magnetic, x, y, z);
-                    centred_electric.push(e);
-                    centred_magnetic.push(m);
-                }
-            }
-        }
         Ok(Self {
             domain,
             counts,
@@ -1069,9 +1056,15 @@ impl<'a> YeeFieldView<'a> {
             electric,
             magnetic,
             periodicity,
-            centred_electric,
-            centred_magnetic,
         })
+    }
+
+    /// Cell-centred `(E, B)` at one node, de-staggered on demand — see
+    /// [`centred_fields`]. Computed lazily rather than cached for the whole
+    /// grid, since most callers (a probe, a slice plane) only ever touch a
+    /// small fraction of the domain's cells.
+    fn centred_at(&self, x: u32, y: u32, z: u32) -> (DVec3, DVec3) {
+        centred_fields(self.counts, self.electric, self.magnetic, x, y, z)
     }
 
     /// Which cell indices on one axis hold a value this channel cannot trust.
@@ -1151,8 +1144,14 @@ impl<'a> YeeFieldView<'a> {
     /// from) is defined at every node with no staggering, so a symmetric
     /// stencil is both available and more accurate. Column `j` is
     /// `∂field/∂x_j`, matching [`GradientColumn::Vector`]'s convention.
-    fn gradient_of(&self, field: &[DVec3], x: u32, y: u32, z: u32) -> DMat3 {
-        let at = |values: &[DVec3], x, y, z| values[linear_index(self.counts, x, y, z)];
+    fn gradient_of(
+        &self,
+        select: impl Fn((DVec3, DVec3)) -> DVec3,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> DMat3 {
+        let at = |x, y, z| select(self.centred_at(x, y, z));
         let xn = wrap_next(x, self.counts.x);
         let xp = wrap_previous(x, self.counts.x);
         let yn = wrap_next(y, self.counts.y);
@@ -1160,18 +1159,18 @@ impl<'a> YeeFieldView<'a> {
         let zn = wrap_next(z, self.counts.z);
         let zp = wrap_previous(z, self.counts.z);
         DMat3::from_cols(
-            (at(field, xn, y, z) - at(field, xp, y, z)) / (2.0 * self.spacing.x),
-            (at(field, x, yn, z) - at(field, x, yp, z)) / (2.0 * self.spacing.y),
-            (at(field, x, y, zn) - at(field, x, y, zp)) / (2.0 * self.spacing.z),
+            (at(xn, y, z) - at(xp, y, z)) / (2.0 * self.spacing.x),
+            (at(x, yn, z) - at(x, yp, z)) / (2.0 * self.spacing.y),
+            (at(x, y, zn) - at(x, y, zp)) / (2.0 * self.spacing.z),
         )
     }
 
     fn electric_gradient(&self, x: u32, y: u32, z: u32) -> DMat3 {
-        self.gradient_of(&self.centred_electric, x, y, z)
+        self.gradient_of(|(e, _)| e, x, y, z)
     }
 
     fn magnetic_gradient(&self, x: u32, y: u32, z: u32) -> DMat3 {
-        self.gradient_of(&self.centred_magnetic, x, y, z)
+        self.gradient_of(|(_, b)| b, x, y, z)
     }
 
     /// Reconstruct a vector field at an arbitrary (possibly off-grid)
@@ -1198,10 +1197,9 @@ impl<'a> YeeFieldView<'a> {
             for dy in 0..=1 {
                 for dx in 0..=1 {
                     let cell = self.wrapped_cell(base.x + dx, base.y + dy, base.z + dz);
-                    let index = linear_index(self.counts, cell.x, cell.y, cell.z);
                     let corner = (dx + 2 * dy + 4 * dz) as usize;
                     let (value, gradient) = select(
-                        (self.centred_electric[index], self.centred_magnetic[index]),
+                        self.centred_at(cell.x, cell.y, cell.z),
                         (
                             self.electric_gradient(cell.x, cell.y, cell.z),
                             self.magnetic_gradient(cell.x, cell.y, cell.z),
@@ -1283,9 +1281,9 @@ impl<'a> YeeFieldView<'a> {
     }
 
     fn energy_at_cell(&self, x: u32, y: u32, z: u32) -> f64 {
-        let index = linear_index(self.counts, x, y, z);
-        0.5 * (VACUUM_PERMITTIVITY * self.centred_electric[index].length_squared()
-            + self.centred_magnetic[index].length_squared() / VACUUM_PERMEABILITY)
+        let (electric, magnetic) = self.centred_at(x, y, z);
+        0.5 * (VACUUM_PERMITTIVITY * electric.length_squared()
+            + magnetic.length_squared() / VACUUM_PERMEABILITY)
     }
 }
 
@@ -1490,9 +1488,9 @@ impl EquationSystemSolver for MaxwellSolver {
         self.core.accept_tick(context)?;
         let coupled = if self.core.has_particle_coupling() {
             self.core.advance_particles(
-                &YeeFieldState {
-                    electric: self.electric.clone(),
-                    magnetic: self.magnetic.clone(),
+                YeeFieldRef {
+                    electric: &self.electric,
+                    magnetic: &self.magnetic,
                 },
                 context.time_step.seconds(),
             )?

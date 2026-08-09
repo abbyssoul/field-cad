@@ -86,6 +86,14 @@ struct SnapshotDerived {
     vector_channels: Vec<ChannelId>,
     diagnostics: Vec<String>,
     has_errors: bool,
+    /// Bundled here too: which field systems exist cannot change without a
+    /// new snapshot being published (see the note on `build` below), so
+    /// re-fetching it from the source — and re-deriving `fields` and
+    /// `mutable_vector_channels` from it — is exactly as reusable as
+    /// everything else in this group, not an unconditional per-frame cost.
+    field_systems: Vec<FieldSystemStatus>,
+    fields: Vec<FieldRow>,
+    mutable_vector_channels: Vec<ChannelId>,
 }
 
 impl ComputeView {
@@ -113,13 +121,6 @@ impl ComputeView {
         let snapshot = source.latest_snapshot();
         let snapshot_sequence = snapshot.as_ref().map(|snapshot| snapshot.identity.sequence);
 
-        let field_systems = source.field_systems();
-        let mutable_vector_channels = field_systems
-            .iter()
-            .filter(|system| system.enabled)
-            .flat_map(|system| system.mutable_vector_channels.iter().cloned())
-            .collect();
-
         let reusable = previous.filter(|previous| previous.snapshot_sequence == snapshot_sequence);
         let SnapshotDerived {
             total_samples,
@@ -129,6 +130,9 @@ impl ComputeView {
             vector_channels,
             diagnostics,
             has_errors,
+            field_systems,
+            fields,
+            mutable_vector_channels,
         } = match reusable {
             Some(previous) => SnapshotDerived {
                 total_samples: previous.total_samples,
@@ -138,8 +142,11 @@ impl ComputeView {
                 vector_channels: previous.vector_channels.clone(),
                 diagnostics: previous.diagnostics.clone(),
                 has_errors: previous.has_errors,
+                field_systems: previous.field_systems.clone(),
+                fields: previous.fields.clone(),
+                mutable_vector_channels: previous.mutable_vector_channels.clone(),
             },
-            None => snapshot_derived(&snapshot, world, &field_systems),
+            None => snapshot_derived(source, &snapshot, world),
         };
 
         let queue = match previous {
@@ -170,7 +177,7 @@ impl ComputeView {
             domain_summary,
             probe_readings,
             channel_names,
-            fields: FieldRow::collect(&field_systems),
+            fields,
             field_systems,
             edit_history: source.edit_history(),
             vector_channels,
@@ -225,12 +232,22 @@ impl ComputeView {
 
 /// The expensive part of [`ComputeView::build`]: everything that scales
 /// with the number of published channels and probes, computed fresh only
-/// when there is no snapshot to reuse it from.
+/// when there is no snapshot to reuse it from — including `field_systems`
+/// itself, which clones a `ChannelSchema` per channel per system and is no
+/// cheaper to ask for than the rest of this group.
 fn snapshot_derived(
+    source: &dyn FieldDataSource,
     snapshot: &Option<Arc<FieldSnapshot>>,
     world: &WorldSnapshot,
-    field_systems: &[FieldSystemStatus],
 ) -> SnapshotDerived {
+    let field_systems = source.field_systems();
+    let mutable_vector_channels = field_systems
+        .iter()
+        .filter(|system| system.enabled)
+        .flat_map(|system| system.mutable_vector_channels.iter().cloned())
+        .collect();
+    let fields = FieldRow::collect(&field_systems);
+
     let mut probe_readings = Vec::new();
     let mut diagnostics = Vec::new();
     let mut has_errors = false;
@@ -241,7 +258,7 @@ fn snapshot_derived(
 
     // Available field names outlive publication. This keeps inactive
     // channels identifiable in probe recorders and the scene inspector.
-    for system in field_systems {
+    for system in &field_systems {
         for channel in &system.channels {
             channel_names.insert(channel.id.clone(), channel.display_name.clone());
         }
@@ -329,6 +346,9 @@ fn snapshot_derived(
         vector_channels,
         diagnostics,
         has_errors,
+        field_systems,
+        fields,
+        mutable_vector_channels,
     }
 }
 
@@ -749,6 +769,44 @@ mod tests {
         assert!(view.channel_names.contains_key(&vector_channel_id()));
         assert!(view.vector_channels.is_empty());
         assert!(view.probe_readings.is_empty());
+    }
+
+    /// Regression for the `field_systems()` per-frame-clone fix: reusing
+    /// `field_systems`/`fields`/`mutable_vector_channels` from `previous`
+    /// whenever `snapshot_sequence` is unchanged is only correct if every
+    /// realtime flip actually publishes a new snapshot — not just the
+    /// mid-gesture catch-up path `set_field_system_realtime` used to gate
+    /// it behind. Before that companion fix, toggling realtime outside an
+    /// edit changed `slot.realtime` without bumping `snapshot_sequence`, so
+    /// this view would have shown the stale value from `previous` forever.
+    #[test]
+    fn toggling_realtime_outside_a_gesture_is_visible_on_the_next_frame() {
+        let world = seeded_world();
+        let mut source = source();
+        let system = source.field_systems()[0].plugin.id.clone();
+        let before = ComputeView::build(&source, &world.snapshot(), None);
+        assert!(
+            before.field_systems[0].realtime,
+            "test assumes realtime starts on"
+        );
+
+        source
+            .execute(fieldcad_simulation::CommandSequencer::default().issue(
+                fieldcad_simulation::CommandPayload::SetFieldSystemRealtime {
+                    plugin: system,
+                    realtime: false,
+                },
+            ))
+            .unwrap();
+
+        let after = ComputeView::build(&source, &world.snapshot(), Some(&before));
+
+        assert_ne!(
+            after.snapshot_sequence, before.snapshot_sequence,
+            "a realtime flip outside a gesture must still publish, or a cache keyed \
+             on snapshot_sequence shows a stale field_systems() forever"
+        );
+        assert!(!after.field_systems[0].realtime);
     }
 
     #[test]

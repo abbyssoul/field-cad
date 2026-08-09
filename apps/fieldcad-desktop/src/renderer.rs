@@ -62,7 +62,14 @@ pub(crate) struct SceneFrame<'a> {
     pub grid_visible: bool,
     pub axes_visible: bool,
     pub instances: &'a [ObjectInstance],
-    pub field: &'a FieldGeometry,
+    /// The channel-layer geometry cached across frames — see
+    /// `WindowState::field_layer_geometry`.
+    pub base: &'a FieldGeometry,
+    /// Live drag/selection-dependent geometry (authoring proxies, compute
+    /// bounds, pending-edit ghosts, the transform gizmo) rebuilt fresh every
+    /// frame, kept separate from `base` so a cache hit there is never
+    /// mutated in place.
+    pub overlay: &'a FieldGeometry,
     /// Wall-clock seconds since the window was created, independent of
     /// simulation time. Drives the animated flow-line shader; meaningless to
     /// everything else this renderer draws.
@@ -256,7 +263,8 @@ impl ViewportRenderer {
             frame.camera,
             frame.viewport.aspect_ratio(),
             frame.instances,
-            frame.field,
+            frame.base,
+            frame.overlay,
             frame.time_seconds,
             [frame.viewport.width as f32, frame.viewport.height as f32],
         );
@@ -601,6 +609,9 @@ pub(crate) struct SceneRenderer {
     sphere_index_count: u32,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
+    /// Reused across frames instead of collected fresh — see the analogous
+    /// `scratch` field on [`DynamicVertexBuffer`].
+    instance_scratch: Vec<InstanceRaw>,
     box_instance_count: u32,
     sphere_instance_count: u32,
     field_surface: DynamicVertexBuffer,
@@ -806,6 +817,7 @@ impl SceneRenderer {
             sphere_index_count: sphere_indices.len() as u32,
             instance_buffer,
             instance_capacity,
+            instance_scratch: Vec::new(),
             box_instance_count: 0,
             sphere_instance_count: 0,
             field_surface: DynamicVertexBuffer::new(device, "Field magnitude surface"),
@@ -822,7 +834,8 @@ impl SceneRenderer {
         camera: &OrbitCamera,
         aspect_ratio: f32,
         instances: &[ObjectInstance],
-        field: &FieldGeometry,
+        base: &FieldGeometry,
+        overlay: &FieldGeometry,
         time_seconds: f32,
         viewport_size: [f32; 2],
     ) {
@@ -843,24 +856,24 @@ impl SceneRenderer {
             }),
         );
 
-        let raw: Vec<InstanceRaw> = instances
-            .iter()
-            .filter(|instance| instance.mesh == ObjectMesh::Box)
-            .chain(
-                instances
-                    .iter()
-                    .filter(|instance| instance.mesh == ObjectMesh::Sphere),
-            )
-            .map(InstanceRaw::from_instance)
-            .collect();
-        self.box_instance_count = instances
-            .iter()
-            .filter(|instance| instance.mesh == ObjectMesh::Box)
-            .count() as u32;
-        self.sphere_instance_count = raw.len() as u32 - self.box_instance_count;
-        if !raw.is_empty() {
-            if raw.len() > self.instance_capacity {
-                self.instance_capacity = raw.len().next_power_of_two();
+        self.instance_scratch.clear();
+        self.instance_scratch.extend(
+            instances
+                .iter()
+                .filter(|instance| instance.mesh == ObjectMesh::Box)
+                .map(InstanceRaw::from_instance),
+        );
+        self.box_instance_count = self.instance_scratch.len() as u32;
+        self.instance_scratch.extend(
+            instances
+                .iter()
+                .filter(|instance| instance.mesh == ObjectMesh::Sphere)
+                .map(InstanceRaw::from_instance),
+        );
+        self.sphere_instance_count = self.instance_scratch.len() as u32 - self.box_instance_count;
+        if !self.instance_scratch.is_empty() {
+            if self.instance_scratch.len() > self.instance_capacity {
+                self.instance_capacity = self.instance_scratch.len().next_power_of_two();
                 self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Object instances"),
                     size: (self.instance_capacity * std::mem::size_of::<InstanceRaw>())
@@ -869,13 +882,23 @@ impl SceneRenderer {
                     mapped_at_creation: false,
                 });
             }
-            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&raw));
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.instance_scratch),
+            );
         }
 
-        self.field_surface
-            .update(device, queue, &field.surface_triangles);
-        self.field_lines.update(device, queue, &field.vector_lines);
-        self.flow_lines.update(device, queue, &field.flow_ribbons);
+        self.field_surface.update(
+            device,
+            queue,
+            &base.surface_triangles,
+            &overlay.surface_triangles,
+        );
+        self.field_lines
+            .update(device, queue, &base.vector_lines, &overlay.vector_lines);
+        self.flow_lines
+            .update(device, queue, &base.flow_ribbons, &overlay.flow_ribbons);
     }
 
     pub(crate) fn draw<'pass>(
@@ -1011,6 +1034,10 @@ struct DynamicVertexBuffer {
     buffer: wgpu::Buffer,
     capacity: usize,
     count: u32,
+    /// Reused across `update` calls instead of collected fresh — `.clear()`
+    /// and `.extend()` in place keep this buffer's capacity warm rather than
+    /// freeing and reallocating it every frame.
+    scratch: Vec<Vertex>,
 }
 
 impl DynamicVertexBuffer {
@@ -1026,30 +1053,41 @@ impl DynamicVertexBuffer {
             }),
             capacity,
             count: 0,
+            scratch: Vec::new(),
         }
     }
 
-    fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[ColoredVertex]) {
+    /// `base` and `overlay` are drawn as one combined buffer — see
+    /// [`crate::renderer::SceneFrame`] — with `base` given priority over
+    /// `overlay` if together they exceed what one GPU buffer can hold, since
+    /// `overlay` is UI extras (authoring proxies, ghosts, the gizmo) rather
+    /// than the geometry a channel layer actually publishes.
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        base: &[ColoredVertex],
+        overlay: &[ColoredVertex],
+    ) {
         // 6 is safe for either primitive type this buffer is drawn as
         // (`LineList` needs a multiple of 2, `TriangleList` a multiple of 3).
         let allowed = clamp_vertex_count(
             device,
-            vertices.len(),
+            base.len() + overlay.len(),
             std::mem::size_of::<Vertex>(),
             6,
             self.label,
         );
-        let vertices = &vertices[..allowed];
-        self.count = vertices.len() as u32;
-        if vertices.is_empty() {
+        self.count = allowed as u32;
+        self.scratch.clear();
+        if allowed == 0 {
             return;
         }
-        if vertices.len() > self.capacity {
+        if allowed > self.capacity {
             // Never past the device limit — `next_power_of_two` alone can
-            // round straight back over it even though `vertices.len()` was
-            // already clamped under it.
-            self.capacity = vertices
-                .len()
+            // round straight back over it even though `allowed` was already
+            // clamped under it.
+            self.capacity = allowed
                 .next_power_of_two()
                 .min(max_buffer_elements(device, std::mem::size_of::<Vertex>()));
             self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1059,8 +1097,13 @@ impl DynamicVertexBuffer {
                 mapped_at_creation: false,
             });
         }
-        let raw: Vec<Vertex> = vertices.iter().copied().map(Vertex::from).collect();
-        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&raw));
+        let base_allowed = allowed.min(base.len());
+        let overlay_allowed = allowed - base_allowed;
+        self.scratch
+            .extend(base[..base_allowed].iter().copied().map(Vertex::from));
+        self.scratch
+            .extend(overlay[..overlay_allowed].iter().copied().map(Vertex::from));
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.scratch));
     }
 }
 
@@ -1073,6 +1116,8 @@ struct DynamicFlowLineBuffer {
     buffer: wgpu::Buffer,
     capacity: usize,
     count: u32,
+    /// See the equivalent field on [`DynamicVertexBuffer`].
+    scratch: Vec<FlowLineVertex>,
 }
 
 impl DynamicFlowLineBuffer {
@@ -1088,31 +1133,35 @@ impl DynamicFlowLineBuffer {
             }),
             capacity,
             count: 0,
+            scratch: Vec::new(),
         }
     }
 
+    /// See the equivalent doc comment and base/overlay priority rule on
+    /// [`DynamicVertexBuffer::update`].
     fn update(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vertices: &[FlowRibbonVertex],
+        base: &[FlowRibbonVertex],
+        overlay: &[FlowRibbonVertex],
     ) {
         // 6 vertices per ribbon quad — see `build_flow_ribbon`.
         let allowed = clamp_vertex_count(
             device,
-            vertices.len(),
+            base.len() + overlay.len(),
             std::mem::size_of::<FlowLineVertex>(),
             6,
             self.label,
         );
-        let vertices = &vertices[..allowed];
-        self.count = vertices.len() as u32;
-        if vertices.is_empty() {
+        self.count = allowed as u32;
+        self.scratch.clear();
+        if allowed == 0 {
             return;
         }
-        if vertices.len() > self.capacity {
+        if allowed > self.capacity {
             // See the equivalent comment in `DynamicVertexBuffer::update`.
-            self.capacity = vertices.len().next_power_of_two().min(max_buffer_elements(
+            self.capacity = allowed.next_power_of_two().min(max_buffer_elements(
                 device,
                 std::mem::size_of::<FlowLineVertex>(),
             ));
@@ -1124,8 +1173,21 @@ impl DynamicFlowLineBuffer {
                 mapped_at_creation: false,
             });
         }
-        let raw: Vec<FlowLineVertex> = vertices.iter().copied().map(FlowLineVertex::from).collect();
-        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&raw));
+        let base_allowed = allowed.min(base.len());
+        let overlay_allowed = allowed - base_allowed;
+        self.scratch.extend(
+            base[..base_allowed]
+                .iter()
+                .copied()
+                .map(FlowLineVertex::from),
+        );
+        self.scratch.extend(
+            overlay[..overlay_allowed]
+                .iter()
+                .copied()
+                .map(FlowLineVertex::from),
+        );
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.scratch));
     }
 }
 

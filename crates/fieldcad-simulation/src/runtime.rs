@@ -945,8 +945,14 @@ impl SimulationRuntime {
         if realtime && self.is_editing() && self.plugins[index].enabled {
             let world = self.world.snapshot();
             self.plugins[index].solver_mut().on_world_changed(&world)?;
-            self.publish_snapshot(SamplingPolicy::All)?;
         }
+        // Every branch above changes what `field_systems()` reports (the
+        // `realtime` flag itself), not just the mid-gesture catch-up, so
+        // every branch must publish — a consumer that caches
+        // `field_systems()` behind the published sequence would otherwise
+        // show a stale toggle until an unrelated publication happened to
+        // come along.
+        self.publish_snapshot(SamplingPolicy::All)?;
         Ok(())
     }
 

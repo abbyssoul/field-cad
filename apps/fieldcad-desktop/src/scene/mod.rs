@@ -21,6 +21,7 @@ pub use authoring::{
     SceneVisibility, append_authoring_geometry, append_compute_bounds, append_pending_edit_ghosts,
 };
 pub use field::field_geometry;
+pub(crate) use field::region_geometry;
 pub use gizmo::{
     GizmoDisplay, TransformHandle, TransformPreview, append_transform_gizmo_with_display,
     constrained_translation, dragged_box_rotation, dragged_plane_normal,
@@ -31,8 +32,8 @@ pub use gizmo::{
 pub use pick::pick_scene;
 
 use fieldcad_core::{
-    BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SceneScale, SphereId, WorldObject,
-    WorldSnapshot,
+    BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SampleGeometry, SceneScale, SphereId,
+    WorldObject, WorldSnapshot,
 };
 use glam::{DQuat, DVec3, Mat4, Quat, Vec3, Vec4};
 
@@ -325,6 +326,37 @@ pub struct FieldGeometry {
     pub surface_triangles: Vec<ColoredVertex>,
     pub vector_lines: Vec<ColoredVertex>,
     pub flow_ribbons: Vec<FlowRibbonVertex>,
+}
+
+/// Which entity a batch's [`fieldcad_core::SampleGeometry`] names, independent
+/// of that entity's current transform — the stable half of a batch's
+/// identity. The transform-dependent half (the lattice baked into the
+/// batch) is not part of this: a cache keyed on `RegionId` compares the
+/// batch itself as content, so a region that has moved is detected by its
+/// batch differing, not by this identifier changing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RegionId {
+    Plane(PlaneId),
+    Box(BoxId),
+    Sphere(SphereId),
+    /// The whole-domain sample every channel may publish alongside its
+    /// per-entity batches — one per channel, not tied to any world entity.
+    Grid,
+}
+
+impl RegionId {
+    /// `None` for a batch [`field_geometry`](field::field_geometry) never
+    /// draws (`SampleGeometry::Probes` — probe readings are presented
+    /// elsewhere, not as channel-layer geometry).
+    pub(crate) fn of(geometry: &SampleGeometry) -> Option<Self> {
+        match geometry {
+            SampleGeometry::Plane { plane, .. } => Some(Self::Plane(*plane)),
+            SampleGeometry::Box { region, .. } => Some(Self::Box(*region)),
+            SampleGeometry::Sphere { region, .. } => Some(Self::Sphere(*region)),
+            SampleGeometry::Grid(_) => Some(Self::Grid),
+            SampleGeometry::Probes { .. } => None,
+        }
+    }
 }
 
 /// One channel's per-region layer settings, borrowed from its owner (the
