@@ -348,6 +348,26 @@ pub struct QueueStatus {
     pub history: Vec<CommandRecord>,
 }
 
+/// The pending command queue's full contents, for durable storage.
+///
+/// Sibling of [`QueueStatus`], but each entry is a directly resubmittable
+/// [`CommandPayload`] rather than display-only [`CommandRecord`] metadata —
+/// `QueueStatus`/`CommandRecord` stay a read-only wire contract (their
+/// payload is deliberately never serialized, see [`CommandRecord`]'s own
+/// doc), while this type exists specifically so a paused queue's edits — a
+/// world/domain-change write-ahead log the authored world hasn't yet
+/// absorbed — survive a save/load cycle rather than being silently
+/// discarded. Restoring one replays each entry through the ordinary command
+/// path (`PauseQueue` then each pending payload in order), not a bypass.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct QueueDocument {
+    pub paused: bool,
+    /// Oldest first, matching `pending_mutations`' order. Always
+    /// [`CommandPayload::CommitWorld`] or [`CommandPayload::ReconfigureDomain`]
+    /// — the only two variants a queued [`PendingPayload`] ever holds.
+    pub pending: Vec<CommandPayload>,
+}
+
 /// The shape of a [`QueueStatus`] without its contents: whether it is
 /// paused, how many pending/history records it holds, and the newest
 /// history entry's id. A change-detecting caller (a publish/broadcast loop
@@ -723,6 +743,30 @@ impl SessionCore {
             paused: self.queue_paused,
             pending: self.pending_mutations.iter().cloned().collect(),
             history: self.terminal_history.iter().cloned().collect(),
+        }
+    }
+
+    /// The pending queue's full contents, for durable storage — see
+    /// [`QueueDocument`]. `payload` is always `Some` for a `Queued` record
+    /// (only cleared once a record goes terminal, [`Self::record_terminal`]),
+    /// so nothing is silently dropped.
+    fn queue_document(&self) -> QueueDocument {
+        QueueDocument {
+            paused: self.queue_paused,
+            pending: self
+                .pending_mutations
+                .iter()
+                .filter_map(|record| {
+                    record.payload.as_ref().map(|payload| match payload {
+                        PendingPayload::World(commands) => {
+                            CommandPayload::CommitWorld(commands.clone())
+                        }
+                        PendingPayload::Domain(domain) => {
+                            CommandPayload::ReconfigureDomain(*domain)
+                        }
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -1167,6 +1211,14 @@ impl LocalDataSource {
 
     pub fn cancellation(&self) -> fieldcad_plugin_api::SolverCancellation {
         self.core.runtime.cancellation()
+    }
+
+    /// The pending command queue's full contents, for durable storage — see
+    /// [`QueueDocument`]. Not a [`FieldDataSource`] trait method: save/load
+    /// is inherently local-session-only, and a future remote implementor
+    /// should not be forced to support raw queue export.
+    pub fn queue_document(&self) -> QueueDocument {
+        self.core.queue_document()
     }
 
     fn publish(&mut self) -> Result<bool, SourceError> {

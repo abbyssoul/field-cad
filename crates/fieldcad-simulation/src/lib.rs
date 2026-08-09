@@ -28,7 +28,7 @@ pub use source::{
     Command, CommandDisposition, CommandId, CommandKind, CommandLifecycle, CommandPayload,
     CommandReceipt, CommandRecord, CommandSequencer, DataSourceStatus, FieldDataSource,
     LocalDataSource, LoopbackDataSource, PlaybackSpeed, PlaybackSpeedError, PollOutcome,
-    QueueStatus, QueueSummary, SnapshotMailbox, SnapshotRejection, SourceError,
+    QueueDocument, QueueStatus, QueueSummary, SnapshotMailbox, SnapshotRejection, SourceError,
 };
 
 #[cfg(test)]

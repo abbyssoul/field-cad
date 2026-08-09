@@ -46,17 +46,26 @@ pub use event_hub::{EventHub, EventWatcher, SessionEvent, WatchEvent};
 pub fn default_session() -> Result<AsyncLocalDataSource, SessionError> {
     let domain = Domain::centred_cube(5.0, 32)?;
     let time_step = TimeStep::from_seconds(courant_limit(&domain) * 0.8)?;
-    let runtime = SimulationRuntime::new(
-        RuntimeConfig::new(domain, time_step, SessionId::from_u128(1))
-            .with_plugin(Box::new(ElectrostaticsPlugin::new()))
-            .with_plugin_registration(
-                PluginRegistration::with_default_configuration(Box::new(
-                    ElectromagnetismPlugin::new(),
-                ))
-                .with_enabled(false),
-            ),
-    )?;
+    let config = server_plugin_catalog().into_iter().fold(
+        RuntimeConfig::new(domain, time_step, SessionId::from_u128(1)),
+        |config, registration| config.with_plugin_registration(registration),
+    );
+    let runtime = SimulationRuntime::new(config)?;
     Ok(AsyncLocalDataSource::new(LocalDataSource::new(runtime)))
+}
+
+/// The headless server's CPU-only plugin composition: one electric field,
+/// two candidate models — electrostatics active, Maxwell composed but
+/// inactive. Factored out of [`default_session`] so a scene-lifecycle
+/// loader (new/save/load, `fieldcad-scene-document`) can rebuild a session
+/// from this same composition rather than a hardcoded one, the way the
+/// desktop app's GPU-backed catalog does for its own host.
+pub fn server_plugin_catalog() -> Vec<PluginRegistration> {
+    vec![
+        PluginRegistration::with_default_configuration(Box::new(ElectrostaticsPlugin::new())),
+        PluginRegistration::with_default_configuration(Box::new(ElectromagnetismPlugin::new()))
+            .with_enabled(false),
+    ]
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -257,6 +266,51 @@ impl HeadlessServer {
 
     pub fn scene_scale(&self) -> SceneScale {
         self.source.scene_scale()
+    }
+
+    /// The current authoritative numerical time step.
+    pub fn time_step(&self) -> TimeStep {
+        self.source.simulation_status().time_step()
+    }
+
+    /// Synchronously read the current session's full world contents (with
+    /// identifier counters) and pending-queue contents, for durable
+    /// storage — see [`fieldcad_core::WorldDocument`] and
+    /// [`fieldcad_simulation::QueueDocument`]. A rare, explicit, one-shot
+    /// save action; blocking on the compute worker is deliberate, the same
+    /// way `AsyncLocalDataSource::capture_document` documents.
+    pub fn capture_document(
+        &mut self,
+    ) -> Result<
+        (
+            fieldcad_core::WorldDocument,
+            fieldcad_simulation::QueueDocument,
+        ),
+        SourceError,
+    > {
+        self.source.capture_document()
+    }
+
+    /// Replace the inner session in place — a new/loaded scene replaces the
+    /// world, domain, and field-system composition without disturbing the
+    /// `Arc<Mutex<HeadlessServer>>` every attached transport (desktop UI,
+    /// embedded MCP) already holds a clone of.
+    ///
+    /// Every waiter registered by [`submit_and_await`](Self::submit_and_await)
+    /// against the *old* session can never resolve — drop their senders so
+    /// an awaiting caller gets a clean disconnect instead of hanging
+    /// forever. Reset the event hub's change-detection cache: the new
+    /// session's first `SnapshotIdentity`/`SimulationStatus` can
+    /// coincidentally equal cached values from the old session (both
+    /// commonly start at sequence 0 / tick 0), which would otherwise
+    /// suppress the first post-replace publish and leave subscribers on
+    /// stale state.
+    pub fn replace_source(&mut self, source: AsyncLocalDataSource) {
+        self.source = source;
+        self.waiters.clear();
+        self.events.clear();
+        self.hub.reset();
+        self.publish();
     }
 }
 

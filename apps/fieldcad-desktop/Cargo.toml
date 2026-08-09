@@ -10,14 +10,17 @@ path = "src/main.rs"
 [dependencies]
 bytemuck = { workspace = true }
 clap = { workspace = true }
+directories = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
 egui-winit = { workspace = true }
 fieldcad-core = { workspace = true }
+fieldcad-dynamics = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-electromagnetism = { workspace = true }
 fieldcad-electrostatics = { workspace = true }
 fieldcad-gravity = { workspace = true }
+fieldcad-scene-document = { workspace = true }
 fieldcad-sources = { workspace = true }
 fieldcad-mcp = { workspace = true }
 fieldcad-particles = { workspace = true }
@@ -26,6 +29,9 @@ fieldcad-server = { workspace = true }
 fieldcad-simulation = { workspace = true }
 glam = { workspace = true }
 pollster = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 tokio-util = { workspace = true }

@@ -11,6 +11,11 @@ path = "src/main.rs"
 [dependencies]
 axum = { workspace = true }
 fieldcad-core = { workspace = true }
+fieldcad-dynamics = { workspace = true }
+fieldcad-electromagnetic-sources = { workspace = true }
+fieldcad-electromagnetism = { workspace = true }
+fieldcad-electrostatics = { workspace = true }
+fieldcad-scene-document = { workspace = true }
 fieldcad-server = { workspace = true }
 fieldcad-simulation = { workspace = true }
 glam = { workspace = true }
@@ -34,6 +39,5 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-fieldcad-electromagnetic-sources = { workspace = true }
-fieldcad-electrostatics = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util"] }

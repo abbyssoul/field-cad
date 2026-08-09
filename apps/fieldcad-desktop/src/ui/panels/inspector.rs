@@ -27,8 +27,10 @@ pub fn inspector(
                             frame.edit_in_progress,
                             output,
                         );
-                    } else if let Some(object) =
-                        model.selection.and_then(|id| frame.world.object(id))
+                    } else if let Some(object) = model
+                        .selection
+                        .and_then(|id| frame.world.object(id))
+                        .filter(|object| !object.derived)
                     {
                         ui.heading("Object");
                         ui.separator();

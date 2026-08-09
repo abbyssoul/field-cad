@@ -24,7 +24,10 @@ async fn connections_reflects_a_real_client_session() {
     let addr = listener.local_addr().unwrap();
 
     let source = fieldcad_server::default_session().expect("default session builds");
-    let server = McpServer::new(Arc::new(Mutex::new(HeadlessServer::new(source))));
+    let server = McpServer::new(
+        Arc::new(Mutex::new(HeadlessServer::new(source))),
+        Arc::new(fieldcad_mcp::mcp_plugin_catalog),
+    );
 
     let ct = CancellationToken::new();
     let serve_ct = ct.clone();

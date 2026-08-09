@@ -7,7 +7,7 @@ use crate::ui::compute::{
     ComputeView, WorkbenchState, format_simulation_time, format_time_step, parse_playback_speed,
     time_step_drag_speed,
 };
-use crate::ui::{FrameContext, UiFrameOutput, UiModel, ViewportTool};
+use crate::ui::{AppAction, FrameContext, UiFrameOutput, UiModel, ViewportTool};
 
 pub fn menu_bar(
     root: &mut egui::Ui,
@@ -21,6 +21,33 @@ pub fn menu_bar(
     egui::Panel::top("menu_bar").show(root, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.strong("Field CAD");
+            ui.menu_button("File", |ui| {
+                if ui.button("New (Empty)").clicked() {
+                    output.app_action = Some(AppAction::NewScene { template: false });
+                    ui.close();
+                }
+                if ui.button("New (Demo Scene)").clicked() {
+                    output.app_action = Some(AppAction::NewScene { template: true });
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Save").clicked() {
+                    output.app_action = Some(AppAction::SaveScene);
+                    ui.close();
+                }
+                if ui.button("Save As…").clicked() {
+                    output.app_action = Some(AppAction::SaveSceneAs);
+                    ui.close();
+                }
+                if ui.button("Open…").clicked() {
+                    output.app_action = Some(AppAction::OpenScene);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.checkbox(&mut model.settings_visible, "Settings…").clicked() {
+                    ui.close();
+                }
+            });
             ui.separator();
 
             ui.label("Tool");

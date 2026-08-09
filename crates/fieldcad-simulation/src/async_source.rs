@@ -24,8 +24,8 @@ use glam::DVec3;
 use crate::{
     Command, CommandDisposition, CommandId, CommandKind, CommandPayload, CommandReceipt,
     CommandRecord, DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus,
-    LocalDataSource, PlaybackSpeed, PollOutcome, QueueStatus, QueueSummary, SimulationStatus,
-    SnapshotMailbox, SourceError, Subscription,
+    LocalDataSource, PlaybackSpeed, PollOutcome, QueueDocument, QueueStatus, QueueSummary,
+    SimulationStatus, SnapshotMailbox, SourceError, Subscription,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +50,12 @@ impl CommandEvent {
 enum WorkerRequest {
     Execute(Command),
     Poll(Duration),
+    /// A synchronous, save-only read of the full world/queue contents — see
+    /// [`AsyncLocalDataSource::capture_document`]. Sent on the ordinary
+    /// `requests` channel, not `priority_requests`: a save should reflect
+    /// state as of everything already submitted before it, not jump ahead of
+    /// a backlog the way a queue-control command does.
+    CaptureDocument,
     Stop,
 }
 
@@ -82,6 +88,12 @@ enum WorkerEvent {
         terminal: Vec<CommandEvent>,
     },
     PollFailed(SourceError),
+    /// Answer to [`WorkerRequest::CaptureDocument`] — carries no `state`,
+    /// since a save-only read changes nothing about the running session.
+    DocumentCaptured {
+        world: fieldcad_core::WorldDocument,
+        queue: QueueDocument,
+    },
 }
 
 #[derive(Debug)]
@@ -245,71 +257,17 @@ impl AsyncLocalDataSource {
         let mut aggregate = PollOutcome::default();
         loop {
             match self.events.try_recv() {
-                Ok(WorkerEvent::CommandCompleted {
-                    receipt,
-                    state,
-                    terminal,
-                }) => {
-                    self.submitted_commands.remove(&receipt.command);
-                    aggregate.snapshot_updated |= self.adopt(state)?;
-                    self.command_events.extend(terminal);
-                    // A queued acknowledgement is not terminal completion:
-                    // its real completion (or rejection) arrives later, via
-                    // a `PollCompleted.terminal` entry, once a tick boundary
-                    // actually applies it.
-                    if receipt.disposition != CommandDisposition::Queued {
-                        self.command_events.push(CommandEvent::Completed(receipt));
+                Ok(event) => {
+                    if let Some(outcome) = self.handle_worker_event(event)? {
+                        aggregate.snapshot_updated |= outcome.snapshot_updated;
+                        aggregate.ticks_advanced = aggregate
+                            .ticks_advanced
+                            .saturating_add(outcome.ticks_advanced);
+                        aggregate.commands_applied = aggregate
+                            .commands_applied
+                            .saturating_add(outcome.commands_applied);
+                        aggregate.fell_behind |= outcome.fell_behind;
                     }
-                }
-                Ok(WorkerEvent::CommandFailed {
-                    command,
-                    error,
-                    state,
-                    terminal,
-                }) => {
-                    self.submitted_commands.remove(&command);
-                    aggregate.snapshot_updated |= self.adopt(state)?;
-                    // terminal may already contain a Failed for this command
-                    // (e.g. from reject_if_queue_paused in BE-7). Only push
-                    // one if it's not already there — otherwise the same
-                    // command failure is reported twice.
-                    let already_reported = terminal.iter().any(|event| {
-                        matches!(
-                            event,
-                            CommandEvent::Failed { command: id, .. } if *id == command
-                        )
-                    });
-                    self.command_events.extend(terminal);
-                    if !already_reported {
-                        self.command_events
-                            .push(CommandEvent::Failed { command, error });
-                    }
-                }
-                Ok(WorkerEvent::PollCompleted {
-                    outcome,
-                    state,
-                    terminal,
-                }) => {
-                    self.poll_in_flight = false;
-                    aggregate.snapshot_updated |= outcome.snapshot_updated;
-                    aggregate.snapshot_updated |= self.adopt(state)?;
-                    aggregate.ticks_advanced = aggregate
-                        .ticks_advanced
-                        .saturating_add(outcome.ticks_advanced);
-                    aggregate.commands_applied = aggregate
-                        .commands_applied
-                        .saturating_add(outcome.commands_applied);
-                    aggregate.fell_behind |= outcome.fell_behind;
-                    self.command_events.extend(terminal);
-                }
-                Ok(WorkerEvent::PollFailed(error)) => {
-                    self.poll_in_flight = false;
-                    self.failure = Some(error.to_string());
-                    // Don't return early (BE-9): earlier events in this
-                    // batch already called adopt() and their aggregate is
-                    // valid. Return it so the caller (e.g. the desktop's
-                    // per-frame pump) still redraws. The failure is visible
-                    // through status().
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -320,6 +278,128 @@ impl AsyncLocalDataSource {
             }
         }
         Ok(aggregate)
+    }
+
+    /// One worker event's effect on `self` — shared between the
+    /// non-blocking [`Self::drain_worker_events`] loop and the blocking wait
+    /// in [`Self::capture_document`], which must apply any ordinary event it
+    /// happens to receive while waiting for its own answer, exactly as
+    /// `drain_worker_events` would have. Returns the poll-shaped part of the
+    /// outcome (`None` for anything that isn't a `PollCompleted`) so the
+    /// non-blocking caller can still aggregate it; `capture_document` ignores
+    /// it and matches `WorkerEvent::DocumentCaptured` directly instead of
+    /// routing it through here.
+    fn handle_worker_event(
+        &mut self,
+        event: WorkerEvent,
+    ) -> Result<Option<PollOutcome>, SourceError> {
+        match event {
+            WorkerEvent::CommandCompleted {
+                receipt,
+                state,
+                terminal,
+            } => {
+                self.submitted_commands.remove(&receipt.command);
+                let snapshot_updated = self.adopt(state)?;
+                self.command_events.extend(terminal);
+                // A queued acknowledgement is not terminal completion: its
+                // real completion (or rejection) arrives later, via a
+                // `PollCompleted.terminal` entry, once a tick boundary
+                // actually applies it.
+                if receipt.disposition != CommandDisposition::Queued {
+                    self.command_events.push(CommandEvent::Completed(receipt));
+                }
+                Ok(Some(PollOutcome {
+                    snapshot_updated,
+                    ..Default::default()
+                }))
+            }
+            WorkerEvent::CommandFailed {
+                command,
+                error,
+                state,
+                terminal,
+            } => {
+                self.submitted_commands.remove(&command);
+                let snapshot_updated = self.adopt(state)?;
+                // terminal may already contain a Failed for this command
+                // (e.g. from reject_if_queue_paused in BE-7). Only push one
+                // if it's not already there — otherwise the same command
+                // failure is reported twice.
+                let already_reported = terminal.iter().any(|event| {
+                    matches!(
+                        event,
+                        CommandEvent::Failed { command: id, .. } if *id == command
+                    )
+                });
+                self.command_events.extend(terminal);
+                if !already_reported {
+                    self.command_events
+                        .push(CommandEvent::Failed { command, error });
+                }
+                Ok(Some(PollOutcome {
+                    snapshot_updated,
+                    ..Default::default()
+                }))
+            }
+            WorkerEvent::PollCompleted {
+                outcome,
+                state,
+                terminal,
+            } => {
+                self.poll_in_flight = false;
+                let snapshot_updated = outcome.snapshot_updated | self.adopt(state)?;
+                self.command_events.extend(terminal);
+                Ok(Some(PollOutcome {
+                    snapshot_updated,
+                    ..outcome
+                }))
+            }
+            WorkerEvent::PollFailed(error) => {
+                self.poll_in_flight = false;
+                self.failure = Some(error.to_string());
+                // Don't return early (BE-9): earlier events in this batch
+                // already called adopt() and their aggregate is valid.
+                // Return it so the caller (e.g. the desktop's per-frame
+                // pump) still redraws. The failure is visible through
+                // status().
+                Ok(None)
+            }
+            WorkerEvent::DocumentCaptured { .. } => {
+                // Only meaningful to `capture_document`'s own blocking wait,
+                // which matches this variant directly before routing
+                // anything else through here.
+                Ok(None)
+            }
+        }
+    }
+
+    /// Synchronously read the current session's full world contents (with
+    /// identifier counters) and pending-queue contents, for durable storage.
+    /// See [`fieldcad_core::WorldDocument`] and [`QueueDocument`].
+    ///
+    /// Blocking is deliberate: this is a rare, explicit, one-shot save
+    /// action, not part of the per-frame poll loop. Any other worker event
+    /// received while waiting is applied exactly as `drain_worker_events`
+    /// would have, so a save never silently drops an unrelated command's
+    /// completion that happened to land first.
+    pub fn capture_document(
+        &mut self,
+    ) -> Result<(fieldcad_core::WorldDocument, QueueDocument), SourceError> {
+        if self.failure.is_some() {
+            return Err(SourceError::Disconnected);
+        }
+        self.requests
+            .send(WorkerRequest::CaptureDocument)
+            .map_err(|_| SourceError::Disconnected)?;
+        loop {
+            match self.events.recv().map_err(|_| SourceError::Disconnected)? {
+                WorkerEvent::DocumentCaptured { world, queue } => return Ok((world, queue)),
+                other => {
+                    self.handle_worker_event(other)?;
+                }
+            }
+        }
     }
 
     fn submit_poll_if_idle(&mut self) -> Result<(), SourceError> {
@@ -581,6 +661,15 @@ fn worker_loop(
                         terminal: source.drain_command_events(),
                     },
                     Err(error) => WorkerEvent::PollFailed(error),
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+            Ok(WorkerRequest::CaptureDocument) => {
+                let event = WorkerEvent::DocumentCaptured {
+                    world: source.runtime().world_document(),
+                    queue: source.queue_document(),
                 };
                 if events.send(event).is_err() {
                     break;

@@ -72,6 +72,9 @@ pub struct ComputeView {
     /// Wall-clock milliseconds the most recent simulation tick took to
     /// compute. Zero before the first tick.
     pub step_compute_ms: f32,
+    /// Live centre of mass / total momentum / total kinetic energy over
+    /// every mass-bearing object. `None` when nothing has mass.
+    pub universe: Option<fieldcad_core::UniverseSummary>,
 }
 
 /// The fields [`ComputeView::build`] derives purely from the latest
@@ -97,6 +100,7 @@ struct SnapshotDerived {
     field_systems: Vec<FieldSystemStatus>,
     fields: Vec<FieldRow>,
     mutable_vector_channels: Vec<ChannelId>,
+    universe: Option<fieldcad_core::UniverseSummary>,
 }
 
 impl ComputeView {
@@ -136,6 +140,7 @@ impl ComputeView {
             field_systems,
             fields,
             mutable_vector_channels,
+            universe,
         } = match reusable {
             Some(previous) => SnapshotDerived {
                 total_samples: previous.total_samples,
@@ -148,6 +153,7 @@ impl ComputeView {
                 field_systems: previous.field_systems.clone(),
                 fields: previous.fields.clone(),
                 mutable_vector_channels: previous.mutable_vector_channels.clone(),
+                universe: previous.universe,
             },
             None => snapshot_derived(source, &snapshot, world),
         };
@@ -191,6 +197,7 @@ impl ComputeView {
             has_errors,
             body_forces: source.body_forces(),
             step_compute_ms: source.step_compute_ms(),
+            universe,
         }
     }
 
@@ -259,6 +266,7 @@ fn snapshot_derived(
     let mut vector_channels = Vec::new();
     let mut total_samples = 0;
     let mut domain_summary = "No data".to_owned();
+    let mut universe = None;
 
     // Available field names outlive publication. This keeps inactive
     // channels identifiable in probe recorders and the scene inspector.
@@ -269,6 +277,7 @@ fn snapshot_derived(
     }
 
     if let Some(snapshot) = snapshot {
+        universe = snapshot.universe;
         let active_plugins: BTreeSet<_> = field_systems
             .iter()
             .filter(|system| system.enabled)
@@ -353,6 +362,7 @@ fn snapshot_derived(
         field_systems,
         fields,
         mutable_vector_channels,
+        universe,
     }
 }
 

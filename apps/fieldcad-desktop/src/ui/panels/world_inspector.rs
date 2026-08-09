@@ -1,9 +1,10 @@
 //! Inspector sections for the Simulation (world) node: domain, fields,
 //! field systems, transport sampling, and compute status.
 
-use fieldcad_core::{BoundaryCondition, Precision, PropertyValue};
+use fieldcad_core::{BoundaryCondition, Dimension, Precision, PropertyValue};
 use fieldcad_simulation::{CommandPayload, IntegrationScheme};
 
+use super::coordinate_editor;
 use crate::ui::compute::{ComputeView, validity_note};
 use crate::ui::{UiFrameOutput, UiModel};
 use fieldcad_core::SnapshotFreshness;
@@ -43,6 +44,51 @@ pub(super) fn world_properties(
     super::section(ui, "inspector_compute", "Compute", true, |ui| {
         compute_panel(ui, compute);
     });
+    super::section(
+        ui,
+        "inspector_universe_summary",
+        "Center of mass",
+        true,
+        |ui| universe_summary_panel(ui, compute),
+    );
+}
+
+fn universe_summary_panel(ui: &mut egui::Ui, compute: &ComputeView) {
+    let Some(universe) = compute.universe else {
+        ui.weak("No mass-bearing objects yet.");
+        return;
+    };
+    egui::Grid::new("universe_summary")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Position").on_hover_text(
+                "The mass-weighted centroid of every object carrying inertial mass. \
+                 Drawn in the viewport as a small gold ring; attach a plane, box, or \
+                 sphere to it like any other object to follow it.",
+            );
+            ui.label(super::object_inspector::format_vector(
+                universe.center_of_mass,
+                "m",
+            ));
+            ui.end_row();
+
+            ui.label("Total momentum")
+                .on_hover_text("Σ γmv over every mass-bearing object.");
+            ui.label(super::object_inspector::format_vector(
+                universe.total_momentum,
+                "kg·m/s",
+            ));
+            ui.end_row();
+
+            ui.label("Total kinetic energy")
+                .on_hover_text("Σ (γ−1)mc² over every mass-bearing object.");
+            ui.label(format!(
+                "{} J",
+                crate::ui::compute::format_engineering(universe.total_kinetic_energy_j)
+            ));
+            ui.end_row();
+        });
 }
 
 fn numerical_domain_editor(
@@ -112,18 +158,28 @@ fn numerical_domain_editor(
         Ok(domain) => {
             let spacing = domain.cell_size();
             let cells = domain.resolution().cell_count();
-            let scalar_bytes = match domain.precision() {
-                Precision::F32 => 4_u64,
-                Precision::F64 => 8_u64,
-            };
-            let minimum_field_bytes = cells.saturating_mul(6).saturating_mul(scalar_bytes);
-            ui.small(format!(
-                "cell size {:.4} × {:.4} × {:.4} m · {cells} cells · Maxwell E/B minimum {}",
-                spacing.x,
-                spacing.y,
-                spacing.z,
-                format_bytes(minimum_field_bytes),
-            ));
+            let mut summary = format!(
+                "cell size {:.4} × {:.4} × {:.4} m · {cells} cells",
+                spacing.x, spacing.y, spacing.z,
+            );
+            // Only a real cost if Maxwell is actually active on this
+            // lattice — showing it while the system is disabled reads as a
+            // memory commitment the domain isn't actually making.
+            let maxwell_active = compute.field_systems.iter().any(|system| {
+                system.enabled && system.plugin.id == fieldcad_electromagnetism::plugin_id()
+            });
+            if maxwell_active {
+                let scalar_bytes = match domain.precision() {
+                    Precision::F32 => 4_u64,
+                    Precision::F64 => 8_u64,
+                };
+                let minimum_field_bytes = cells.saturating_mul(6).saturating_mul(scalar_bytes);
+                summary.push_str(&format!(
+                    " · Maxwell E/B minimum {}",
+                    format_bytes(minimum_field_bytes),
+                ));
+            }
+            ui.small(summary);
             let changed = domain != compute.domain;
             let response = ui
                 .add_enabled(
@@ -152,12 +208,12 @@ fn numerical_domain_editor(
 }
 
 fn domain_coordinate(ui: &mut egui::Ui, axis: &str, value: &mut f64) {
-    ui.add(
-        egui::DragValue::new(value)
-            .speed(0.02)
-            .prefix(format!("{axis}: "))
-            .suffix(" m"),
-    );
+    // The domain draft has no held-edit/"scene edit in progress" concept of
+    // its own (it's staged, applied only by "Apply domain and reset"), so
+    // the per-field editing flag `coordinate_editor` normally reports back
+    // through is discarded here rather than threaded anywhere.
+    let mut editing = false;
+    coordinate_editor(ui, axis, value, Dimension::LENGTH, &mut editing);
 }
 
 fn domain_cells(ui: &mut egui::Ui, axis: &str, value: &mut u32) {

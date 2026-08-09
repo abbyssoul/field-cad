@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -9,7 +10,8 @@ use fieldcad_core::quantities::{ChargeCoulombs, LengthMetres, SiScalar};
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, Domain, DomainBounds, FieldBoxSpec,
     FieldSphereSpec, ObjectShape, ObjectSpec, Precision, ProbePosition, ProbeSpec, Resolution,
-    SessionId, SimulationMode, SlicePlaneSpec, TimeStep, Transform, WorldCommand, WorldSnapshot,
+    SessionId, SimulationMode, SlicePlaneSpec, TimeStep, Transform, WorldCommand, WorldRevision,
+    WorldSnapshot,
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electromagnetism::{
@@ -46,9 +48,10 @@ use crate::{
     electromagnetism_gpu::GpuMaxwellBackend,
     electrostatics_gpu::GpuElectrostaticEvaluator,
     mcp::{self, McpAction, McpSession},
+    profile::UserProfile,
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
-    ui::{self, CameraAction, ComputeView, UiModel, ViewportGesture, ViewportTool},
+    ui::{self, AppAction, CameraAction, ComputeView, UiModel, ViewportGesture, ViewportTool},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +88,12 @@ pub struct LaunchOptions {
     /// open the MCP panel — for an agent that launches this process itself
     /// and needs the token before it can connect.
     pub mcp: Option<SocketAddr>,
+    /// Load this `fieldcad.scene/v1` document at startup instead of the
+    /// built-in demo scene — for `field-cad path/to/scene.fcscene` from a
+    /// terminal. A path that fails to load is a startup error, not a silent
+    /// fall-back to the demo scene: a user naming a specific file expects
+    /// that file, not a surprise substitute.
+    pub open_path: Option<PathBuf>,
 }
 
 /// Run the application per `options`.
@@ -103,6 +112,7 @@ pub fn run_for(options: LaunchOptions) -> Result<(), RunError> {
     let mut application = DesktopApplication {
         deadline: options.lifetime.map(|lifetime| Instant::now() + lifetime),
         mcp_autostart: options.mcp,
+        open_path: options.open_path,
         ..DesktopApplication::default()
     };
     event_loop.run_app(&mut application)?;
@@ -123,6 +133,8 @@ struct DesktopApplication {
     /// server itself, once, rather than this being re-applied on every
     /// suspend/resume cycle a window can go through.
     mcp_autostart: Option<SocketAddr>,
+    /// Consumed by the first `resumed()`, same reasoning as `mcp_autostart`.
+    open_path: Option<PathBuf>,
 }
 
 impl ApplicationHandler for DesktopApplication {
@@ -131,7 +143,7 @@ impl ApplicationHandler for DesktopApplication {
             return;
         }
 
-        match WindowState::new(event_loop, self.mcp_autostart.take()) {
+        match WindowState::new(event_loop, self.mcp_autostart.take(), self.open_path.take()) {
             Ok(window_state) => self.window_state = Some(window_state),
             Err(error) => {
                 tracing::error!(%error, "application initialization failed");
@@ -456,12 +468,28 @@ struct WindowState {
     /// Whether an embedded MCP server is running against `data_source`, and
     /// its token, if so. Disabled until the user opts in from the MCP panel.
     mcp: McpSession,
+    /// The file the current session was last saved to or loaded from —
+    /// `None` for an unsaved new scene. `Save` writes here directly; `Save
+    /// As`/`Open` update it on success.
+    known_path: Option<PathBuf>,
+    /// The world revision as of the last successful save/load — compared
+    /// against the live revision to warn before New/Open would discard
+    /// unsaved work. Not a complete "modified" tracker (domain/plugin-config
+    /// changes aren't compared), but catches the common case cheaply.
+    last_saved_revision: Option<WorldRevision>,
+    /// The current document's `created_at`, carried forward so a re-save
+    /// (not Save As) doesn't reset it to "now".
+    last_created_at: Option<String>,
+    /// Recent files, default dialog directory, and startup-window
+    /// preferences — local to this machine, never part of a saved scene.
+    profile: UserProfile,
 }
 
 impl WindowState {
     fn new(
         event_loop: &ActiveEventLoop,
         mcp_autostart: Option<SocketAddr>,
+        open_path: Option<PathBuf>,
     ) -> Result<Self, String> {
         let attributes = WindowAttributes::default()
             .with_title("Field CAD")
@@ -500,34 +528,84 @@ impl WindowState {
         );
         let maxwell: Arc<dyn MaxwellSolverBackend> =
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
-        let data_source = create_local_data_source(evaluator, maxwell)?;
+        let mut profile = UserProfile::load();
+        // `open_path` (from `field-cad path/to/scene.fcscene` on the command
+        // line) takes over startup entirely; otherwise startup keeps showing
+        // the built-in demo scene by default — no change to first-run
+        // behavior now that File > New offers an explicit empty alternative.
+        // A path that fails to load is a startup error (propagated via `?`),
+        // never a silent fall-back to the demo scene.
+        let (data_source, warnings, queue, known_path, created_at) = match open_path {
+            None => {
+                let (source, warnings) =
+                    build_session(desktop_plugin_catalog(evaluator, maxwell), None, true)?;
+                (source, warnings, None, None, None)
+            }
+            Some(path) => {
+                let outcome = fieldcad_scene_document::load_newest_valid(&path)
+                    .map_err(|error| format!("opening {}: {error}", path.display()))?;
+                let queue = outcome.document.queue.clone();
+                let created_at = outcome.document.metadata.created_at.clone();
+                let (source, warnings) = build_session(
+                    desktop_plugin_catalog(evaluator, maxwell),
+                    Some(outcome.document),
+                    false,
+                )?;
+                (source, warnings, Some(queue), Some(path), Some(created_at))
+            }
+        };
         let world = data_source.world();
+        let world_revision = world.revision();
         let run_generation = data_source.simulation_status().run_generation;
+        if let Some(path) = &known_path {
+            profile.push_recent_file(path.clone());
+        }
         // Which layer opens visible is `UiModel`'s own rule — it reveals the
         // first field a session sees — so the shell does not also decide it here
         // and leave two places that can disagree.
-        let ui_model = UiModel::new();
+        let mut ui_model = UiModel::new();
+        ui_model.diagnostics_visible = profile.show_diagnostics_on_startup;
+        ui_model.help_visible = profile.show_help_on_startup;
+        if !warnings.is_empty() {
+            ui_model.command_error = Some(format_resolve_warnings(&warnings));
+        }
         let data_source = Arc::new(Mutex::new(HeadlessServer::new(data_source)));
+        // Replay a loaded document's paused-queue write-ahead log through the
+        // ordinary command path — see `replace_session` for the same
+        // sequence used after New/Open at runtime.
+        if let Some(queue) = queue {
+            let mut model = lock_model(&data_source);
+            if queue.paused {
+                model
+                    .submit(CommandPayload::PauseQueue)
+                    .map_err(|error| error.to_string())?;
+            }
+            for payload in queue.pending {
+                model.submit(payload).map_err(|error| error.to_string())?;
+            }
+        }
 
         // Started here rather than left to the MCP panel's own "Enable"
         // button: an agent driving `--mcp <address>` needs the token before
         // the window has even finished coming up, and the startup log is
         // the one place guaranteed to reach it before any UI does.
         let mcp = match mcp_autostart {
-            Some(addr) => match mcp::enable_at(data_source.clone(), addr) {
-                Ok(running) => {
-                    tracing::info!(
-                        addr = %running.addr,
-                        token = %running.token,
-                        "MCP server listening — pass this token and address to your agent's MCP client config"
-                    );
-                    McpSession::Running(running)
+            Some(addr) => {
+                match mcp::enable_at(data_source.clone(), addr, mcp_plugin_catalog_for(&renderer)) {
+                    Ok(running) => {
+                        tracing::info!(
+                            addr = %running.addr,
+                            token = %running.token,
+                            "MCP server listening — pass this token and address to your agent's MCP client config"
+                        );
+                        McpSession::Running(running)
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "MCP server failed to start at launch");
+                        McpSession::Failed(error)
+                    }
                 }
-                Err(error) => {
-                    tracing::error!(%error, "MCP server failed to start at launch");
-                    McpSession::Failed(error)
-                }
-            },
+            }
             None => McpSession::default(),
         };
 
@@ -559,6 +637,10 @@ impl WindowState {
             animation_clock: Instant::now(),
             occluded: false,
             mcp,
+            known_path,
+            last_saved_revision: Some(world_revision),
+            last_created_at: created_at,
+            profile,
         })
     }
 
@@ -825,6 +907,7 @@ impl WindowState {
                     camera_pitch: self.camera.pitch(),
                     mcp: &self.mcp,
                 },
+                &mut self.profile,
             );
         });
 
@@ -842,6 +925,9 @@ impl WindowState {
         self.apply_camera_follow(compute.scene_scale);
         if let Some(action) = ui_frame.mcp_action {
             self.apply_mcp_action(action);
+        }
+        if let Some(action) = ui_frame.app_action {
+            self.apply_app_action(action);
         }
         // Before the frame's own commands are dispatched: a held inspector
         // control submits an edit every frame, and the pause has to precede the
@@ -938,6 +1024,9 @@ impl WindowState {
             self.ui_model.scene_selection(),
             show,
             scene_scale,
+            field_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.universe),
         );
         if self.ui_model.view.compute_bounds {
             scene::append_compute_bounds(&mut overlay, compute.domain.bounds(), scene_scale);
@@ -1788,13 +1877,180 @@ impl WindowState {
         Ok(())
     }
 
+    /// New/Save/Save As/Open — a rare, explicit, one-shot action, so a
+    /// blocking native file dialog and a blocking scene-replace/save are
+    /// both acceptable here the same way `apply_mcp_action`'s brief block on
+    /// `Enable` already is.
+    fn apply_app_action(&mut self, action: AppAction) {
+        let result = match action {
+            AppAction::NewScene { template } => {
+                self.replace_session(SessionSource::New { template })
+            }
+            AppAction::SaveScene => self.save_scene(self.known_path.clone()),
+            AppAction::SaveSceneAs => {
+                match rfd::FileDialog::new()
+                    .add_filter("Field CAD scene", &[fieldcad_scene_document::EXTENSION])
+                    .set_directory(self.profile.last_directory_or_home())
+                    .save_file()
+                {
+                    // Not every desktop-portal backend appends the selected
+                    // filter's extension to a name typed without one (behavior
+                    // varies by portal implementation) — enforced here instead
+                    // of trusted from the dialog, so a saved file always
+                    // matches the extension Open's own filter looks for.
+                    Some(path) => self.save_scene(Some(ensure_scene_extension(path))),
+                    None => Ok(()),
+                }
+            }
+            AppAction::OpenScene => {
+                match rfd::FileDialog::new()
+                    .add_filter("Field CAD scene", &[fieldcad_scene_document::EXTENSION])
+                    .set_directory(self.profile.last_directory_or_home())
+                    .pick_file()
+                {
+                    Some(path) => self.replace_session(SessionSource::Load(path)),
+                    None => Ok(()),
+                }
+            }
+        };
+        if let Err(error) = result {
+            self.ui_model.command_error = Some(error);
+        }
+    }
+
+    /// Replace the whole session in place: a new (empty or demo) scene, or
+    /// one loaded from `path`. Rebuilds through [`build_session`] — the same
+    /// construction path startup uses — then swaps it into the existing
+    /// `Arc<Mutex<HeadlessServer>>` so the embedded MCP session (which holds
+    /// a clone of that same `Arc`) observes the replacement too.
+    fn replace_session(&mut self, source: SessionSource) -> Result<(), String> {
+        let (compute_device, compute_queue) = self.renderer.compute_handles();
+        let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
+            GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        );
+        let maxwell: Arc<dyn MaxwellSolverBackend> =
+            Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
+        let catalog = desktop_plugin_catalog(evaluator, maxwell);
+
+        let (new_source, warnings, path, queue) = match source {
+            SessionSource::New { template } => {
+                let (source, warnings) = build_session(catalog, None, template)?;
+                (source, warnings, None, None)
+            }
+            SessionSource::Load(path) => {
+                let outcome = fieldcad_scene_document::load_newest_valid(&path)
+                    .map_err(|error| error.to_string())?;
+                let queue = outcome.document.queue.clone();
+                let (source, warnings) = build_session(catalog, Some(outcome.document), false)?;
+                (source, warnings, Some(path), Some(queue))
+            }
+        };
+
+        {
+            let mut model = lock_model(&self.data_source);
+            model.replace_source(new_source);
+            // Replay the saved paused-queue write-ahead log through the
+            // ordinary command path: pause first if it was paused, then
+            // resubmit each pending edit as an ordinary
+            // `CommitWorld`/`ReconfigureDomain`, which lands back in the
+            // queue unapplied because the queue is now paused. Never for
+            // `NewScene`, whose `queue` is `None`.
+            if let Some(queue) = queue {
+                if queue.paused {
+                    model
+                        .submit(CommandPayload::PauseQueue)
+                        .map_err(|error| error.to_string())?;
+                }
+                for payload in queue.pending {
+                    model.submit(payload).map_err(|error| error.to_string())?;
+                }
+            }
+        }
+
+        self.known_path = path.clone();
+        self.last_created_at = None;
+        if let Some(path) = &path {
+            self.profile.push_recent_file(path.clone());
+        }
+
+        // Everything below assumes ID/generation continuity with the
+        // previous session and must not survive a session replace. A fresh
+        // session's `run_generation` always starts at 0, which the *old*
+        // session's may also still be — forcing a sentinel here makes
+        // `refresh_world`'s generation-diff check reset the histories
+        // unconditionally rather than relying on that coincidence not
+        // occurring.
+        self.run_generation = u64::MAX;
+        self.region_geometry_cache.clear();
+        self.active_transform = None;
+        self.active_field_brush = None;
+        self.edit_gesture = None;
+        self.pending_deferred_edit = None;
+        self.deferred_edits.clear();
+        self.ui_model.select_world();
+        self.ui_model.probe_plots.clear();
+        self.ui_model.distance_probe_plots.clear();
+        self.ui_model.distance_probe_series.clear();
+        self.ui_model.field_layers.clear();
+        self.ui_model.domain_draft = None;
+        self.ui_model.following = None;
+        self.ui_model.command_error = if warnings.is_empty() {
+            None
+        } else {
+            Some(format_resolve_warnings(&warnings))
+        };
+
+        self.refresh_world();
+        self.last_saved_revision = Some(self.world.revision());
+        Ok(())
+    }
+
+    /// Save the current session to `path`, falling back to Save As if no
+    /// path is known yet (first save of a new scene).
+    fn save_scene(&mut self, path: Option<PathBuf>) -> Result<(), String> {
+        let Some(path) = path.or_else(|| self.known_path.clone()) else {
+            self.apply_app_action(AppAction::SaveSceneAs);
+            return Ok(());
+        };
+        let inputs = {
+            let mut model = lock_model(&self.data_source);
+            let (world, queue) = model
+                .capture_document()
+                .map_err(|error| error.to_string())?;
+            fieldcad_scene_document::SceneDocumentInputs {
+                domain: model.domain(),
+                time_step: model.time_step(),
+                scene_scale: model.scene_scale(),
+                integration_scheme: model.integration_scheme(),
+                field_systems: model.field_systems(),
+                world,
+                queue,
+            }
+        };
+        let document = fieldcad_scene_document::SceneDocument::capture(
+            inputs,
+            concat!("fieldcad-desktop/", env!("CARGO_PKG_VERSION")),
+            self.last_created_at.clone(),
+        );
+        fieldcad_scene_document::save_to_path(&document, &path)
+            .map_err(|error| error.to_string())?;
+        self.known_path = Some(path.clone());
+        self.last_saved_revision = Some(self.world.revision());
+        self.last_created_at = Some(document.metadata.created_at);
+        self.profile.push_recent_file(path);
+        Ok(())
+    }
+
     /// Enable or disable the embedded MCP server against this window's
     /// shared model. `Enable` blocks briefly (see `crate::mcp::enable`) —
     /// acceptable for a rare, explicit button click.
     fn apply_mcp_action(&mut self, action: McpAction) {
         match action {
             McpAction::Enable => {
-                self.mcp = match mcp::enable(self.data_source.clone()) {
+                self.mcp = match mcp::enable(
+                    self.data_source.clone(),
+                    mcp_plugin_catalog_for(&self.renderer),
+                ) {
                     Ok(running) => McpSession::Running(running),
                     Err(error) => McpSession::Failed(error),
                 };
@@ -2171,87 +2427,237 @@ struct BoxFrame {
     rotation: DQuat,
 }
 
-fn create_local_data_source(
+/// This host's plugin composition — one electric field, three candidate
+/// models (electrostatics active by default; Newtonian gravity and Maxwell
+/// composed but inactive) — each backed by this window's own GPU device.
+///
+/// Factored out of the old `create_local_data_source` so [`build_session`]
+/// can reuse the exact same wiring for New Scene, Load, and startup, rather
+/// than only the hardcoded demo scene construction that used to be the only
+/// caller.
+/// A [`mcp::PluginCatalog`] closure over this window's GPU device/queue, for
+/// [`mcp::enable`]/[`mcp::enable_at`] — so `create_scene`/`open_scene`
+/// called through the embedded MCP server build plugins with the same
+/// evaluator backends the desktop's own File menu would have used, not the
+/// standalone server's CPU-only catalog.
+fn mcp_plugin_catalog_for(renderer: &ViewportRenderer) -> mcp::PluginCatalog {
+    let (compute_device, compute_queue) = renderer.compute_handles();
+    Arc::new(move || {
+        let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
+            GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        );
+        let maxwell: Arc<dyn MaxwellSolverBackend> = Arc::new(GpuMaxwellBackend::new(
+            compute_device.clone(),
+            compute_queue.clone(),
+        ));
+        desktop_plugin_catalog(evaluator, maxwell)
+    })
+}
+
+fn desktop_plugin_catalog(
     evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
     maxwell: Arc<dyn MaxwellSolverBackend>,
-) -> Result<AsyncLocalDataSource, String> {
-    let domain = Domain::new(
-        DomainBounds::centred_cube(5.0).map_err(|error| error.to_string())?,
-        Resolution::uniform(32).map_err(|error| error.to_string())?,
-        BoundaryConditions::uniform(BoundaryCondition::Periodic),
-        Precision::F32,
-    );
-    let time_step =
-        TimeStep::from_seconds(courant_limit(&domain) * 0.8).map_err(|error| error.to_string())?;
-    let mut runtime = SimulationRuntime::new(
-        RuntimeConfig::new(domain, time_step, SessionId::from_u128(1))
-            .with_subscription(
-                Subscription::PROBES_ONLY
-                    .with_planes(UVec2::splat(33))
-                    .with_domain_stride(8)
-                    .with_boxes(UVec3::splat(9))
-                    .with_spheres(9),
-            )
-            // Two models of one electric field. Both are composed into the
-            // scene so either can compute it, and the analytic one is active
-            // because the default scene is a single stationary charge — a case
-            // it answers exactly and immediately. Choosing Maxwell instead is
-            // one control in the inspector's Fields section, and brings the
-            // magnetic field with it.
-            .with_plugin(Box::new(ElectrostaticsPlugin::with_evaluator(evaluator)))
-            .with_plugin_registration(
-                PluginRegistration::with_default_configuration(Box::new(NewtonianGravityPlugin))
-                    .with_enabled(false),
-            )
-            .with_plugin_registration(
-                PluginRegistration::with_default_configuration(Box::new(
-                    ElectromagnetismPlugin::with_backend(maxwell),
-                ))
-                .with_enabled(false),
-            ),
-    )
-    .map_err(|error| error.to_string())?;
-    runtime
-        .commit_world_commands(vec![
-            WorldCommand::CreateObject(
-                ObjectSpec::new("Positive point charge")
-                    .with_transform(
-                        Transform::at(DVec3::new(0.0, 0.0, 0.6)).map_err(|e| e.to_string())?,
-                    )
-                    .with_shape(ObjectShape::point(0.15).map_err(|error| error.to_string())?)
-                    .with_component(
-                        charge_component_id(),
-                        charge_properties(ChargeCoulombs::from_si(1.0e-9))
-                            .map_err(|error| error.to_string())?,
-                    ),
-            ),
-            WorldCommand::CreateProbe(ProbeSpec::at(
-                "Field probe",
-                DVec3::new(1.0, 0.0, 0.6),
-                // One entry for the electric field, whichever model computes
-                // it. The rest are Maxwell's own method diagnostics, recorded
-                // when that model is the active one.
-                vec![
-                    electric_field_channel_id(),
-                    electric_potential_channel_id(),
-                    maxwell_magnetic_field_channel_id(),
-                    maxwell_energy_density_channel_id(),
-                    maxwell_electric_divergence_channel_id(),
-                    maxwell_magnetic_divergence_channel_id(),
-                ],
-            )),
-            WorldCommand::CreatePlane(
-                SlicePlaneSpec::new("XY field plane", DVec3::ZERO, DVec3::Z)
-                    .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
-                    .map_err(|error| error.to_string())?,
-            ),
-        ])
-        .map_err(|error| error.to_string())?;
-    // The default scene is where this session starts, not the user's first
+) -> Vec<PluginRegistration> {
+    vec![
+        PluginRegistration::with_default_configuration(Box::new(
+            ElectrostaticsPlugin::with_evaluator(evaluator),
+        )),
+        PluginRegistration::with_default_configuration(Box::new(NewtonianGravityPlugin))
+            .with_enabled(false),
+        PluginRegistration::with_default_configuration(Box::new(
+            ElectromagnetismPlugin::with_backend(maxwell),
+        ))
+        .with_enabled(false),
+    ]
+}
+
+/// The desktop's built-in demo scene: one positive point charge, a probe
+/// recording it, and an XY slice plane. Content for New Scene's "Demo Scene"
+/// variant and for the app's own startup (which keeps showing this scene by
+/// default, per product decision, now that File > New offers an explicit
+/// empty alternative too) — never for a loaded document, which brings its
+/// own content.
+fn demo_scene_commands() -> Result<Vec<WorldCommand>, String> {
+    Ok(vec![
+        WorldCommand::CreateObject(
+            ObjectSpec::new("Positive point charge")
+                .with_transform(
+                    Transform::at(DVec3::new(0.0, 0.0, 0.6)).map_err(|e| e.to_string())?,
+                )
+                .with_shape(ObjectShape::point(0.15).map_err(|error| error.to_string())?)
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::from_si(1.0e-9))
+                        .map_err(|error| error.to_string())?,
+                ),
+        ),
+        WorldCommand::CreateProbe(ProbeSpec::at(
+            "Field probe",
+            DVec3::new(1.0, 0.0, 0.6),
+            // One entry for the electric field, whichever model computes
+            // it. The rest are Maxwell's own method diagnostics, recorded
+            // when that model is the active one.
+            vec![
+                electric_field_channel_id(),
+                electric_potential_channel_id(),
+                maxwell_magnetic_field_channel_id(),
+                maxwell_energy_density_channel_id(),
+                maxwell_electric_divergence_channel_id(),
+                maxwell_magnetic_divergence_channel_id(),
+            ],
+        )),
+        WorldCommand::CreatePlane(
+            SlicePlaneSpec::new("XY field plane", DVec3::ZERO, DVec3::Z)
+                .and_then(|plane| plane.with_half_extent(DVec2::splat(4.0)))
+                .map_err(|error| error.to_string())?,
+        ),
+    ])
+}
+
+/// Appends `.fcscene` if `path` doesn't already end in it (case-insensitive),
+/// so a name typed into the Save As dialog without an extension still
+/// matches Open's own extension filter afterward.
+fn ensure_scene_extension(path: PathBuf) -> PathBuf {
+    let has_extension = path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case(fieldcad_scene_document::EXTENSION)
+    });
+    if has_extension {
+        path
+    } else {
+        let mut name = path
+            .file_name()
+            .map(|name| name.to_os_string())
+            .unwrap_or_default();
+        name.push(".");
+        name.push(fieldcad_scene_document::EXTENSION);
+        path.with_file_name(name)
+    }
+}
+
+/// A fresh, session-scoped identity (US-01: "stable session identifier" —
+/// stable *within* the session, never required to match a prior save's id).
+/// Every call site used to hardcode `SessionId::from_u128(1)`; New Scene and
+/// Load each need a session distinguishable from whatever came before.
+fn fresh_session_id() -> SessionId {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(1);
+    SessionId::from_u128(nanos)
+}
+
+/// Build a fresh runtime from either an empty world or a loaded document,
+/// through one construction path — same domain/plugin wiring, same
+/// `clear_edit_history()` discipline ADR 0024 requires of "a default scene,
+/// later a loaded file." `demo_content` adds the built-in demo scene
+/// (`demo_scene_commands`) before history is cleared; only meaningful when
+/// `document` is `None` — a loaded document brings its own content instead.
+///
+/// Does not restore a saved document's paused command queue — that replay
+/// happens one level up, after the caller has swapped this session into the
+/// shared `HeadlessServer` (see `WindowState::replace_session`), since it
+/// needs the session to already be reachable through the ordinary command
+/// path rather than a bare `SimulationRuntime`.
+fn build_session(
+    catalog: Vec<PluginRegistration>,
+    document: Option<fieldcad_scene_document::SceneDocument>,
+    demo_content: bool,
+) -> Result<
+    (
+        AsyncLocalDataSource,
+        Vec<fieldcad_scene_document::ResolveWarning>,
+    ),
+    String,
+> {
+    let (domain, time_step, scene_scale, integration_scheme, world, plugins, warnings) =
+        match document {
+            None => {
+                let domain = Domain::new(
+                    DomainBounds::centred_cube(5.0).map_err(|error| error.to_string())?,
+                    Resolution::uniform(32).map_err(|error| error.to_string())?,
+                    BoundaryConditions::uniform(BoundaryCondition::Periodic),
+                    Precision::F32,
+                );
+                let time_step = TimeStep::from_seconds(courant_limit(&domain) * 0.8)
+                    .map_err(|error| error.to_string())?;
+                (
+                    domain,
+                    time_step,
+                    fieldcad_core::SceneScale::default(),
+                    fieldcad_dynamics::IntegrationScheme::default(),
+                    fieldcad_core::World::new(),
+                    catalog,
+                    Vec::new(),
+                )
+            }
+            Some(doc) => {
+                let (plugins, warnings) =
+                    fieldcad_scene_document::resolve_plugins(catalog, &doc.field_systems)
+                        .map_err(|error| error.to_string())?;
+                (
+                    doc.domain,
+                    doc.time_step,
+                    doc.scene_scale,
+                    doc.integration_scheme,
+                    fieldcad_core::World::from_document(doc.world),
+                    plugins,
+                    warnings,
+                )
+            }
+        };
+    let mut config = RuntimeConfig::new(domain, time_step, fresh_session_id())
+        .with_world(world)
+        .with_scene_scale(scene_scale)
+        .with_integration_scheme(integration_scheme)
+        .with_subscription(
+            Subscription::PROBES_ONLY
+                .with_planes(UVec2::splat(33))
+                .with_domain_stride(8)
+                .with_boxes(UVec3::splat(9))
+                .with_spheres(9),
+        );
+    for plugin in plugins {
+        config = config.with_plugin_registration(plugin);
+    }
+    let mut runtime = SimulationRuntime::new(config).map_err(|error| error.to_string())?;
+    if demo_content {
+        runtime
+            .commit_world_commands(demo_scene_commands()?)
+            .map_err(|error| error.to_string())?;
+    }
+    // The starting scene is where this session begins, not the user's first
     // edit. Without this the opening undo would empty the workspace.
     runtime.clear_edit_history();
 
-    Ok(AsyncLocalDataSource::new(LocalDataSource::new(runtime)))
+    Ok((
+        AsyncLocalDataSource::new(LocalDataSource::new(runtime)),
+        warnings,
+    ))
+}
+
+/// What [`WindowState::replace_session`] is building: a new scene (empty or
+/// demo), or one loaded from a saved document.
+enum SessionSource {
+    New { template: bool },
+    Load(PathBuf),
+}
+
+/// Surfaces a loaded document's plugin-version mismatches (minor/patch only
+/// — a major mismatch is a hard [`fieldcad_scene_document::ResolveError`],
+/// not a warning) as one human-readable message for `command_error`, the
+/// same field an ordinary rejected command already reports through.
+fn format_resolve_warnings(warnings: &[fieldcad_scene_document::ResolveWarning]) -> String {
+    let mut message = String::from("Loaded with plugin version differences: ");
+    for (index, warning) in warnings.iter().enumerate() {
+        if index > 0 {
+            message.push_str("; ");
+        }
+        message.push_str(&format!(
+            "{} document={} linked={}",
+            warning.plugin, warning.document_version, warning.linked_version
+        ));
+    }
+    message
 }
 
 const HISTORY_SIZE: usize = 120;
@@ -2716,6 +3122,7 @@ mod tests {
                 )]),
                 diagnostics: Arc::from([]),
                 distances: Arc::from([]),
+                universe: None,
             }
         }
 

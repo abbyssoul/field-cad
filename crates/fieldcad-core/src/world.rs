@@ -176,6 +176,12 @@ pub struct ObjectSpec {
     /// mass is by itself enough to make a body respond to fields.
     pub pinned: bool,
     pub components: BTreeMap<ComponentTypeId, PropertyBag>,
+    /// Whether this is a runtime-owned object rather than an authored one.
+    ///
+    /// See [`WorldObject::derived`]. Not exposed through any builder a normal
+    /// caller would reach for — only the simulation runtime itself sets this,
+    /// via [`Self::derived`].
+    pub derived: bool,
 }
 
 impl ObjectSpec {
@@ -188,6 +194,7 @@ impl ObjectSpec {
             visible: true,
             pinned: false,
             components: BTreeMap::new(),
+            derived: false,
         }
     }
 
@@ -221,6 +228,12 @@ impl ObjectSpec {
         self
     }
 
+    /// Mark this object as runtime-owned — see [`WorldObject::derived`].
+    pub fn derived(mut self) -> Self {
+        self.derived = true;
+        self
+    }
+
     fn validate(&self) -> Result<(), WorldError> {
         self.transform.validate()?;
         self.velocity.validate()?;
@@ -249,6 +262,21 @@ pub struct WorldObject {
     /// configuration is held in place.
     pub pinned: bool,
     pub components: BTreeMap<ComponentTypeId, PropertyBag>,
+    /// Whether the simulation runtime owns this object rather than a user.
+    ///
+    /// A derived object (the universe's centre of mass, say) is computed
+    /// every publish, not authored — it can still be a valid [`attached_to`]
+    /// target for a plane/box/sphere/distance probe like any other object,
+    /// but the desktop UI never lists, selects, or offers to move or delete
+    /// it, and [`WorldCommand::RemoveObject`] rejects it outright. Its
+    /// transform is still set through the ordinary [`WorldCommand::SetTransform`]
+    /// path — there is no caller-identity concept to distinguish the runtime
+    /// from an external client, so that one command is deliberately left
+    /// unguarded; a stray external write is simply overwritten on the next
+    /// publish.
+    ///
+    /// [`attached_to`]: crate::SlicePlane::attached_to
+    pub derived: bool,
 }
 
 impl WorldObject {
@@ -1122,6 +1150,21 @@ impl WorldCheckpoint {
     }
 }
 
+/// A `World`'s full contents — state and identifier counters — captured for
+/// durable storage.
+///
+/// Sibling of [`WorldCheckpoint`], but serde-round-trippable
+/// (`WorldCheckpoint` only ever comes from the live undo stack, and its
+/// counters are always the enclosing `World`'s current ones) and consumable
+/// without an existing `World` to restore onto. Opaque outside this crate on
+/// purpose, the same way `WorldCheckpoint` is: a thing to hand to
+/// [`World::from_document`], not a second way to read a world.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorldDocument {
+    state: WorldState,
+    counters: Counters,
+}
+
 impl Default for World {
     fn default() -> Self {
         Self::new()
@@ -1160,6 +1203,34 @@ impl World {
     /// makes it affordable to take one before every edit.
     pub fn checkpoint(&self) -> WorldCheckpoint {
         WorldCheckpoint(Arc::clone(&self.state))
+    }
+
+    /// Capture full contents — state and identifier counters — for durable
+    /// storage. Distinct from [`Self::checkpoint`], which is for the
+    /// in-memory undo stack and does not need counters, since a checkpoint is
+    /// always restored onto the same `World` whose counters never rewind.
+    pub fn to_document(&self) -> WorldDocument {
+        WorldDocument {
+            state: (*self.state).clone(),
+            counters: self.counters,
+        }
+    }
+
+    /// Adopt a previously captured document as a fresh `World`.
+    ///
+    /// Same whole-state-swap shape as [`Self::restore`], but the document's
+    /// own revision and counters are kept as-is rather than rebased forward:
+    /// a loaded document is the start of a session, not an edit within one
+    /// that already had its own revision/counter history.
+    ///
+    /// No validation happens here — the document model owns durable state,
+    /// but adopting it against an active set of solvers is the simulation
+    /// runtime's job, not this crate's.
+    pub fn from_document(document: WorldDocument) -> Self {
+        Self {
+            state: Arc::new(document.state),
+            counters: document.counters,
+        }
     }
 
     /// Restore captured contents as a **new** revision.
@@ -1489,7 +1560,7 @@ impl CommitReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 struct Counters {
     object: u64,
     plane: u64,
@@ -1604,13 +1675,17 @@ fn apply_command(
                     visible: spec.visible,
                     pinned: spec.pinned,
                     components: spec.components,
+                    derived: spec.derived,
                 },
             );
             report.created_objects.push(id);
         }
         WorldCommand::RemoveObject(id) => {
-            if !state.objects.contains_key(&id) {
+            let Some(object) = state.objects.get(&id) else {
                 return Err(WorldError::ObjectNotFound { id });
+            };
+            if object.derived {
+                return Err(WorldError::DerivedObjectCannotBeRemoved { id });
             }
             if state.probes.values().any(|probe| {
                 matches!(probe.position, ProbePosition::Attached { object, .. } if object == id)
@@ -2039,6 +2114,8 @@ pub enum WorldError {
     ObjectHasAttachedSphere { id: ObjectId },
     #[error("object {id} still has an attached distance probe")]
     ObjectHasAttachedDistanceProbe { id: ObjectId },
+    #[error("object {id} is runtime-owned and cannot be removed")]
+    DerivedObjectCannotBeRemoved { id: ObjectId },
     #[error("a distance probe requires two distinct objects")]
     InvalidDistanceProbe,
     #[error("distance probe {id} does not exist")]
@@ -2861,6 +2938,52 @@ mod tests {
                 .is_err()
         );
         assert_eq!(world.snapshot().objects().len(), 2);
+    }
+
+    #[test]
+    fn a_derived_object_cannot_be_removed() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("center of mass").derived(),
+            )])
+            .unwrap();
+
+        assert!(
+            world
+                .commit([WorldCommand::RemoveObject(ObjectId::new(0))])
+                .is_err()
+        );
+        assert_eq!(world.snapshot().objects().len(), 1);
+    }
+
+    #[test]
+    fn a_derived_object_can_still_have_its_transform_set() {
+        // `derived` only guards `RemoveObject` — the runtime that owns a
+        // derived object still needs to reposition it every publish through
+        // the ordinary `SetTransform` path.
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("center of mass").derived(),
+            )])
+            .unwrap();
+
+        world
+            .commit([WorldCommand::SetTransform {
+                object: ObjectId::new(0),
+                transform: Transform::at(DVec3::new(1.0, 2.0, 3.0)).unwrap(),
+            }])
+            .unwrap();
+        assert_eq!(
+            world
+                .snapshot()
+                .object(ObjectId::new(0))
+                .unwrap()
+                .transform
+                .translation,
+            DVec3::new(1.0, 2.0, 3.0)
+        );
     }
 
     #[test]

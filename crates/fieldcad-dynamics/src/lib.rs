@@ -143,6 +143,73 @@ pub fn collect_bodies(
     Ok((dynamic, carried))
 }
 
+/// Every object carrying inertial mass, regardless of pinned state.
+///
+/// Unlike [`collect_bodies`], this keeps pinned-and-stationary bodies too:
+/// that partition is about which bodies need a per-tick kinematics update,
+/// but a pinned, stationary mass still has a position and (zero) velocity
+/// that physical totals like center of mass and kinetic energy must include.
+pub fn collect_mass_bearing_bodies(
+    world: &WorldSnapshot,
+) -> Result<Vec<DynamicBody>, DynamicsError> {
+    world
+        .objects_with(&inertial_mass_component_id())
+        .map(|(object, _properties)| {
+            Ok(DynamicBody {
+                object: object.id,
+                inertial_mass_kg: inertial_mass_of(object)?,
+                position: object.transform.translation,
+                velocity: object.velocity.linear,
+            })
+        })
+        .collect()
+}
+
+/// Live totals over every mass-bearing object — center of mass, total
+/// momentum, and total kinetic energy. `None` when nothing in the world
+/// carries mass (a zero or negative total is otherwise impossible: mass is
+/// validated positive wherever it is attached).
+///
+/// Momentum and kinetic energy use the same relativistic formulas as a
+/// single object's own derived-values display (`relativistic_momentum`/
+/// `relativistic_kinetic_energy`), so this total never quietly disagrees
+/// with the per-object numbers it's summed from.
+pub fn universe_summary(world: &WorldSnapshot) -> Option<fieldcad_core::UniverseSummary> {
+    let bodies = collect_mass_bearing_bodies(world).ok()?;
+    let total_mass_kg: f64 = bodies
+        .iter()
+        .map(|body| body.inertial_mass_kg.into_si())
+        .sum();
+    if total_mass_kg <= 0.0 {
+        return None;
+    }
+    let center_of_mass = bodies
+        .iter()
+        .map(|body| body.position * body.inertial_mass_kg.into_si())
+        .sum::<DVec3>()
+        / total_mass_kg;
+    let total_momentum = bodies
+        .iter()
+        .map(|body| {
+            fieldcad_core::relativistic_momentum(body.velocity, body.inertial_mass_kg.into_si())
+        })
+        .sum();
+    let total_kinetic_energy_j = bodies
+        .iter()
+        .map(|body| {
+            fieldcad_core::relativistic_kinetic_energy(
+                body.velocity,
+                body.inertial_mass_kg.into_si(),
+            )
+        })
+        .sum();
+    Some(fieldcad_core::UniverseSummary {
+        center_of_mass,
+        total_momentum,
+        total_kinetic_energy_j,
+    })
+}
+
 /// Sum one force contribution per field system into a total per body.
 ///
 /// Each contribution must have one entry per body; a mismatch means a system
@@ -560,6 +627,54 @@ mod tests {
         let update = carry(&carried, 2.0).unwrap()[0];
         assert_eq!(update.velocity.linear, DVec3::X);
         assert_eq!(update.transform.translation, DVec3::new(2.0, 0.0, 0.0));
+
+        // `collect_mass_bearing_bodies` keeps all three, including "held" —
+        // it's about physical bookkeeping, not who needs a tick update.
+        let all = collect_mass_bearing_bodies(&snapshot).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn universe_summary_is_none_without_any_mass() {
+        let world = World::new();
+        assert_eq!(universe_summary(&world.snapshot()), None);
+    }
+
+    #[test]
+    fn universe_summary_computes_center_of_mass_momentum_and_energy() {
+        let mut world = World::new();
+        let commands = mass_component_schemas()
+            .into_iter()
+            .map(WorldCommand::RegisterComponentSchema)
+            .chain([
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("a")
+                        .with_transform(CoreTransform::at(DVec3::ZERO).unwrap())
+                        .with_component(
+                            inertial_mass_component_id(),
+                            inertial_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap(),
+                        ),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("b")
+                        .with_transform(CoreTransform::at(DVec3::new(4.0, 0.0, 0.0)).unwrap())
+                        .with_velocity(Velocity::new(DVec3::X, DVec3::ZERO).unwrap())
+                        .with_component(
+                            inertial_mass_component_id(),
+                            inertial_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap(),
+                        ),
+                ),
+            ]);
+        world.commit(commands).unwrap();
+
+        let summary = universe_summary(&world.snapshot()).unwrap();
+
+        // Equal masses at x=0 and x=4: centroid at x=2.
+        assert!((summary.center_of_mass - DVec3::new(2.0, 0.0, 0.0)).length() < 1.0e-12);
+        // p = m*v, only "b" moves: 2 kg * (1, 0, 0) m/s.
+        assert!((summary.total_momentum - DVec3::new(2.0, 0.0, 0.0)).length() < 1.0e-12);
+        // KE = 1/2 * 2 * 1^2 = 1 J.
+        assert!((summary.total_kinetic_energy_j - 1.0).abs() < 1.0e-12);
     }
 
     #[test]

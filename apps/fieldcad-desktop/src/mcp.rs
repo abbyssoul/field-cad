@@ -17,7 +17,16 @@ use std::{
 
 use fieldcad_mcp::McpServer;
 use fieldcad_server::HeadlessServer;
+use fieldcad_simulation::PluginRegistration;
 use tokio_util::sync::CancellationToken;
+
+/// What `enable`/`enable_at` need in order to build `McpServer`'s
+/// plugin-catalog closure: this window's own GPU-backed composition, not
+/// the standalone server's CPU-only one — an agent driving `create_scene`/
+/// `open_scene` through the embedded server must get the exact same
+/// evaluator backends the desktop's own File menu would have built, or a
+/// loaded/new scene would silently diverge from what the user sees.
+pub type PluginCatalog = Arc<dyn Fn() -> Vec<PluginRegistration> + Send + Sync>;
 
 /// Matches the standalone `fieldcad-mcp --http` default, so an agent's
 /// config can hardcode one address either way.
@@ -61,9 +70,12 @@ pub enum McpAction {
 /// can transiently fail with "address in use" if the previous listener
 /// hasn't finished tearing down yet — the message below names that as the
 /// likely cause rather than surfacing a raw OS error.
-pub fn enable(model: Arc<Mutex<HeadlessServer>>) -> Result<McpRunning, String> {
+pub fn enable(
+    model: Arc<Mutex<HeadlessServer>>,
+    plugin_catalog: PluginCatalog,
+) -> Result<McpRunning, String> {
     let addr: SocketAddr = DEFAULT_ADDR.parse().expect("hardcoded address is valid");
-    enable_at(model, addr)
+    enable_at(model, addr, plugin_catalog)
 }
 
 /// Same as [`enable`], against an explicit address — what `--mcp <address>`
@@ -71,6 +83,7 @@ pub fn enable(model: Arc<Mutex<HeadlessServer>>) -> Result<McpRunning, String> {
 pub fn enable_at(
     model: Arc<Mutex<HeadlessServer>>,
     addr: SocketAddr,
+    plugin_catalog: PluginCatalog,
 ) -> Result<McpRunning, String> {
     let token = fieldcad_mcp::generate_token();
     let ct = CancellationToken::new();
@@ -107,7 +120,7 @@ pub fn enable_at(
                 }
             };
             let _ = ready_tx.send(Ok(()));
-            let server = McpServer::new(model);
+            let server = McpServer::new(model, plugin_catalog);
             if let Err(error) = fieldcad_mcp::serve_http(
                 listener,
                 server,

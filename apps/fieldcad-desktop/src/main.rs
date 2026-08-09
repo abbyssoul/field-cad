@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::Parser;
 use fieldcad_desktop::LaunchOptions;
@@ -36,6 +36,12 @@ struct Cli {
     /// that launches this process itself and needs to connect immediately.
     #[arg(long, value_name = "ADDRESS")]
     mcp: Option<SocketAddr>,
+
+    /// Open this fieldcad.scene/v1 document at startup instead of the
+    /// built-in demo scene. Fails to start, rather than falling back to the
+    /// demo scene, if the file cannot be loaded.
+    #[arg(value_name = "SCENE")]
+    scene: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -58,6 +64,7 @@ fn main() -> ExitCode {
             .exit_after
             .map(|seconds| Duration::from_secs_f64(seconds.max(0.1))),
         mcp: cli.mcp,
+        open_path: cli.scene,
     };
     match fieldcad_desktop::run_for(options) {
         Ok(()) => ExitCode::SUCCESS,

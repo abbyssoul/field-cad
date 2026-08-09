@@ -77,7 +77,13 @@ fn object_section(
     frame: &FrameContext<'_>,
     output: &mut UiFrameOutput,
 ) {
-    let title = format!("Objects ({})", frame.world.objects().len());
+    let object_count = frame
+        .world
+        .objects()
+        .values()
+        .filter(|object| !object.derived)
+        .count();
+    let title = format!("Objects ({object_count})");
     super::section(ui, "scene_objects_section", title, true, |ui| {
         let choices: Vec<(&str, ObjectPreset)> = std::iter::once(("Empty", ObjectPreset::Empty))
             .chain(
@@ -101,10 +107,15 @@ fn object_section(
         }
         ui.add_space(4.0);
 
-        if frame.world.objects().is_empty() {
+        if object_count == 0 {
             ui.weak("No objects yet.");
         }
-        for object in frame.world.objects().values() {
+        for object in frame
+            .world
+            .objects()
+            .values()
+            .filter(|object| !object.derived)
+        {
             match entity_row(
                 ui,
                 "▣",

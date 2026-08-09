@@ -33,14 +33,21 @@ use std::{
 
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, DistanceProbeId, Domain,
-    DomainBounds, PluginId, PluginProvenance, Precision, Resolution, SceneScale,
-    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, TimeStep, WorldCommand,
+    DomainBounds, ObjectShape, ObjectSpec, PluginId, PluginProvenance, Precision, ProbeSpec,
+    Resolution, SceneScale, SessionId, SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic,
+    TimeStep, Transform, UniverseSummary, World, WorldCommand,
+    quantities::{ChargeCoulombs, coulomb},
 };
+use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
+use fieldcad_electromagnetism::courant_limit;
+use fieldcad_electrostatics::electric_field_channel_id;
 use fieldcad_server::{HeadlessServer, SessionEvent, WatchEvent};
 use fieldcad_simulation::{
-    CommandEvent, CommandId, CommandPayload, CommandReceipt, DataSourceStatus, FieldDataSource,
-    PlaybackSpeed, QueueStatus, SimulationStatus, SourceError, Subscription,
+    AsyncLocalDataSource, CommandEvent, CommandId, CommandPayload, CommandReceipt,
+    DataSourceStatus, FieldDataSource, LocalDataSource, PlaybackSpeed, PluginRegistration,
+    QueueStatus, RuntimeConfig, SimulationRuntime, SimulationStatus, SourceError, Subscription,
 };
+use glam::DVec3;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::wrapper::Parameters,
@@ -497,6 +504,7 @@ struct SnapshotView<'a> {
     channels: BTreeMap<ChannelId, &'a ChannelSnapshot>,
     diagnostics: &'a [SolverDiagnostic],
     distances: &'a [(DistanceProbeId, f64)],
+    universe: Option<UniverseSummary>,
 }
 
 /// The MCP-facing handle onto one session's model.
@@ -509,11 +517,27 @@ struct SnapshotView<'a> {
 #[derive(Clone)]
 pub struct McpServer {
     model: Arc<Mutex<HeadlessServer>>,
+    /// Builds this host's plugin composition fresh on every call — for
+    /// `create_scene`/`open_scene`, which each need their own concrete
+    /// `Box<dyn EquationSystemPlugin>` set (not `Clone`, so a stored `Vec`
+    /// would only be usable once). Host-supplied rather than hardcoded: the
+    /// standalone binary uses a CPU-only catalog
+    /// (`fieldcad_server::server_plugin_catalog`), while the desktop-embedded
+    /// server must use the desktop's own GPU-backed catalog — using the
+    /// wrong one would silently diverge from what the desktop's own File
+    /// menu New/Load would have built.
+    plugin_catalog: Arc<dyn Fn() -> Vec<fieldcad_simulation::PluginRegistration> + Send + Sync>,
 }
 
 impl McpServer {
-    pub fn new(model: Arc<Mutex<HeadlessServer>>) -> Self {
-        Self { model }
+    pub fn new(
+        model: Arc<Mutex<HeadlessServer>>,
+        plugin_catalog: Arc<dyn Fn() -> Vec<fieldcad_simulation::PluginRegistration> + Send + Sync>,
+    ) -> Self {
+        Self {
+            model,
+            plugin_catalog,
+        }
     }
 }
 
@@ -617,6 +641,7 @@ impl McpServer {
             channels,
             diagnostics: &snapshot.diagnostics,
             distances: &snapshot.distances,
+            universe: snapshot.universe,
         })
     }
 
@@ -976,6 +1001,287 @@ impl McpServer {
             Err(error) => tool_error(error.to_string()),
         }
     }
+
+    #[tool(
+        description = "Save the current session — the authored world, domain/time-step, field-system composition, and any edits still sitting paused in the command queue — as a fieldcad.scene/v1 document at the given server-local filesystem path. Overwrites atomically and keeps one .bak of the previous verified document. The path is on the machine running this server, not the calling client's filesystem."
+    )]
+    async fn save_scene(
+        &self,
+        Parameters(params): Parameters<SaveSceneParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let inputs = {
+            let mut server = lock(&self.model);
+            let (world, queue) = match server.capture_document() {
+                Ok(document) => document,
+                Err(error) => return tool_error(error.to_string()),
+            };
+            fieldcad_scene_document::SceneDocumentInputs {
+                domain: server.domain(),
+                time_step: server.time_step(),
+                scene_scale: server.scene_scale(),
+                integration_scheme: server.integration_scheme(),
+                field_systems: server.field_systems(),
+                world,
+                queue,
+            }
+        };
+        let document = fieldcad_scene_document::SceneDocument::capture(
+            inputs,
+            concat!("fieldcad-mcp/", env!("CARGO_PKG_VERSION")),
+            None,
+        );
+        match fieldcad_scene_document::save_to_path(&document, std::path::Path::new(&params.path)) {
+            Ok(()) => ok_json(&SaveSceneResult { path: params.path }),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Replace the current session with a fieldcad.scene/v1 document loaded from the given server-local path. IDs, schemas, domain, and field-system composition are restored exactly; any edits saved paused in the command queue are restored still paused and unapplied, never replayed into the world. The session always comes back paused, regardless of whether it was running when saved. An unknown or incompatible plugin, or a document this build cannot parse, is reported as a structured error rather than silently dropped or reinterpreted."
+    )]
+    async fn open_scene(
+        &self,
+        Parameters(params): Parameters<OpenSceneParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let outcome =
+            match fieldcad_scene_document::load_newest_valid(std::path::Path::new(&params.path)) {
+                Ok(outcome) => outcome,
+                Err(error) => return tool_error(error.to_string()),
+            };
+        let queue = outcome.document.queue.clone();
+        let source_label = format!("{:?}", outcome.source);
+        let (new_source, warnings) =
+            match build_session((self.plugin_catalog)(), Some(outcome.document)) {
+                Ok(result) => result,
+                Err(error) => return tool_error(error),
+            };
+        let mut server = lock(&self.model);
+        server.replace_source(new_source);
+        if queue.paused
+            && let Err(error) = server.submit(CommandPayload::PauseQueue)
+        {
+            return tool_error(error.to_string());
+        }
+        for payload in queue.pending {
+            if let Err(error) = server.submit(payload) {
+                return tool_error(error.to_string());
+            }
+        }
+        drop(server);
+        ok_json(&OpenOrCreateSceneResult {
+            source: source_label,
+            warnings: warnings.iter().map(format_resolve_warning).collect(),
+        })
+    }
+
+    #[tool(
+        description = "Replace the current session with a new scene: empty by default, or the built-in demo scene (one point charge and a probe recording its electric field) when template=true. Goes through the same construction path as loading a document, including starting paused with no undo history."
+    )]
+    async fn create_scene(
+        &self,
+        Parameters(params): Parameters<CreateSceneParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (new_source, warnings) =
+            match build_session_with_template((self.plugin_catalog)(), params.template) {
+                Ok(result) => result,
+                Err(error) => return tool_error(error),
+            };
+        lock(&self.model).replace_source(new_source);
+        ok_json(&OpenOrCreateSceneResult {
+            source: "new".to_owned(),
+            warnings: warnings.iter().map(format_resolve_warning).collect(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SaveSceneParams {
+    /// Server-local filesystem path to write the document to (not the
+    /// calling client's filesystem).
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SaveSceneResult {
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OpenSceneParams {
+    /// Server-local filesystem path to read the document from.
+    path: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct CreateSceneParams {
+    /// `false` (default) starts empty; `true` starts with the built-in demo
+    /// scene (one point charge, a probe, and an XY slice plane).
+    #[serde(default)]
+    template: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenOrCreateSceneResult {
+    /// Which candidate file the load actually used (`open_scene` only,
+    /// `"new"` for `create_scene`) — anything other than the primary file is
+    /// worth a caller's attention.
+    source: String,
+    /// Non-fatal plugin minor/patch version differences between the document
+    /// and this build, if any.
+    warnings: Vec<String>,
+}
+
+fn format_resolve_warning(warning: &fieldcad_scene_document::ResolveWarning) -> String {
+    format!(
+        "{} document={} linked={}",
+        warning.plugin, warning.document_version, warning.linked_version
+    )
+}
+
+/// This server's plugin composition — one electric field, two candidate
+/// models, electrostatics active — reused unchanged from
+/// [`fieldcad_server::server_plugin_catalog`], the same catalog
+/// `default_session()` builds from. The standalone binary's default plugin
+/// catalog for `McpServer::new`.
+pub fn mcp_plugin_catalog() -> Vec<PluginRegistration> {
+    fieldcad_server::server_plugin_catalog()
+}
+
+/// The built-in demo scene: one positive point charge and a probe recording
+/// its electric field — [`create_scene`](McpServer::create_scene)'s
+/// `template: true` content. Deliberately smaller than the desktop's own
+/// demo scene (no slice plane, no Maxwell-specific channels): this crate has
+/// no GPU-backed Maxwell channel imports to draw on, and a point charge plus
+/// a probe is enough to demonstrate a non-empty session.
+fn demo_scene_commands() -> Result<Vec<WorldCommand>, String> {
+    Ok(vec![
+        WorldCommand::CreateObject(
+            ObjectSpec::new("Positive point charge")
+                .with_transform(Transform::at(DVec3::ZERO).map_err(|error| error.to_string())?)
+                .with_shape(ObjectShape::point(0.1).map_err(|error| error.to_string())?)
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9))
+                        .map_err(|error| error.to_string())?,
+                ),
+        ),
+        WorldCommand::CreateProbe(ProbeSpec::at(
+            "Field probe",
+            DVec3::new(1.0, 0.0, 0.0),
+            vec![electric_field_channel_id()],
+        )),
+    ])
+}
+
+/// A session-scoped identity, freshly minted — every prior call site
+/// hardcoded a fixed `SessionId`; `create_scene`/`open_scene` need one
+/// distinguishable from whatever session came before (US-01: "stable session
+/// identifier," stable *within* the session only).
+fn fresh_session_id() -> SessionId {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(1);
+    SessionId::from_u128(nanos)
+}
+
+/// Build a fresh runtime from either an empty world or a loaded document,
+/// through one construction path — mirrors `fieldcad-desktop`'s own
+/// `build_session`, differing only in `catalog` (CPU-only here) and in never
+/// restoring a saved document's paused command queue itself: that replay
+/// happens one level up, in `open_scene`, after the session is reachable
+/// through the ordinary `HeadlessServer::submit` path.
+fn build_session(
+    catalog: Vec<PluginRegistration>,
+    document: Option<fieldcad_scene_document::SceneDocument>,
+) -> Result<
+    (
+        AsyncLocalDataSource,
+        Vec<fieldcad_scene_document::ResolveWarning>,
+    ),
+    String,
+> {
+    let (domain, time_step, scene_scale, integration_scheme, world, plugins, warnings) =
+        match document {
+            None => {
+                let domain = Domain::centred_cube(5.0, 32).map_err(|error| error.to_string())?;
+                let time_step = TimeStep::from_seconds(courant_limit(&domain) * 0.8)
+                    .map_err(|error| error.to_string())?;
+                (
+                    domain,
+                    time_step,
+                    SceneScale::default(),
+                    fieldcad_dynamics::IntegrationScheme::default(),
+                    World::new(),
+                    catalog,
+                    Vec::new(),
+                )
+            }
+            Some(doc) => {
+                let (plugins, warnings) =
+                    fieldcad_scene_document::resolve_plugins(catalog, &doc.field_systems)
+                        .map_err(|error| error.to_string())?;
+                (
+                    doc.domain,
+                    doc.time_step,
+                    doc.scene_scale,
+                    doc.integration_scheme,
+                    World::from_document(doc.world),
+                    plugins,
+                    warnings,
+                )
+            }
+        };
+    let mut config = RuntimeConfig::new(domain, time_step, fresh_session_id())
+        .with_world(world)
+        .with_scene_scale(scene_scale)
+        .with_integration_scheme(integration_scheme);
+    for plugin in plugins {
+        config = config.with_plugin_registration(plugin);
+    }
+    let mut runtime = SimulationRuntime::new(config).map_err(|error| error.to_string())?;
+    runtime.clear_edit_history();
+    Ok((
+        AsyncLocalDataSource::new(LocalDataSource::new(runtime)),
+        warnings,
+    ))
+}
+
+/// `create_scene`'s own entry point: `build_session` plus, if `template`,
+/// the demo content committed (and folded into the same
+/// `clear_edit_history()`) before the session is handed back — so New Scene
+/// never leaves an opening undo entry, matching ADR 0024.
+fn build_session_with_template(
+    catalog: Vec<PluginRegistration>,
+    template: bool,
+) -> Result<
+    (
+        AsyncLocalDataSource,
+        Vec<fieldcad_scene_document::ResolveWarning>,
+    ),
+    String,
+> {
+    if !template {
+        return build_session(catalog, None);
+    }
+    let domain = Domain::centred_cube(5.0, 32).map_err(|error| error.to_string())?;
+    let time_step =
+        TimeStep::from_seconds(courant_limit(&domain) * 0.8).map_err(|error| error.to_string())?;
+    let mut config = RuntimeConfig::new(domain, time_step, fresh_session_id())
+        .with_scene_scale(SceneScale::default())
+        .with_integration_scheme(fieldcad_dynamics::IntegrationScheme::default());
+    for plugin in catalog {
+        config = config.with_plugin_registration(plugin);
+    }
+    let mut runtime = SimulationRuntime::new(config).map_err(|error| error.to_string())?;
+    runtime
+        .commit_world_commands(demo_scene_commands()?)
+        .map_err(|error| error.to_string())?;
+    runtime.clear_edit_history();
+    Ok((
+        AsyncLocalDataSource::new(LocalDataSource::new(runtime)),
+        Vec::new(),
+    ))
 }
 
 impl McpServer {
@@ -1011,6 +1317,7 @@ impl McpServer {
                             .collect(),
                         diagnostics: &snapshot.diagnostics,
                         distances: &snapshot.distances,
+                        universe: snapshot.universe,
                     },
                 ),
                 None => resource_text(uri, &Option::<()>::None),
@@ -1135,7 +1442,10 @@ mod tests {
 
     fn server() -> McpServer {
         let source = fieldcad_server::default_session().expect("default session builds");
-        McpServer::new(Arc::new(Mutex::new(HeadlessServer::new(source))))
+        McpServer::new(
+            Arc::new(Mutex::new(HeadlessServer::new(source))),
+            Arc::new(mcp_plugin_catalog),
+        )
     }
 
     /// A tool call that submits a running edit (`commit_world` while
@@ -2214,11 +2524,79 @@ mod tests {
         let model = Arc::new(Mutex::new(HeadlessServer::new(
             fieldcad_server::default_session().expect("default session builds"),
         )));
-        let mcp = McpServer::new(Arc::clone(&model));
+        let mcp = McpServer::new(Arc::clone(&model), Arc::new(mcp_plugin_catalog));
 
         let direct_log = direct_script(&mut direct);
         let mcp_log = mcp_script(&mcp, &model).await;
 
         assert_eq!(direct_log, mcp_log);
+    }
+
+    #[tokio::test]
+    async fn save_open_and_create_scene_round_trip_through_mcp_tools() {
+        let mcp = server();
+        let authored = json_of(
+            &mcp.commit_world(Parameters(CommitWorldParams {
+                commands: vec![
+                    serde_json::to_value(WorldCommand::CreateObject(ObjectSpec::new(
+                        "saved-object",
+                    )))
+                    .unwrap(),
+                ],
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(authored["disposition"], "Applied");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scene.fcscene");
+        let saved = json_of(
+            &mcp.save_scene(Parameters(SaveSceneParams {
+                path: path.to_string_lossy().into_owned(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(saved["path"], path.to_string_lossy().as_ref());
+        assert!(path.exists());
+
+        let opened = json_of(
+            &mcp.open_scene(Parameters(OpenSceneParams {
+                path: path.to_string_lossy().into_owned(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(opened["source"], "Primary");
+        assert!(
+            opened["warnings"].as_array().unwrap().is_empty(),
+            "reopening a document just saved by this build must not warn: {opened}"
+        );
+
+        // The reopened world must contain exactly what was saved — proof
+        // `open_scene` actually replaced the session rather than being a
+        // no-op, and that IDs survived the round trip.
+        let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
+            .expect("get_world returns a WorldSnapshot");
+        assert_eq!(world.objects().len(), 1);
+        assert_eq!(
+            world.objects().values().next().unwrap().name,
+            "saved-object"
+        );
+
+        // create_scene replaces the session again, back to empty.
+        let created = json_of(
+            &mcp.create_scene(Parameters(CreateSceneParams { template: false }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(created["source"], "new");
+        let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
+            .expect("get_world returns a WorldSnapshot");
+        assert!(
+            world.objects().is_empty(),
+            "create_scene without a template must start empty"
+        );
     }
 }

@@ -77,6 +77,7 @@ pub fn append_authoring_geometry(
     selection: Option<SceneSelection>,
     show: SceneVisibility,
     scene_scale: SceneScale,
+    universe: Option<fieldcad_core::UniverseSummary>,
 ) {
     if show.planes {
         for plane in world.planes().values().filter(|plane| plane.visible) {
@@ -111,6 +112,50 @@ pub fn append_authoring_geometry(
             );
         }
     }
+    // Always drawn, independent of `show`: the centre of mass isn't a
+    // `SceneVisibility` class of its own (it's not user-authored, so there's
+    // nothing for a visibility toggle to hide), and it's the one derived
+    // object in `world.objects()` — see `WorldObject::derived`.
+    if let Some(center_of_mass) = world.objects().values().find(|object| object.derived) {
+        let position = scene_scale.to_render_vec3(center_of_mass.transform.translation);
+        let radius = 0.1;
+        let color = Vec4::new(1.0, 0.82, 0.2, 1.0);
+        push_circle(
+            &mut geometry.vector_lines,
+            position,
+            Vec3::X,
+            Vec3::Y,
+            radius,
+            color,
+        );
+        push_circle(
+            &mut geometry.vector_lines,
+            position,
+            Vec3::Y,
+            Vec3::Z,
+            radius,
+            color,
+        );
+        push_circle(
+            &mut geometry.vector_lines,
+            position,
+            Vec3::Z,
+            Vec3::X,
+            radius,
+            color,
+        );
+
+        if let Some(universe) = universe {
+            super::append_arrow(
+                &mut geometry.vector_lines,
+                position,
+                universe.total_momentum.as_vec3(),
+                0.25,
+                Vec4::new(0.4, 0.85, 1.0, 1.0),
+            );
+        }
+    }
+
     if !show.probes {
         return;
     }
@@ -504,8 +549,8 @@ fn append_sphere_visual(
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{
-        BoxId, FieldBoxSpec, FieldSphereSpec, ObjectId, PlaneId, ProbeId, SphereId, World,
-        WorldCommand,
+        BoxId, FieldBoxSpec, FieldSphereSpec, ObjectId, ObjectSpec, PlaneId, ProbeId, SphereId,
+        Transform as CoreTransform, World, WorldCommand,
     };
     use glam::DVec3;
 
@@ -565,6 +610,7 @@ mod tests {
             None,
             SceneVisibility::ALL,
             SceneScale::metre(),
+            None,
         );
         assert!(!geometry.surface_triangles.is_empty());
         assert!(!geometry.vector_lines.is_empty());
@@ -580,9 +626,52 @@ mod tests {
                 ..SceneVisibility::ALL
             },
             SceneScale::metre(),
+            None,
         );
         assert!(hidden.surface_triangles.is_empty());
         assert!(hidden.vector_lines.is_empty());
+    }
+
+    #[test]
+    fn a_derived_object_gets_a_marker_and_a_momentum_arrow_when_universe_is_known() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("Center of mass")
+                    .with_transform(CoreTransform::at(DVec3::new(1.0, 2.0, 3.0)).unwrap())
+                    .derived(),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+        let universe = fieldcad_core::UniverseSummary {
+            center_of_mass: DVec3::new(1.0, 2.0, 3.0),
+            total_momentum: DVec3::new(1.0, 0.0, 0.0),
+            total_kinetic_energy_j: 4.0,
+        };
+
+        let mut without_universe = FieldGeometry::default();
+        append_authoring_geometry(
+            &mut without_universe,
+            &snapshot,
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+            None,
+        );
+        // The marker itself doesn't need `universe` — only the arrow does.
+        assert!(!without_universe.vector_lines.is_empty());
+        let marker_only_lines = without_universe.vector_lines.len();
+
+        let mut with_universe = FieldGeometry::default();
+        append_authoring_geometry(
+            &mut with_universe,
+            &snapshot,
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+            Some(universe),
+        );
+        assert!(with_universe.vector_lines.len() > marker_only_lines);
     }
 
     #[test]

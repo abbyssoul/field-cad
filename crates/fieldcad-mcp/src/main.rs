@@ -158,7 +158,10 @@ async fn main() -> ExitCode {
         }
     };
     let model = Arc::new(Mutex::new(HeadlessServer::new(source)));
-    let server = McpServer::new(Arc::clone(&model));
+    let server = McpServer::new(
+        Arc::clone(&model),
+        Arc::new(fieldcad_mcp::mcp_plugin_catalog),
+    );
 
     let root_ct = CancellationToken::new();
     tokio::spawn({

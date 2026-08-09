@@ -11,6 +11,7 @@ members = [
     "crates/fieldcad-mcp",
     "crates/fieldcad-particles",
     "crates/fieldcad-plugin-api",
+    "crates/fieldcad-scene-document",
     "crates/fieldcad-server",
     "crates/fieldcad-simulation",
     "crates/fieldcad-superposition",
@@ -42,6 +43,7 @@ default-members = ["apps/fieldcad-desktop"]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
+directories = "6"
 egui = "0.35"
 egui-wgpu = "0.35"
 egui-winit = "0.35"
@@ -50,10 +52,12 @@ hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 naga = { version = "29", features = ["wgsl-in"] }
 pollster = "1.0"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 rmcp = "3.1.0"
 schemars = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 tokio = "1"
 tokio-util = "0.7"
@@ -74,6 +78,7 @@ fieldcad-newtonian-gravity = { path = "crates/fieldcad-newtonian-gravity" }
 fieldcad-mcp = { path = "crates/fieldcad-mcp" }
 fieldcad-particles = { path = "crates/fieldcad-particles" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
+fieldcad-scene-document = { path = "crates/fieldcad-scene-document" }
 fieldcad-server = { path = "crates/fieldcad-server" }
 fieldcad-simulation = { path = "crates/fieldcad-simulation" }
 fieldcad-superposition = { path = "crates/fieldcad-superposition" }

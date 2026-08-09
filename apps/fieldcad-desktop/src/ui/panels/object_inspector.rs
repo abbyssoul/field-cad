@@ -551,13 +551,13 @@ fn scalar_editor(
     note_held_edit(&response, editing)
 }
 
-fn radius_editor(ui: &mut egui::Ui, radius: &mut f64, minimum: f64, editing: &mut bool) -> bool {
-    let response = ui.add(
-        egui::DragValue::new(radius)
-            .speed(0.01)
-            .range(minimum..=f64::INFINITY)
-            .prefix("r: ")
-            .suffix(" m"),
-    );
-    note_held_edit(&response, editing)
+/// `minimum` is advisory only, same as everywhere else `coordinate_editor` is
+/// used for a shape/position field: `ObjectShape::point`/`sphere`'s own
+/// validation is what actually rejects a non-positive radius (silently, by
+/// returning `Err` at the call site rather than submitting), so a UI-level
+/// range clamp would only duplicate that check while blocking the SI-prefix
+/// parser (`coordinate_editor`) from accepting "6400 km" the same way every
+/// other length field in this inspector already does.
+fn radius_editor(ui: &mut egui::Ui, radius: &mut f64, _minimum: f64, editing: &mut bool) -> bool {
+    coordinate_editor(ui, "r", radius, Dimension::LENGTH, editing)
 }

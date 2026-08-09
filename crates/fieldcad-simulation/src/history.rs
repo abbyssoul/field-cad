@@ -283,6 +283,7 @@ mod tests {
             )]),
             diagnostics: Arc::from([]),
             distances: Arc::from([]),
+            universe: None,
         }
     }
 

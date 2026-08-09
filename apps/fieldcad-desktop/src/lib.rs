@@ -4,6 +4,7 @@ mod electromagnetism_gpu;
 mod electrostatics_gpu;
 pub mod gpu;
 mod mcp;
+mod profile;
 mod renderer;
 pub mod scene;
 mod ui;

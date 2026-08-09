@@ -43,24 +43,45 @@ per-client conveniences, not shared experiment mutations.
 | Client presentation | individual client | selection, camera, panel layout, layer style, floating plots | Keep local unless explicitly saved as a named view. |
 | Transport subscription | individual client plus source acknowledgement | requested channels, planes, grid stride, level of detail | Set independently of the world; re-establish after reconnect. |
 
+App settings/user profile (recent files, default dialog directory,
+startup-window preferences) is intentionally outside this document's scope
+entirely: it is desktop-client-local configuration in the same spirit as the
+"Client presentation" row above, but it is not even part of a session — it
+persists across every scene and is never MCP-exposed.
+
 ## User stories
 
 ### 1. Start, discover, and connect
 
-- **US-01 — Create a new scene** *(Required for API/MCP parity)*  
+- **US-01 — Create a new scene** *(Implemented)*  
   As a modeller, I want to create an empty or explicitly templated scene so
   that I can begin a reproducible experiment.  
   Acceptance: the result has a stable experiment/session identifier, initial
   world revision, declared schemas/catalog versions, field-system composition,
   and initial run configuration. Creating a scene must use the same validation
-  path as later edits and must not leave unwanted undo entries.
+  path as later edits and must not leave unwanted undo entries.  
+  Desktop File > New (Empty/Demo Scene) and MCP `create_scene` both go through
+  one shared construction path (`build_session`) that mints a fresh session
+  id, applies the same plugin/domain wiring as every other session, and calls
+  `clear_edit_history()` before returning — so no opening undo entry is ever
+  left, matching ADR 0024.
 
-- **US-02 — Open an existing scene/experiment** *(Required for API/MCP parity)*  
+- **US-02 — Open an existing scene/experiment** *(Implemented)*  
   As a modeller, I want to load a saved experiment so that I can continue or
   reproduce prior work.  
   Acceptance: all authored state and experiment configuration are restored with
   their schemas, units, plugin/model versions, domain, numerical settings, and
-  provenance; incompatibility is reported, never silently adapted.
+  provenance; incompatibility is reported, never silently adapted.  
+  Desktop File > Open and MCP `open_scene` load a `fieldcad.scene/v1` document
+  (`fieldcad-scene-document`), rebuild the world with its original identifiers
+  intact (including any gap left by a since-deleted object — no ID
+  renumbering), and restore any edits that were still sitting paused in the
+  command queue at save time, still paused and unapplied. An unknown plugin, a
+  major plugin-version mismatch, a conflicting component schema, or an
+  unsupported document format/version is rejected with a structured error
+  rather than silently reinterpreted. The session always comes back paused,
+  regardless of whether it was running when saved, so opening a file never by
+  itself starts consuming machine resources.
 
 - **US-03 — Inspect the current scene** *(Implemented)*  
   As a modeller, I want to retrieve the complete current world, including its
@@ -206,15 +227,13 @@ physical sources or alter a solver result.
   geometry/attachment, channels, visibility, and current status so that I can
   understand how the experiment is observed.
 
-- **US-31 — Add, edit, duplicate, hide, and remove a slice plane** *(Implemented,
-  except rename)*  
+- **US-31 — Add, edit, duplicate, hide, and remove a slice plane** *(Implemented)*  
   As a modeller, I want to create a bounded, orientable slice plane; set its
   origin, normal, in-plane orientation and extents; choose standard XY/XZ/YZ
   orientations; duplicate it; hide it; and remove it so that I can inspect a
   field across relevant surfaces.
 
-- **US-32 — Add, position, attach, show/hide, and remove a probe** *(Implemented,
-  except rename)*  
+- **US-32 — Add, position, attach, show/hide, and remove a probe** *(Implemented)*  
   As a modeller, I want to create a point probe, place it at a world coordinate
   or attach it with a local offset to an object, detach it at its current world
   position, hide it, and remove it so that I can measure a fixed or moving
@@ -260,8 +279,7 @@ physical sources or alter a solver result.
   As a modeller, I want to set a positive wall-clock speed multiplier so that I
   can watch a run faster or slower without altering fixed `dt` or results.
 
-- **US-45 — Change scene or numerical configuration safely while simulation is
-  running** *(Implemented)*
+- **US-45 — Change scene or numerical configuration safely while simulation is running** *(Implemented)*
   As a modeller, I want an authored scene or domain edit submitted during a run
   to be applied atomically immediately before a fixed tick, in submission order,
   so that the result does not depend on GUI frame cadence. A domain change then
@@ -339,13 +357,20 @@ physical sources or alter a solver result.
   then replay them against a fresh session so that I can reproduce a result
   independently of rendered frames and UI timing.
 
-- **US-63 — Save, export, import, and share an experiment** *(Required for
-  API/MCP parity)*  
+- **US-63 — Save, export, import, and share an experiment** *(Partially
+  implemented)*  
   As a researcher, I want to persist and exchange a documented experiment,
   optional named views, recordings, and selected observations so that another
   person or agent can reproduce, audit, and extend it. Export must include
   identifiers, schemas, units, catalogue/model/plugin versions, numerical
-  configuration, provenance, and any compatibility warnings.
+  configuration, provenance, and any compatibility warnings.  
+  Save/load of a `fieldcad.scene/v1` document — world, domain, numerical
+  configuration, field-system composition, and provenance, including any
+  edits still paused in the command queue — is implemented via the desktop
+  File menu and MCP's `save_scene`/`open_scene`/`create_scene` tools (see
+  US-01/US-02). Named views, recordings, and selected-observation
+  export/import remain out of scope; see `docs/tasks/product-capability-gaps.md`
+  items 6-8.
 
 ### 8. Navigate and present the scene
 

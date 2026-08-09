@@ -78,3 +78,26 @@ fn a_headless_session_authors_a_scene_and_steps_with_no_gpu() {
         .expect("a step produces a snapshot");
     assert!(snapshot.is_complete());
 }
+
+#[test]
+fn capture_document_round_trips_through_the_async_worker() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+
+    let authored = submit_and_wait(&mut server, CommandPayload::CommitWorld(charge_and_probe()));
+    assert!(matches!(authored, CommandEvent::Completed(_)));
+
+    let (world, queue) = server
+        .capture_document()
+        .expect("capture succeeds against a healthy session");
+    assert!(!queue.paused);
+    assert!(queue.pending.is_empty());
+
+    // The captured world must match what the ordinary read path reports —
+    // proof the blocking round-trip actually reached the worker's live
+    // session rather than returning stale/default data.
+    let live = server.world();
+    let reloaded = fieldcad_core::World::from_document(world);
+    assert_eq!(reloaded.snapshot().objects(), live.objects());
+    assert_eq!(reloaded.snapshot().probes(), live.probes());
+}

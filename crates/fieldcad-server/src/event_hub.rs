@@ -71,6 +71,25 @@ impl EventHub {
         EventWatcher(self.sender.subscribe())
     }
 
+    /// Clear every "last published" value without rebuilding the broadcast
+    /// channel — used when the session behind this hub is replaced
+    /// ([`crate::HeadlessServer::replace_source`]).
+    ///
+    /// The new session's first `SnapshotIdentity`/`SimulationStatus`/etc. can
+    /// coincidentally equal cached values from the *old* session (both
+    /// commonly start at sequence 0 / tick 0), which would otherwise
+    /// suppress the very first post-replace publish and leave every
+    /// subscriber showing stale state. Existing subscribers keep their
+    /// handle and receive the next, unsuppressed publish normally — nothing
+    /// about the channel itself changes, only what counts as "new."
+    pub fn reset(&mut self) {
+        self.last_snapshot = None;
+        self.last_diagnostics = None;
+        self.last_status = None;
+        self.last_source_status = None;
+        self.last_queue = None;
+    }
+
     /// Compares every state category against what was last published and
     /// sends (and remembers) only what changed. A snapshot update may be
     /// superseded under backpressure — that is normal, not a lost event —

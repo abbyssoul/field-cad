@@ -13,6 +13,7 @@ mod object_inspector;
 mod probe_inspector;
 mod queue;
 mod scene_tree;
+mod settings;
 mod shape_inspector;
 mod world_inspector;
 
@@ -24,6 +25,7 @@ pub use mcp::mcp_window;
 pub use menu_bar::{field_brush_dialog, menu_bar};
 pub use queue::queue_window;
 pub use scene_tree::scene_tree;
+pub use settings::settings_window;
 
 // ── Re-exports for sibling sub-modules ─────────────────────────────────────
 // Used via `super::section(...)` etc. in function-body path expressions.

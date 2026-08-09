@@ -648,7 +648,7 @@ pub fn instances(
     world
         .objects()
         .values()
-        .filter(|object| object.visible)
+        .filter(|object| object.visible && !object.derived)
         .map(|object| {
             ObjectInstance::from_object(object, selection == Some(object.id), scene_scale)
         })
@@ -716,6 +716,25 @@ mod tests {
 
         assert_eq!(built.len(), 1);
         assert!(built[0].half_extent.min_element() > 0.0);
+    }
+
+    #[test]
+    fn a_derived_object_gets_no_instance_proxy() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("Center of mass").derived(),
+            )])
+            .unwrap();
+
+        let built = instances(
+            &world.snapshot(),
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+        );
+
+        assert!(built.is_empty());
     }
 
     #[test]

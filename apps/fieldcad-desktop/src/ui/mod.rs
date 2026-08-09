@@ -19,7 +19,7 @@ pub use compute::ComputeView;
 use help::help_window;
 use panels::{
     diagnostics_window, field_brush_dialog, inspector, mcp_window, menu_bar, queue_window,
-    scene_tree,
+    scene_tree, settings_window,
 };
 use plot::{floating_distance_probe_plots, floating_probe_plots};
 use viewcontrols::view_controls;
@@ -268,6 +268,9 @@ pub struct UiModel {
     /// `mcp_panel_open`: an empty queue is the common case and shouldn't
     /// demand screen space by default.
     pub queue_panel_open: bool,
+    /// Whether the app-settings panel is shown. Defaults closed, matching
+    /// `mcp_panel_open`/`queue_panel_open`: there's nothing urgent to show.
+    pub settings_visible: bool,
     /// The object the camera is locked onto, if any — independent of
     /// `selection`, so following one object while inspecting another is
     /// possible. `App::apply_camera_follow` re-targets the camera to this
@@ -303,6 +306,7 @@ impl UiModel {
             domain_draft: None,
             mcp_panel_open: false,
             queue_panel_open: false,
+            settings_visible: false,
             following: None,
         }
     }
@@ -525,6 +529,26 @@ pub struct ChannelLayerSettings {
     pub spheres: BTreeMap<SphereId, SphereLayerSettings>,
 }
 
+/// A one-shot request to replace or persist the whole session — new scene,
+/// save, save as, or open — rather than a single world edit.
+///
+/// Handled the same way [`McpAction`] is: these mutate `WindowState` itself
+/// (touch the filesystem, potentially swap the entire runtime), not the
+/// live session through `commands`/`CommandPayload`.
+#[derive(Debug, Clone)]
+pub enum AppAction {
+    /// `template = false` starts empty; `true` starts with the built-in demo
+    /// scene.
+    NewScene {
+        template: bool,
+    },
+    /// Save to the session's known path, falling back to `SaveSceneAs` if
+    /// none is known yet.
+    SaveScene,
+    SaveSceneAs,
+    OpenScene,
+}
+
 #[derive(Debug)]
 pub struct UiFrameOutput {
     pub viewport: egui::Rect,
@@ -547,6 +571,9 @@ pub struct UiFrameOutput {
     /// app-level infrastructure, not a simulation command, so it travels
     /// the same way `camera_action` does rather than through `commands`.
     pub mcp_action: Option<McpAction>,
+    /// A one-shot request to replace or persist the whole session — see
+    /// [`AppAction`].
+    pub app_action: Option<AppAction>,
 }
 
 impl UiFrameOutput {
@@ -569,6 +596,7 @@ impl Default for UiFrameOutput {
             commands: Vec::new(),
             scene_edit_in_progress: false,
             mcp_action: None,
+            app_action: None,
         }
     }
 }
@@ -821,7 +849,12 @@ fn section<R>(
         .body_returned
 }
 
-pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -> UiFrameOutput {
+pub fn show(
+    root: &mut egui::Ui,
+    model: &mut UiModel,
+    frame: FrameContext<'_>,
+    profile: &mut crate::profile::UserProfile,
+) -> UiFrameOutput {
     let mut output = UiFrameOutput::default();
     let context = root.ctx().clone();
     model.synchronize_field_layers(frame.compute);
@@ -850,6 +883,7 @@ pub fn show(root: &mut egui::Ui, model: &mut UiModel, frame: FrameContext<'_>) -
     if model.queue_panel_open {
         queue_window(&context, &frame, &mut output);
     }
+    settings_window(&context, model, profile);
     floating_probe_plots(&context, model, &frame);
     floating_distance_probe_plots(&context, model, &frame);
     field_brush_dialog(&context, model, frame.compute);
@@ -1067,6 +1101,7 @@ mod tests {
             )),
             ..Default::default()
         };
+        let mut profile = crate::profile::UserProfile::default();
         let full_output = context.run_ui(input, |root| {
             show(
                 root,
@@ -1097,6 +1132,7 @@ mod tests {
                     cpu_history: &[],
                     step_compute_history: &[],
                 },
+                &mut profile,
             );
         });
 
@@ -1141,6 +1177,7 @@ mod tests {
             events,
             ..Default::default()
         };
+        let mut profile = crate::profile::UserProfile::default();
         let _ = context.run_ui(input, |root| {
             output = show(
                 root,
@@ -1171,6 +1208,7 @@ mod tests {
                     cpu_history: &[],
                     step_compute_history: &[],
                 },
+                &mut profile,
             );
         });
         output

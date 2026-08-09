@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -141,6 +142,19 @@ pub struct FieldSnapshot {
     /// `ChannelSnapshot`: a distance is a pure geometric measurement with no
     /// `ChannelId` or plugin behind it.
     pub distances: Arc<[(DistanceProbeId, f64)]>,
+    /// Live totals over every mass-bearing object. `None` when nothing in
+    /// the world carries mass. Sibling to `distances` for the same reason —
+    /// these are pure computed quantities with no `ChannelId` or plugin
+    /// behind them.
+    pub universe: Option<UniverseSummary>,
+}
+
+/// Live totals computed over every object carrying inertial mass.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UniverseSummary {
+    pub center_of_mass: DVec3,
+    pub total_momentum: DVec3,
+    pub total_kinetic_energy_j: f64,
 }
 
 impl FieldSnapshot {
