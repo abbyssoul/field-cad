@@ -1749,8 +1749,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_step_undo_redo_are_refused_while_the_queue_is_paused_with_pending_work() {
-        for tool in ["pause", "step", "undo", "redo"] {
+    async fn pause_step_redo_are_refused_while_the_queue_is_paused_with_pending_work() {
+        for tool in ["pause", "step", "redo"] {
             let server = server();
             server.pause_queue().await.unwrap();
             server.play().await.unwrap();
@@ -1768,7 +1768,6 @@ mod tests {
             let result = match tool {
                 "pause" => server.pause().await.unwrap(),
                 "step" => server.step().await.unwrap(),
-                "undo" => server.undo().await.unwrap(),
                 "redo" => server.redo().await.unwrap(),
                 _ => unreachable!(),
             };
@@ -1790,6 +1789,58 @@ mod tests {
             // nothing in this iteration resumes or cancels it.
             commit.abort();
         }
+    }
+
+    /// Unlike `pause`/`step`/`redo`, `undo` does not reject a still-pending
+    /// edit — it cancels it, since the edit was never recorded in history to
+    /// begin with. Mirrors `cancel_queued_command_prevents_its_application`.
+    #[tokio::test]
+    async fn undo_cancels_a_queued_command_instead_of_being_refused() {
+        let server = server();
+        server.pause_queue().await.unwrap();
+        server.play().await.unwrap();
+
+        let commit_server = server.clone();
+        let commit = tokio::spawn(async move {
+            commit_server
+                .commit_world(Parameters(CommitWorldParams {
+                    commands: charge_and_probe_commands(),
+                }))
+                .await
+        });
+        wait_for_one_pending_command_id(&server).await;
+
+        let undone = json_of(&server.undo().await.unwrap());
+        assert_eq!(undone["disposition"], "Applied");
+
+        // The cancelled command's own waiter resolves with a rejection, not
+        // a hang.
+        let commit_result = commit.await.unwrap().unwrap();
+        assert_eq!(commit_result.is_error, Some(true));
+        let [ContentBlock::Text(text)] = commit_result.content.as_slice() else {
+            panic!(
+                "expected one text content block, got {:?}",
+                commit_result.content
+            );
+        };
+        assert!(
+            text.text.contains("cancelled"),
+            "the undone command's own waiter should report cancellation: {}",
+            text.text
+        );
+
+        let queue = json_of(&server.get_queue().await.unwrap());
+        assert!(queue["pending"].as_array().unwrap().is_empty());
+        let history = queue["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["state"], "cancelled");
+
+        // Nothing left to flush: resuming and forcing a boundary must not
+        // resurrect the cancelled edit.
+        server.resume_queue().await.unwrap();
+        server.pause().await.unwrap();
+        let world = json_of(&server.get_world().await.unwrap());
+        assert!(world["objects"].as_object().unwrap().is_empty());
     }
 
     #[tokio::test]

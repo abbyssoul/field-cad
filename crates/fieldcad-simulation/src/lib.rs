@@ -1610,12 +1610,15 @@ mod tests {
 
     /// Unlike the `Running` case (where a resumed queue waits for the next
     /// tick boundary — see `resuming_a_paused_queue_applies_pending_edits_in_submission_order`),
-    /// a `Paused` simulation has no boundary to wait for, so its held edit
-    /// applies the instant the queue stops being the only reason it was
-    /// held — resuming must not leave it stranded until some unrelated
-    /// command happens to flush it.
+    /// a `Paused` simulation has no boundary to wait for. But `ResumeQueue`
+    /// itself does not flush a `Paused` simulation's held backlog
+    /// synchronously either (that would report the whole backlog as one
+    /// final state, losing the same per-edit feedback a live edit gets —
+    /// see `flush_one_pending_mutation`): it drains one held edit per
+    /// `poll` instead, so resuming must not leave anything stranded past
+    /// the very next poll.
     #[test]
-    fn resuming_the_queue_immediately_applies_a_paused_simulations_held_edit() {
+    fn resuming_the_queue_drains_a_paused_simulations_held_edit_on_the_next_poll() {
         let mut source = LocalDataSource::new(runtime());
         source.execute(command(CommandPayload::PauseQueue)).unwrap();
         source
@@ -1628,8 +1631,60 @@ mod tests {
             .execute(command(CommandPayload::ResumeQueue))
             .unwrap();
 
+        // Not yet flushed by `ResumeQueue` itself...
+        assert_eq!(source.get_queue().pending.len(), 1);
+        assert!(source.world().objects().is_empty());
+
+        // ...but drains on the very next poll, with no unrelated command
+        // needed to flush it.
+        source.poll(Duration::ZERO).unwrap();
         assert!(source.get_queue().pending.is_empty());
         assert_eq!(source.world().objects().len(), 1);
+    }
+
+    /// The heart of the fix: a multi-edit backlog drains exactly one edit
+    /// per `poll`, not all of it on the first poll after resuming — a real
+    /// UI polling once per frame therefore sees the object move through
+    /// its held positions one at a time, the same way it would have while
+    /// live-dragging, instead of freezing and then jumping straight to the
+    /// final position.
+    #[test]
+    fn resuming_the_queue_drains_a_multi_edit_backlog_one_poll_at_a_time() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::PauseQueue))
+            .unwrap();
+
+        let names = ["first", "second", "third"];
+        for name in names {
+            source
+                .execute(sequencer.issue(CommandPayload::CommitWorld(vec![
+                    WorldCommand::CreateObject(ObjectSpec::new(name)),
+                ])))
+                .unwrap();
+        }
+        assert_eq!(source.get_queue().pending.len(), names.len());
+
+        source
+            .execute(sequencer.issue(CommandPayload::ResumeQueue))
+            .unwrap();
+
+        for expected_objects in 1..=names.len() {
+            assert_eq!(
+                source.get_queue().pending.len(),
+                names.len() - expected_objects + 1,
+                "still {} left pending before this poll",
+                names.len() - expected_objects + 1
+            );
+            source.poll(Duration::ZERO).unwrap();
+            assert_eq!(
+                source.world().objects().len(),
+                expected_objects,
+                "poll #{expected_objects} should apply exactly one more held edit, not the whole backlog"
+            );
+        }
+        assert!(source.get_queue().pending.is_empty());
     }
 
     #[test]
@@ -1837,11 +1892,10 @@ mod tests {
     }
 
     #[test]
-    fn pause_step_undo_redo_are_refused_while_the_queue_is_paused_with_pending_work() {
+    fn pause_step_redo_are_refused_while_the_queue_is_paused_with_pending_work() {
         for payload in [
             CommandPayload::Pause,
             CommandPayload::Step,
-            CommandPayload::Undo,
             CommandPayload::Redo,
         ] {
             let result = queue_paused_conflict(payload);
@@ -1850,6 +1904,104 @@ mod tests {
                 "expected a queue-paused conflict, got {result:?}"
             );
         }
+    }
+
+    /// Undo does not share `Pause`/`Step`/`Redo`'s rejection: a still-pending
+    /// edit has not been recorded in `EditHistory` yet, so "the last action
+    /// I took hasn't landed" is cancelled instead of erroring.
+    #[test]
+    fn undo_cancels_the_most_recently_queued_command_when_the_queue_is_paused() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        let queued = sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::CreateObject(ObjectSpec::new("queued object")),
+        ]));
+        let queued_id = queued.id;
+        assert_eq!(
+            source.execute(queued).unwrap().disposition,
+            CommandDisposition::Queued
+        );
+
+        source
+            .execute(sequencer.issue(CommandPayload::PauseQueue))
+            .unwrap();
+
+        let receipt = source
+            .execute(sequencer.issue(CommandPayload::Undo))
+            .unwrap();
+        assert_eq!(receipt.disposition, CommandDisposition::Applied);
+
+        let queue = source.get_queue();
+        assert!(queue.pending.is_empty());
+        let cancelled = queue
+            .history
+            .iter()
+            .find(|record| record.command == queued_id)
+            .expect("the cancelled command is retained in terminal history");
+        assert_eq!(cancelled.state, CommandLifecycle::Cancelled);
+
+        let events = source.drain_command_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CommandEvent::Cancelled(id) if *id == queued_id)),
+            "a CommandEvent::Cancelled must be emitted for the undone pending command"
+        );
+
+        source.poll(Duration::from_millis(100)).unwrap();
+        assert!(source.world().objects().is_empty());
+    }
+
+    /// Undo picks the newest pending record (LIFO), leaving earlier ones
+    /// still queued rather than cancelling everything.
+    #[test]
+    fn undo_cancels_only_the_most_recently_queued_command_leaving_earlier_ones_pending() {
+        let mut sequencer = CommandSequencer::default();
+        let mut source = LocalDataSource::new(runtime());
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        let first = sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::CreateObject(ObjectSpec::new("first queued object")),
+        ]));
+        let first_id = first.id;
+        assert_eq!(
+            source.execute(first).unwrap().disposition,
+            CommandDisposition::Queued
+        );
+
+        let second = sequencer.issue(CommandPayload::CommitWorld(vec![
+            WorldCommand::CreateObject(ObjectSpec::new("second queued object")),
+        ]));
+        let second_id = second.id;
+        assert_eq!(
+            source.execute(second).unwrap().disposition,
+            CommandDisposition::Queued
+        );
+
+        let receipt = source
+            .execute(sequencer.issue(CommandPayload::Undo))
+            .unwrap();
+        assert_eq!(receipt.disposition, CommandDisposition::Applied);
+
+        let queue = source.get_queue();
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(
+            queue.pending[0].command, first_id,
+            "only the newest pending record is cancelled"
+        );
+
+        let cancelled = queue
+            .history
+            .iter()
+            .find(|record| record.command == second_id)
+            .expect("the cancelled command is retained in terminal history");
+        assert_eq!(cancelled.state, CommandLifecycle::Cancelled);
     }
 
     fn flush_rejected_conflict(
@@ -1892,11 +2044,10 @@ mod tests {
     /// actually landed — regression test for a flush that was briefly
     /// infallible and silently ignored at these four call sites.
     #[test]
-    fn pause_step_undo_redo_are_refused_when_their_own_flush_rejects_a_mutation() {
+    fn pause_step_redo_are_refused_when_their_own_flush_rejects_a_mutation() {
         for payload in [
             CommandPayload::Pause,
             CommandPayload::Step,
-            CommandPayload::Undo,
             CommandPayload::Redo,
         ] {
             let (source, valid_id, result) = flush_rejected_conflict(payload);

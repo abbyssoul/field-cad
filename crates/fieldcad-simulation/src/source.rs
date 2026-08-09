@@ -736,6 +736,17 @@ impl SessionCore {
         }
     }
 
+    /// Marks a still-pending record cancelled, retires it to terminal
+    /// history, and emits its `Cancelled` event. Shared by
+    /// `CancelQueuedCommand` (which picks the record by id) and `Undo`
+    /// (which always cancels the most recently queued one).
+    fn cancel_pending_record(&mut self, mut record: CommandRecord) {
+        let target = record.command;
+        record.state = CommandLifecycle::Cancelled;
+        self.record_terminal(record);
+        self.emitted.push(CommandEvent::Cancelled(target));
+    }
+
     /// Apply one command to the authoritative side and report how it landed.
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
         let id = command.id;
@@ -826,14 +837,33 @@ impl SessionCore {
                 created = Some(self.runtime.commit_world_commands(commands)?);
             }
             CommandPayload::Undo => {
-                // Never queued. An edit waiting for a tick boundary is an edit
-                // the history has not recorded yet, so undoing past it would
-                // step over an edit that is still on its way in.
-                self.reject_if_queue_paused(id, kind, "undo")?;
-                self.flush_and_check("undo")?;
-                self.runtime.undo()?;
+                // An edit still waiting for a tick boundary has not been
+                // recorded in `EditHistory` yet — that happens only once it
+                // actually applies — so there is nothing there yet to step
+                // back to. But "the last action I took hasn't landed" is
+                // exactly what undo means to a user, so cancel the most
+                // recently queued record instead, mirroring
+                // `CancelQueuedCommand`'s mechanics but always picking the
+                // newest one rather than one named explicitly. This applies
+                // whenever anything is pending, regardless of *why* it's
+                // pending (queue explicitly paused, or simply `Running` and
+                // waiting for the next tick boundary) — consistent with
+                // `CancelQueuedCommand`, which is likewise pause-state-agnostic.
+                // Once nothing is left pending, undo falls through to the
+                // ordinary, already-applied history.
+                if let Some(record) = self.pending_mutations.pop_back() {
+                    self.cancel_pending_record(record);
+                } else {
+                    self.reject_if_queue_paused(id, kind, "undo")?;
+                    self.flush_and_check("undo")?;
+                    self.runtime.undo()?;
+                }
             }
             CommandPayload::Redo => {
+                // No counterpart to Undo's pending-cancel: there is nothing
+                // to "redo" a still-pending mutation into — it either
+                // applies or it doesn't. Stays guarded by
+                // `reject_if_queue_paused` as before.
                 self.reject_if_queue_paused(id, kind, "redo")?;
                 self.flush_and_check("redo")?;
                 self.runtime.redo()?;
@@ -847,13 +877,16 @@ impl SessionCore {
                 // `advance` already flushes as soon as it sees the queue is
                 // no longer paused, and doing it here too would apply a
                 // mutation off the tick it is supposed to be atomic with.
-                // `Paused` has no boundary to wait for — a mutation held here
-                // only because the queue was paused (not because the sim
-                // was) is due immediately once that reason is gone, same as
-                // any other edit submitted while paused.
-                if self.runtime.status().mode() != SimulationMode::Running {
-                    self.flush_pending_mutations();
-                }
+                // `Paused` has no boundary to wait for either, but does NOT
+                // flush its whole backlog synchronously right here: a queue
+                // paused mid-gesture can be holding many held edits, each
+                // its own real solve, and applying all of them inside this
+                // one command would report exactly one final state — the UI
+                // would sit still, then jump straight to the end, losing
+                // the same per-edit feedback a live (unpaused) edit gets.
+                // Instead `poll` drains it one held edit at a time (see
+                // `flush_one_pending_mutation`), so resuming looks and
+                // feels like the drag simply continuing.
             }
             CommandPayload::CancelQueuedCommand(target) => {
                 let Some(index) = self
@@ -863,13 +896,11 @@ impl SessionCore {
                 else {
                     return Err(SourceError::CommandNotQueued(target));
                 };
-                let mut record = self
+                let record = self
                     .pending_mutations
                     .remove(index)
                     .expect("index was just found in this deque");
-                record.state = CommandLifecycle::Cancelled;
-                self.record_terminal(record);
-                self.emitted.push(CommandEvent::Cancelled(target));
+                self.cancel_pending_record(record);
             }
         }
         let created =
@@ -891,9 +922,14 @@ impl SessionCore {
         self.runtime.status().mode() == SimulationMode::Running || self.queue_paused
     }
 
-    /// `Pause`/`Step`/`Undo`/`Redo` must not silently flush a paused queue.
-    /// Fires only when there is something a flush would actually hold back —
+    /// `Pause`/`Step`/`Redo` must not silently flush a paused queue. Fires
+    /// only when there is something a flush would actually hold back —
     /// pausing an idle queue must not block these commands.
+    ///
+    /// `Undo` also calls this, but only once `pending_mutations` is already
+    /// empty — a non-empty queue is handled earlier by cancelling the
+    /// newest pending record instead — so for `Undo` this check is now
+    /// always a no-op, kept only for the same call shape as the other three.
     ///
     /// Records the rejection in terminal history and emits a `CommandEvent::Failed`
     /// before returning the error, matching the contract that every terminal
@@ -1007,49 +1043,72 @@ impl SessionCore {
     /// Applies every still-queued mutation in submission order. Infallible:
     /// a rejected mutation becomes its own terminal `Rejected` record
     /// (observable through `get_queue()`'s history) rather than failing the
-    /// whole tick boundary or command that triggered the flush.
+    /// whole tick boundary or command that triggered the flush. Used where
+    /// the whole backlog must land atomically with a single boundary
+    /// (`advance`'s `Running` tick boundary, and `flush_and_check` ahead of
+    /// `Pause`/`Step`/`Redo`) — see `flush_one_pending_mutation` for the
+    /// incremental alternative used when there is no such boundary to be
+    /// atomic with.
     fn flush_pending_mutations(&mut self) -> FlushSummary {
         let mut summary = FlushSummary::default();
-        while let Some(mut record) = self.pending_mutations.pop_front() {
-            let command_id = record.command;
-            let payload = record
-                .payload
-                .take()
-                .expect("a queued record always carries its payload");
-            let result: Result<CommitReport, RuntimeError> = match payload {
-                PendingPayload::World(commands) => self.runtime.commit_world_commands(commands),
-                PendingPayload::Domain(domain) => {
-                    let outcome = self.runtime.reconfigure_domain(domain);
-                    if outcome.is_ok() {
-                        self.pacer.reset();
-                    }
-                    outcome.map(|()| CommitReport::empty(self.runtime.status().world_revision))
-                }
-            };
-            match result {
-                Ok(created) => {
-                    let receipt = self.receipt(command_id, CommandDisposition::Applied, created);
-                    record.state = CommandLifecycle::Applied;
-                    record.receipt = Some(receipt.clone());
-                    self.record_terminal(record);
-                    self.emitted.push(CommandEvent::Completed(receipt));
-                    summary.applied += 1;
-                }
-                Err(error) => {
-                    let error: SourceError = error.into();
-                    record.state = CommandLifecycle::Rejected;
-                    record.error = Some(error.to_string());
-                    self.record_terminal(record);
-                    self.emitted.push(CommandEvent::Failed {
-                        command: command_id,
-                        error,
-                    });
-                    summary.rejected = true;
-                    break;
-                }
+        while let Some(step) = self.flush_one_pending_mutation() {
+            summary.applied += step.applied;
+            if step.rejected {
+                summary.rejected = true;
+                break;
             }
         }
         summary
+    }
+
+    /// Applies exactly the oldest still-queued mutation, or does nothing
+    /// and returns `None` if there isn't one. Driven one call at a time
+    /// from `LocalDataSource::poll` once the queue is no longer paused and
+    /// the simulation isn't `Running` (so there's no tick boundary this
+    /// needs to be atomic with) — each call reports its own state, giving a
+    /// resumed backlog the same per-edit visual feedback a live edit gets,
+    /// rather than the whole backlog silently landing between one poll and
+    /// the next.
+    fn flush_one_pending_mutation(&mut self) -> Option<FlushSummary> {
+        let mut record = self.pending_mutations.pop_front()?;
+        let command_id = record.command;
+        let payload = record
+            .payload
+            .take()
+            .expect("a queued record always carries its payload");
+        let result: Result<CommitReport, RuntimeError> = match payload {
+            PendingPayload::World(commands) => self.runtime.commit_world_commands(commands),
+            PendingPayload::Domain(domain) => {
+                let outcome = self.runtime.reconfigure_domain(domain);
+                if outcome.is_ok() {
+                    self.pacer.reset();
+                }
+                outcome.map(|()| CommitReport::empty(self.runtime.status().world_revision))
+            }
+        };
+        let mut summary = FlushSummary::default();
+        match result {
+            Ok(created) => {
+                let receipt = self.receipt(command_id, CommandDisposition::Applied, created);
+                record.state = CommandLifecycle::Applied;
+                record.receipt = Some(receipt.clone());
+                self.record_terminal(record);
+                self.emitted.push(CommandEvent::Completed(receipt));
+                summary.applied = 1;
+            }
+            Err(error) => {
+                let error: SourceError = error.into();
+                record.state = CommandLifecycle::Rejected;
+                record.error = Some(error.to_string());
+                self.record_terminal(record);
+                self.emitted.push(CommandEvent::Failed {
+                    command: command_id,
+                    error,
+                });
+                summary.rejected = true;
+            }
+        }
+        Some(summary)
     }
 }
 
@@ -1169,11 +1228,25 @@ impl FieldDataSource for LocalDataSource {
 
     fn poll(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
         let progress = self.core.advance(elapsed)?;
+
+        // A resumed queue's backlog (nothing to do with `advance`'s own
+        // `Running`-mode tick-boundary flush, which only ever runs while
+        // `Running`) drains one held edit per poll instead of all at once —
+        // see `SessionCore::flush_one_pending_mutation`.
+        let mut commands_applied = progress.commands_applied;
+        if !self.core.queue_paused
+            && self.core.pending_count() > 0
+            && self.core.status().mode() != SimulationMode::Running
+            && let Some(step) = self.core.flush_one_pending_mutation()
+        {
+            commands_applied += step.applied;
+        }
+
         Ok(PollOutcome {
             snapshot_updated: self.publish()?,
             ticks_advanced: progress.ticks_advanced,
             fell_behind: progress.fell_behind,
-            commands_applied: progress.commands_applied,
+            commands_applied,
         })
     }
 

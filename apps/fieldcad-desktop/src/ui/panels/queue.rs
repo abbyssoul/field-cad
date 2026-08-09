@@ -8,7 +8,8 @@ pub fn queue_window(context: &egui::Context, frame: &FrameContext<'_>, output: &
     let queue = &frame.compute.queue;
     egui::Window::new("Queue")
         .default_pos(egui::pos2(218.0, 48.0))
-        .resizable(false)
+        .default_size(egui::vec2(360.0, 320.0))
+        .resizable(true)
         .collapsible(true)
         .show(context, |ui| {
             ui.horizontal(|ui| {
@@ -40,22 +41,26 @@ pub fn queue_window(context: &egui::Context, frame: &FrameContext<'_>, output: &
             });
 
             ui.separator();
-            if queue.pending.is_empty() {
-                ui.label("Nothing pending.");
-            } else {
-                for record in &queue.pending {
-                    queue_record_row(ui, record, output);
-                }
-            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if queue.pending.is_empty() {
+                        ui.label("Nothing pending.");
+                    } else {
+                        for record in &queue.pending {
+                            queue_record_row(ui, record, output);
+                        }
+                    }
 
-            if !queue.history.is_empty() {
-                ui.separator();
-                ui.collapsing("History", |ui| {
-                    for record in queue.history.iter().rev() {
-                        queue_record_row(ui, record, output);
+                    if !queue.history.is_empty() {
+                        ui.separator();
+                        ui.collapsing("History", |ui| {
+                            for record in queue.history.iter().rev() {
+                                queue_record_row(ui, record, output);
+                            }
+                        });
                     }
                 });
-            }
         });
 }
 

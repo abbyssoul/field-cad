@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -52,6 +52,7 @@ enum WorkerRequest {
     Stop,
 }
 
+#[derive(Debug)]
 enum WorkerEvent {
     CommandCompleted {
         receipt: CommandReceipt,
@@ -82,6 +83,7 @@ enum WorkerEvent {
     PollFailed(SourceError),
 }
 
+#[derive(Debug)]
 struct SourceState {
     simulation: SimulationStatus,
     domain: Domain,
@@ -119,6 +121,12 @@ impl SourceState {
 /// A local runtime driven on a dedicated compute thread.
 pub struct AsyncLocalDataSource {
     requests: Sender<WorkerRequest>,
+    /// Queue-control commands (`PauseQueue`/`ResumeQueue`/
+    /// `CancelQueuedCommand`) bypass `requests` and go here instead, so they
+    /// only ever wait behind whatever the worker is already mid-executing,
+    /// never behind a backlog of heavy `CommitWorld` solves — see
+    /// `worker_loop`.
+    priority_requests: Sender<Command>,
     events: Receiver<WorkerEvent>,
     stop: Arc<AtomicBool>,
     cancellation: SolverCancellation,
@@ -160,6 +168,7 @@ impl AsyncLocalDataSource {
             let _ = mailbox.offer(Arc::clone(snapshot));
         }
         let (request_sender, request_receiver) = mpsc::channel();
+        let (priority_sender, priority_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         #[cfg(test)]
         let test_events_tx = event_sender.clone();
@@ -167,11 +176,20 @@ impl AsyncLocalDataSource {
         let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
             .name("fieldcad-compute".to_owned())
-            .spawn(move || worker_loop(source, request_receiver, event_sender, worker_stop))
+            .spawn(move || {
+                worker_loop(
+                    source,
+                    request_receiver,
+                    priority_receiver,
+                    event_sender,
+                    worker_stop,
+                )
+            })
             .expect("the local compute worker thread must be spawnable");
 
         Self {
             requests: request_sender,
+            priority_requests: priority_sender,
             events: event_receiver,
             stop,
             cancellation,
@@ -418,9 +436,25 @@ impl FieldDataSource for AsyncLocalDataSource {
         }
         let command_id = command.id;
         let kind = command.payload.kind();
-        self.requests
-            .send(WorkerRequest::Execute(command))
-            .map_err(|_| SourceError::Disconnected)?;
+        // Queue-control commands are never a world-simulation event, so
+        // they must not wait behind a backlog of heavy `CommitWorld`
+        // solves already sitting in `requests` — send them on the
+        // priority channel `worker_loop` drains first instead.
+        let is_queue_control = matches!(
+            command.payload,
+            CommandPayload::PauseQueue
+                | CommandPayload::ResumeQueue
+                | CommandPayload::CancelQueuedCommand(_)
+        );
+        if is_queue_control {
+            self.priority_requests
+                .send(command)
+                .map_err(|_| SourceError::Disconnected)?;
+        } else {
+            self.requests
+                .send(WorkerRequest::Execute(command))
+                .map_err(|_| SourceError::Disconnected)?;
+        }
         let seq = self.submission_counter;
         self.submission_counter += 1;
         self.submitted_commands.insert(command_id, (kind, seq));
@@ -461,46 +495,75 @@ impl Drop for AsyncLocalDataSource {
     }
 }
 
+/// Runs one command against `source` and turns the outcome into the
+/// `WorkerEvent` the main thread expects, draining any terminal side
+/// effects the command produced synchronously (see
+/// `WorkerEvent::CommandCompleted::terminal`) — not just on `Poll`, since a
+/// command that flushes another, already-queued one as its own side effect
+/// (e.g. `pause` flushing a running edit) produces that other command's
+/// terminal event synchronously, inside this same call. Returns `Err(())`
+/// if `events` is disconnected, the caller's cue to stop the worker loop.
+fn run_command(
+    source: &mut LocalDataSource,
+    command: Command,
+    events: &Sender<WorkerEvent>,
+) -> Result<(), ()> {
+    let command_id = command.id;
+    let result = source.execute(command);
+    let state = SourceState::capture(source);
+    let terminal = source.drain_command_events();
+    let event = match result {
+        Ok(receipt) => WorkerEvent::CommandCompleted {
+            receipt,
+            state,
+            terminal,
+        },
+        Err(error) => WorkerEvent::CommandFailed {
+            command: command_id,
+            error,
+            state,
+            terminal,
+        },
+    };
+    events.send(event).map_err(|_| ())
+}
+
+/// A backlog of already-submitted `Execute` requests must never delay a
+/// queue-control command (`PauseQueue`/`ResumeQueue`/
+/// `CancelQueuedCommand`, sent on `priority_requests` instead of
+/// `requests` — see `AsyncLocalDataSource::execute`) by more than the one
+/// request already in flight when it arrives.
+const PRIORITY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 fn worker_loop(
     mut source: LocalDataSource,
     requests: Receiver<WorkerRequest>,
+    priority_requests: Receiver<Command>,
     events: Sender<WorkerEvent>,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Acquire) {
-        let Ok(request) = requests.recv() else {
-            break;
-        };
-        match request {
-            WorkerRequest::Execute(command) => {
-                let command_id = command.id;
-                let result = source.execute(command);
-                let state = SourceState::capture(&source);
-                // Drained here, not just on `Poll`: a command that flushes
-                // another, already-queued one as its own side effect (e.g.
-                // `pause` flushing a running edit) produces that other
-                // command's terminal event synchronously, inside this same
-                // `execute` call — leaving it buffered until some later
-                // `Poll` happens to run would strand any waiter for it.
-                let terminal = source.drain_command_events();
-                let event = match result {
-                    Ok(receipt) => WorkerEvent::CommandCompleted {
-                        receipt,
-                        state,
-                        terminal,
-                    },
-                    Err(error) => WorkerEvent::CommandFailed {
-                        command: command_id,
-                        error,
-                        state,
-                        terminal,
-                    },
-                };
-                if events.send(event).is_err() {
-                    break;
+        // Drained unconditionally at the top of every iteration — i.e.
+        // right after whatever `Execute` just finished, before the next
+        // backlog item is even looked at — so a queue-control command
+        // waits behind at most one already-in-flight command, never the
+        // whole backlog.
+        while let Ok(command) = priority_requests.try_recv() {
+            if run_command(&mut source, command, &events).is_err() {
+                return;
+            }
+        }
+
+        // `recv_timeout`, not a blocking `recv`: with an empty backlog the
+        // worker would otherwise block indefinitely and only notice a
+        // priority arrival once some other request happened to wake it.
+        match requests.recv_timeout(PRIORITY_POLL_INTERVAL) {
+            Ok(WorkerRequest::Execute(command)) => {
+                if run_command(&mut source, command, &events).is_err() {
+                    return;
                 }
             }
-            WorkerRequest::Poll(elapsed) => {
+            Ok(WorkerRequest::Poll(elapsed)) => {
                 let event = match source.poll(elapsed) {
                     Ok(outcome) => WorkerEvent::PollCompleted {
                         outcome,
@@ -513,7 +576,9 @@ fn worker_loop(
                     break;
                 }
             }
-            WorkerRequest::Stop => break,
+            Ok(WorkerRequest::Stop) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -535,7 +600,7 @@ mod tests {
         RuntimeConfig, SimulationRuntime, SourceError,
     };
 
-    use super::{AsyncLocalDataSource, WorkerEvent, WorkerRequest};
+    use super::{AsyncLocalDataSource, WorkerEvent, WorkerRequest, worker_loop};
 
     fn runtime() -> SimulationRuntime {
         let domain = Domain::new(
@@ -628,5 +693,60 @@ mod tests {
         // send to the dead channel and returns Err(Disconnected).
         let err = source.poll(Duration::from_millis(1)).unwrap_err();
         assert_eq!(err, SourceError::Disconnected);
+    }
+
+    /// A queue-control command sent on the priority channel must not wait
+    /// behind a backlog already sitting in the normal `requests` channel —
+    /// regression test for the pause/resume-gets-stuck-behind-a-backlog
+    /// bug. Deterministic: the whole backlog is enqueued before the worker
+    /// thread is even spawned, so there is no timing race to get right.
+    #[test]
+    fn priority_channel_commands_are_observed_before_the_backlog_drains() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (priority_tx, priority_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut sequencer = CommandSequencer::default();
+
+        let mut backlog_ids = Vec::new();
+        for _ in 0..5 {
+            let command = sequencer.issue(CommandPayload::Play);
+            backlog_ids.push(command.id);
+            request_tx.send(WorkerRequest::Execute(command)).unwrap();
+        }
+
+        let pause = sequencer.issue(CommandPayload::PauseQueue);
+        let pause_id = pause.id;
+        priority_tx.send(pause).unwrap();
+
+        let source = LocalDataSource::new(runtime());
+        let worker = std::thread::spawn(move || {
+            worker_loop(source, request_rx, priority_rx, event_tx, stop);
+        });
+
+        match event_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            WorkerEvent::CommandCompleted { receipt, .. } => {
+                assert_eq!(
+                    receipt.command, pause_id,
+                    "the priority command must complete first"
+                );
+            }
+            other => panic!("expected the priority command first, got {other:?}"),
+        }
+
+        let mut remaining = Vec::new();
+        for _ in 0..backlog_ids.len() {
+            match event_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                WorkerEvent::CommandCompleted { receipt, .. } => remaining.push(receipt.command),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            remaining, backlog_ids,
+            "backlog still completes, in submission order"
+        );
+
+        request_tx.send(WorkerRequest::Stop).unwrap();
+        worker.join().unwrap();
     }
 }
