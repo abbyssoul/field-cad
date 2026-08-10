@@ -331,9 +331,20 @@ fn region_world_visible(region: scene::RegionId, world: &WorldSnapshot) -> bool 
 ///
 /// Free rather than a `WindowState` method so the caching decision is
 /// testable without a window or a GPU device.
+/// `previous_geometry` is last frame's merged result, reused verbatim (a
+/// refcount bump, no rebuild) when every region below is a cache hit and no
+/// region present last frame has disappeared — see the `unchanged` check
+/// below. Without this, every frame rebuilds and copies the full merged
+/// buffer regardless of whether any region actually changed, which is cheap
+/// for a static scene's occasional redraw but not for the continuous
+/// redraws animated flow lines force (`WindowState::has_visible_animated_flow_lines`)
+/// — those exist purely to scroll a shader uniform, not to change any
+/// region's geometry, so paying a fresh multi-megabyte allocate-and-copy on
+/// every one of them was pure waste.
 #[allow(clippy::too_many_arguments)]
 fn compute_field_layer_geometry(
     mut cache: BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
+    previous_geometry: Option<Arc<scene::FieldGeometry>>,
     field_snapshot: Option<&fieldcad_core::FieldSnapshot>,
     world: &WorldSnapshot,
     field_layers: &BTreeMap<ChannelId, ui::ChannelLayerSettings>,
@@ -345,7 +356,12 @@ fn compute_field_layer_geometry(
     BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
 ) {
     let mut new_cache = BTreeMap::new();
-    let mut geometry = scene::FieldGeometry::default();
+    // Each visible region's geometry, in the same order the merge below
+    // reads them in — kept separate from `new_cache` (a `BTreeMap`, whose
+    // key order need not match publish order) so a full rebuild still
+    // merges in exactly the order it always has.
+    let mut ordered = Vec::new();
+    let mut any_rebuilt = false;
     if let Some(field_snapshot) = field_snapshot {
         for (channel_id, layer) in field_layers {
             if !layer.visible || !vector_channels.contains(channel_id) {
@@ -376,36 +392,51 @@ fn compute_field_layer_geometry(
                     {
                         entry
                     }
-                    _ => RegionGeometryCache {
-                        inputs: RegionGeometryInputs {
-                            batch: batch.clone(),
-                            settings,
-                            world_visible,
-                            show,
-                            scene_scale,
-                        },
-                        geometry: Arc::new(scene::region_geometry(
-                            batch,
-                            layer.whole_domain,
-                            layers,
-                            show,
-                            world,
-                            scene_scale,
-                        )),
-                    },
+                    _ => {
+                        any_rebuilt = true;
+                        RegionGeometryCache {
+                            inputs: RegionGeometryInputs {
+                                batch: batch.clone(),
+                                settings,
+                                world_visible,
+                                show,
+                                scene_scale,
+                            },
+                            geometry: Arc::new(scene::region_geometry(
+                                batch,
+                                layer.whole_domain,
+                                layers,
+                                show,
+                                world,
+                                scene_scale,
+                            )),
+                        }
+                    }
                 };
-                geometry
-                    .surface_triangles
-                    .extend(entry.geometry.surface_triangles.iter().copied());
-                geometry
-                    .vector_lines
-                    .extend(entry.geometry.vector_lines.iter().copied());
-                geometry
-                    .flow_ribbons
-                    .extend(entry.geometry.flow_ribbons.iter().copied());
+                ordered.push(Arc::clone(&entry.geometry));
                 new_cache.insert(key, entry);
             }
         }
+    }
+    // Every region visited above was a cache hit, and nothing left in
+    // `cache` (every entry present last frame that wasn't reused above —
+    // a region that disappeared or went invisible) — so the merged result
+    // cannot differ from last frame's.
+    let unchanged = !any_rebuilt && cache.is_empty();
+    if unchanged && let Some(previous) = previous_geometry {
+        return (previous, new_cache);
+    }
+    let mut geometry = scene::FieldGeometry::default();
+    for entry_geometry in &ordered {
+        geometry
+            .surface_triangles
+            .extend(entry_geometry.surface_triangles.iter().copied());
+        geometry
+            .vector_lines
+            .extend(entry_geometry.vector_lines.iter().copied());
+        geometry
+            .flow_ribbons
+            .extend(entry_geometry.flow_ribbons.iter().copied());
     }
     (Arc::new(geometry), new_cache)
 }
@@ -441,6 +472,12 @@ struct WindowState {
     /// Each visible region's last-built geometry, plus the inputs it was
     /// built from — see [`WindowState::field_layer_geometry`].
     region_geometry_cache: BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
+    /// Last frame's merged result from [`WindowState::field_layer_geometry`]
+    /// — reused verbatim when every region in `region_geometry_cache` is
+    /// still a hit, so a redraw that changes nothing about the scene (an
+    /// animated flow line's shader-only scroll, most commonly) costs a
+    /// refcount bump instead of a fresh multi-region copy.
+    cached_field_layer_geometry: Option<Arc<scene::FieldGeometry>>,
     probe_history: ProbeHistory,
     distance_history: DistanceHistory,
     /// The numerical run generation whose recorder data is currently held.
@@ -714,6 +751,7 @@ impl WindowState {
             world,
             compute: None,
             region_geometry_cache: BTreeMap::new(),
+            cached_field_layer_geometry: None,
             probe_history: probe_history.map_or_else(ProbeHistory::default, |state| {
                 probe_history_state::restore_probe_history(
                     state,
@@ -787,6 +825,7 @@ impl WindowState {
     ) -> Arc<scene::FieldGeometry> {
         let (geometry, new_cache) = compute_field_layer_geometry(
             std::mem::take(&mut self.region_geometry_cache),
+            self.cached_field_layer_geometry.clone(),
             field_snapshot,
             &self.world,
             &self.ui_model.field_layers,
@@ -795,6 +834,7 @@ impl WindowState {
             scene_scale,
         );
         self.region_geometry_cache = new_cache;
+        self.cached_field_layer_geometry = Some(Arc::clone(&geometry));
         geometry
     }
 
@@ -3448,6 +3488,7 @@ mod tests {
 
             let (baseline, mut cache) = compute_field_layer_geometry(
                 BTreeMap::new(),
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3482,6 +3523,7 @@ mod tests {
             let (next_snapshot, _) = make_snapshot(1, plane);
             let (reused, cache) = compute_field_layer_geometry(
                 cache,
+                None,
                 Some(&next_snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3511,6 +3553,7 @@ mod tests {
 
             let (baseline, cache) = compute_field_layer_geometry(
                 BTreeMap::new(),
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3524,6 +3567,7 @@ mod tests {
             let (changed_snapshot, _) = make_snapshot_with_values(1, plane, [DVec3::Y; 4]);
             let (rebuilt, _) = compute_field_layer_geometry(
                 cache,
+                None,
                 Some(&changed_snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3559,6 +3603,7 @@ mod tests {
 
             let (_, cache) = compute_field_layer_geometry(
                 BTreeMap::new(),
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3579,6 +3624,7 @@ mod tests {
                 two_plane_snapshot(1, plane_a, origin_a, plane_b, DVec3::new(9.0, 0.0, 0.0));
             let (_, cache) = compute_field_layer_geometry(
                 cache,
+                None,
                 Some(&moved_snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3620,6 +3666,7 @@ mod tests {
 
             let (geometry, _) = compute_field_layer_geometry(
                 BTreeMap::new(),
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3648,6 +3695,7 @@ mod tests {
 
             let (_, mut cache) = compute_field_layer_geometry(
                 BTreeMap::new(),
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3677,6 +3725,7 @@ mod tests {
             )]);
             let (rebuilt, new_cache) = compute_field_layer_geometry(
                 cache,
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &hidden_layers,
@@ -3699,6 +3748,7 @@ mod tests {
             let (world, _) = world_with_plane();
             let (geometry, new_cache) = compute_field_layer_geometry(
                 BTreeMap::new(),
+                None,
                 None,
                 &world.snapshot(),
                 &BTreeMap::new(),
@@ -3725,6 +3775,7 @@ mod tests {
 
             let (baseline, mut cache) = compute_field_layer_geometry(
                 BTreeMap::new(),
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3757,6 +3808,7 @@ mod tests {
             // Same snapshot, same settings, same visibility: reused verbatim.
             let (reused, cache) = compute_field_layer_geometry(
                 cache,
+                None,
                 Some(&snapshot),
                 &world.snapshot(),
                 &layers,
@@ -3778,6 +3830,7 @@ mod tests {
                 .unwrap();
             let (rebuilt, _) = compute_field_layer_geometry(
                 cache,
+                None,
                 Some(&snapshot),
                 &hidden.snapshot(),
                 &layers,
@@ -3789,6 +3842,144 @@ mod tests {
                 rebuilt.vector_lines.is_empty(),
                 "a hidden plane must discard the stale cache and draw nothing"
             );
+        }
+
+        /// The property the top-level merge cache exists to add: two calls
+        /// with byte-identical inputs must return the *same* `Arc`, not a
+        /// fresh rebuild that happens to contain the same values — a
+        /// redraw that changes nothing (an animated flow line's shader-only
+        /// scroll, most commonly) must cost a refcount bump, not a copy of
+        /// every visible region's geometry.
+        #[test]
+        fn nothing_changed_reuses_the_previous_merged_geometry_verbatim() {
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+
+            let (baseline, cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
+                None,
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+
+            let (reused, _) = compute_field_layer_geometry(
+                cache,
+                Some(Arc::clone(&baseline)),
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+
+            assert!(
+                Arc::ptr_eq(&reused, &baseline),
+                "identical inputs across two calls must reuse the previous merged \
+                 geometry verbatim, not rebuild and re-copy an identical result"
+            );
+        }
+
+        /// The merge cache must not paper over a real change: once any
+        /// region's own cache misses, the previous merged `Arc` is stale and
+        /// must not be handed back.
+        #[test]
+        fn a_changed_region_forces_a_fresh_merged_geometry() {
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+
+            let (baseline, cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
+                None,
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+
+            let (changed_snapshot, _) = make_snapshot_with_values(1, plane, [DVec3::Y; 4]);
+            let (rebuilt, _) = compute_field_layer_geometry(
+                cache,
+                Some(Arc::clone(&baseline)),
+                Some(&changed_snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+
+            assert!(
+                !Arc::ptr_eq(&rebuilt, &baseline),
+                "a region that actually changed must not serve the stale previous merge"
+            );
+            assert_ne!(
+                rebuilt.vector_lines, baseline.vector_lines,
+                "the rebuilt geometry must reflect the new field values"
+            );
+        }
+
+        /// Mirrors the change-forces-a-rebuild case above for a region
+        /// disappearing entirely (hidden layer) rather than one of its
+        /// inputs changing — `unchanged`'s `cache.is_empty()` check, not its
+        /// `any_rebuilt` check, is what has to catch this: no region is
+        /// individually rebuilt here, the visible set just shrank.
+        #[test]
+        fn a_region_going_hidden_forces_a_fresh_merged_geometry() {
+            let (world, plane) = world_with_plane();
+            let (snapshot, channel) = make_snapshot(0, plane);
+            let layers = visible_layers(&channel);
+            let show = scene::SceneVisibility::ALL;
+
+            let (baseline, cache) = compute_field_layer_geometry(
+                BTreeMap::new(),
+                None,
+                Some(&snapshot),
+                &world.snapshot(),
+                &layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+            assert!(
+                !baseline.vector_lines.is_empty(),
+                "test setup: expected arrows"
+            );
+
+            let hidden_layers = BTreeMap::from([(
+                channel.clone(),
+                ui::ChannelLayerSettings {
+                    visible: false,
+                    ..ui::ChannelLayerSettings::default()
+                },
+            )]);
+            let (rebuilt, _) = compute_field_layer_geometry(
+                cache,
+                Some(Arc::clone(&baseline)),
+                Some(&snapshot),
+                &world.snapshot(),
+                &hidden_layers,
+                show,
+                std::slice::from_ref(&channel),
+                fieldcad_core::SceneScale::metre(),
+            );
+
+            assert!(
+                !Arc::ptr_eq(&rebuilt, &baseline),
+                "a region that disappeared from the visible set must not serve the \
+                 stale previous merge, which still included it"
+            );
+            assert!(rebuilt.vector_lines.is_empty());
         }
     }
 }

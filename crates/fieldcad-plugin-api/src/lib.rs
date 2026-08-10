@@ -18,10 +18,10 @@ use std::{
 
 use fieldcad_core::quantities::{LengthMetres, MassKg};
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, Domain, FieldColumn, GradientColumn, ObjectId,
-    PlaneId, PluginId, PluginVersion, PropertyBag, PropertySchema, Quantity, SampleGeometry,
-    SampleValidity, SchemaError, SolverDiagnostic, StepContext, TimeStep, Transform, Velocity,
-    WorldSnapshot, validate_properties,
+    BoxId, ChannelId, ChannelSchema, ComponentSchema, Domain, FieldColumn, GradientColumn,
+    ObjectId, PlaneId, PluginId, PluginVersion, ProbeId, PropertyBag, PropertySchema, Quantity,
+    SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic, SphereId, StepContext, TimeStep,
+    Transform, Velocity, WorldSnapshot, validate_properties,
 };
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
@@ -391,21 +391,53 @@ pub trait EquationSystemSolver: Send {
     }
 }
 
+/// A geometry's stable identity, independent of its currently-resolved
+/// value.
+///
+/// A plane/box/sphere/probe-set attached to a moving object resolves to a
+/// structurally different [`SampleGeometry`] value every tick (its
+/// world-space origin/normal/axes, or its probes' positions, are baked
+/// into the value) even though it is still, semantically, the same
+/// geometry the runtime is sampling. Keying [`SampleCache`] on this
+/// instead of on full `SampleGeometry` equality is what lets a cache entry
+/// survive that motion.
+#[derive(Clone, PartialEq)]
+enum SampleGeometryIdentity {
+    Probes(Arc<[ProbeId]>),
+    Plane(PlaneId),
+    Grid,
+    Box(BoxId),
+    Sphere(SphereId),
+}
+
+impl SampleGeometryIdentity {
+    fn of(geometry: &SampleGeometry) -> Self {
+        match geometry {
+            SampleGeometry::Probes { ids, .. } => Self::Probes(Arc::clone(ids)),
+            SampleGeometry::Plane { plane, .. } => Self::Plane(*plane),
+            SampleGeometry::Grid(_) => Self::Grid,
+            SampleGeometry::Box { region, .. } => Self::Box(*region),
+            SampleGeometry::Sphere { region, .. } => Self::Sphere(*region),
+        }
+    }
+}
+
 /// A small, size-bounded memoization of the last few sample geometries a
-/// solver was asked to evaluate, keyed by structural equality on
-/// [`SampleGeometry`] and evicted oldest-first once full.
+/// solver was asked to evaluate, keyed by [`SampleGeometryIdentity`] and
+/// evicted oldest-first once full.
 ///
 /// A runtime publication samples the same handful of geometries (each
 /// visible plane, box, sphere, and the probe set) once per channel; without
 /// this, an analytic solver with several channels over the same geometry
 /// redoes the same evaluation once per channel, every tick.
 struct SampleCacheEntry<T> {
-    geometry: SampleGeometry,
+    identity: SampleGeometryIdentity,
     samples: Arc<[T]>,
     /// Set by [`SampleCache::clear`]; a moved source invalidates the
-    /// *values* here without changing `geometry` itself (the geometry a
-    /// runtime publication samples — a plane, box, sphere, or probe set —
-    /// is stable tick to tick even while its sources move), so the entry's
+    /// *values* here without changing the geometry's identity (the
+    /// geometry a runtime publication samples — a plane, box, sphere, or
+    /// probe set — is the same logical geometry tick to tick even while
+    /// its sources, or the object it's attached to, move), so the entry's
     /// buffer is worth keeping and refilling rather than dropping.
     stale: bool,
 }
@@ -426,28 +458,34 @@ impl<T> SampleCache<T> {
     /// The cached samples for `geometry`.
     ///
     /// A warm hit returns the existing `Arc` directly, running neither
-    /// closure. A stale entry (same geometry, invalidated by [`Self::clear`])
-    /// is refilled in place via `refresh` whenever the cache is still the
-    /// sole owner of its buffer — the common case, since nothing else holds
-    /// onto a `samples_for` result past its own call — so a moved source
-    /// costs a recompute but not a reallocation. `compute` is the
-    /// allocating fallback: a geometry never seen before, or the rare case
-    /// where the existing buffer is still shared and can't be reused.
+    /// closure. A stale entry (same [`SampleGeometryIdentity`], invalidated
+    /// by [`Self::clear`]) is refilled in place via `refresh` whenever the
+    /// cache is still the sole owner of its buffer *and* the buffer is
+    /// still the right length — the common case, since nothing else holds
+    /// onto a `samples_for` result past its own call and an identity's
+    /// sample count is normally stable — so a moved source, or a moved
+    /// attachment, costs a recompute but not a reallocation. `compute` is
+    /// the allocating fallback: an identity never seen before, the rare
+    /// case where the existing buffer is still shared, or the rarer case
+    /// where the same identity now resolves to a different sample count.
     pub fn get_or_try_insert_with(
         &self,
         geometry: &SampleGeometry,
         compute: impl FnOnce() -> Result<Vec<T>, PluginError>,
         refresh: impl FnOnce(&mut [T]) -> Result<(), PluginError>,
     ) -> Result<Arc<[T]>, PluginError> {
+        let identity = SampleGeometryIdentity::of(geometry);
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| PluginError::Solver("sample cache poisoned".to_owned()))?;
-        if let Some(entry) = entries.iter_mut().find(|entry| &entry.geometry == geometry) {
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.identity == identity) {
             if !entry.stale {
                 return Ok(Arc::clone(&entry.samples));
             }
-            if let Some(slice) = Arc::get_mut(&mut entry.samples) {
+            if entry.samples.len() == geometry.len()
+                && let Some(slice) = Arc::get_mut(&mut entry.samples)
+            {
                 refresh(slice)?;
             } else {
                 entry.samples = compute()?.into();
@@ -460,7 +498,7 @@ impl<T> SampleCache<T> {
             entries.pop_front();
         }
         entries.push_back(SampleCacheEntry {
-            geometry: geometry.clone(),
+            identity,
             samples: Arc::clone(&samples),
             stale: false,
         });
@@ -500,7 +538,10 @@ pub enum PluginError {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{Dimension, ProbeId, PropertyId, PropertyKind, PropertyValue, Quantity};
+    use fieldcad_core::{
+        Dimension, PlaneLattice, ProbeId, PropertyId, PropertyKind, PropertyValue, Quantity,
+    };
+    use glam::UVec2;
 
     use super::*;
 
@@ -510,6 +551,13 @@ mod tests {
             vec![DVec3::X * value, DVec3::Y * value],
         )
         .unwrap()
+    }
+
+    fn plane_geometry(origin: DVec3, counts: UVec2) -> SampleGeometry {
+        SampleGeometry::Plane {
+            plane: PlaneId::new(1),
+            lattice: PlaneLattice::new(origin, DVec3::X, DVec3::Y, counts),
+        }
     }
 
     #[test]
@@ -568,6 +616,86 @@ mod tests {
             "a stale hit should refill the existing allocation, not replace it"
         );
         assert_eq!(&*refreshed, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn a_stale_hit_with_a_different_resolved_value_still_reuses_the_buffer() {
+        // The same `PlaneId` (a plane attached to a moving object) resolving
+        // to a different origin every tick is exactly the case a moved
+        // source already exercises for probes above — this is the same
+        // property, but for the identity a plane/box/sphere carries instead
+        // of value equality on the whole geometry.
+        let mut cache = SampleCache::<f64>::new(4);
+        let counts = UVec2::new(2, 1);
+        let before = plane_geometry(DVec3::ZERO, counts);
+        let after = plane_geometry(DVec3::X * 10.0, counts);
+        assert_ne!(
+            before, after,
+            "the two geometries must differ in resolved value"
+        );
+
+        let first = cache
+            .get_or_try_insert_with(&before, || Ok(vec![1.0, 2.0]), |_| unreachable!())
+            .unwrap();
+        let original_allocation = Arc::as_ptr(&first);
+        drop(first);
+
+        cache.clear().unwrap();
+
+        let refreshed = cache
+            .get_or_try_insert_with(
+                &after,
+                || panic!("compute must not run — the plane's identity is unchanged"),
+                |samples| {
+                    samples[0] = 5.0;
+                    samples[1] = 6.0;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            Arc::as_ptr(&refreshed),
+            original_allocation,
+            "a moved attachment must still refill the existing allocation"
+        );
+        assert_eq!(&*refreshed, [5.0, 6.0]);
+    }
+
+    #[test]
+    fn a_length_change_for_the_same_identity_falls_back_to_reallocating() {
+        let mut cache = SampleCache::<f64>::new(4);
+        let short = plane_geometry(DVec3::ZERO, UVec2::new(2, 1));
+        let long = plane_geometry(DVec3::ZERO, UVec2::new(3, 1));
+        assert_eq!(short.len(), 2);
+        assert_eq!(long.len(), 3);
+
+        let first = cache
+            .get_or_try_insert_with(&short, || Ok(vec![1.0, 2.0]), |_| unreachable!())
+            .unwrap();
+        let original_allocation = Arc::as_ptr(&first);
+        drop(first);
+
+        cache.clear().unwrap();
+
+        let mut computed = false;
+        let refreshed = cache
+            .get_or_try_insert_with(
+                &long,
+                || {
+                    computed = true;
+                    Ok(vec![7.0, 8.0, 9.0])
+                },
+                |_| panic!("refresh must not run — the existing buffer is the wrong length"),
+            )
+            .unwrap();
+
+        assert!(
+            computed,
+            "a length change for the same identity must reallocate"
+        );
+        assert_ne!(Arc::as_ptr(&refreshed), original_allocation);
+        assert_eq!(&*refreshed, [7.0, 8.0, 9.0]);
     }
 
     #[test]
