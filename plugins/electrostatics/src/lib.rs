@@ -9,8 +9,8 @@ use std::sync::Arc;
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, GradientColumn,
-    ObjectId, ObjectIndex, PluginId, PluginVersion, Precision, SampleGeometry, SampleValidity,
-    SolverDiagnostic, WorldSnapshot,
+    ObjectId, ObjectIndex, PluginId, PluginVersion, SampleGeometry, SolverDiagnostic,
+    WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_properties, charge_property_id,
@@ -23,11 +23,14 @@ use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
     PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
 };
-use fieldcad_superposition::InverseSquareSource;
-use glam::{DMat3, DVec3};
+use fieldcad_superposition::{
+    CpuInverseSquareEvaluator, InverseSquareBatchEvaluator, InverseSquareSample,
+    InverseSquareSource,
+};
+use glam::DVec3;
 
 #[cfg(test)]
-use fieldcad_core::PropertyBag;
+use fieldcad_core::{Precision, PropertyBag, SampleValidity};
 
 pub const PLUGIN_ID: &str = "fieldcad.electrostatics";
 
@@ -48,99 +51,6 @@ pub use fieldcad_electromagnetic_sources::{
     electric_field_channel_id, electric_potential_channel_id,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ElectrostaticSample {
-    pub electric_field: DVec3,
-    pub potential: f64,
-    /// The field's own Jacobian (`∂E_i/∂x_j`), if the evaluator that
-    /// produced this sample computed one. `Option`, not a bare `DMat3`: a
-    /// future non-CPU [`ElectrostaticBatchEvaluator`] (a `wgpu` compute
-    /// backend, say) that hasn't implemented the derivative math yet must
-    /// still be able to report `None` per-sample without breaking the
-    /// trait's contract.
-    pub gradient: Option<DMat3>,
-    pub validity: SampleValidity,
-}
-
-/// Evaluator for one complete sample geometry.
-///
-/// The plugin defines this narrow, renderer-free seam while the application
-/// host owns concrete GPU device/queue access and resource budgets. Results
-/// return through ordinary snapshot columns, so a local GPU is an implementation
-/// detail of compute and the visualizer remains interchangeable with a remote
-/// data source.
-///
-/// The reference `f64` evaluator implements this trait too, so there is one
-/// plugin and one solver rather than a CPU pair and an accelerated pair that
-/// must be kept in step by hand.
-pub trait ElectrostaticBatchEvaluator: Send + Sync {
-    /// Numerical representation written into the returned snapshot columns.
-    fn precision(&self) -> Precision;
-
-    /// Evaluate both electrostatic channels in one dispatch/readback.
-    fn evaluate(
-        &self,
-        sources: &[ChargeSource],
-        domain: &Domain,
-        geometry: &SampleGeometry,
-    ) -> Result<Vec<ElectrostaticSample>, String>;
-
-    /// [`Self::evaluate`], writing into a caller-owned buffer instead of
-    /// allocating a fresh `Vec`.
-    ///
-    /// The default forwards to [`Self::evaluate`] and copies the result —
-    /// correct for any evaluator, but still allocating. An evaluator that
-    /// can write its result directly (the CPU reference evaluator can;
-    /// nothing requires a GPU evaluator to) should override this to skip
-    /// that intermediate `Vec` on the hot path a cache refresh takes.
-    fn evaluate_into(
-        &self,
-        sources: &[ChargeSource],
-        domain: &Domain,
-        geometry: &SampleGeometry,
-        out: &mut [ElectrostaticSample],
-    ) -> Result<(), String> {
-        out.copy_from_slice(&self.evaluate(sources, domain, geometry)?);
-        Ok(())
-    }
-}
-
-/// The reference `f64` evaluator, and the oracle every faster backend is
-/// checked against.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CpuBatchEvaluator;
-
-impl ElectrostaticBatchEvaluator for CpuBatchEvaluator {
-    fn precision(&self) -> Precision {
-        Precision::F64
-    }
-
-    fn evaluate(
-        &self,
-        sources: &[ChargeSource],
-        _domain: &Domain,
-        geometry: &SampleGeometry,
-    ) -> Result<Vec<ElectrostaticSample>, String> {
-        Ok(geometry
-            .positions()
-            .map(|position| evaluate_sources(sources, position))
-            .collect())
-    }
-
-    fn evaluate_into(
-        &self,
-        sources: &[ChargeSource],
-        _domain: &Domain,
-        geometry: &SampleGeometry,
-        out: &mut [ElectrostaticSample],
-    ) -> Result<(), String> {
-        for (position, out) in geometry.positions().zip(out) {
-            *out = evaluate_sources(sources, position);
-        }
-        Ok(())
-    }
-}
-
 /// `ChargeSource` → the shared, coupling-value-agnostic source shape
 /// `fieldcad-superposition`'s kernel (and any GPU evaluator built over it)
 /// actually operates on. Public so a GPU evaluator can build its own source
@@ -155,27 +65,17 @@ pub fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
 }
 
 /// Evaluate the superposed electrostatic field and potential in SI units.
-///
-/// The closed-form Jacobian is cheap and exact, so this reference evaluator
-/// always reports one — `gradient` only becomes `None` for a future
-/// evaluator that cannot compute it.
-pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> ElectrostaticSample {
-    let sample = fieldcad_superposition::evaluate_sources(
+pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> InverseSquareSample {
+    fieldcad_superposition::evaluate_sources(
         COULOMB_CONSTANT,
         sources.iter().map(inverse_square_source),
         position,
-    );
-    ElectrostaticSample {
-        electric_field: sample.field,
-        potential: sample.potential,
-        gradient: Some(sample.gradient),
-        validity: sample.validity,
-    }
+    )
 }
 
 /// Analytic electrostatics over a pluggable batched evaluator.
 pub struct ElectrostaticsPlugin {
-    evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
+    evaluator: Arc<dyn InverseSquareBatchEvaluator>,
 }
 
 impl Default for ElectrostaticsPlugin {
@@ -188,12 +88,12 @@ impl ElectrostaticsPlugin {
     /// Backed by the reference `f64` evaluator.
     pub fn new() -> Self {
         Self {
-            evaluator: Arc::new(CpuBatchEvaluator),
+            evaluator: Arc::new(CpuInverseSquareEvaluator),
         }
     }
 
     /// Backed by a host-owned evaluator, typically a `wgpu` compute backend.
-    pub fn with_evaluator(evaluator: Arc<dyn ElectrostaticBatchEvaluator>) -> Self {
+    pub fn with_evaluator(evaluator: Arc<dyn InverseSquareBatchEvaluator>) -> Self {
         Self { evaluator }
     }
 }
@@ -233,12 +133,19 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
                 context.domain.precision().label()
             )));
         }
+        let sources = ObjectIndex::new(
+            collect_sources(context.world)
+                .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
+        );
+        let inverse_square_sources = sources
+            .as_slice()
+            .iter()
+            .map(inverse_square_source)
+            .collect();
         Ok(Box::new(ElectrostaticsSolver {
             domain: *context.domain,
-            sources: ObjectIndex::new(
-                collect_sources(context.world)
-                    .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
-            ),
+            sources,
+            inverse_square_sources,
             world_revision: context.world.revision(),
             evaluator: Arc::clone(&self.evaluator),
             cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
@@ -254,11 +161,15 @@ const SAMPLE_CACHE_CAPACITY: usize = 16;
 struct ElectrostaticsSolver {
     domain: Domain,
     sources: ObjectIndex<ChargeSource>,
+    /// Rebuilt with the object-indexed sources on creation/world changes;
+    /// this is the cache-local input shape the shared evaluator expects,
+    /// converted once per world change rather than on every channel read.
+    inverse_square_sources: Vec<InverseSquareSource>,
     world_revision: fieldcad_core::WorldRevision,
-    evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
+    evaluator: Arc<dyn InverseSquareBatchEvaluator>,
     /// Runtime publication asks for E and V separately. Retain the small set of
     /// geometries from this publication so both channels share one evaluation.
-    cache: SampleCache<ElectrostaticSample>,
+    cache: SampleCache<InverseSquareSample>,
 }
 
 impl EquationSystemSolver for ElectrostaticsSolver {
@@ -277,6 +188,12 @@ impl EquationSystemSolver for ElectrostaticsSolver {
             collect_sources(world)
                 .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
         );
+        self.inverse_square_sources = self
+            .sources
+            .as_slice()
+            .iter()
+            .map(inverse_square_source)
+            .collect();
         self.world_revision = world.revision();
         self.cache.clear()
     }
@@ -298,9 +215,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
         match channel {
             ELECTRIC_FIELD_HANDLE => {
                 let column = SampledColumn::new(
-                    FieldColumn::vectors(
-                        samples.iter().map(|sample| sample.electric_field).collect(),
-                    ),
+                    FieldColumn::vectors(samples.iter().map(|sample| sample.field).collect()),
                     validity,
                 );
                 Ok(match gradients {
@@ -322,10 +237,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
                 // for the same evaluator.
                 Ok(match gradients {
                     Some(_) => column.with_gradient(GradientColumn::Scalar(
-                        samples
-                            .iter()
-                            .map(|sample| -sample.electric_field)
-                            .collect(),
+                        samples.iter().map(|sample| -sample.field).collect(),
                     )),
                     None => column,
                 })
@@ -399,13 +311,18 @@ impl ElectrostaticsSolver {
     fn samples_for(
         &self,
         geometry: &SampleGeometry,
-    ) -> Result<Arc<[ElectrostaticSample]>, PluginError> {
+    ) -> Result<Arc<[InverseSquareSample]>, PluginError> {
         self.cache.get_or_try_insert_with(
             geometry,
             || {
                 let evaluated = self
                     .evaluator
-                    .evaluate(self.sources.as_slice(), &self.domain, geometry)
+                    .evaluate(
+                        COULOMB_CONSTANT,
+                        &self.inverse_square_sources,
+                        &self.domain,
+                        geometry,
+                    )
                     .map_err(PluginError::Solver)?;
                 if evaluated.len() != geometry.len() {
                     return Err(PluginError::Solver(format!(
@@ -418,7 +335,13 @@ impl ElectrostaticsSolver {
             },
             |out| {
                 self.evaluator
-                    .evaluate_into(self.sources.as_slice(), &self.domain, geometry, out)
+                    .evaluate_into(
+                        COULOMB_CONSTANT,
+                        &self.inverse_square_sources,
+                        &self.domain,
+                        geometry,
+                        out,
+                    )
                     .map_err(PluginError::Solver)
             },
         )
@@ -462,9 +385,9 @@ mod tests {
     fn a_positive_point_charge_matches_coulombs_law() {
         let sample = evaluate_sources(&[point(DVec3::ZERO, 2.0e-9, 0.01)], DVec3::X);
 
-        relative_eq(sample.electric_field.x, COULOMB_CONSTANT * 2.0e-9, 1.0e-14);
+        relative_eq(sample.field.x, COULOMB_CONSTANT * 2.0e-9, 1.0e-14);
         relative_eq(sample.potential, COULOMB_CONSTANT * 2.0e-9, 1.0e-14);
-        assert_eq!(sample.electric_field.y, 0.0);
+        assert_eq!(sample.field.y, 0.0);
         assert_eq!(sample.validity, SampleValidity::Exact);
     }
 
@@ -473,21 +396,17 @@ mod tests {
         let positive = evaluate_sources(&[point(DVec3::ZERO, 1.0e-9, 0.0)], DVec3::X);
         let negative = evaluate_sources(&[point(DVec3::ZERO, -1.0e-9, 0.0)], DVec3::X);
 
-        assert!(positive.electric_field.x > 0.0);
+        assert!(positive.field.x > 0.0);
         assert!(positive.potential > 0.0);
-        assert!(negative.electric_field.x < 0.0);
+        assert!(negative.field.x < 0.0);
         assert!(negative.potential < 0.0);
     }
 
     #[test]
     fn point_field_has_inverse_square_falloff() {
         let source = point(DVec3::ZERO, 1.0e-9, 0.0);
-        let near = evaluate_sources(&[source], DVec3::X)
-            .electric_field
-            .length();
-        let far = evaluate_sources(&[source], DVec3::X * 2.0)
-            .electric_field
-            .length();
+        let near = evaluate_sources(&[source], DVec3::X).field.length();
+        let far = evaluate_sources(&[source], DVec3::X * 2.0).field.length();
 
         relative_eq(far / near, 0.25, 1.0e-14);
     }
@@ -500,7 +419,7 @@ mod tests {
             DVec3::ZERO,
         );
 
-        assert_eq!(sample.electric_field, DVec3::ZERO);
+        assert_eq!(sample.field, DVec3::ZERO);
         relative_eq(sample.potential, 2.0 * COULOMB_CONSTANT * charge, 1.0e-14);
     }
 
@@ -512,7 +431,7 @@ mod tests {
             sample.validity,
             SampleValidity::Undefined(UndefinedReason::InsideSourceRadius)
         );
-        assert_eq!(sample.electric_field, DVec3::ZERO);
+        assert_eq!(sample.field, DVec3::ZERO);
         assert_eq!(sample.potential, 0.0);
     }
 
@@ -531,14 +450,14 @@ mod tests {
         let centre = evaluate_sources(&[source], DVec3::ZERO);
         let surface = evaluate_sources(&[source], DVec3::X * radius);
 
-        assert_eq!(centre.electric_field, DVec3::ZERO);
+        assert_eq!(centre.field, DVec3::ZERO);
         relative_eq(
             centre.potential,
             1.5 * COULOMB_CONSTANT * charge / radius,
             1.0e-14,
         );
         relative_eq(
-            surface.electric_field.x,
+            surface.field.x,
             COULOMB_CONSTANT * charge / radius.powi(2),
             1.0e-14,
         );
@@ -611,8 +530,8 @@ mod tests {
     /// though `evaluate_sources` has always had the correct finite
     /// interior formula right next to it — a body dragged inside a charged
     /// sphere felt exactly zero force from it. Fixed by sharing one
-    /// implementation with `fieldcad-newtonian-gravity`, which already got
-    /// this right for gravity (PH-2/PH-19).
+    /// implementation with `plugins/gravity`, which already got this right
+    /// for gravity (PH-2/PH-19).
     #[test]
     fn a_body_inside_a_charged_sphere_feels_its_finite_interior_field() {
         let mut world = World::new();
@@ -684,21 +603,22 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl ElectrostaticBatchEvaluator for CountingEvaluator {
+    impl InverseSquareBatchEvaluator for CountingEvaluator {
         fn precision(&self) -> Precision {
             Precision::F32
         }
 
         fn evaluate(
             &self,
-            _sources: &[ChargeSource],
+            _coupling_constant: f64,
+            _sources: &[InverseSquareSource],
             _domain: &Domain,
             geometry: &SampleGeometry,
-        ) -> Result<Vec<ElectrostaticSample>, String> {
+        ) -> Result<Vec<InverseSquareSample>, String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(vec![
-                ElectrostaticSample {
-                    electric_field: DVec3::X,
+                InverseSquareSample {
+                    field: DVec3::X,
                     potential: 2.0,
                     gradient: None,
                     validity: SampleValidity::Exact,
@@ -750,9 +670,15 @@ mod tests {
             ),
         };
         let domain = Domain::centred_cube(4.0, 8).unwrap();
+        let inverse_square_sources: Vec<_> = sources.iter().map(inverse_square_source).collect();
 
-        let batched = CpuBatchEvaluator
-            .evaluate(&sources, &domain, &geometry)
+        let batched = CpuInverseSquareEvaluator
+            .evaluate(
+                COULOMB_CONSTANT,
+                &inverse_square_sources,
+                &domain,
+                &geometry,
+            )
             .unwrap();
 
         assert_eq!(batched.len(), geometry.len());

@@ -1,15 +1,14 @@
-//! Shared `wgpu` core for a batched pairwise inverse-square-law evaluator.
+//! Shared `wgpu` adapter for a batched pairwise inverse-square-law
+//! evaluator.
 //!
 //! Coulomb's law and Newton's law of gravitation are the same functional
 //! form with a different coupling constant and, for gravity, an opposite
-//! sign — see `fieldcad-superposition`'s module doc, which is why both
-//! plugins' CPU reference evaluators already share that crate's kernel.
-//! `electrostatics_gpu.rs` and `gravity_gpu.rs` are thin adapters over this
-//! module: each converts its own domain's source/sample types to and from
-//! the shared [`fieldcad_superposition::InverseSquareSource`]/
-//! [`GpuInverseSquareSample`] shape and supplies its own coupling constant.
-//! Dispatch, buffer management, and the compute shader itself are identical
-//! either way.
+//! sign — see `fieldcad-superposition`'s module doc. [`GpuInverseSquareEvaluator`]
+//! implements that crate's `InverseSquareBatchEvaluator` directly and is
+//! injected into both `plugins/electrostatics` and `plugins/gravity` with
+//! their own coupling constant; there is no per-equation-system wrapper
+//! left to keep in step, since source conversion and the coupling constant
+//! are the plugins' own job now, not this adapter's.
 
 use std::{
     sync::{Mutex, PoisonError, mpsc},
@@ -17,8 +16,12 @@ use std::{
 };
 
 use bytemuck::{Pod, Zeroable};
-use fieldcad_core::{ChargeDistribution, SampleGeometry, SampleValidity, UndefinedReason};
-use fieldcad_superposition::InverseSquareSource;
+use fieldcad_core::{
+    ChargeDistribution, Domain, Precision, SampleGeometry, SampleValidity, UndefinedReason,
+};
+use fieldcad_superposition::{
+    InverseSquareBatchEvaluator, InverseSquareSample, InverseSquareSource,
+};
 use glam::DVec3;
 
 const SHADER: &str = include_str!("inverse_square.wgsl");
@@ -193,8 +196,10 @@ impl GpuInverseSquareEvaluator {
 
     /// Evaluate one batch of sample positions against `sources`, superposed
     /// under `coupling_constant` (Coulomb's constant for electrostatics,
-    /// `-G` for gravity).
-    pub(crate) fn evaluate(
+    /// `-G` for gravity). The raw GPU readback shape — see
+    /// [`InverseSquareBatchEvaluator::evaluate`] (below) for the public,
+    /// plugin-facing form this feeds.
+    pub(crate) fn evaluate_raw(
         &self,
         coupling_constant: f64,
         sources: &[InverseSquareSource],
@@ -387,6 +392,34 @@ impl GpuInverseSquareEvaluator {
     }
 }
 
+impl InverseSquareBatchEvaluator for GpuInverseSquareEvaluator {
+    fn precision(&self) -> Precision {
+        Precision::F32
+    }
+
+    fn evaluate(
+        &self,
+        coupling_constant: f64,
+        sources: &[InverseSquareSource],
+        _domain: &Domain,
+        geometry: &SampleGeometry,
+    ) -> Result<Vec<InverseSquareSample>, String> {
+        let samples = self.evaluate_raw(coupling_constant, sources, geometry)?;
+        Ok(samples
+            .into_iter()
+            .map(|sample| InverseSquareSample {
+                field: sample.field,
+                potential: sample.potential,
+                // The compute shader does not (yet) output a Jacobian —
+                // consumers fall back to today's plain trilinear/bilinear
+                // reconstruction for batches this evaluator produces.
+                gradient: None,
+                validity: sample.validity,
+            })
+            .collect())
+    }
+}
+
 fn gpu_source(source: &InverseSquareSource) -> Result<GpuSource, String> {
     let (kind, radius) = match source.distribution {
         ChargeDistribution::Point { exclusion_radius } => (0.0, exclusion_radius),
@@ -432,6 +465,13 @@ fn validity(code: u32) -> SampleValidity {
 
 #[cfg(test)]
 mod tests {
+    use fieldcad_core::quantities::{ChargeCoulombs, MassKg, SiScalar, kilogram};
+    use fieldcad_core::{
+        BoundaryConditions, ChargeDistribution, DomainBounds, GridLattice, ObjectId, PlaneLattice,
+        ProbeId, Resolution, SampleGeometry, Velocity,
+    };
+    use glam::{DVec3, UVec2, UVec3};
+
     use super::*;
 
     #[test]
@@ -448,5 +488,274 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == "evaluate")
         );
+    }
+
+    /// Agreement required between the f32 GPU backend and the f64 CPU
+    /// oracle. The absolute term protects expected zeroes; the relative
+    /// term covers normal f32 rounding and operation-order differences in
+    /// superposed fields.
+    const GPU_RELATIVE_TOLERANCE: f64 = 5.0e-4;
+    const GPU_ABSOLUTE_TOLERANCE: f64 = 2.0e-3;
+
+    fn close(actual: f64, expected: f64, index: usize) {
+        let tolerance =
+            GPU_ABSOLUTE_TOLERANCE + GPU_RELATIVE_TOLERANCE * actual.abs().max(expected.abs());
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "GPU {actual:e} differs from CPU {expected:e} at sample {index}; tolerance {tolerance:e}"
+        );
+    }
+
+    /// A headless GPU adapter, or `None` (with a message on stderr) when
+    /// this environment has no usable GPU — every GPU test below skips
+    /// gracefully rather than failing in that case.
+    async fn headless_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = crate::gpu::GpuConfig::from_env().instance();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .ok()?;
+        Some(
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some(label),
+                    ..Default::default()
+                })
+                .await
+                .expect("adapter must provide a default device"),
+        )
+    }
+
+    fn test_geometries() -> [SampleGeometry; 2] {
+        [
+            SampleGeometry::Plane {
+                plane: fieldcad_core::PlaneId::new(0),
+                lattice: PlaneLattice::new(
+                    DVec3::new(-3.5, -3.5, 0.0),
+                    DVec3::new(1.75, 0.0, 0.0),
+                    DVec3::new(0.0, 1.75, 0.0),
+                    UVec2::new(5, 4),
+                ),
+            },
+            SampleGeometry::Grid(GridLattice::new(
+                DVec3::new(-1.1, -0.9, -0.7),
+                DVec3::new(0.55, 0.45, 0.4),
+                UVec3::new(4, 3, 3),
+            )),
+        ]
+    }
+
+    #[test]
+    fn electrostatics_plane_and_grid_samples_match_the_f64_oracle() {
+        pollster::block_on(async {
+            let Some((device, queue)) = headless_device("electrostatics parity test device").await
+            else {
+                eprintln!("skipping GPU parity test: no headless adapter");
+                return;
+            };
+            let evaluator = GpuInverseSquareEvaluator::new(device, queue);
+            let domain = Domain::new(
+                DomainBounds::centred_cube(3.0).unwrap(),
+                Resolution::uniform(8).unwrap(),
+                BoundaryConditions::default(),
+                Precision::F32,
+            );
+            let sources = [
+                fieldcad_electrostatics::ChargeSource::new(
+                    ObjectId::new(0),
+                    DVec3::new(-0.3, 0.0, 0.0),
+                    Velocity::default(),
+                    ChargeCoulombs::from_si(1.2e-9),
+                    ChargeDistribution::Point {
+                        exclusion_radius: 0.08,
+                    },
+                ),
+                fieldcad_electrostatics::ChargeSource::new(
+                    ObjectId::new(1),
+                    DVec3::new(0.5, -0.2, 0.3),
+                    Velocity::default(),
+                    ChargeCoulombs::from_si(-0.7e-9),
+                    ChargeDistribution::Point {
+                        exclusion_radius: 0.05,
+                    },
+                ),
+                fieldcad_electrostatics::ChargeSource::new(
+                    ObjectId::new(2),
+                    DVec3::new(0.2, 0.7, -0.4),
+                    Velocity::default(),
+                    ChargeCoulombs::from_si(0.4e-9),
+                    ChargeDistribution::UniformSphere { radius: 0.35 },
+                ),
+            ];
+            let inverse_square_sources: Vec<_> = sources
+                .iter()
+                .map(fieldcad_electrostatics::inverse_square_source)
+                .collect();
+
+            for geometry in test_geometries() {
+                let gpu = InverseSquareBatchEvaluator::evaluate(
+                    &evaluator,
+                    fieldcad_electrostatics::COULOMB_CONSTANT,
+                    &inverse_square_sources,
+                    &domain,
+                    &geometry,
+                )
+                .unwrap();
+                assert_eq!(gpu.len(), geometry.len());
+                for (index, (gpu, position)) in gpu.iter().zip(geometry.positions()).enumerate() {
+                    let cpu = fieldcad_electrostatics::evaluate_sources(&sources, position);
+                    assert_eq!(gpu.validity, cpu.validity, "validity at sample {index}");
+                    if cpu.validity.is_usable() {
+                        for (actual, expected) in
+                            gpu.field.to_array().into_iter().zip(cpu.field.to_array())
+                        {
+                            close(actual, expected, index);
+                        }
+                        close(gpu.potential, cpu.potential, index);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn gravity_plane_and_grid_samples_match_the_f64_oracle() {
+        pollster::block_on(async {
+            let Some((device, queue)) = headless_device("gravity parity test device").await else {
+                eprintln!("skipping GPU parity test: no headless adapter");
+                return;
+            };
+            let evaluator = GpuInverseSquareEvaluator::new(device, queue);
+            let domain = Domain::new(
+                DomainBounds::centred_cube(3.0).unwrap(),
+                Resolution::uniform(8).unwrap(),
+                BoundaryConditions::default(),
+                Precision::F32,
+            );
+            let source = |object: u64, position: DVec3, mass_kg: f64| {
+                fieldcad_core::CoupledSource::new(
+                    ObjectId::new(object),
+                    position,
+                    Velocity::default(),
+                    MassKg::new::<kilogram>(mass_kg),
+                    ChargeDistribution::Point {
+                        exclusion_radius: 0.08,
+                    },
+                )
+            };
+            let sources = [
+                source(0, DVec3::new(-0.3, 0.0, 0.0), 5.0e18),
+                source(1, DVec3::new(0.5, -0.2, 0.3), 3.0e18),
+                source(2, DVec3::new(0.2, 0.7, -0.4), 4.0e18),
+            ];
+            let inverse_square_sources: Vec<_> = sources
+                .iter()
+                .map(fieldcad_gravity::inverse_square_source)
+                .collect();
+
+            for geometry in test_geometries() {
+                let gpu = InverseSquareBatchEvaluator::evaluate(
+                    &evaluator,
+                    -fieldcad_gravity::GRAVITATIONAL_CONSTANT,
+                    &inverse_square_sources,
+                    &domain,
+                    &geometry,
+                )
+                .unwrap();
+                assert_eq!(gpu.len(), geometry.len());
+                for (index, (gpu, position)) in gpu.iter().zip(geometry.positions()).enumerate() {
+                    let cpu = fieldcad_gravity::evaluate_sources(&sources, position);
+                    assert_eq!(gpu.validity, cpu.validity, "validity at sample {index}");
+                    if cpu.validity.is_usable() {
+                        for (actual, expected) in
+                            gpu.field.to_array().into_iter().zip(cpu.field.to_array())
+                        {
+                            close(actual, expected, index);
+                        }
+                        close(gpu.potential, cpu.potential, index);
+                    }
+                }
+            }
+        });
+    }
+
+    /// The scratch buffers this evaluator reuses across calls never shrink
+    /// — a later call with fewer samples than a previous, larger one reuses
+    /// an over-sized staging buffer. This is the code path
+    /// `GpuInverseSquareEvaluator::evaluate_raw`'s buffer-reuse logic that
+    /// no call was ever independent enough to exercise before: mapping the
+    /// wrong byte range after a shrink would silently serve bytes a larger,
+    /// earlier call wrote, rather than this call's own output.
+    #[test]
+    fn evaluate_reuses_buffers_across_growing_and_shrinking_calls() {
+        pollster::block_on(async {
+            let Some((device, queue)) = headless_device("buffer-reuse test device").await else {
+                eprintln!("skipping GPU buffer-reuse test: no headless adapter");
+                return;
+            };
+            let evaluator = GpuInverseSquareEvaluator::new(device, queue);
+            let sources = [fieldcad_electrostatics::ChargeSource::new(
+                ObjectId::new(0),
+                DVec3::new(-0.3, 0.1, 0.2),
+                Velocity::default(),
+                ChargeCoulombs::from_si(1.2e-9),
+                ChargeDistribution::Point {
+                    exclusion_radius: 0.08,
+                },
+            )];
+            let inverse_square_sources: Vec<_> = sources
+                .iter()
+                .map(fieldcad_electrostatics::inverse_square_source)
+                .collect();
+
+            let probes_at = |positions: &[DVec3]| {
+                SampleGeometry::probes(
+                    (0..positions.len())
+                        .map(|index| ProbeId::new(index as u64))
+                        .collect(),
+                    positions.to_vec(),
+                )
+                .unwrap()
+            };
+
+            // Small, then large (grows every buffer), then small again
+            // (reuses the now-larger buffers) — the shrink step is what
+            // would previously have read stale bytes from the large call.
+            let small: Vec<DVec3> = vec![DVec3::new(0.4, -0.2, 0.1), DVec3::new(-0.6, 0.3, -0.1)];
+            let large: Vec<DVec3> = (0..24)
+                .map(|index| {
+                    let t = index as f64 * 0.37;
+                    DVec3::new(t.sin(), t.cos(), 0.1 * t)
+                })
+                .collect();
+
+            for positions in [&small, &large, &small] {
+                let geometry = probes_at(positions);
+                let gpu = evaluator
+                    .evaluate_raw(
+                        fieldcad_electrostatics::COULOMB_CONSTANT,
+                        &inverse_square_sources,
+                        &geometry,
+                    )
+                    .unwrap();
+                assert_eq!(gpu.len(), positions.len());
+                for (index, (gpu, position)) in gpu.iter().zip(positions.iter()).enumerate() {
+                    let cpu = fieldcad_electrostatics::evaluate_sources(&sources, *position);
+                    assert_eq!(gpu.validity, cpu.validity, "validity at sample {index}");
+                    if cpu.validity.is_usable() {
+                        for (actual, expected) in
+                            gpu.field.to_array().into_iter().zip(cpu.field.to_array())
+                        {
+                            close(actual, expected, index);
+                        }
+                        close(gpu.potential, cpu.potential, index);
+                    }
+                }
+            }
+        });
     }
 }

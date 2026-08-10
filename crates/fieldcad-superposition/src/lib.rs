@@ -8,10 +8,15 @@
 //! opposite sign. This crate owns that shared numerical core once; a
 //! caller supplies only the constant (magnitude and sign) and its sources.
 //! It has no notion of "charge" or "mass," no plugin, and no runtime
-//! dependency, matching `fieldcad-newtonian-gravity`'s own existing split
-//! between physics kernel and plugin glue.
+//! dependency — `plugins/electrostatics` and `plugins/gravity` are both
+//! thin adapters over it, converting their own source/sample types to and
+//! from the generic shapes here and supplying their own coupling constant.
+//! [`InverseSquareBatchEvaluator`] is the shared evaluator seam both
+//! plugins inject a CPU or GPU implementation through.
 
-use fieldcad_core::{ChargeDistribution, SampleValidity, UndefinedReason};
+use fieldcad_core::{
+    ChargeDistribution, Domain, Precision, SampleGeometry, SampleValidity, UndefinedReason,
+};
 use glam::{DMat3, DVec3};
 
 /// One source of a superposed field: a position, a coupling strength
@@ -29,11 +34,21 @@ pub struct InverseSquareSource {
 /// `gradient` is the field's own spatial derivative (`∂field_i/∂x_j` in
 /// column `j`), not the potential's — a caller that wants `∇φ` uses `-field`
 /// directly, since `E = -∇φ` already.
+///
+/// `Some` for every sample from the CPU analytical solver
+/// ([`evaluate_sources`] in this crate), including an undefined sample
+/// whose validity makes its zero placeholder unusable — an undefined
+/// position must not withdraw the gradient *capability* from every other
+/// position in the batch. An evaluator without derivative support (a GPU
+/// compute-shader adapter, say) reports `None` for every sample in a
+/// batch instead. A caller uses that batch-wide capability to decide
+/// whether to attach a gradient column to what it publishes; see
+/// [`InverseSquareBatchEvaluator`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InverseSquareSample {
     pub field: DVec3,
     pub potential: f64,
-    pub gradient: DMat3,
+    pub gradient: Option<DMat3>,
     pub validity: SampleValidity,
 }
 
@@ -42,7 +57,7 @@ impl InverseSquareSample {
         Self {
             field: DVec3::ZERO,
             potential: 0.0,
-            gradient: DMat3::ZERO,
+            gradient: Some(DMat3::ZERO),
             validity: SampleValidity::Undefined(reason),
         }
     }
@@ -136,7 +151,7 @@ pub fn evaluate_sources(
     InverseSquareSample {
         field,
         potential,
-        gradient,
+        gradient: Some(gradient),
         validity: SampleValidity::Exact,
     }
 }
@@ -173,6 +188,110 @@ pub fn field_excluding(
         field += field_contribution;
     }
     field.is_finite().then_some(field)
+}
+
+/// Batch evaluator for an inverse-square coupling law.
+///
+/// A single evaluator can serve both electrostatic (Coulomb) and
+/// gravitational equation systems — the caller supplies the coupling
+/// constant (sign and magnitude) separately. A successful batch reports
+/// gradient availability uniformly: every sample has `Some(gradient)`, or
+/// every sample has `None` — see [`InverseSquareSample::gradient`].
+pub trait InverseSquareBatchEvaluator: Send + Sync {
+    /// The numerical precision this evaluator produces (e.g. `F64` for the
+    /// CPU oracle, `F32` for a WGSL compute shader).
+    fn precision(&self) -> Precision;
+
+    /// Evaluate the field, potential, and (if available) gradient at every
+    /// sample position described by `geometry`. On success, the returned
+    /// vector has exactly `geometry.len()` entries; a backend that cannot
+    /// meet that contract returns `Err`, never a partial result.
+    fn evaluate(
+        &self,
+        coupling_constant: f64,
+        sources: &[InverseSquareSource],
+        domain: &Domain,
+        geometry: &SampleGeometry,
+    ) -> Result<Vec<InverseSquareSample>, String>;
+
+    /// [`Self::evaluate`], writing into a caller-owned buffer.
+    ///
+    /// `out.len()` must equal `geometry.len()`. The default forwards to
+    /// [`Self::evaluate`] and copies the result — correct for any
+    /// evaluator, but still allocating; an evaluator that can write its
+    /// result directly should override this to skip that intermediate
+    /// `Vec` on a cache's refill-in-place path.
+    fn evaluate_into(
+        &self,
+        coupling_constant: f64,
+        sources: &[InverseSquareSource],
+        domain: &Domain,
+        geometry: &SampleGeometry,
+        out: &mut [InverseSquareSample],
+    ) -> Result<(), String> {
+        if out.len() != geometry.len() {
+            return Err(format!(
+                "inverse-square output buffer has length {}, expected {}",
+                out.len(),
+                geometry.len()
+            ));
+        }
+        let evaluated = self.evaluate(coupling_constant, sources, domain, geometry)?;
+        if evaluated.len() != geometry.len() {
+            return Err(format!(
+                "inverse-square evaluator returned {} samples for a geometry of length {}",
+                evaluated.len(),
+                geometry.len()
+            ));
+        }
+        out.copy_from_slice(&evaluated);
+        Ok(())
+    }
+}
+
+/// The reference CPU `f64` oracle, and the correctness baseline every
+/// faster backend is checked against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuInverseSquareEvaluator;
+
+impl InverseSquareBatchEvaluator for CpuInverseSquareEvaluator {
+    fn precision(&self) -> Precision {
+        Precision::F64
+    }
+
+    fn evaluate(
+        &self,
+        coupling_constant: f64,
+        sources: &[InverseSquareSource],
+        _domain: &Domain,
+        geometry: &SampleGeometry,
+    ) -> Result<Vec<InverseSquareSample>, String> {
+        Ok(geometry
+            .positions()
+            .map(|position| evaluate_sources(coupling_constant, sources.iter().copied(), position))
+            .collect())
+    }
+
+    fn evaluate_into(
+        &self,
+        coupling_constant: f64,
+        sources: &[InverseSquareSource],
+        _domain: &Domain,
+        geometry: &SampleGeometry,
+        out: &mut [InverseSquareSample],
+    ) -> Result<(), String> {
+        if out.len() != geometry.len() {
+            return Err(format!(
+                "inverse-square output buffer has length {}, expected {}",
+                out.len(),
+                geometry.len()
+            ));
+        }
+        for (position, out) in geometry.positions().zip(out) {
+            *out = evaluate_sources(coupling_constant, sources.iter().copied(), position);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -292,11 +411,12 @@ mod tests {
             (field_at(position + DVec3::Z * h) - field_at(position - DVec3::Z * h)) / (2.0 * h),
         );
 
+        let gradient = sample
+            .gradient
+            .expect("CPU evaluator always reports a gradient");
         assert!(
-            matrix_close(sample.gradient, numerical, 1.0e-4),
-            "closed-form {:?} vs numerical {:?}",
-            sample.gradient,
-            numerical
+            matrix_close(gradient, numerical, 1.0e-4),
+            "closed-form {gradient:?} vs numerical {numerical:?}"
         );
     }
 
@@ -306,9 +426,9 @@ mod tests {
         let b = point(-1.5, DVec3::new(3.0, 1.0, 0.0));
         let position = DVec3::new(0.5, 0.2, 0.1);
 
-        let combined = evaluate_sources(1.0, [a, b], position).gradient;
-        let separate = evaluate_sources(1.0, [a], position).gradient
-            + evaluate_sources(1.0, [b], position).gradient;
+        let combined = evaluate_sources(1.0, [a, b], position).gradient.unwrap();
+        let separate = evaluate_sources(1.0, [a], position).gradient.unwrap()
+            + evaluate_sources(1.0, [b], position).gradient.unwrap();
 
         assert!(matrix_close(combined, separate, 1.0e-9));
     }
@@ -323,6 +443,27 @@ mod tests {
         let sample = evaluate_sources(1.0, [source], DVec3::new(0.3, -0.1, 0.5));
 
         let expected = DMat3::from_diagonal(DVec3::splat(3.0 / 2.0_f64.powi(3)));
-        assert!(matrix_close(sample.gradient, expected, 1.0e-9));
+        assert!(matrix_close(sample.gradient.unwrap(), expected, 1.0e-9));
+    }
+
+    /// Regression: an undefined sample must still carry a gradient
+    /// capability, or a batch with one undefined position (validity
+    /// already marks it unusable) would silently withdraw the gradient
+    /// column from every *other* position in the same batch too.
+    #[test]
+    fn an_undefined_sample_still_reports_a_placeholder_gradient() {
+        let source = InverseSquareSource {
+            position: DVec3::ZERO,
+            strength: 1.0,
+            distribution: ChargeDistribution::Point {
+                exclusion_radius: 0.5,
+            },
+        };
+        let sample = evaluate_sources(1.0, [source], DVec3::X * 0.4);
+        assert_eq!(
+            sample.validity,
+            SampleValidity::Undefined(UndefinedReason::InsideSourceRadius)
+        );
+        assert_eq!(sample.gradient, Some(DMat3::ZERO));
     }
 }

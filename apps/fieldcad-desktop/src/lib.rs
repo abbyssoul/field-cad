@@ -1,10 +1,8 @@
 mod app;
 pub mod camera;
 mod electromagnetism_gpu;
-mod electrostatics_gpu;
 pub mod gpu;
 mod gpu_inverse_square;
-mod gravity_gpu;
 mod mcp;
 mod probe_history_state;
 mod profile;

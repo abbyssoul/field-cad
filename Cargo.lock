@@ -1143,7 +1143,6 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-gravity",
- "fieldcad-newtonian-gravity",
  "fieldcad-plugin-api",
  "fieldcad-scene-document",
  "fieldcad-simulation",
@@ -1181,7 +1180,6 @@ dependencies = [
  "fieldcad-electrostatics",
  "fieldcad-gravity",
  "fieldcad-mcp",
- "fieldcad-newtonian-gravity",
  "fieldcad-particles",
  "fieldcad-plugin-api",
  "fieldcad-scene-document",
@@ -1255,9 +1253,9 @@ name = "fieldcad-gravity"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
- "fieldcad-newtonian-gravity",
  "fieldcad-plugin-api",
  "fieldcad-sources",
+ "fieldcad-superposition",
  "glam",
 ]
 
@@ -1289,16 +1287,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "fieldcad-newtonian-gravity"
-version = "0.1.0"
-dependencies = [
- "fieldcad-core",
- "fieldcad-sources",
- "fieldcad-superposition",
- "glam",
 ]
 
 [[package]]

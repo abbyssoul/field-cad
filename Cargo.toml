@@ -7,7 +7,6 @@ members = [
     "crates/fieldcad-dynamics",
     "crates/fieldcad-electromagnetic-sources",
     "crates/fieldcad-sources",
-    "crates/fieldcad-newtonian-gravity",
     "crates/fieldcad-mcp",
     "crates/fieldcad-particles",
     "crates/fieldcad-plugin-api",
@@ -74,7 +73,6 @@ fieldcad-core = { path = "crates/fieldcad-core" }
 fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
 fieldcad-sources = { path = "crates/fieldcad-sources" }
-fieldcad-newtonian-gravity = { path = "crates/fieldcad-newtonian-gravity" }
 fieldcad-mcp = { path = "crates/fieldcad-mcp" }
 fieldcad-particles = { path = "crates/fieldcad-particles" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }

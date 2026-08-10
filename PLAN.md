@@ -103,12 +103,15 @@ Progress as of 2026-08-06:
   solver-owned, undoable numerical intervention; it uses a selected slice
   plane's normal and works only for vector channels advertised mutable by a
   time-stepped solver. Analytical fields remain explicitly read-only.
-- Milestone 7 is implemented. `fieldcad-newtonian-gravity` owns the reusable
-  analytic point/sphere source law; `fieldcad-gravity` adapts it to the generic
-  solver interface, publishes gravitational acceleration and potential, and
-  contributes gravitational force through the existing dynamics interface. The
-  desktop registers it as an opt-in field system. The Orishu integration plan
-  records the corresponding shared-kernel adapter task.
+- Milestone 7 is implemented. `fieldcad-superposition` owns the reusable
+  analytic point/sphere inverse-square source law, shared with electrostatics
+  — Newton's law of gravitation and Coulomb's law are the same functional
+  form with a different coupling constant and sign; `fieldcad-gravity` adapts
+  it to the generic solver interface, publishes gravitational acceleration
+  and potential, and contributes gravitational force through the existing
+  dynamics interface. The desktop registers it as an opt-in field system. The
+  Orishu integration plan records the corresponding shared-kernel adapter
+  task.
 
 The plan deliberately built a thin end-to-end product before the time-domain
 Maxwell solver. Each milestone ends in something observable and testable, and
@@ -127,7 +130,7 @@ crates/
   fieldcad-core/         world, domain, sampling, units, time        [present]
   fieldcad-electromagnetic-sources/ shared charge schema/sources     [present]
   fieldcad-mass-sources/ shared mass schema/sources                  [present]
-  fieldcad-newtonian-gravity/ reusable Newtonian gravity kernel      [present]
+  fieldcad-superposition/ shared inverse-square source law kernel    [present]
   fieldcad-particles/    catalog provenance and particle view        [present]
   fieldcad-plugin-api/   equation-system contract and schemas        [present]
   fieldcad-simulation/   runtime and data-source boundary            [present]
@@ -422,14 +425,16 @@ Exit criteria:
 
 ## Milestone 7 — prove extensibility with gravity
 
-Implementation status: **complete.** `fieldcad-newtonian-gravity` is a
-headless reusable kernel for Newton's point/sphere source law and is kept free
-of the plugin/runtime/UI/transport layers. `fieldcad-gravity` is its local
-equation-system adapter. It publishes gravitational acceleration `g` (`m/s²`)
-and potential `Φ` (`m²/s²`), returns `m_g g` through the generic force path,
-and is registered as an opt-in desktop model. This is deliberately
-gravi-static; dynamic gravity is a later stateful solver, not an extension of
-this oracle.
+Implementation status: **complete.** `fieldcad-superposition` is a headless
+reusable kernel for the point/sphere inverse-square source law, shared by
+gravity and electrostatics (Newton's law of gravitation and Coulomb's law
+are the same functional form with a different coupling constant and sign),
+and is kept free of the plugin/runtime/UI/transport layers.
+`fieldcad-gravity` is its local equation-system adapter. It publishes
+gravitational acceleration `g` (`m/s²`) and potential `Φ` (`m²/s²`), returns
+`m_g g` through the generic force path, and is registered as an opt-in
+desktop model. This is deliberately gravi-static; dynamic gravity is a later
+stateful solver, not an extension of this oracle.
 
 Implement a minimal gravity plugin to test that abstractions are not secretly
 electromagnetic:

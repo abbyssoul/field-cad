@@ -21,8 +21,10 @@ partially resolved.
 
 Two related but distinct live-session observations, both against a GPU
 evaluator scene ("f32 batched evaluator" in Solver diagnostics —
-`GpuNewtonianGravityEvaluator`/`GpuInverseSquareEvaluator`, not the CPU
-reference evaluator):
+`GpuInverseSquareEvaluator`, injected into both `plugins/gravity` and
+`plugins/electrostatics` as `Arc<dyn InverseSquareBatchEvaluator>` since
+`unify-inverse-square-sample-and-evaluator` landed; not the CPU reference
+evaluator):
 
 1. The Diagnostics **Mem** plot shows a sawtooth — it goes up and down,
    not just up. Partly explained already: the frame-merge fix (above)
@@ -71,8 +73,11 @@ found none:
 
 ## What was fixed, and its measured effect (the receipts)
 
-`apps/fieldcad-desktop/src/gpu_inverse_square.rs`'s `GpuInverseSquareEvaluator::evaluate`
-(shared by both the gravity and electrostatics GPU evaluators) built a
+`apps/fieldcad-desktop/src/gpu_inverse_square.rs`'s `GpuInverseSquareEvaluator::evaluate_raw`
+(the low-level dispatch method — renamed from `evaluate` when
+`unify-inverse-square-sample-and-evaluator` landed `GpuInverseSquareEvaluator`'s
+own `InverseSquareBatchEvaluator::evaluate` as a thin wrapper over it;
+shared by both the gravity and electrostatics GPU paths either way) built a
 **fresh `wgpu::BindGroup` on every single call** — every sampled geometry,
 every tick — even though only the underlying buffers' *contents* changed,
 not their identity (the buffers themselves were already correctly reused
@@ -110,7 +115,7 @@ containers" theory and toward the GPU dispatch path in the first place.
 In rough order of suspicion:
 
 1. **`device.poll(wgpu::PollType::Wait { .. })`** in
-   `GpuInverseSquareEvaluator::evaluate` (`apps/fieldcad-desktop/src/gpu_inverse_square.rs`,
+   `GpuInverseSquareEvaluator::evaluate_raw` (`apps/fieldcad-desktop/src/gpu_inverse_square.rs`,
    near the end of the function) blocks once per dispatch — once per
    sampled geometry per tick. If `wgpu`'s or the Vulkan driver's internal
    submission/fence tracking has its own cost that grows with cumulative
@@ -120,8 +125,9 @@ In rough order of suspicion:
    batch every sampled geometry's dispatch into **one** command encoder /
    one submit / one poll per tick instead of one pair per geometry — a
    bigger, more invasive change than today's fix, needs its own design
-   (the current code processes one `SampleGeometry` per `evaluate()` call,
-   called independently per geometry from `plugins/gravity`'s
+   (the current code processes one `SampleGeometry` per
+   `InverseSquareBatchEvaluator::evaluate`/`evaluate_into` call, called
+   independently per geometry from `plugins/gravity`'s/`plugins/electrostatics`'s
    `samples_for`/`SampleCache`).
 2. **`wgpu::CommandEncoder`** is still created fresh every call
    (`self.device.create_command_encoder(...)`, same function). Lower
@@ -142,9 +148,13 @@ In rough order of suspicion:
    cheap and low-risk to convert regardless, and doing so would help rule
    it out cleanly.
 4. Not yet checked at all: whether the *electrostatics* GPU evaluator
-   path (which shares this same `GpuInverseSquareEvaluator`, so already
-   benefits from today's fix) or any CPU-side sampling path shows the same
-   residual creep, or whether it's specific to gravity/Newtonian scenes.
+   path (which is now literally the same `GpuInverseSquareEvaluator`
+   instance type as gravity's, not just sharing an internal core, since
+   `unify-inverse-square-sample-and-evaluator` removed the separate
+   `GpuElectrostaticEvaluator`/`GpuNewtonianGravityEvaluator` wrappers —
+   so it already benefits from today's fix identically) or any CPU-side
+   sampling path shows the same residual creep, or whether it's specific
+   to gravity/Newtonian scenes.
 
 ## Suggested next steps
 
@@ -168,8 +178,11 @@ In rough order of suspicion:
 
 ## Relevant code
 
-- `apps/fieldcad-desktop/src/gpu_inverse_square.rs` — `GpuInverseSquareEvaluator::evaluate`,
-  already fixed for bind-group caching this session; `device.poll`/
+- `apps/fieldcad-desktop/src/gpu_inverse_square.rs` — `GpuInverseSquareEvaluator::evaluate_raw`
+  (renamed from `evaluate` by `unify-inverse-square-sample-and-evaluator`;
+  the type now also implements `fieldcad_superposition::InverseSquareBatchEvaluator`
+  directly, with `evaluate` a thin wrapper over `evaluate_raw`), already
+  fixed for bind-group caching this session; `device.poll`/
   `create_command_encoder` are the remaining per-call GPU resource
   creation in this function.
 - `crates/fieldcad-simulation/src/runtime.rs` — `apply_tick_inner`,

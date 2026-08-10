@@ -22,10 +22,9 @@ use fieldcad_electromagnetism::{
     magnetic_field_channel_id as maxwell_magnetic_field_channel_id,
 };
 use fieldcad_electrostatics::{
-    ElectrostaticBatchEvaluator, ElectrostaticsPlugin, electric_field_channel_id,
-    electric_potential_channel_id,
+    ElectrostaticsPlugin, electric_field_channel_id, electric_potential_channel_id,
 };
-use fieldcad_gravity::{GravityBatchEvaluator, NewtonianGravityPlugin};
+use fieldcad_gravity::NewtonianGravityPlugin;
 use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
@@ -33,6 +32,7 @@ use fieldcad_simulation::{
     FieldDataSource, LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig,
     SimulationRuntime, Subscription,
 };
+use fieldcad_superposition::InverseSquareBatchEvaluator;
 use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2};
 use winit::{
     application::ApplicationHandler,
@@ -46,8 +46,7 @@ use winit::{
 use crate::{
     camera::{AxisView, OrbitCamera, Viewport},
     electromagnetism_gpu::GpuMaxwellBackend,
-    electrostatics_gpu::GpuElectrostaticEvaluator,
-    gravity_gpu::GpuNewtonianGravityEvaluator,
+    gpu_inverse_square::GpuInverseSquareEvaluator,
     mcp::{self, McpAction, McpSession},
     probe_history_state,
     profile::UserProfile,
@@ -593,13 +592,12 @@ impl WindowState {
         );
 
         let (compute_device, compute_queue) = renderer.compute_handles();
-        let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
-            GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        let evaluator: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
+            GpuInverseSquareEvaluator::new(compute_device.clone(), compute_queue.clone()),
         );
-        let gravity: Arc<dyn GravityBatchEvaluator> = Arc::new(GpuNewtonianGravityEvaluator::new(
-            compute_device.clone(),
-            compute_queue.clone(),
-        ));
+        let gravity: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
+            GpuInverseSquareEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        );
         let maxwell: Arc<dyn MaxwellSolverBackend> =
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
         let mut profile = UserProfile::load();
@@ -2071,13 +2069,12 @@ impl WindowState {
     /// a clone of that same `Arc`) observes the replacement too.
     fn replace_session(&mut self, source: SessionSource) -> Result<(), String> {
         let (compute_device, compute_queue) = self.renderer.compute_handles();
-        let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
-            GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        let evaluator: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
+            GpuInverseSquareEvaluator::new(compute_device.clone(), compute_queue.clone()),
         );
-        let gravity: Arc<dyn GravityBatchEvaluator> = Arc::new(GpuNewtonianGravityEvaluator::new(
-            compute_device.clone(),
-            compute_queue.clone(),
-        ));
+        let gravity: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
+            GpuInverseSquareEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        );
         let maxwell: Arc<dyn MaxwellSolverBackend> =
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
         let catalog = desktop_plugin_catalog(evaluator, gravity, maxwell);
@@ -2734,13 +2731,12 @@ struct BoxFrame {
 fn mcp_plugin_catalog_for(renderer: &ViewportRenderer) -> mcp::PluginCatalog {
     let (compute_device, compute_queue) = renderer.compute_handles();
     Arc::new(move || {
-        let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
-            GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        let evaluator: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
+            GpuInverseSquareEvaluator::new(compute_device.clone(), compute_queue.clone()),
         );
-        let gravity: Arc<dyn GravityBatchEvaluator> = Arc::new(GpuNewtonianGravityEvaluator::new(
-            compute_device.clone(),
-            compute_queue.clone(),
-        ));
+        let gravity: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
+            GpuInverseSquareEvaluator::new(compute_device.clone(), compute_queue.clone()),
+        );
         let maxwell: Arc<dyn MaxwellSolverBackend> = Arc::new(GpuMaxwellBackend::new(
             compute_device.clone(),
             compute_queue.clone(),
@@ -2750,8 +2746,8 @@ fn mcp_plugin_catalog_for(renderer: &ViewportRenderer) -> mcp::PluginCatalog {
 }
 
 fn desktop_plugin_catalog(
-    evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
-    gravity: Arc<dyn GravityBatchEvaluator>,
+    evaluator: Arc<dyn InverseSquareBatchEvaluator>,
+    gravity: Arc<dyn InverseSquareBatchEvaluator>,
     maxwell: Arc<dyn MaxwellSolverBackend>,
 ) -> Vec<PluginRegistration> {
     vec![

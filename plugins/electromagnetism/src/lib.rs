@@ -1922,8 +1922,7 @@ mod tests {
             .unwrap();
         let position = DVec3::new(1.0, 0.0, 0.0);
         let geometry = points(vec![position]);
-        let expected =
-            evaluate_sources(&collect_sources(&snapshot).unwrap(), position).electric_field;
+        let expected = evaluate_sources(&collect_sources(&snapshot).unwrap(), position).field;
         let initial = solver.sample(ELECTRIC_FIELD_HANDLE, &geometry).unwrap();
         let FieldColumn::Vector(initial) = initial.values else {
             panic!("electric field must be a vector column");
@@ -2179,7 +2178,7 @@ mod tests {
 
         let mut worst: f64 = 0.0;
         for (position, actual) in positions.iter().zip(actual.iter()) {
-            let expected = evaluate_sources(&sources, *position).electric_field;
+            let expected = evaluate_sources(&sources, *position).field;
             assert!(
                 actual.normalize().dot(expected.normalize()) > 0.99,
                 "at {position:?} Maxwell E {actual:?} points away from electrostatic {expected:?}"

@@ -15,10 +15,14 @@ window/presentation surface.
 
 ## Decision
 
-The electrostatics plugin declares a narrow `ElectrostaticBatchEvaluator` seam.
-In local desktop mode the composition root injects a host-owned `wgpu` evaluator
-that shares the application's device and queue. It evaluates both electric
-field and potential for one probe, plane, or grid geometry in a single dispatch.
+The electrostatics plugin declares a narrow batch-evaluator seam (originally
+`ElectrostaticBatchEvaluator`; later unified with gravity's identically-shaped
+evaluator into `fieldcad_superposition::InverseSquareBatchEvaluator`, since
+both plugins turned out to be the same inverse-square law with a different
+coupling constant and sign). In local desktop mode the composition root
+injects a host-owned `wgpu` evaluator that shares the application's device
+and queue. It evaluates both electric field and potential for one probe,
+plane, or grid geometry in a single dispatch.
 
 GPU results are read back and published through the same immutable
 `FieldSnapshot` columns as CPU and remote results. The snapshot domain declares

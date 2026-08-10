@@ -7,6 +7,6 @@ description = "Analytic Newtonian gravity equation-system plugin"
 [dependencies]
 fieldcad-core = { workspace = true }
 fieldcad-sources = { workspace = true }
-fieldcad-newtonian-gravity = { workspace = true }
+fieldcad-superposition = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 glam = { workspace = true }
