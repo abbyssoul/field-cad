@@ -22,7 +22,7 @@ use fieldcad_core::{
 use fieldcad_superposition::{
     InverseSquareBatchEvaluator, InverseSquareSample, InverseSquareSource,
 };
-use glam::DVec3;
+use glam::{DMat3, DVec3};
 
 const SHADER: &str = include_str!("inverse_square.wgsl");
 const WORKGROUP_SIZE: u32 = 64;
@@ -52,17 +52,12 @@ struct GpuPosition {
 struct GpuOutput {
     field_potential: [f32; 4],
     validity: [u32; 4],
-}
-
-/// One batched sample, read back from the GPU. Deliberately has no Jacobian:
-/// the compute shader has never computed one (unlike the CPU `f64` oracle,
-/// whose closed-form gradient is cheap to include), so a caller that wants a
-/// gradient-bearing public sample type reports it absent itself, rather than
-/// this core fabricating a placeholder value.
-pub(crate) struct GpuInverseSquareSample {
-    pub(crate) field: DVec3,
-    pub(crate) potential: f64,
-    pub(crate) validity: SampleValidity,
+    // The field's own Jacobian, one column per lane — matches
+    // `inverse_square.wgsl`'s `SampleOutput.gradient_col{0,1,2}` layout, each
+    // padded to 16 bytes for `mat3x3<f32>`'s column alignment.
+    gradient_col0: [f32; 4],
+    gradient_col1: [f32; 4],
+    gradient_col2: [f32; 4],
 }
 
 /// Buffers reused across `evaluate` calls instead of being created fresh
@@ -193,18 +188,26 @@ impl GpuInverseSquareEvaluator {
             scratch,
         }
     }
+}
+
+impl InverseSquareBatchEvaluator for GpuInverseSquareEvaluator {
+    fn precision(&self) -> Precision {
+        Precision::F32
+    }
 
     /// Evaluate one batch of sample positions against `sources`, superposed
     /// under `coupling_constant` (Coulomb's constant for electrostatics,
-    /// `-G` for gravity). The raw GPU readback shape — see
-    /// [`InverseSquareBatchEvaluator::evaluate`] (below) for the public,
-    /// plugin-facing form this feeds.
-    pub(crate) fn evaluate_raw(
+    /// `-G` for gravity), writing GPU readback fields directly into
+    /// [`InverseSquareSample`] — no intermediate raw-sample `Vec` to map
+    /// over afterward, since nothing else needs the GPU's own struct
+    /// layout once the bytes are off the wire.
+    fn evaluate(
         &self,
         coupling_constant: f64,
         sources: &[InverseSquareSource],
+        _domain: &Domain,
         geometry: &SampleGeometry,
-    ) -> Result<Vec<GpuInverseSquareSample>, String> {
+    ) -> Result<Vec<InverseSquareSample>, String> {
         if geometry.is_empty() {
             return Ok(Vec::new());
         }
@@ -376,47 +379,24 @@ impl GpuInverseSquareEvaluator {
         let raw: &[GpuOutput] = bytemuck::cast_slice(&mapped);
         let evaluated = raw
             .iter()
-            .map(|sample| GpuInverseSquareSample {
+            .map(|sample| InverseSquareSample {
                 field: DVec3::new(
                     f64::from(sample.field_potential[0]),
                     f64::from(sample.field_potential[1]),
                     f64::from(sample.field_potential[2]),
                 ),
                 potential: f64::from(sample.field_potential[3]),
+                gradient: Some(DMat3::from_cols(
+                    gradient_column(sample.gradient_col0),
+                    gradient_column(sample.gradient_col1),
+                    gradient_column(sample.gradient_col2),
+                )),
                 validity: validity(sample.validity[0]),
             })
             .collect();
         drop(mapped);
         scratch.staging_buffer.unmap();
         Ok(evaluated)
-    }
-}
-
-impl InverseSquareBatchEvaluator for GpuInverseSquareEvaluator {
-    fn precision(&self) -> Precision {
-        Precision::F32
-    }
-
-    fn evaluate(
-        &self,
-        coupling_constant: f64,
-        sources: &[InverseSquareSource],
-        _domain: &Domain,
-        geometry: &SampleGeometry,
-    ) -> Result<Vec<InverseSquareSample>, String> {
-        let samples = self.evaluate_raw(coupling_constant, sources, geometry)?;
-        Ok(samples
-            .into_iter()
-            .map(|sample| InverseSquareSample {
-                field: sample.field,
-                potential: sample.potential,
-                // The compute shader does not (yet) output a Jacobian —
-                // consumers fall back to today's plain trilinear/bilinear
-                // reconstruction for batches this evaluator produces.
-                gradient: None,
-                validity: sample.validity,
-            })
-            .collect())
     }
 }
 
@@ -452,6 +432,16 @@ fn finite_f32(value: f64, label: &str) -> Result<f32, String> {
     } else {
         Err(format!("{label} cannot be represented as f32"))
     }
+}
+
+/// One `mat3x3<f32>` column read back from the GPU (padded to 4 lanes on
+/// the shader side) widened to `f64`, dropping the padding lane.
+fn gradient_column(column: [f32; 4]) -> DVec3 {
+    DVec3::new(
+        f64::from(column[0]),
+        f64::from(column[1]),
+        f64::from(column[2]),
+    )
 }
 
 fn validity(code: u32) -> SampleValidity {
@@ -616,6 +606,18 @@ mod tests {
                             close(actual, expected, index);
                         }
                         close(gpu.potential, cpu.potential, index);
+                        let gpu_gradient =
+                            gpu.gradient.expect("GPU evaluator now reports a gradient");
+                        let cpu_gradient = cpu
+                            .gradient
+                            .expect("CPU evaluator always reports a gradient");
+                        for (actual, expected) in gpu_gradient
+                            .to_cols_array()
+                            .into_iter()
+                            .zip(cpu_gradient.to_cols_array())
+                        {
+                            close(actual, expected, index);
+                        }
                     }
                 }
             }
@@ -677,6 +679,18 @@ mod tests {
                             close(actual, expected, index);
                         }
                         close(gpu.potential, cpu.potential, index);
+                        let gpu_gradient =
+                            gpu.gradient.expect("GPU evaluator now reports a gradient");
+                        let cpu_gradient = cpu
+                            .gradient
+                            .expect("CPU evaluator always reports a gradient");
+                        for (actual, expected) in gpu_gradient
+                            .to_cols_array()
+                            .into_iter()
+                            .zip(cpu_gradient.to_cols_array())
+                        {
+                            close(actual, expected, index);
+                        }
                     }
                 }
             }
@@ -686,8 +700,8 @@ mod tests {
     /// The scratch buffers this evaluator reuses across calls never shrink
     /// — a later call with fewer samples than a previous, larger one reuses
     /// an over-sized staging buffer. This is the code path
-    /// `GpuInverseSquareEvaluator::evaluate_raw`'s buffer-reuse logic that
-    /// no call was ever independent enough to exercise before: mapping the
+    /// `GpuInverseSquareEvaluator::evaluate`'s buffer-reuse logic that no
+    /// call was ever independent enough to exercise before: mapping the
     /// wrong byte range after a shrink would silently serve bytes a larger,
     /// earlier call wrote, rather than this call's own output.
     #[test]
@@ -698,6 +712,12 @@ mod tests {
                 return;
             };
             let evaluator = GpuInverseSquareEvaluator::new(device, queue);
+            let domain = Domain::new(
+                DomainBounds::centred_cube(3.0).unwrap(),
+                Resolution::uniform(8).unwrap(),
+                BoundaryConditions::default(),
+                Precision::F32,
+            );
             let sources = [fieldcad_electrostatics::ChargeSource::new(
                 ObjectId::new(0),
                 DVec3::new(-0.3, 0.1, 0.2),
@@ -735,13 +755,14 @@ mod tests {
 
             for positions in [&small, &large, &small] {
                 let geometry = probes_at(positions);
-                let gpu = evaluator
-                    .evaluate_raw(
-                        fieldcad_electrostatics::COULOMB_CONSTANT,
-                        &inverse_square_sources,
-                        &geometry,
-                    )
-                    .unwrap();
+                let gpu = InverseSquareBatchEvaluator::evaluate(
+                    &evaluator,
+                    fieldcad_electrostatics::COULOMB_CONSTANT,
+                    &inverse_square_sources,
+                    &domain,
+                    &geometry,
+                )
+                .unwrap();
                 assert_eq!(gpu.len(), positions.len());
                 for (index, (gpu, position)) in gpu.iter().zip(positions.iter()).enumerate() {
                     let cpu = fieldcad_electrostatics::evaluate_sources(&sources, *position);

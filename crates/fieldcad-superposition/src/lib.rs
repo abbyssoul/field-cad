@@ -36,13 +36,15 @@ pub struct InverseSquareSource {
 /// directly, since `E = -∇φ` already.
 ///
 /// `Some` for every sample from the CPU analytical solver
-/// ([`evaluate_sources`] in this crate), including an undefined sample
-/// whose validity makes its zero placeholder unusable — an undefined
-/// position must not withdraw the gradient *capability* from every other
-/// position in the batch. An evaluator without derivative support (a GPU
-/// compute-shader adapter, say) reports `None` for every sample in a
-/// batch instead. A caller uses that batch-wide capability to decide
-/// whether to attach a gradient column to what it publishes; see
+/// ([`evaluate_sources`] in this crate) and from the desktop's `wgpu`
+/// compute-shader evaluator, which ports the same closed-form Jacobian —
+/// including an undefined sample whose validity makes its zero placeholder
+/// unusable — an undefined position must not withdraw the gradient
+/// *capability* from every other position in the batch. `None` is for a
+/// hypothetical evaluator without derivative support at all; nothing
+/// shipped today produces that, but the type stays optional so one could
+/// without breaking this contract. A caller uses that batch-wide capability
+/// to decide whether to attach a gradient column to what it publishes; see
 /// [`InverseSquareBatchEvaluator`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InverseSquareSample {
