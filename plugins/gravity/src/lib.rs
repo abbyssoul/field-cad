@@ -9,7 +9,7 @@ use fieldcad_core::{
     SampleGeometry, SolverDiagnostic, WorldSnapshot,
 };
 use fieldcad_newtonian_gravity::{
-    NewtonianSample, evaluate_acceleration_excluding, evaluate_geometry,
+    NewtonianSample, evaluate_acceleration_excluding, evaluate_geometry, evaluate_geometry_into,
 };
 use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
@@ -72,6 +72,25 @@ pub trait GravityBatchEvaluator: Send + Sync {
         domain: &Domain,
         geometry: &SampleGeometry,
     ) -> Result<Vec<NewtonianSample>, String>;
+
+    /// [`Self::evaluate`], writing into a caller-owned buffer instead of
+    /// allocating a fresh `Vec`.
+    ///
+    /// The default forwards to [`Self::evaluate`] and copies the result —
+    /// correct for any evaluator, but still allocating. An evaluator that
+    /// can write its result directly (the CPU reference evaluator can;
+    /// nothing requires a GPU evaluator to) should override this to skip
+    /// that intermediate `Vec` on the hot path a cache refresh takes.
+    fn evaluate_into(
+        &self,
+        sources: &[CoupledSource<MassKg>],
+        domain: &Domain,
+        geometry: &SampleGeometry,
+        out: &mut [NewtonianSample],
+    ) -> Result<(), String> {
+        out.copy_from_slice(&self.evaluate(sources, domain, geometry)?);
+        Ok(())
+    }
 }
 
 pub struct CpuGravityEvaluator;
@@ -88,6 +107,17 @@ impl GravityBatchEvaluator for CpuGravityEvaluator {
         geometry: &SampleGeometry,
     ) -> Result<Vec<NewtonianSample>, String> {
         Ok(evaluate_geometry(sources, geometry))
+    }
+
+    fn evaluate_into(
+        &self,
+        sources: &[CoupledSource<MassKg>],
+        _domain: &Domain,
+        geometry: &SampleGeometry,
+        out: &mut [NewtonianSample],
+    ) -> Result<(), String> {
+        evaluate_geometry_into(sources, geometry, out);
+        Ok(())
     }
 }
 
@@ -241,15 +271,27 @@ impl NewtonianGravitySolver {
         &self,
         geometry: &SampleGeometry,
     ) -> Result<Arc<[NewtonianSample]>, PluginError> {
-        self.cache.get_or_try_insert_with(geometry, || {
-            Ok(self
-                .evaluator
-                .evaluate(self.sources.as_slice(), &self.domain, geometry)
-                .map_err(PluginError::Solver)?
-                .into_iter()
-                .map(|sample| quantize(sample, self.domain.precision()))
-                .collect())
-        })
+        self.cache.get_or_try_insert_with(
+            geometry,
+            || {
+                Ok(self
+                    .evaluator
+                    .evaluate(self.sources.as_slice(), &self.domain, geometry)
+                    .map_err(PluginError::Solver)?
+                    .into_iter()
+                    .map(|sample| quantize(sample, self.domain.precision()))
+                    .collect())
+            },
+            |out| {
+                self.evaluator
+                    .evaluate_into(self.sources.as_slice(), &self.domain, geometry, out)
+                    .map_err(PluginError::Solver)?;
+                for sample in out.iter_mut() {
+                    *sample = quantize(*sample, self.domain.precision());
+                }
+                Ok(())
+            },
+        )
     }
 }
 

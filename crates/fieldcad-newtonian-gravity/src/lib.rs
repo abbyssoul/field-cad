@@ -74,6 +74,20 @@ pub fn evaluate_geometry(
         .collect()
 }
 
+/// [`evaluate_geometry`], writing into a caller-owned buffer instead of
+/// allocating a fresh `Vec` — for a cache that already holds a
+/// correctly-sized buffer from a previous evaluation of this geometry and
+/// only needs its values refreshed.
+pub fn evaluate_geometry_into(
+    sources: &[CoupledSource<MassKg>],
+    geometry: &SampleGeometry,
+    out: &mut [NewtonianSample],
+) {
+    for (position, out) in geometry.positions().zip(out) {
+        *out = evaluate_sources(sources, position);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

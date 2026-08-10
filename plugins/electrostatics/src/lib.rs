@@ -84,6 +84,25 @@ pub trait ElectrostaticBatchEvaluator: Send + Sync {
         domain: &Domain,
         geometry: &SampleGeometry,
     ) -> Result<Vec<ElectrostaticSample>, String>;
+
+    /// [`Self::evaluate`], writing into a caller-owned buffer instead of
+    /// allocating a fresh `Vec`.
+    ///
+    /// The default forwards to [`Self::evaluate`] and copies the result —
+    /// correct for any evaluator, but still allocating. An evaluator that
+    /// can write its result directly (the CPU reference evaluator can;
+    /// nothing requires a GPU evaluator to) should override this to skip
+    /// that intermediate `Vec` on the hot path a cache refresh takes.
+    fn evaluate_into(
+        &self,
+        sources: &[ChargeSource],
+        domain: &Domain,
+        geometry: &SampleGeometry,
+        out: &mut [ElectrostaticSample],
+    ) -> Result<(), String> {
+        out.copy_from_slice(&self.evaluate(sources, domain, geometry)?);
+        Ok(())
+    }
 }
 
 /// The reference `f64` evaluator, and the oracle every faster backend is
@@ -106,6 +125,19 @@ impl ElectrostaticBatchEvaluator for CpuBatchEvaluator {
             .positions()
             .map(|position| evaluate_sources(sources, position))
             .collect())
+    }
+
+    fn evaluate_into(
+        &self,
+        sources: &[ChargeSource],
+        _domain: &Domain,
+        geometry: &SampleGeometry,
+        out: &mut [ElectrostaticSample],
+    ) -> Result<(), String> {
+        for (position, out) in geometry.positions().zip(out) {
+            *out = evaluate_sources(sources, position);
+        }
+        Ok(())
     }
 }
 
@@ -368,20 +400,28 @@ impl ElectrostaticsSolver {
         &self,
         geometry: &SampleGeometry,
     ) -> Result<Arc<[ElectrostaticSample]>, PluginError> {
-        self.cache.get_or_try_insert_with(geometry, || {
-            let evaluated = self
-                .evaluator
-                .evaluate(self.sources.as_slice(), &self.domain, geometry)
-                .map_err(PluginError::Solver)?;
-            if evaluated.len() != geometry.len() {
-                return Err(PluginError::Solver(format!(
-                    "batched evaluator returned {} samples for a geometry of length {}",
-                    evaluated.len(),
-                    geometry.len()
-                )));
-            }
-            Ok(evaluated)
-        })
+        self.cache.get_or_try_insert_with(
+            geometry,
+            || {
+                let evaluated = self
+                    .evaluator
+                    .evaluate(self.sources.as_slice(), &self.domain, geometry)
+                    .map_err(PluginError::Solver)?;
+                if evaluated.len() != geometry.len() {
+                    return Err(PluginError::Solver(format!(
+                        "batched evaluator returned {} samples for a geometry of length {}",
+                        evaluated.len(),
+                        geometry.len()
+                    )));
+                }
+                Ok(evaluated)
+            },
+            |out| {
+                self.evaluator
+                    .evaluate_into(self.sources.as_slice(), &self.domain, geometry, out)
+                    .map_err(PluginError::Solver)
+            },
+        )
     }
 }
 

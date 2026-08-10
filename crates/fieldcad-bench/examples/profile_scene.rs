@@ -88,8 +88,9 @@ fn main() -> ExitCode {
         fieldcad_scene_document::load_newest_valid(&path).expect("scene file loads and parses");
     let doc = outcome.document;
 
-    let (plugins, warnings) = fieldcad_scene_document::resolve_plugins(cpu_catalog(), &doc.field_systems)
-        .expect("document plugin composition resolves against the CPU catalog");
+    let (plugins, warnings) =
+        fieldcad_scene_document::resolve_plugins(cpu_catalog(), &doc.field_systems)
+            .expect("document plugin composition resolves against the CPU catalog");
     for warning in &warnings {
         eprintln!(
             "warning: {} document={} linked={}",
@@ -121,7 +122,9 @@ fn main() -> ExitCode {
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     let started = Instant::now();
     for _ in 0..ticks {
-        runtime.step_once().expect("a Courant-limited step is accepted");
+        runtime
+            .step_once()
+            .expect("a Courant-limited step is accepted");
     }
     let elapsed = started.elapsed();
     let after = ALLOCATIONS.load(Ordering::Relaxed);

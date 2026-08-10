@@ -399,9 +399,20 @@ pub trait EquationSystemSolver: Send {
 /// visible plane, box, sphere, and the probe set) once per channel; without
 /// this, an analytic solver with several channels over the same geometry
 /// redoes the same evaluation once per channel, every tick.
+struct SampleCacheEntry<T> {
+    geometry: SampleGeometry,
+    samples: Arc<[T]>,
+    /// Set by [`SampleCache::clear`]; a moved source invalidates the
+    /// *values* here without changing `geometry` itself (the geometry a
+    /// runtime publication samples — a plane, box, sphere, or probe set —
+    /// is stable tick to tick even while its sources move), so the entry's
+    /// buffer is worth keeping and refilling rather than dropping.
+    stale: bool,
+}
+
 pub struct SampleCache<T> {
     capacity: usize,
-    entries: Mutex<VecDeque<(SampleGeometry, Arc<[T]>)>>,
+    entries: Mutex<VecDeque<SampleCacheEntry<T>>>,
 }
 
 impl<T> SampleCache<T> {
@@ -412,36 +423,63 @@ impl<T> SampleCache<T> {
         }
     }
 
-    /// The cached samples for `geometry`, or `compute`'s freshly-evaluated
-    /// result, stored for next time. `compute` runs at most once, and not
-    /// at all on a cache hit.
+    /// The cached samples for `geometry`.
+    ///
+    /// A warm hit returns the existing `Arc` directly, running neither
+    /// closure. A stale entry (same geometry, invalidated by [`Self::clear`])
+    /// is refilled in place via `refresh` whenever the cache is still the
+    /// sole owner of its buffer — the common case, since nothing else holds
+    /// onto a `samples_for` result past its own call — so a moved source
+    /// costs a recompute but not a reallocation. `compute` is the
+    /// allocating fallback: a geometry never seen before, or the rare case
+    /// where the existing buffer is still shared and can't be reused.
     pub fn get_or_try_insert_with(
         &self,
         geometry: &SampleGeometry,
         compute: impl FnOnce() -> Result<Vec<T>, PluginError>,
+        refresh: impl FnOnce(&mut [T]) -> Result<(), PluginError>,
     ) -> Result<Arc<[T]>, PluginError> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| PluginError::Solver("sample cache poisoned".to_owned()))?;
-        if let Some((_, samples)) = entries.iter().find(|(cached, _)| cached == geometry) {
-            return Ok(Arc::clone(samples));
+        if let Some(entry) = entries.iter_mut().find(|entry| &entry.geometry == geometry) {
+            if !entry.stale {
+                return Ok(Arc::clone(&entry.samples));
+            }
+            if let Some(slice) = Arc::get_mut(&mut entry.samples) {
+                refresh(slice)?;
+            } else {
+                entry.samples = compute()?.into();
+            }
+            entry.stale = false;
+            return Ok(Arc::clone(&entry.samples));
         }
         let samples: Arc<[T]> = compute()?.into();
         if entries.len() >= self.capacity {
             entries.pop_front();
         }
-        entries.push_back((geometry.clone(), Arc::clone(&samples)));
+        entries.push_back(SampleCacheEntry {
+            geometry: geometry.clone(),
+            samples: Arc::clone(&samples),
+            stale: false,
+        });
         Ok(samples)
     }
 
-    /// Discard every cached entry — call when the world changes and cached
-    /// values would no longer reflect it.
+    /// Invalidate every cached entry's *values* — call when the world
+    /// changes and cached samples would no longer reflect it. Buffers are
+    /// kept, not dropped: [`Self::get_or_try_insert_with`] refills them in
+    /// place on the next request for the same geometry rather than
+    /// reallocating.
     pub fn clear(&mut self) -> Result<(), PluginError> {
-        self.entries
+        for entry in self
+            .entries
             .get_mut()
             .map_err(|_| PluginError::Solver("sample cache poisoned".to_owned()))?
-            .clear();
+        {
+            entry.stale = true;
+        }
         Ok(())
     }
 }
@@ -462,9 +500,75 @@ pub enum PluginError {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::{Dimension, PropertyId, PropertyKind, PropertyValue, Quantity};
+    use fieldcad_core::{Dimension, ProbeId, PropertyId, PropertyKind, PropertyValue, Quantity};
 
     use super::*;
+
+    fn probe_geometry(value: f64) -> SampleGeometry {
+        SampleGeometry::probes(
+            vec![ProbeId::new(1), ProbeId::new(2)],
+            vec![DVec3::X * value, DVec3::Y * value],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_warm_hit_runs_neither_closure() {
+        let cache = SampleCache::<f64>::new(4);
+        let geometry = probe_geometry(1.0);
+        cache
+            .get_or_try_insert_with(
+                &geometry,
+                || Ok(vec![1.0, 2.0]),
+                |_| panic!("refresh must not run on the very first insert"),
+            )
+            .unwrap();
+
+        let hit = cache
+            .get_or_try_insert_with(
+                &geometry,
+                || panic!("compute must not run on a warm hit"),
+                |_| panic!("refresh must not run on a warm hit"),
+            )
+            .unwrap();
+
+        assert_eq!(&*hit, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_stale_hit_refreshes_the_same_buffer_instead_of_reallocating() {
+        let mut cache = SampleCache::<f64>::new(4);
+        let geometry = probe_geometry(1.0);
+        let first = cache
+            .get_or_try_insert_with(&geometry, || Ok(vec![1.0, 2.0]), |_| unreachable!())
+            .unwrap();
+        let original_allocation = Arc::as_ptr(&first);
+        // A real `samples_for` never lets its `Arc` clone outlive the call
+        // that produced it — drop this one the same way, so the cache is
+        // the sole owner again by the time it's asked to refresh.
+        drop(first);
+
+        cache.clear().unwrap();
+
+        let refreshed = cache
+            .get_or_try_insert_with(
+                &geometry,
+                || panic!("compute must not run once a stale buffer can be reused in place"),
+                |samples| {
+                    samples[0] = 3.0;
+                    samples[1] = 4.0;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            Arc::as_ptr(&refreshed),
+            original_allocation,
+            "a stale hit should refill the existing allocation, not replace it"
+        );
+        assert_eq!(&*refreshed, [3.0, 4.0]);
+    }
 
     #[test]
     fn configuration_validation_rejects_wrong_dimensions() {
