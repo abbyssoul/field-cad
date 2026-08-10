@@ -23,10 +23,12 @@ fieldcad-gravity = { workspace = true }
 fieldcad-scene-document = { workspace = true }
 fieldcad-sources = { workspace = true }
 fieldcad-mcp = { workspace = true }
+fieldcad-newtonian-gravity = { workspace = true }
 fieldcad-particles = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 fieldcad-server = { workspace = true }
 fieldcad-simulation = { workspace = true }
+fieldcad-superposition = { workspace = true }
 glam = { workspace = true }
 pollster = { workspace = true }
 rfd = { workspace = true }

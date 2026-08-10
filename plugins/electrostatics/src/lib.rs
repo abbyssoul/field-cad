@@ -109,7 +109,12 @@ impl ElectrostaticBatchEvaluator for CpuBatchEvaluator {
     }
 }
 
-fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
+/// `ChargeSource` → the shared, coupling-value-agnostic source shape
+/// `fieldcad-superposition`'s kernel (and any GPU evaluator built over it)
+/// actually operates on. Public so a GPU evaluator can build its own source
+/// buffer from the same mapping this crate's CPU reference uses, rather than
+/// duplicating it.
+pub fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
     InverseSquareSource {
         position: source.position,
         strength: source.coupling_value.into_si(),

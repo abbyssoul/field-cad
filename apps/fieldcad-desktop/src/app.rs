@@ -25,7 +25,7 @@ use fieldcad_electrostatics::{
     ElectrostaticBatchEvaluator, ElectrostaticsPlugin, electric_field_channel_id,
     electric_potential_channel_id,
 };
-use fieldcad_gravity::NewtonianGravityPlugin;
+use fieldcad_gravity::{GravityBatchEvaluator, NewtonianGravityPlugin};
 use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
@@ -47,6 +47,7 @@ use crate::{
     camera::{AxisView, OrbitCamera, Viewport},
     electromagnetism_gpu::GpuMaxwellBackend,
     electrostatics_gpu::GpuElectrostaticEvaluator,
+    gravity_gpu::GpuNewtonianGravityEvaluator,
     mcp::{self, McpAction, McpSession},
     profile::UserProfile,
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
@@ -557,6 +558,10 @@ impl WindowState {
         let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
             GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
         );
+        let gravity: Arc<dyn GravityBatchEvaluator> = Arc::new(GpuNewtonianGravityEvaluator::new(
+            compute_device.clone(),
+            compute_queue.clone(),
+        ));
         let maxwell: Arc<dyn MaxwellSolverBackend> =
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
         let mut profile = UserProfile::load();
@@ -568,8 +573,11 @@ impl WindowState {
         // never a silent fall-back to the demo scene.
         let (data_source, warnings, queue, known_path, created_at, view) = match open_path {
             None => {
-                let (source, warnings) =
-                    build_session(desktop_plugin_catalog(evaluator, maxwell), None, true)?;
+                let (source, warnings) = build_session(
+                    desktop_plugin_catalog(evaluator, gravity, maxwell),
+                    None,
+                    true,
+                )?;
                 (source, warnings, None, None, None, None)
             }
             Some(path) => {
@@ -579,7 +587,7 @@ impl WindowState {
                 let created_at = outcome.document.metadata.created_at.clone();
                 let view = outcome.document.view.clone();
                 let (source, warnings) = build_session(
-                    desktop_plugin_catalog(evaluator, maxwell),
+                    desktop_plugin_catalog(evaluator, gravity, maxwell),
                     Some(outcome.document),
                     false,
                 )?;
@@ -1989,9 +1997,13 @@ impl WindowState {
         let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
             GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
         );
+        let gravity: Arc<dyn GravityBatchEvaluator> = Arc::new(GpuNewtonianGravityEvaluator::new(
+            compute_device.clone(),
+            compute_queue.clone(),
+        ));
         let maxwell: Arc<dyn MaxwellSolverBackend> =
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
-        let catalog = desktop_plugin_catalog(evaluator, maxwell);
+        let catalog = desktop_plugin_catalog(evaluator, gravity, maxwell);
 
         let (new_source, warnings, path, queue, view) = match source {
             SessionSource::New { template } => {
@@ -2600,24 +2612,31 @@ fn mcp_plugin_catalog_for(renderer: &ViewportRenderer) -> mcp::PluginCatalog {
         let evaluator: Arc<dyn ElectrostaticBatchEvaluator> = Arc::new(
             GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
         );
+        let gravity: Arc<dyn GravityBatchEvaluator> = Arc::new(GpuNewtonianGravityEvaluator::new(
+            compute_device.clone(),
+            compute_queue.clone(),
+        ));
         let maxwell: Arc<dyn MaxwellSolverBackend> = Arc::new(GpuMaxwellBackend::new(
             compute_device.clone(),
             compute_queue.clone(),
         ));
-        desktop_plugin_catalog(evaluator, maxwell)
+        desktop_plugin_catalog(evaluator, gravity, maxwell)
     })
 }
 
 fn desktop_plugin_catalog(
     evaluator: Arc<dyn ElectrostaticBatchEvaluator>,
+    gravity: Arc<dyn GravityBatchEvaluator>,
     maxwell: Arc<dyn MaxwellSolverBackend>,
 ) -> Vec<PluginRegistration> {
     vec![
         PluginRegistration::with_default_configuration(Box::new(
             ElectrostaticsPlugin::with_evaluator(evaluator),
         )),
-        PluginRegistration::with_default_configuration(Box::new(NewtonianGravityPlugin))
-            .with_enabled(false),
+        PluginRegistration::with_default_configuration(Box::new(
+            NewtonianGravityPlugin::with_evaluator(gravity),
+        ))
+        .with_enabled(false),
         PluginRegistration::with_default_configuration(Box::new(
             ElectromagnetismPlugin::with_backend(maxwell),
         ))

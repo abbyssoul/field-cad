@@ -167,7 +167,7 @@ fn gravity_world(scene: &Scene) -> World {
 
 fn gravity_solver(scene: &Scene, world: &World) -> Box<dyn EquationSystemSolver> {
     use fieldcad_gravity::NewtonianGravityPlugin;
-    NewtonianGravityPlugin
+    NewtonianGravityPlugin::new()
         .create_solver(SolverContext {
             configuration: &Default::default(),
             domain: &scene.domain(),

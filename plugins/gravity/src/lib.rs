@@ -54,11 +54,68 @@ fn channels() -> Vec<ChannelSchema> {
     ]
 }
 
-/// Analytic, static Newtonian gravity. It is intentionally a thin adapter over
-/// `fieldcad-newtonian-gravity`; a distributed backend can use that crate
-/// directly without loading Field CAD's plugin/runtime interface.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NewtonianGravityPlugin;
+/// Evaluator for one complete sample geometry.
+///
+/// Mirrors `fieldcad-electrostatics`'s `ElectrostaticBatchEvaluator`: the
+/// plugin defines this narrow, renderer-free seam while the application host
+/// owns concrete GPU device/queue access. The reference CPU evaluator
+/// implements this trait too, so there is one plugin and one solver rather
+/// than a CPU pair and an accelerated pair that must be kept in step by hand.
+pub trait GravityBatchEvaluator: Send + Sync {
+    /// Numerical representation written into the returned snapshot columns.
+    fn precision(&self) -> Precision;
+
+    /// Evaluate both gravitational channels in one dispatch/readback.
+    fn evaluate(
+        &self,
+        sources: &[CoupledSource<MassKg>],
+        domain: &Domain,
+        geometry: &SampleGeometry,
+    ) -> Result<Vec<NewtonianSample>, String>;
+}
+
+pub struct CpuGravityEvaluator;
+
+impl GravityBatchEvaluator for CpuGravityEvaluator {
+    fn precision(&self) -> Precision {
+        Precision::F64
+    }
+
+    fn evaluate(
+        &self,
+        sources: &[CoupledSource<MassKg>],
+        _domain: &Domain,
+        geometry: &SampleGeometry,
+    ) -> Result<Vec<NewtonianSample>, String> {
+        Ok(evaluate_geometry(sources, geometry))
+    }
+}
+
+/// Analytic, static Newtonian gravity over a pluggable batched evaluator. It
+/// is intentionally a thin adapter over `fieldcad-newtonian-gravity`; a
+/// distributed backend can use that crate directly without loading Field
+/// CAD's plugin/runtime interface.
+pub struct NewtonianGravityPlugin {
+    evaluator: Arc<dyn GravityBatchEvaluator>,
+}
+
+impl Default for NewtonianGravityPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NewtonianGravityPlugin {
+    pub fn new() -> Self {
+        Self {
+            evaluator: Arc::new(CpuGravityEvaluator),
+        }
+    }
+
+    pub fn with_evaluator(evaluator: Arc<dyn GravityBatchEvaluator>) -> Self {
+        Self { evaluator }
+    }
+}
 
 impl EquationSystemPlugin for NewtonianGravityPlugin {
     fn metadata(&self) -> PluginMetadata {
@@ -87,6 +144,7 @@ impl EquationSystemPlugin for NewtonianGravityPlugin {
             domain: *context.domain,
             sources: sources(context.world)?,
             world_revision: context.world.revision(),
+            evaluator: Arc::clone(&self.evaluator),
             cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
         }))
     }
@@ -102,6 +160,7 @@ struct NewtonianGravitySolver {
     domain: Domain,
     sources: ObjectIndex<CoupledSource<MassKg>>,
     world_revision: fieldcad_core::WorldRevision,
+    evaluator: Arc<dyn GravityBatchEvaluator>,
     cache: SampleCache<NewtonianSample>,
 }
 
@@ -170,8 +229,9 @@ impl EquationSystemSolver for NewtonianGravitySolver {
             severity: DiagnosticSeverity::Info,
             code: "newtonian-gravity-source-count".to_owned(),
             message: format!(
-                "{} mass source(s), analytic f64 kernel, world revision {}",
+                "{} mass source(s), {} batched evaluator, world revision {}",
                 self.sources.len(),
+                self.evaluator.precision().label(),
                 self.world_revision
             ),
         }]
@@ -184,7 +244,10 @@ impl NewtonianGravitySolver {
         geometry: &SampleGeometry,
     ) -> Result<Arc<[NewtonianSample]>, PluginError> {
         self.cache.get_or_try_insert_with(geometry, || {
-            Ok(evaluate_geometry(self.sources.as_slice(), geometry)
+            Ok(self
+                .evaluator
+                .evaluate(self.sources.as_slice(), &self.domain, geometry)
+                .map_err(PluginError::Solver)?
                 .into_iter()
                 .map(|sample| quantize(sample, self.domain.precision()))
                 .collect())
@@ -216,7 +279,7 @@ mod tests {
     };
 
     fn solver() -> Box<dyn EquationSystemSolver> {
-        let plugin = NewtonianGravityPlugin;
+        let plugin = NewtonianGravityPlugin::new();
         let mut world = World::new();
         world
             .commit(
@@ -284,7 +347,7 @@ mod tests {
     /// that to zero.
     #[test]
     fn a_body_grazing_one_sources_exclusion_radius_still_feels_the_others() {
-        let plugin = NewtonianGravityPlugin;
+        let plugin = NewtonianGravityPlugin::new();
         let mut world = World::new();
         world
             .commit(
