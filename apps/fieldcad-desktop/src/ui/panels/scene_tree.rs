@@ -50,7 +50,9 @@ fn simulation_section(ui: &mut egui::Ui, model: &mut UiModel, frame: &FrameConte
                 ui.weak("No field systems available.");
             }
             for system in &frame.compute.field_systems {
-                let mark = if system.enabled { "◈" } else { "◇" };
+                // ☑/☐, not ◈/◇: neither diamond glyph exists in egui's
+                // bundled fonts and both render as tofu boxes.
+                let mark = if system.enabled { "☑" } else { "☐" };
                 let row = ui
                     .selectable_label(false, format!("{mark}  {}", system.plugin.display_name))
                     .on_hover_text(format!(
@@ -217,7 +219,9 @@ fn measurement_section(
             for probe in frame.world.probes().values() {
                 match entity_row(
                     ui,
-                    "◉",
+                    // ◎, not ◉: the latter is missing from egui's bundled
+                    // fonts and renders as a tofu box.
+                    "◎",
                     &probe.name,
                     probe.visible,
                     model.probe_selection == Some(probe.id),
@@ -361,7 +365,9 @@ fn measurement_section(
 }
 
 fn visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
-    ui.small_button(if visible { "◉" } else { "○" })
+    // ☑/☐ (not ◉/○) because egui's bundled fonts lack a glyph for ◉ and
+    // render it as a tofu box.
+    ui.small_button(if visible { "☑" } else { "☐" })
         .on_hover_text(if visible {
             "Hide in viewport"
         } else {

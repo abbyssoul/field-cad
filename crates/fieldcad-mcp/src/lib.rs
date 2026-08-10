@@ -1018,12 +1018,17 @@ impl McpServer {
             fieldcad_scene_document::SceneDocumentInputs {
                 domain: server.domain(),
                 time_step: server.time_step(),
+                playback_speed: server.playback_speed(),
                 scene_scale: server.scene_scale(),
                 integration_scheme: server.integration_scheme(),
                 field_systems: server.field_systems(),
                 world,
                 queue,
                 view: fieldcad_scene_document::SceneViewState::default(),
+                // MCP has no client-local probe-plot recording to capture —
+                // see this crate's module doc.
+                probe_history: fieldcad_scene_document::ProbeHistoryState::default(),
+                distance_history: fieldcad_scene_document::DistanceHistoryState::default(),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(

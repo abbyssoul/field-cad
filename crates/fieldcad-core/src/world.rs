@@ -2152,6 +2152,7 @@ mod tests {
             properties: vec![PropertySchema {
                 id: PropertyId::new("charge").unwrap(),
                 display_name: "Charge".to_owned(),
+                description: None,
                 kind: PropertyKind::Scalar(Dimension::CHARGE),
                 required: true,
                 default_value: None,

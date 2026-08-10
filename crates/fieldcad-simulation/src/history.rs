@@ -123,6 +123,30 @@ impl ProbeHistory {
             .filter(|(_, series)| !series.is_empty())
             .map(|((probe, channel), _)| (*probe, channel))
     }
+
+    /// Every non-empty series, for a caller that persists the whole history
+    /// (a scene save) rather than reading one probe/channel at a time.
+    pub fn entries(&self) -> impl Iterator<Item = (ProbeId, &ChannelId, &VecDeque<ProbeReading>)> {
+        self.series
+            .iter()
+            .filter(|(_, series)| !series.is_empty())
+            .map(|((probe, channel), series)| (*probe, channel, series))
+    }
+
+    /// Replace a whole series directly, dropping the oldest readings past
+    /// `capacity` — the counterpart to [`Self::entries`] for restoring a
+    /// history saved with a possibly different capacity than this one's.
+    pub fn insert_series(
+        &mut self,
+        probe: ProbeId,
+        channel: ChannelId,
+        mut readings: VecDeque<ProbeReading>,
+    ) {
+        while readings.len() > self.capacity {
+            readings.pop_front();
+        }
+        self.series.insert((probe, channel), readings);
+    }
 }
 
 impl Default for ProbeHistory {
@@ -222,6 +246,29 @@ impl DistanceHistory {
             .iter()
             .filter(|(_, series)| !series.is_empty())
             .map(|(probe, _)| *probe)
+    }
+
+    /// Every non-empty series, for a caller that persists the whole history
+    /// (a scene save) rather than reading one probe at a time.
+    pub fn entries(&self) -> impl Iterator<Item = (DistanceProbeId, &VecDeque<DistanceReading>)> {
+        self.series
+            .iter()
+            .filter(|(_, series)| !series.is_empty())
+            .map(|(probe, series)| (*probe, series))
+    }
+
+    /// Replace a whole series directly, dropping the oldest readings past
+    /// `capacity` — the counterpart to [`Self::entries`] for restoring a
+    /// history saved with a possibly different capacity than this one's.
+    pub fn insert_series(
+        &mut self,
+        probe: DistanceProbeId,
+        mut readings: VecDeque<DistanceReading>,
+    ) {
+        while readings.len() > self.capacity {
+            readings.pop_front();
+        }
+        self.series.insert(probe, readings);
     }
 }
 

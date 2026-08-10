@@ -136,12 +136,15 @@ fn inputs(runtime: &SimulationRuntime, queue: QueueDocument) -> SceneDocumentInp
     SceneDocumentInputs {
         domain: *runtime.domain(),
         time_step: runtime.clock_snapshot().time_step(),
+        playback_speed: fieldcad_simulation::PlaybackSpeed::default(),
         scene_scale: runtime.scene_scale(),
         integration_scheme: runtime.integration_scheme(),
         field_systems: runtime.field_systems(),
         world: runtime.world_document(),
         queue,
         view: SceneViewState::default(),
+        probe_history: fieldcad_scene_document::ProbeHistoryState::default(),
+        distance_history: fieldcad_scene_document::DistanceHistoryState::default(),
     }
 }
 
@@ -247,6 +250,70 @@ fn view_state_round_trips_camera_follow_and_channel_settings() {
     let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
 
     assert_eq!(outcome.document.view, view);
+}
+
+#[test]
+fn playback_speed_round_trips() {
+    let runtime = build_runtime(World::new());
+    let mut inputs = inputs(&runtime, QueueDocument::default());
+    inputs.playback_speed = fieldcad_simulation::PlaybackSpeed::from_multiplier(350.0).unwrap();
+    let document = SceneDocument::capture(inputs, "test", None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scene.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
+
+    assert_eq!(outcome.document.playback_speed.multiplier(), 350.0);
+}
+
+#[test]
+fn probe_and_distance_history_round_trip() {
+    use fieldcad_core::{Dimension, DistanceProbeId, ProbeId, SampleValidity, WorldRevision};
+    use fieldcad_scene_document::{
+        DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, ProbeHistoryState,
+        ProbeReadingRecord, ProbeSeriesRecord,
+    };
+
+    let runtime = build_runtime(World::new());
+    let mut inputs = inputs(&runtime, QueueDocument::default());
+    inputs.probe_history = ProbeHistoryState {
+        series: vec![ProbeSeriesRecord {
+            probe: ProbeId::new(0),
+            channel: mass_channel_id(),
+            readings: vec![ProbeReadingRecord {
+                tick: 1,
+                time_seconds: 0.5,
+                world_revision: WorldRevision::INITIAL,
+                snapshot_sequence: 1,
+                value: fieldcad_core::FieldValue::Scalar(
+                    fieldcad_core::Quantity::new(3.0, Dimension::MASS).unwrap(),
+                ),
+                validity: SampleValidity::Exact,
+            }],
+        }],
+    };
+    inputs.distance_history = DistanceHistoryState {
+        series: vec![DistanceSeriesRecord {
+            probe: DistanceProbeId::new(0),
+            readings: vec![DistanceReadingRecord {
+                tick: 1,
+                time_seconds: 0.5,
+                world_revision: WorldRevision::INITIAL,
+                snapshot_sequence: 1,
+                distance: 42.0,
+            }],
+        }],
+    };
+    let document = SceneDocument::capture(inputs, "test", None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scene.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
+
+    assert_eq!(outcome.document.probe_history, document.probe_history);
+    assert_eq!(outcome.document.distance_history, document.distance_history);
 }
 
 /// A document saved before `view` existed (`format_version` 1, no `view` key

@@ -100,6 +100,7 @@ pub fn charge_component_schema() -> ComponentSchema {
         properties: vec![PropertySchema {
             id: charge_property_id(),
             display_name: "Charge".to_owned(),
+            description: None,
             kind: PropertyKind::Scalar(Dimension::CHARGE),
             required: true,
             default_value: None,

@@ -183,6 +183,7 @@ pub fn particle_component_schema() -> ComponentSchema {
         properties: vec![PropertySchema {
             id: template_property_id(),
             display_name: "Catalog template".to_owned(),
+            description: None,
             kind: PropertyKind::Choice(
                 ParticleTemplate::all()
                     .map(|template| template.label().to_owned())

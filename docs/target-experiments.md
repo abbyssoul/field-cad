@@ -2,6 +2,8 @@
 
 This document serves as the target benchmark list of foundational physics experiments in **Electromagnetism** and **Gravitation** that Field CAD solvers, integrators, and field models aim to numerically reproduce or match.
 
+> See [`target-experiments-prerequisites.md`](file:///home/soultaker/workspace/field-cad/docs/target-experiments-prerequisites.md) for the minimal primitive object types, solver capabilities, and feature gap matrix required to implement these target experiments.
+
 ---
 
 ## 1. Classical Electromagnetism & Electrostatics

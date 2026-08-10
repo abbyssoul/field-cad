@@ -70,6 +70,7 @@ fn mass_property_schema() -> PropertySchema {
     PropertySchema {
         id: mass_property_id(),
         display_name: "Mass".to_owned(),
+        description: None,
         kind: PropertyKind::Scalar(Dimension::MASS),
         required: true,
         relevant_when: None,
@@ -106,6 +107,11 @@ pub fn gravitational_mass_component_schema() -> ComponentSchema {
             PropertySchema {
                 id: follows_inertial_property_id(),
                 display_name: "Equal to inertial mass".to_owned(),
+                description: Some(
+                    "This body's gravitational mass tracks its inertial mass. \
+                     Uncheck this to set an independent gravitational mass."
+                        .to_owned(),
+                ),
                 kind: PropertyKind::Boolean,
                 required: true,
                 default_value: Some(PropertyValue::Boolean(true)),
@@ -119,8 +125,7 @@ pub fn gravitational_mass_component_schema() -> ComponentSchema {
                 relevant_when: Some(PropertyCondition {
                     property: follows_inertial_property_id(),
                     equals: PropertyValue::Boolean(false),
-                    because: "This body's gravitational mass is its inertial mass. \
-                              Clear “Equal to inertial mass” to set it independently."
+                    because: "Uncheck “Equal to inertial mass” above to edit this value."
                         .to_owned(),
                 }),
                 ..mass_property_schema()

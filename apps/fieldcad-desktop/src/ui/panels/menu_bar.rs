@@ -279,7 +279,9 @@ pub fn field_brush_dialog(context: &egui::Context, model: &mut UiModel, compute:
 }
 
 fn state_badge(ui: &mut egui::Ui, state: WorkbenchState) {
-    ui.colored_label(state.color(), format!("● {}", state.label()));
+    // •, not ●: the latter is missing from egui's bundled fonts and
+    // renders as a tofu box (this is the "Pause" badge that looked broken).
+    ui.colored_label(state.color(), format!("• {}", state.label()));
 }
 
 const UNDO_SHORTCUT: egui::KeyboardShortcut =
@@ -308,16 +310,18 @@ pub(super) fn history_controls(
         "Pause the simulation to step through the edit history."
     };
 
+    // ↺/↻ (not ↶/↷) because egui's bundled fonts lack glyphs for the latter
+    // pair and render them as tofu boxes.
     for (glyph, shortcut, entry, payload, verb) in [
         (
-            "↶",
+            "↺",
             UNDO_SHORTCUT,
             history.undo.as_deref(),
             CommandPayload::Undo,
             "Undo",
         ),
         (
-            "↷",
+            "↻",
             REDO_SHORTCUT,
             history.redo.as_deref(),
             CommandPayload::Redo,

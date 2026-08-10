@@ -6,6 +6,7 @@ pub mod gpu;
 mod gpu_inverse_square;
 mod gravity_gpu;
 mod mcp;
+mod probe_history_state;
 mod profile;
 mod renderer;
 pub mod scene;

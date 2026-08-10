@@ -49,6 +49,7 @@ use crate::{
     electrostatics_gpu::GpuElectrostaticEvaluator,
     gravity_gpu::GpuNewtonianGravityEvaluator,
     mcp::{self, McpAction, McpSession},
+    probe_history_state,
     profile::UserProfile,
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
@@ -571,14 +572,24 @@ impl WindowState {
         // behavior now that File > New offers an explicit empty alternative.
         // A path that fails to load is a startup error (propagated via `?`),
         // never a silent fall-back to the demo scene.
-        let (data_source, warnings, queue, known_path, created_at, view) = match open_path {
+        let (
+            data_source,
+            warnings,
+            queue,
+            known_path,
+            created_at,
+            view,
+            playback_speed,
+            probe_history,
+            distance_history,
+        ) = match open_path {
             None => {
                 let (source, warnings) = build_session(
                     desktop_plugin_catalog(evaluator, gravity, maxwell),
                     None,
                     true,
                 )?;
-                (source, warnings, None, None, None, None)
+                (source, warnings, None, None, None, None, None, None, None)
             }
             Some(path) => {
                 let outcome = fieldcad_scene_document::load_newest_valid(&path)
@@ -586,6 +597,9 @@ impl WindowState {
                 let queue = outcome.document.queue.clone();
                 let created_at = outcome.document.metadata.created_at.clone();
                 let view = outcome.document.view.clone();
+                let playback_speed = outcome.document.playback_speed;
+                let probe_history = outcome.document.probe_history.clone();
+                let distance_history = outcome.document.distance_history.clone();
                 let (source, warnings) = build_session(
                     desktop_plugin_catalog(evaluator, gravity, maxwell),
                     Some(outcome.document),
@@ -598,6 +612,9 @@ impl WindowState {
                     Some(path),
                     Some(created_at),
                     Some(view),
+                    Some(playback_speed),
+                    Some(probe_history),
+                    Some(distance_history),
                 )
             }
         };
@@ -649,6 +666,16 @@ impl WindowState {
                 model.submit(payload).map_err(|error| error.to_string())?;
             }
         }
+        // Restore a loaded document's wall-clock playback rate the same way:
+        // `PlaybackSpeed` has no constructor path through `RuntimeConfig`, so
+        // it's applied as an ordinary live command rather than threaded
+        // through `build_session`.
+        if let Some(speed) = playback_speed {
+            let mut model = lock_model(&data_source);
+            model
+                .submit(CommandPayload::SetPlaybackSpeed(speed))
+                .map_err(|error| error.to_string())?;
+        }
 
         // Started here rather than left to the MCP panel's own "Enable"
         // button: an agent driving `--mcp <address>` needs the token before
@@ -687,8 +714,18 @@ impl WindowState {
             world,
             compute: None,
             region_geometry_cache: BTreeMap::new(),
-            probe_history: ProbeHistory::default(),
-            distance_history: DistanceHistory::default(),
+            probe_history: probe_history.map_or_else(ProbeHistory::default, |state| {
+                probe_history_state::restore_probe_history(
+                    state,
+                    fieldcad_core::DEFAULT_PROBE_HISTORY,
+                )
+            }),
+            distance_history: distance_history.map_or_else(DistanceHistory::default, |state| {
+                probe_history_state::restore_distance_history(
+                    state,
+                    fieldcad_core::DEFAULT_PROBE_HISTORY,
+                )
+            }),
             run_generation,
             active_transform: None,
             active_field_brush: None,
@@ -2005,18 +2042,39 @@ impl WindowState {
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
         let catalog = desktop_plugin_catalog(evaluator, gravity, maxwell);
 
-        let (new_source, warnings, path, queue, view) = match source {
+        let (
+            new_source,
+            warnings,
+            path,
+            queue,
+            view,
+            playback_speed,
+            probe_history,
+            distance_history,
+        ) = match source {
             SessionSource::New { template } => {
                 let (source, warnings) = build_session(catalog, None, template)?;
-                (source, warnings, None, None, None)
+                (source, warnings, None, None, None, None, None, None)
             }
             SessionSource::Load(path) => {
                 let outcome = fieldcad_scene_document::load_newest_valid(&path)
                     .map_err(|error| error.to_string())?;
                 let queue = outcome.document.queue.clone();
                 let view = outcome.document.view.clone();
+                let playback_speed = outcome.document.playback_speed;
+                let probe_history = outcome.document.probe_history.clone();
+                let distance_history = outcome.document.distance_history.clone();
                 let (source, warnings) = build_session(catalog, Some(outcome.document), false)?;
-                (source, warnings, Some(path), Some(queue), Some(view))
+                (
+                    source,
+                    warnings,
+                    Some(path),
+                    Some(queue),
+                    Some(view),
+                    Some(playback_speed),
+                    Some(probe_history),
+                    Some(distance_history),
+                )
             }
         };
 
@@ -2038,6 +2096,14 @@ impl WindowState {
                 for payload in queue.pending {
                     model.submit(payload).map_err(|error| error.to_string())?;
                 }
+            }
+            // Restore a loaded document's wall-clock playback rate the same
+            // way — see `WindowState::new` for why this is a live command
+            // rather than a `build_session` constructor argument.
+            if let Some(speed) = playback_speed {
+                model
+                    .submit(CommandPayload::SetPlaybackSpeed(speed))
+                    .map_err(|error| error.to_string())?;
             }
         }
 
@@ -2101,6 +2167,20 @@ impl WindowState {
         }
 
         self.refresh_world();
+        // After `refresh_world()`, not before: its generation-diff check
+        // (triggered above by the `u64::MAX` sentinel) unconditionally
+        // resets both histories to empty, which would otherwise discard a
+        // restore landing here first.
+        if let Some(state) = probe_history {
+            self.probe_history =
+                probe_history_state::restore_probe_history(state, self.probe_history.capacity());
+        }
+        if let Some(state) = distance_history {
+            self.distance_history = probe_history_state::restore_distance_history(
+                state,
+                self.distance_history.capacity(),
+            );
+        }
         self.last_saved_revision = Some(self.world.revision());
         Ok(())
     }
@@ -2129,6 +2209,7 @@ impl WindowState {
             fieldcad_scene_document::SceneDocumentInputs {
                 domain: model.domain(),
                 time_step: model.time_step(),
+                playback_speed: model.playback_speed(),
                 scene_scale: model.scene_scale(),
                 integration_scheme: model.integration_scheme(),
                 field_systems: model.field_systems(),
@@ -2139,6 +2220,10 @@ impl WindowState {
                     self.ui_model.following,
                     &self.ui_model.view,
                     &self.ui_model.field_layers,
+                ),
+                probe_history: probe_history_state::capture_probe_history(&self.probe_history),
+                distance_history: probe_history_state::capture_distance_history(
+                    &self.distance_history,
                 ),
             }
         };

@@ -462,6 +462,7 @@ mod tests {
             properties: vec![PropertySchema {
                 id: id.clone(),
                 display_name: "Gain".to_owned(),
+                description: None,
                 kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
                 required: true,
                 default_value: None,

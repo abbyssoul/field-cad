@@ -79,6 +79,7 @@ impl EquationSystemPlugin for TestFieldPlugin {
             properties: vec![PropertySchema {
                 id: gain_property_id(),
                 display_name: "Gain".to_owned(),
+                description: None,
                 kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
                 required: true,
                 default_value: None,

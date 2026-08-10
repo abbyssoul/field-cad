@@ -347,6 +347,9 @@ fn object_components(
                 let mut edited = properties.clone();
                 let mut changed = false;
                 for property in &schema.properties {
+                    if !property.is_relevant(&edited) {
+                        continue;
+                    }
                     changed |= property_editor(
                         ui,
                         object.id,
@@ -429,16 +432,17 @@ pub(super) fn property_editor(
 ) -> bool {
     let relevant = schema.is_relevant(values);
     let mut changed = false;
-    ui.add_enabled_ui(relevant, |ui| {
-        let response = ui.horizontal(|ui| {
-            ui.label(&schema.display_name);
-            changed = property_widget(ui, object, schema, values, editing);
-        });
-        if let Some(condition) = schema.relevant_when.as_ref().filter(|_| !relevant) {
-            response
-                .response
-                .on_disabled_hover_text(condition.because.clone());
+    if !relevant {
+        // The property is hidden from the generic editor when its condition is
+        // unsatisfied — that's the caller's choice. We don't render it here.
+        return changed;
+    }
+    ui.horizontal(|ui| {
+        let label = ui.label(&schema.display_name);
+        if let Some(description) = &schema.description {
+            let _ = label.on_hover_text(description);
         }
+        changed = property_widget(ui, object, schema, values, editing);
     });
     changed
 }

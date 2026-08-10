@@ -288,6 +288,7 @@ impl EquationSystemPlugin for ElectromagnetismPlugin {
                 PropertySchema {
                     id: initial_condition_property_id(),
                     display_name: "Initial condition".to_owned(),
+                    description: None,
                     kind: PropertyKind::Choice(vec![
                         STATIC_CHARGES_OPTION.to_owned(),
                         PLANE_WAVE_OPTION.to_owned(),
@@ -299,6 +300,7 @@ impl EquationSystemPlugin for ElectromagnetismPlugin {
                 PropertySchema {
                     id: amplitude_property_id(),
                     display_name: "Initial plane-wave amplitude".to_owned(),
+                    description: None,
                     kind: PropertyKind::Scalar(Dimension::ELECTRIC_FIELD),
                     required: true,
                     default_value: None,
@@ -307,6 +309,7 @@ impl EquationSystemPlugin for ElectromagnetismPlugin {
                 PropertySchema {
                     id: mode_property_id(),
                     display_name: "Initial plane-wave mode".to_owned(),
+                    description: None,
                     kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
                     required: true,
                     default_value: None,

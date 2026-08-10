@@ -24,10 +24,15 @@ use fieldcad_core::{
     Domain, PluginId, PluginVersion, PropertyBag, SceneScale, TimeStep, WorldDocument,
 };
 use fieldcad_dynamics::IntegrationScheme;
-use fieldcad_simulation::{FieldSystemStatus, PluginRegistration, QueueDocument};
+use fieldcad_simulation::{FieldSystemStatus, PlaybackSpeed, PluginRegistration, QueueDocument};
 use serde::{Deserialize, Serialize};
 
+mod history;
 mod view;
+pub use history::{
+    DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, ProbeHistoryState,
+    ProbeReadingRecord, ProbeSeriesRecord,
+};
 pub use view::{
     CameraProjection, CameraState, ChannelViewState, FieldLayerViewState, FlowLineDisplayState,
     GizmoDisplayState, PlaneVectorModeState, PlaneViewState, RegionViewState, SceneViewState,
@@ -40,10 +45,13 @@ pub use view::{
 pub const FORMAT_ID: &str = "fieldcad.scene/v1";
 /// The highest `format_version` this build can load. A document reporting a
 /// higher version is rejected outright rather than partially interpreted.
-/// Bumped 1 → 2 when `SceneDocument::view` was added: a v1 file still loads
-/// fine (the field is `#[serde(default)]`), but a v2 file is refused by a
-/// build that only knows v1, rather than silently losing the view section.
-pub const FORMAT_VERSION: u32 = 2;
+/// Bumped 1 → 2 when `SceneDocument::view` was added, and 2 → 3 when
+/// `playback_speed`/`probe_history`/`distance_history` were added: each
+/// field's own file still loads fine on an older-format read (all
+/// `#[serde(default)]`), but a build that only knows the prior version must
+/// refuse a newer file outright rather than silently dropping that content
+/// on the next resave.
+pub const FORMAT_VERSION: u32 = 3;
 /// File extension for a saved scene document (without the leading dot).
 pub const EXTENSION: &str = "fcscene";
 
@@ -64,6 +72,12 @@ pub struct SceneDocument {
     pub metadata: SceneMetadata,
     pub domain: Domain,
     pub time_step: TimeStep,
+    /// Wall-clock playback rate. `#[serde(default)]` so a document saved
+    /// before this field existed still loads, simply at the default 1×
+    /// rather than whatever rate the session happened to be running at when
+    /// saved.
+    #[serde(default)]
+    pub playback_speed: PlaybackSpeed,
     pub scene_scale: SceneScale,
     pub integration_scheme: IntegrationScheme,
     pub field_systems: Vec<FieldSystemComposition>,
@@ -79,6 +93,14 @@ pub struct SceneDocument {
     /// simply with nothing to restore.
     #[serde(default)]
     pub view: SceneViewState,
+    /// Recorded field-probe history, so a session's plots survive a save/
+    /// reload instead of starting empty until the simulation runs again.
+    /// `#[serde(default)]` for the same reason as `view`.
+    #[serde(default)]
+    pub probe_history: ProbeHistoryState,
+    /// Recorded distance-probe history — see `probe_history`.
+    #[serde(default)]
+    pub distance_history: DistanceHistoryState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,12 +141,15 @@ pub struct FieldSystemComposition {
 pub struct SceneDocumentInputs {
     pub domain: Domain,
     pub time_step: TimeStep,
+    pub playback_speed: PlaybackSpeed,
     pub scene_scale: SceneScale,
     pub integration_scheme: IntegrationScheme,
     pub field_systems: Vec<FieldSystemStatus>,
     pub world: WorldDocument,
     pub queue: QueueDocument,
     pub view: SceneViewState,
+    pub probe_history: ProbeHistoryState,
+    pub distance_history: DistanceHistoryState,
 }
 
 impl SceneDocument {
@@ -149,6 +174,7 @@ impl SceneDocument {
             },
             domain: inputs.domain,
             time_step: inputs.time_step,
+            playback_speed: inputs.playback_speed,
             scene_scale: inputs.scene_scale,
             integration_scheme: inputs.integration_scheme,
             field_systems: inputs
@@ -165,6 +191,8 @@ impl SceneDocument {
             world: inputs.world,
             queue: inputs.queue,
             view: inputs.view,
+            probe_history: inputs.probe_history,
+            distance_history: inputs.distance_history,
         }
     }
 }

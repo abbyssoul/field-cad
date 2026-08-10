@@ -66,6 +66,11 @@ pub struct PropertyCondition {
 pub struct PropertySchema {
     pub id: PropertyId,
     pub display_name: String,
+    /// Explanatory text shown as a tooltip on the property label in a generic
+    /// inspector. Use this to clarify what a control means or how it relates
+    /// to other properties in the same component.
+    #[serde(default)]
+    pub description: Option<String>,
     pub kind: PropertyKind,
     pub required: bool,
     /// When set, this property only takes effect while the named sibling holds
@@ -363,6 +368,7 @@ mod tests {
         PropertySchema {
             id: PropertyId::new("charge").unwrap(),
             display_name: "Charge".to_owned(),
+            description: None,
             kind: PropertyKind::Scalar(Dimension::CHARGE),
             required: true,
             default_value: None,
@@ -376,6 +382,7 @@ mod tests {
         let governed = PropertySchema {
             id: PropertyId::new("value").unwrap(),
             display_name: "Value".to_owned(),
+            description: None,
             kind: PropertyKind::Scalar(Dimension::MASS),
             required: true,
             relevant_when: Some(PropertyCondition {

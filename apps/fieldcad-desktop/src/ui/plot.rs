@@ -156,13 +156,13 @@ pub(super) fn floating_distance_probe_plots(
     }
 }
 
-/// A distance probe's history as a single scalar trace — see
+/// A distance probe's history as one or two scalar traces — see
 /// [`history_plot`], the same single-trace painter the diagnostics panel
 /// uses. A distance never carries a unit-of-measure ambiguity the way a
 /// field probe's [`FieldValue`] can, so this needs none of
 /// `probe_channel_plot`'s trace/validity machinery.
 ///
-/// Draws its own distance/rate-of-change toggle and mutates `series`
+/// Draws its own distance/rate-of-change checkboxes and mutates `series`
 /// directly, so the inline inspector plot and the floating window share one
 /// implementation rather than two copies that could disagree.
 pub(super) fn distance_history_plot(
@@ -173,30 +173,32 @@ pub(super) fn distance_history_plot(
 ) {
     ui.small(format!("Bounded to {} samples", history.capacity()));
     ui.horizontal(|ui| {
-        ui.selectable_value(series, DistanceProbeSeries::Distance, "Distance");
-        ui.selectable_value(series, DistanceProbeSeries::RateOfChange, "Rate of change");
+        ui.checkbox(&mut series.distance, "Distance");
+        ui.checkbox(&mut series.rate_of_change, "Rate of change");
     });
+    if !series.distance && !series.rate_of_change {
+        ui.weak("Select at least one series.");
+        return;
+    }
     let readings: Vec<DistanceReading> = history.readings(probe).copied().collect();
-    match series {
-        DistanceProbeSeries::Distance => {
-            if readings.is_empty() {
-                ui.weak("No samples yet");
-                return;
-            }
-            let values: Vec<f32> = readings
-                .iter()
-                .map(|reading| reading.distance as f32)
-                .collect();
-            ui.label(format!("{:.4} m", values.last().unwrap()));
-            history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75));
-        }
-        DistanceProbeSeries::RateOfChange => {
-            let rates = distance_rate_of_change(&readings);
-            if rates.is_empty() {
-                ui.weak("Not enough samples yet");
-                return;
-            }
-            ui.label(format!("{:.4} m/s", rates.last().unwrap()));
+    if readings.is_empty() {
+        ui.weak("No samples yet");
+        return;
+    }
+    if series.distance {
+        let values: Vec<f32> = readings
+            .iter()
+            .map(|reading| reading.distance as f32)
+            .collect();
+        ui.label(format!("Distance · {:.4} m", values.last().unwrap()));
+        history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75));
+    }
+    if series.rate_of_change {
+        let rates = distance_rate_of_change(&readings);
+        if rates.is_empty() {
+            ui.weak("Not enough samples yet for a rate of change");
+        } else {
+            ui.label(format!("Rate of change · {:.4} m/s", rates.last().unwrap()));
             history_plot(ui, &rates, egui::Color32::from_rgb(100, 155, 245));
         }
     }
@@ -298,6 +300,7 @@ fn paint_probe_plot(ui: &mut egui::Ui, readings: &[fieldcad_simulation::ProbeRea
         );
         return;
     };
+    let (display_min, display_max) = (y_min, y_max);
     if y_min == y_max {
         let padding = y_min.abs().max(1.0) * 0.05;
         y_min -= padding;
@@ -361,6 +364,20 @@ fn paint_probe_plot(ui: &mut egui::Ui, readings: &[fieldcad_simulation::ProbeRea
         legend_x += 30.0;
     }
     painter.text(
+        rect.right_top() + egui::vec2(-4.0, 3.0),
+        egui::Align2::RIGHT_TOP,
+        format!("max {display_max:.3e}"),
+        egui::FontId::monospace(9.0),
+        egui::Color32::GRAY,
+    );
+    painter.text(
+        rect.right_top() + egui::vec2(-4.0, 14.0),
+        egui::Align2::RIGHT_TOP,
+        format!("min {display_min:.3e}"),
+        egui::FontId::monospace(9.0),
+        egui::Color32::GRAY,
+    );
+    painter.text(
         rect.left_bottom() + egui::vec2(4.0, -3.0),
         egui::Align2::LEFT_BOTTOM,
         format!("{x_min:.3e} s"),
@@ -414,6 +431,7 @@ pub(super) fn history_plot(ui: &mut egui::Ui, values: &[f32], color: egui::Color
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), value| {
             (lo.min(value), hi.max(value))
         });
+    let (display_min, display_max) = (y_min, y_max);
     if y_min == y_max {
         let padding = y_min.abs().max(1.0) * 0.05;
         y_min -= padding;
@@ -451,6 +469,20 @@ pub(super) fn history_plot(ui: &mut egui::Ui, values: &[f32], color: egui::Color
         rect.right_bottom() + egui::vec2(-4.0, -3.0),
         egui::Align2::RIGHT_BOTTOM,
         "now",
+        egui::FontId::monospace(9.0),
+        egui::Color32::GRAY,
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(4.0, 3.0),
+        egui::Align2::LEFT_TOP,
+        format!("max {display_max:.3e}"),
+        egui::FontId::monospace(9.0),
+        egui::Color32::GRAY,
+    );
+    painter.text(
+        rect.right_top() + egui::vec2(-4.0, 3.0),
+        egui::Align2::RIGHT_TOP,
+        format!("min {display_min:.3e}"),
         egui::FontId::monospace(9.0),
         egui::Color32::GRAY,
     );

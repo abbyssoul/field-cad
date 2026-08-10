@@ -238,12 +238,14 @@ pub struct UiModel {
     /// Non-modal plot windows pinned independently of scene selection.
     pub probe_plots: BTreeMap<ProbeId, ProbePlotWindow>,
     /// Distance probes with an open floating plot window. A `BTreeSet`, not
-    /// a map like `probe_plots`: a distance probe has exactly one series, so
-    /// there is no per-window channel selection to remember.
+    /// a map like `probe_plots`: a distance probe has only two possible
+    /// series (distance, rate of change), tracked directly in
+    /// `distance_probe_series` rather than as a per-window channel set.
     pub distance_probe_plots: BTreeSet<DistanceProbeId>,
-    /// Which series (distance or rate of change) each distance probe's plot
-    /// currently shows — shared by the inline inspector plot and the
-    /// floating window. Absent means the default, [`DistanceProbeSeries::Distance`].
+    /// Which series (distance, rate of change, or both) each distance
+    /// probe's plot currently shows — shared by the inline inspector plot
+    /// and the floating window. Absent means the default,
+    /// [`DistanceProbeSeries::default`] (distance only).
     pub distance_probe_series: BTreeMap<DistanceProbeId, DistanceProbeSeries>,
     /// Independent visualization state for every published vector channel.
     pub field_layers: BTreeMap<ChannelId, ChannelLayerSettings>,
@@ -517,14 +519,22 @@ pub struct ProbePlotWindow {
 }
 
 /// Which series a distance probe's plot currently shows — the raw distance,
-/// or its rate of change (a discrete derivative over consecutive readings).
-/// Shared between the inline inspector plot and the floating window so
-/// switching one does not desync the other.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DistanceProbeSeries {
-    #[default]
-    Distance,
-    RateOfChange,
+/// its rate of change (a discrete derivative over consecutive readings), or
+/// both at once. Shared between the inline inspector plot and the floating
+/// window so toggling one does not desync the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DistanceProbeSeries {
+    pub distance: bool,
+    pub rate_of_change: bool,
+}
+
+impl Default for DistanceProbeSeries {
+    fn default() -> Self {
+        Self {
+            distance: true,
+            rate_of_change: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -697,7 +707,7 @@ pub struct FrameContext<'a> {
     pub mcp: &'a McpSession,
 }
 
-/// A default-action button with an attached "▾" dropdown listing every named
+/// A default-action button with an attached "☰" dropdown listing every named
 /// choice, the default included.
 ///
 /// Used wherever "add X" has one obvious default — an empty object, a slice
@@ -722,7 +732,9 @@ fn split_add_button<T: Clone>(
         {
             chosen = Some(default.clone());
         }
-        ui.menu_button("▾", |ui| {
+        // ☰, not ▾: no triangle glyph in egui's bundled fonts renders as
+        // anything but a tofu box.
+        ui.menu_button("☰", |ui| {
             for (label, value) in choices {
                 if ui.button(*label).clicked() {
                     chosen = Some(value.clone());
