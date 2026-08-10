@@ -483,12 +483,22 @@ impl EquationSystemSolver for GpuMaxwellSolver {
             )?,
             None => None,
         };
-        if let Some(advance) = &coupled {
-            let current = gpu_fields(&advance.current_density, "Maxwell current density")
-                .map_err(PluginError::Solver)?;
-            self.queue
-                .write_buffer(&self.current_density, 0, bytemuck::cast_slice(&current));
-        }
+        // `coupled` is consumed here rather than just borrowed: once the
+        // current-density grid is uploaded, `current_density` is handed back
+        // to `self.core` for reuse next tick instead of sitting idle until
+        // the whole `CoupledAdvance` is dropped at the end of this method —
+        // see `MaxwellCore::recycle_current_density`.
+        let coupled = match coupled {
+            Some(advance) => {
+                let current = gpu_fields(&advance.current_density, "Maxwell current density")
+                    .map_err(PluginError::Solver)?;
+                self.queue
+                    .write_buffer(&self.current_density, 0, bytemuck::cast_slice(&current));
+                self.core.recycle_current_density(advance.current_density);
+                Some(advance.outcome)
+            }
+            None => None,
+        };
 
         let domain = self.core.domain();
         let half =
@@ -531,7 +541,7 @@ impl EquationSystemSolver for GpuMaxwellSolver {
             .get_mut()
             .map_err(|_| PluginError::Solver("Maxwell readback cache was poisoned".to_owned()))? =
             None;
-        Ok(coupled.map_or_else(SolverStepOutcome::default, |advance| advance.outcome))
+        Ok(coupled.unwrap_or_default())
     }
 
     fn sample(

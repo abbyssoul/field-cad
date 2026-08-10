@@ -27,13 +27,23 @@ use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_simulation::{FieldSystemStatus, PluginRegistration, QueueDocument};
 use serde::{Deserialize, Serialize};
 
+mod view;
+pub use view::{
+    CameraProjection, CameraState, ChannelViewState, FieldLayerViewState, FlowLineDisplayState,
+    GizmoDisplayState, PlaneVectorModeState, PlaneViewState, RegionViewState, SceneViewState,
+    VectorDisplayState, ViewOptionsState,
+};
+
 /// Identifies this document format. Anything else in a candidate file is
 /// rejected before any other field is even interpreted (US-02: incompatibility
 /// reported, never silently adapted).
 pub const FORMAT_ID: &str = "fieldcad.scene/v1";
 /// The highest `format_version` this build can load. A document reporting a
 /// higher version is rejected outright rather than partially interpreted.
-pub const FORMAT_VERSION: u32 = 1;
+/// Bumped 1 → 2 when `SceneDocument::view` was added: a v1 file still loads
+/// fine (the field is `#[serde(default)]`), but a v2 file is refused by a
+/// build that only knows v1, rather than silently losing the view section.
+pub const FORMAT_VERSION: u32 = 2;
 /// File extension for a saved scene document (without the leading dot).
 pub const EXTENSION: &str = "fcscene";
 
@@ -63,6 +73,12 @@ pub struct SceneDocument {
     /// yet applied at save time. A user who paused the command queue mid-edit
     /// and saved must not lose that work.
     pub queue: QueueDocument,
+    /// Camera framing, follow target, view toggles, and per-channel display
+    /// settings — see [`SceneViewState`]. `#[serde(default)]` so a document
+    /// saved before this field existed (`format_version` 1) still loads,
+    /// simply with nothing to restore.
+    #[serde(default)]
+    pub view: SceneViewState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,6 +124,7 @@ pub struct SceneDocumentInputs {
     pub field_systems: Vec<FieldSystemStatus>,
     pub world: WorldDocument,
     pub queue: QueueDocument,
+    pub view: SceneViewState,
 }
 
 impl SceneDocument {
@@ -147,6 +164,7 @@ impl SceneDocument {
                 .collect(),
             world: inputs.world,
             queue: inputs.queue,
+            view: inputs.view,
         }
     }
 }

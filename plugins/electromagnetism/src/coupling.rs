@@ -68,6 +68,14 @@ pub(crate) struct ParticleCoupling {
     current_density: Vec<DVec3>,
     old_charge: Vec<f64>,
     new_charge: Vec<f64>,
+    /// Longest-axis-sized scratch for `deposit_charge_conserving_current`,
+    /// reused across every particle in every tick instead of that function
+    /// allocating its own `delta`/`flux` buffers fresh on each of its
+    /// (particle-count × 1) calls per tick — the hottest of this module's
+    /// allocations, since it scales with particle count rather than once
+    /// per tick like the grid-sized buffers above.
+    delta_scratch: Vec<f64>,
+    flux_scratch: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +117,8 @@ impl ParticleCoupling {
             current_density: Vec::new(),
             old_charge: Vec::new(),
             new_charge: Vec::new(),
+            delta_scratch: Vec::new(),
+            flux_scratch: Vec::new(),
         })
     }
 
@@ -165,6 +175,9 @@ impl ParticleCoupling {
         self.old_charge.fill(0.0);
         self.new_charge.resize(expected, 0.0);
         self.new_charge.fill(0.0);
+        let axis_count = domain.resolution().cells().max_element() as usize;
+        self.delta_scratch.resize(axis_count, 0.0);
+        self.flux_scratch.resize(axis_count, 0.0);
         let mut updates = Vec::with_capacity(self.kinematic_objects.len());
         deposit_particle_charge_into(domain, &self.particles, &mut self.old_charge);
 
@@ -201,6 +214,8 @@ impl ParticleCoupling {
                 unwrapped_position,
                 seconds,
                 &mut self.current_density,
+                &mut self.delta_scratch,
+                &mut self.flux_scratch,
             )?;
             particle.position = new_position;
             particle.velocity = new_velocity;
@@ -228,14 +243,27 @@ impl ParticleCoupling {
             // `MaxwellSolver::advance_magnetic`/`advance_electric` run with
             // `&mut self` on the *outer* solver — a borrow of this scratch
             // buffer can't stay alive across that, so it still needs to be
-            // an owned copy. The scratch buffer is what avoids reallocating
-            // it (and old_charge/new_charge) fresh every tick; this clone is
-            // the one grid-sized allocation this pass does not remove.
-            current_density: self.current_density.clone(),
+            // an owned `Vec`. `mem::take` rather than `.clone()`: it leaves
+            // an empty `Vec` here instead of paying a grid-sized alloc +
+            // memcpy every tick, and the caller is expected to hand the
+            // buffer back via `recycle_current_density` once it's done
+            // reading it, so the next call's `resize` below finds it already
+            // the right size instead of growing from empty.
+            current_density: std::mem::take(&mut self.current_density),
             outcome: SolverStepOutcome {
                 object_kinematics: updates,
             },
         })
+    }
+
+    /// Reclaim a `current_density` buffer previously handed out by
+    /// [`Self::advance`], once the caller is done reading it — see that
+    /// method's doc comment. Not required for correctness (a caller that
+    /// skips this just costs the next `advance` a fresh allocation instead
+    /// of reusing this one), only for avoiding the grid-sized allocation on
+    /// every particle-coupled tick.
+    pub(crate) fn recycle_current_density(&mut self, buffer: Vec<DVec3>) {
+        self.current_density = buffer;
     }
 
     pub(crate) fn diagnostic_summary(&self, field_energy_joules: f64) -> String {
@@ -397,6 +425,14 @@ fn deposit_cic_scalar(domain: Domain, position: DVec3, charge: f64, rho: &mut [f
 
 /// Deposit current for one particle move while preserving
 /// `(rho_new-rho_old)/dt + div(J) = 0` on the periodic grid.
+///
+/// `delta`/`flux` are caller-owned scratch, sized to `domain.resolution()`'s
+/// longest axis, rather than allocated here: this runs once per moving
+/// particle per tick, so a `vec![]` per call here would be the hottest
+/// allocation in the particle-coupling path — hotter than any grid-sized
+/// buffer, which is at most once per tick. Both are overwritten (not read)
+/// before use, so the caller does not need to zero them between calls.
+#[allow(clippy::too_many_arguments)]
 pub fn deposit_charge_conserving_current(
     domain: Domain,
     charge: f64,
@@ -404,6 +440,8 @@ pub fn deposit_charge_conserving_current(
     new_unwrapped_position: DVec3,
     seconds: f64,
     current_density: &mut [DVec3],
+    delta: &mut [f64],
+    flux: &mut [f64],
 ) -> Result<(), PluginError> {
     if seconds <= 0.0 || !seconds.is_finite() {
         return Err(PluginError::Solver(
@@ -415,6 +453,13 @@ pub fn deposit_charge_conserving_current(
             "current grid size does not match the Maxwell domain".to_owned(),
         ));
     }
+    let axis_count = domain.resolution().cells().max_element() as usize;
+    if delta.len() != axis_count || flux.len() != axis_count {
+        return Err(PluginError::Solver(
+            "current deposition scratch does not match the Maxwell domain's longest axis"
+                .to_owned(),
+        ));
+    }
     let displacement = new_unwrapped_position - old_position;
     let spacing = domain.cell_size();
     if (displacement.abs() / spacing).max_element() > 1.0 + 1.0e-12 {
@@ -422,11 +467,6 @@ pub fn deposit_charge_conserving_current(
             "a particle crossed more than one cell in one Maxwell step".to_owned(),
         ));
     }
-
-    let counts = domain.resolution().cells();
-    let axis_count = counts.max_element() as usize;
-    let mut delta = vec![0.0; axis_count];
-    let mut flux = vec![0.0; axis_count];
 
     for order in AXIS_ORDERS {
         let mut start = old_position;
@@ -441,8 +481,8 @@ pub fn deposit_charge_conserving_current(
                 axis,
                 seconds,
                 current_density,
-                &mut delta,
-                &mut flux,
+                delta,
+                flux,
             );
             start = end;
         }
@@ -825,7 +865,20 @@ mod tests {
         deposit_cic_scalar(domain, old, charge, &mut old_rho);
         deposit_cic_scalar(domain, wrap_position(domain, new), charge, &mut new_rho);
         let mut current = zero_vector_grid(domain);
-        deposit_charge_conserving_current(domain, charge, old, new, seconds, &mut current).unwrap();
+        let axis_count = domain.resolution().cells().max_element() as usize;
+        let mut delta = vec![0.0; axis_count];
+        let mut flux = vec![0.0; axis_count];
+        deposit_charge_conserving_current(
+            domain,
+            charge,
+            old,
+            new,
+            seconds,
+            &mut current,
+            &mut delta,
+            &mut flux,
+        )
+        .unwrap();
         let residual = continuity_residual(domain, &old_rho, &new_rho, &current, seconds);
         let scale = old_rho
             .iter()

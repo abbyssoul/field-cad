@@ -7,6 +7,7 @@ mod mcp;
 mod profile;
 mod renderer;
 pub mod scene;
+mod scene_view_state;
 mod ui;
 
 pub use app::{LaunchOptions, RunError, run, run_for};

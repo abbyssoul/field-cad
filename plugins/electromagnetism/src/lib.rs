@@ -823,6 +823,17 @@ impl MaxwellCore {
         Ok(Some(advance))
     }
 
+    /// Hand a spent `CoupledAdvance::current_density` back for reuse by the
+    /// next `advance_particles` call — see
+    /// `ParticleCoupling::recycle_current_density`. A no-op if particle
+    /// coupling isn't active (or was disabled since `advance_particles`
+    /// produced this buffer); the buffer is simply dropped.
+    pub fn recycle_current_density(&mut self, buffer: Vec<DVec3>) {
+        if let Some(coupling) = &mut self.particle_coupling {
+            coupling.recycle_current_density(buffer);
+        }
+    }
+
     /// The constrained state a world edit requires, or `None` when nothing the
     /// solver depends on changed.
     ///
@@ -1506,7 +1517,13 @@ impl EquationSystemSolver for MaxwellSolver {
                 .map(|advance| advance.current_density.as_slice()),
         );
         self.advance_magnetic(half_step);
-        Ok(coupled.map_or_else(SolverStepOutcome::default, |advance| advance.outcome))
+        Ok(match coupled {
+            Some(advance) => {
+                self.core.recycle_current_density(advance.current_density);
+                advance.outcome
+            }
+            None => SolverStepOutcome::default(),
+        })
     }
 
     fn sample(

@@ -1023,6 +1023,7 @@ impl McpServer {
                 field_systems: server.field_systems(),
                 world,
                 queue,
+                view: fieldcad_scene_document::SceneViewState::default(),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(

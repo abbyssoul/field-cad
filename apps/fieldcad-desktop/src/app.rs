@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
     time::{Duration, Instant},
 };
 
@@ -51,6 +51,7 @@ use crate::{
     profile::UserProfile,
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
+    scene_view_state,
     ui::{self, AppAction, CameraAction, ComputeView, UiModel, ViewportGesture, ViewportTool},
 };
 
@@ -219,6 +220,15 @@ impl ApplicationHandler for DesktopApplication {
 /// per-field lock is for.
 fn lock_model(data_source: &Mutex<HeadlessServer>) -> MutexGuard<'_, HeadlessServer> {
     data_source.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The window title for `known_path` — just the file name, not the full
+/// path (the title bar is for "which document", not a path browser).
+fn window_title(known_path: Option<&Path>) -> String {
+    match known_path.and_then(|path| path.file_name()) {
+        Some(name) => format!("{} — Field CAD", name.to_string_lossy()),
+        None => "Field CAD".to_owned(),
+    }
 }
 
 /// One region's memoized contribution to the channel-layer geometry, plus
@@ -483,6 +493,27 @@ struct WindowState {
     /// Recent files, default dialog directory, and startup-window
     /// preferences — local to this machine, never part of a saved scene.
     profile: UserProfile,
+    /// A background scene-save writing to disk, if one is in flight. The
+    /// document is captured synchronously (cheap — see
+    /// `WorldState`'s `Arc<BTreeMap>` structural sharing) but the actual
+    /// `fieldcad_scene_document::save_to_path` — JSON encode, fsync, `.bak`
+    /// copy, atomic rename — runs on its own `std::thread` (this app has no
+    /// ambient tokio runtime; see `crate::mcp`'s doc comment) so a slow disk
+    /// never freezes the render loop. `redraw` polls it non-blockingly once
+    /// per frame rather than joining it.
+    saving_scene: Option<SavingScene>,
+}
+
+/// One background scene-save's completion channel, plus the bookkeeping
+/// `WindowState::poll_save_task` needs to fold a successful save back into
+/// `WindowState` once it lands — captured at the moment the document was
+/// captured, not when the save finishes, so a further edit made while the
+/// save is still writing doesn't get misattributed to it.
+struct SavingScene {
+    path: PathBuf,
+    created_at: String,
+    revision: WorldRevision,
+    outcome: mpsc::Receiver<Result<(), String>>,
 }
 
 impl WindowState {
@@ -535,23 +566,31 @@ impl WindowState {
         // behavior now that File > New offers an explicit empty alternative.
         // A path that fails to load is a startup error (propagated via `?`),
         // never a silent fall-back to the demo scene.
-        let (data_source, warnings, queue, known_path, created_at) = match open_path {
+        let (data_source, warnings, queue, known_path, created_at, view) = match open_path {
             None => {
                 let (source, warnings) =
                     build_session(desktop_plugin_catalog(evaluator, maxwell), None, true)?;
-                (source, warnings, None, None, None)
+                (source, warnings, None, None, None, None)
             }
             Some(path) => {
                 let outcome = fieldcad_scene_document::load_newest_valid(&path)
                     .map_err(|error| format!("opening {}: {error}", path.display()))?;
                 let queue = outcome.document.queue.clone();
                 let created_at = outcome.document.metadata.created_at.clone();
+                let view = outcome.document.view.clone();
                 let (source, warnings) = build_session(
                     desktop_plugin_catalog(evaluator, maxwell),
                     Some(outcome.document),
                     false,
                 )?;
-                (source, warnings, Some(queue), Some(path), Some(created_at))
+                (
+                    source,
+                    warnings,
+                    Some(queue),
+                    Some(path),
+                    Some(created_at),
+                    Some(view),
+                )
             }
         };
         let world = data_source.world();
@@ -560,6 +599,7 @@ impl WindowState {
         if let Some(path) = &known_path {
             profile.push_recent_file(path.clone());
         }
+        window.set_title(&window_title(known_path.as_deref()));
         // Which layer opens visible is `UiModel`'s own rule — it reveals the
         // first field a session sees — so the shell does not also decide it here
         // and leave two places that can disagree.
@@ -568,6 +608,23 @@ impl WindowState {
         ui_model.help_visible = profile.show_help_on_startup;
         if !warnings.is_empty() {
             ui_model.command_error = Some(format_resolve_warnings(&warnings));
+        }
+        // Restore the saved camera/follow/view-toggle/per-channel display
+        // state for a scene opened straight from the command line — same
+        // restore `replace_session` applies for File > Open on a running
+        // window, needed again here since startup builds `WindowState` from
+        // scratch rather than going through that method.
+        let mut camera = OrbitCamera::default();
+        if let Some(view) = view {
+            if let Some(camera_state) = &view.camera {
+                scene_view_state::restore_camera(&mut camera, camera_state);
+            }
+            ui_model.following = view.following;
+            ui_model.view = view
+                .view_options
+                .map(scene_view_state::restore_view_options)
+                .unwrap_or_default();
+            ui_model.field_layers = scene_view_state::restore_field_layers(view.channels);
         }
         let data_source = Arc::new(Mutex::new(HeadlessServer::new(data_source)));
         // Replay a loaded document's paused-queue write-ahead log through the
@@ -615,7 +672,7 @@ impl WindowState {
             adapter_name,
             window,
             egui_context,
-            camera: OrbitCamera::default(),
+            camera,
             ui_model,
             viewport: Viewport::default(),
             data_source,
@@ -641,6 +698,7 @@ impl WindowState {
             last_saved_revision: Some(world_revision),
             last_created_at: created_at,
             profile,
+            saving_scene: None,
         })
     }
 
@@ -826,6 +884,8 @@ impl WindowState {
             }
         }
         self.refresh_world();
+        self.poll_save_task();
+        self.ui_model.save_in_progress = self.saving_scene.is_some();
 
         if self.occluded {
             // Nothing can be presented, so do no GPU work at all and check back
@@ -981,6 +1041,7 @@ impl WindowState {
         let next_frame_delay = if compute.mode == fieldcad_core::SimulationMode::Running
             || self.model().pending_command_count() > 0
             || self.ui_model.has_visible_animated_flow_lines()
+            || self.saving_scene.is_some()
         {
             RUNNING_FRAME_INTERVAL.min(ui_repaint_delay)
         } else {
@@ -1932,17 +1993,18 @@ impl WindowState {
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
         let catalog = desktop_plugin_catalog(evaluator, maxwell);
 
-        let (new_source, warnings, path, queue) = match source {
+        let (new_source, warnings, path, queue, view) = match source {
             SessionSource::New { template } => {
                 let (source, warnings) = build_session(catalog, None, template)?;
-                (source, warnings, None, None)
+                (source, warnings, None, None, None)
             }
             SessionSource::Load(path) => {
                 let outcome = fieldcad_scene_document::load_newest_valid(&path)
                     .map_err(|error| error.to_string())?;
                 let queue = outcome.document.queue.clone();
+                let view = outcome.document.view.clone();
                 let (source, warnings) = build_session(catalog, Some(outcome.document), false)?;
-                (source, warnings, Some(path), Some(queue))
+                (source, warnings, Some(path), Some(queue), Some(view))
             }
         };
 
@@ -1968,6 +2030,8 @@ impl WindowState {
         }
 
         self.known_path = path.clone();
+        self.window
+            .set_title(&window_title(self.known_path.as_deref()));
         self.last_created_at = None;
         if let Some(path) = &path {
             self.profile.push_recent_file(path.clone());
@@ -1991,14 +2055,38 @@ impl WindowState {
         self.ui_model.probe_plots.clear();
         self.ui_model.distance_probe_plots.clear();
         self.ui_model.distance_probe_series.clear();
-        self.ui_model.field_layers.clear();
         self.ui_model.domain_draft = None;
-        self.ui_model.following = None;
         self.ui_model.command_error = if warnings.is_empty() {
             None
         } else {
             Some(format_resolve_warnings(&warnings))
         };
+
+        // Restore the saved camera/follow/view-toggle/per-channel display
+        // state on a Load, or reset it to a blank slate on New — either way,
+        // before `refresh_world()` below: its cleanup pass prunes
+        // `field_layers`/`following` entries whose plane/box/sphere/object ID
+        // no longer exists live, and on a Load those IDs are exactly the ones
+        // the just-loaded world was built from, so restoring first is safe.
+        match view {
+            Some(view) => {
+                if let Some(camera) = &view.camera {
+                    scene_view_state::restore_camera(&mut self.camera, camera);
+                }
+                self.ui_model.following = view.following;
+                self.ui_model.view = view
+                    .view_options
+                    .map(scene_view_state::restore_view_options)
+                    .unwrap_or_default();
+                self.ui_model.field_layers = scene_view_state::restore_field_layers(view.channels);
+            }
+            None => {
+                self.camera = OrbitCamera::default();
+                self.ui_model.following = None;
+                self.ui_model.view = ui::ViewOptions::default();
+                self.ui_model.field_layers.clear();
+            }
+        }
 
         self.refresh_world();
         self.last_saved_revision = Some(self.world.revision());
@@ -2006,12 +2094,21 @@ impl WindowState {
     }
 
     /// Save the current session to `path`, falling back to Save As if no
-    /// path is known yet (first save of a new scene).
+    /// path is known yet (first save of a new scene). Only captures the
+    /// document here — the actual disk write happens in the background (see
+    /// [`SavingScene`], [`poll_save_task`](Self::poll_save_task)), so this
+    /// returns before the save has completed. The File-menu Save/Save
+    /// As/Open actions are disabled while `ui_model.save_in_progress`, so
+    /// the guard against a second save overlapping the first only has to
+    /// cover an action already queued this same frame.
     fn save_scene(&mut self, path: Option<PathBuf>) -> Result<(), String> {
         let Some(path) = path.or_else(|| self.known_path.clone()) else {
             self.apply_app_action(AppAction::SaveSceneAs);
             return Ok(());
         };
+        if self.saving_scene.is_some() {
+            return Ok(());
+        }
         let inputs = {
             let mut model = lock_model(&self.data_source);
             let (world, queue) = model
@@ -2025,6 +2122,12 @@ impl WindowState {
                 field_systems: model.field_systems(),
                 world,
                 queue,
+                view: scene_view_state::capture(
+                    &self.camera,
+                    self.ui_model.following,
+                    &self.ui_model.view,
+                    &self.ui_model.field_layers,
+                ),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(
@@ -2032,13 +2135,64 @@ impl WindowState {
             concat!("fieldcad-desktop/", env!("CARGO_PKG_VERSION")),
             self.last_created_at.clone(),
         );
-        fieldcad_scene_document::save_to_path(&document, &path)
-            .map_err(|error| error.to_string())?;
-        self.known_path = Some(path.clone());
-        self.last_saved_revision = Some(self.world.revision());
-        self.last_created_at = Some(document.metadata.created_at);
-        self.profile.push_recent_file(path);
+        let created_at = document.metadata.created_at.clone();
+        let revision = self.world.revision();
+        let (sender, outcome) = mpsc::channel();
+        let write_path = path.clone();
+        std::thread::Builder::new()
+            .name("fieldcad-scene-save".to_owned())
+            .spawn(move || {
+                let result = fieldcad_scene_document::save_to_path(&document, &write_path)
+                    .map_err(|error| error.to_string());
+                // Ignore a send failure: it only means the window closed
+                // (and `outcome` was dropped) while the save was still
+                // writing, not that anything went wrong with the save
+                // itself — the file on disk is unaffected either way.
+                let _ = sender.send(result);
+            })
+            .expect("spawn scene-save thread");
+        self.saving_scene = Some(SavingScene {
+            path,
+            created_at,
+            revision,
+            outcome,
+        });
         Ok(())
+    }
+
+    /// Fold a finished background save into `WindowState`, once its result
+    /// lands — polled once per frame by `redraw`, never blocking: a save
+    /// still writing is simply not there yet and `saving_scene` is left in
+    /// place for the next frame's poll.
+    fn poll_save_task(&mut self) {
+        let Some(saving) = &self.saving_scene else {
+            return;
+        };
+        match saving.outcome.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(Ok(())) => {
+                let saving = self.saving_scene.take().expect("checked above");
+                self.known_path = Some(saving.path.clone());
+                self.window
+                    .set_title(&window_title(self.known_path.as_deref()));
+                // The revision captured alongside the document, not the
+                // live one: a further edit made while this save was still
+                // writing must still show as unsaved once this lands.
+                self.last_saved_revision = Some(saving.revision);
+                self.last_created_at = Some(saving.created_at);
+                self.profile.push_recent_file(saving.path);
+            }
+            Ok(Err(error)) => {
+                self.saving_scene = None;
+                self.ui_model.command_error = Some(format!("save failed: {error}"));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The save thread panicked before sending a result.
+                self.saving_scene = None;
+                self.ui_model.command_error =
+                    Some("save failed: scene-save thread panicked".to_owned());
+            }
+        }
     }
 
     /// Enable or disable the embedded MCP server against this window's

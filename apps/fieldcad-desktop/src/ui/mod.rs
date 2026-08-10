@@ -276,6 +276,12 @@ pub struct UiModel {
     /// possible. `App::apply_camera_follow` re-targets the camera to this
     /// object's live position every frame; see `CameraAction::ToggleFollow`.
     pub following: Option<ObjectId>,
+    /// Set by `WindowState::redraw` while a background scene save (see
+    /// `WindowState::save_scene`) is writing to disk. Drives the "Saving…"
+    /// modal and disables the File-menu actions that would otherwise race
+    /// it — a second save overlapping the first, or New/Open discarding the
+    /// session it's writing out.
+    pub save_in_progress: bool,
 }
 
 impl UiModel {
@@ -308,6 +314,7 @@ impl UiModel {
             queue_panel_open: false,
             settings_visible: false,
             following: None,
+            save_in_progress: false,
         }
     }
 
@@ -887,8 +894,31 @@ pub fn show(
     floating_probe_plots(&context, model, &frame);
     floating_distance_probe_plots(&context, model, &frame);
     field_brush_dialog(&context, model, frame.compute);
+    if model.save_in_progress {
+        saving_window(&context);
+    }
 
     output
+}
+
+/// Modal-styled progress indicator while a background scene save is
+/// writing to disk — see `WindowState::save_scene`. Not an actual egui
+/// modal (no `Modal::new`/backdrop): the File menu already refuses to
+/// start a colliding action while `save_in_progress`, so this only needs to
+/// tell the user why, not additionally block input to the rest of the app.
+fn saving_window(context: &egui::Context) {
+    egui::Window::new("Saving…")
+        .id(egui::Id::new("saving_scene_window"))
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Saving scene…");
+            });
+        });
 }
 
 fn viewport(

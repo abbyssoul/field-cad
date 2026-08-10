@@ -21,25 +21,46 @@ pub fn menu_bar(
     egui::Panel::top("menu_bar").show(root, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.strong("Field CAD");
+            // A background save (see `WindowState::save_scene`) is in
+            // flight while `save_in_progress`: New/Open would discard the
+            // session it's writing out from under it, and a second Save
+            // would race the first, so the whole group is disabled rather
+            // than only the specific action that would collide.
+            let file_actions_enabled = !model.save_in_progress;
             ui.menu_button("File", |ui| {
-                if ui.button("New (Empty)").clicked() {
+                if ui
+                    .add_enabled(file_actions_enabled, egui::Button::new("New (Empty)"))
+                    .clicked()
+                {
                     output.app_action = Some(AppAction::NewScene { template: false });
                     ui.close();
                 }
-                if ui.button("New (Demo Scene)").clicked() {
+                if ui
+                    .add_enabled(file_actions_enabled, egui::Button::new("New (Demo Scene)"))
+                    .clicked()
+                {
                     output.app_action = Some(AppAction::NewScene { template: true });
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Save").clicked() {
+                if ui
+                    .add_enabled(file_actions_enabled, egui::Button::new("Save"))
+                    .clicked()
+                {
                     output.app_action = Some(AppAction::SaveScene);
                     ui.close();
                 }
-                if ui.button("Save As…").clicked() {
+                if ui
+                    .add_enabled(file_actions_enabled, egui::Button::new("Save As…"))
+                    .clicked()
+                {
                     output.app_action = Some(AppAction::SaveSceneAs);
                     ui.close();
                 }
-                if ui.button("Open…").clicked() {
+                if ui
+                    .add_enabled(file_actions_enabled, egui::Button::new("Open…"))
+                    .clicked()
+                {
                     output.app_action = Some(AppAction::OpenScene);
                     ui.close();
                 }

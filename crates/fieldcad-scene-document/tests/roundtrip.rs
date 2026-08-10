@@ -15,7 +15,8 @@ use fieldcad_plugin_api::{
     SampledColumn, SolverContext, SolverKind,
 };
 use fieldcad_scene_document::{
-    LoadError, LoadSource, ResolveError, SceneDocument, SceneDocumentInputs, resolve_plugins,
+    CameraProjection, CameraState, ChannelViewState, LoadError, LoadSource, PlaneViewState,
+    ResolveError, SceneDocument, SceneDocumentInputs, SceneViewState, resolve_plugins,
     save_to_path,
 };
 use fieldcad_simulation::{PluginRegistration, QueueDocument, RuntimeConfig, SimulationRuntime};
@@ -140,6 +141,7 @@ fn inputs(runtime: &SimulationRuntime, queue: QueueDocument) -> SceneDocumentInp
         field_systems: runtime.field_systems(),
         world: runtime.world_document(),
         queue,
+        view: SceneViewState::default(),
     }
 }
 
@@ -189,6 +191,82 @@ fn document_round_trips_objects_components_probes_and_planes() {
     assert_eq!(original.planes(), restored.planes());
     assert_eq!(original.probes(), restored.probes());
     assert_eq!(original.component_schemas(), restored.component_schemas());
+}
+
+#[test]
+fn view_state_round_trips_camera_follow_and_channel_settings() {
+    use fieldcad_core::SlicePlaneSpec;
+
+    let mut runtime = build_runtime(World::new());
+    let report = runtime
+        .commit_world_commands(vec![
+            WorldCommand::CreateObject(ObjectSpec::new("a")),
+            WorldCommand::CreatePlane(SlicePlaneSpec::new("p", DVec3::ZERO, DVec3::Z).unwrap()),
+        ])
+        .unwrap();
+    let object_id = report.created_objects[0];
+    let plane_id = report.created_planes[0];
+
+    let mut channels = BTreeMap::new();
+    channels.insert(
+        mass_channel_id(),
+        ChannelViewState {
+            visible: true,
+            planes: BTreeMap::from([(
+                plane_id,
+                PlaneViewState {
+                    visible: true,
+                    magnitude_visible: false,
+                    magnitude_density: 33,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        },
+    );
+    let view = SceneViewState {
+        camera: Some(CameraState {
+            target: [1.0, 2.0, 3.0],
+            distance: 42.0,
+            yaw: 0.5,
+            pitch: -0.25,
+            projection: CameraProjection::Orthographic,
+        }),
+        following: Some(object_id),
+        view_options: None,
+        channels,
+    };
+
+    let mut inputs = inputs(&runtime, QueueDocument::default());
+    inputs.view = view.clone();
+    let document = SceneDocument::capture(inputs, "test", None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scene.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
+
+    assert_eq!(outcome.document.view, view);
+}
+
+/// A document saved before `view` existed (`format_version` 1, no `view` key
+/// in the JSON at all) must still load — with a default, empty view state —
+/// rather than being rejected as malformed.
+#[test]
+fn document_without_a_view_section_loads_with_view_defaulted() {
+    let mut runtime = build_runtime(World::new());
+    let document = SceneDocument::capture(inputs(&runtime, QueueDocument::default()), "test", None);
+    let mut value = serde_json::to_value(&document).unwrap();
+    value["format_version"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("view");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scene.fcscene");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
+    assert_eq!(outcome.document.view, SceneViewState::default());
+    let _ = &mut runtime; // silence unused-mut if commit path above changes
 }
 
 #[test]
