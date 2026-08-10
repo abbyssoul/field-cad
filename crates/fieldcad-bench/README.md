@@ -102,6 +102,41 @@ Two unit tests enforce the shape: IDs must be unique and namespaced, and every
 sweep must vary its declared parameter — a sweep that does not cannot produce a
 slope, so its complexity claim would be untestable.
 
+## Profiling an authored scene
+
+The benchmark suite above only runs synthetic, seed-free scenes — good for a
+reproducible O() sweep, useless for chasing a regression seen in one specific
+saved session. `examples/profile_scene.rs` loads a real `.fcscene` file (scene
+save/load, `fieldcad-scene-document`) and ticks it in a loop instead:
+
+```sh
+cargo build --release -p fieldcad-bench --example profile_scene
+./target/release/examples/profile_scene ~/Documents/field-cad/earth-moon-2.fcscene 2000
+```
+
+It reports wall-clock per tick and a per-tick allocation count (via a counting
+global allocator), and it's meant to run *under* a profiler rather than to
+produce a trusted headline number by itself:
+
+```sh
+valgrind --tool=callgrind --callgrind-out-file=scene.callgrind -- \
+    ./target/release/examples/profile_scene ~/Documents/field-cad/earth-moon-2.fcscene 300
+callgrind_annotate --threshold=95 scene.callgrind
+```
+
+`perf record -g` / `cargo flamegraph` work the same way where
+`kernel.perf_event_paranoid` allows it; `valgrind --tool=callgrind` needs no
+special kernel permission, at the cost of running the target much slower
+(instrumented execution, not sampling), so pass a small tick count.
+
+It builds a CPU-only plugin catalog (`ElectrostaticsPlugin::new()`,
+`NewtonianGravityPlugin::new()`, `ElectromagnetismPlugin::new()`), not the
+desktop's GPU-backed one — a headless CLI has no GPU device to hand it. A
+number from here can therefore overstate a cost the desktop app offloads to
+the GPU (electrostatics/gravity/Maxwell `sample()`); it understates nothing,
+since every other code path (dynamics, publish, sampling glue, allocation
+shape) runs the same on both.
+
 ## Why these boundaries
 
 Runners drive `EquationSystemPlugin::create_solver`,

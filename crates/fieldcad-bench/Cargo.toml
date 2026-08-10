@@ -21,3 +21,6 @@ fieldcad-simulation = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+fieldcad-scene-document = { workspace = true }

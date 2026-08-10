@@ -1145,6 +1145,7 @@ dependencies = [
  "fieldcad-gravity",
  "fieldcad-newtonian-gravity",
  "fieldcad-plugin-api",
+ "fieldcad-scene-document",
  "fieldcad-simulation",
  "fieldcad-sources",
  "glam",
