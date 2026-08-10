@@ -4,8 +4,9 @@
 //! this body? — and this system answers the other: given the total force, where
 //! does the body go? Splitting them that way means a new field becomes
 //! dynamically coupled by implementing
-//! [`forces`](fieldcad_plugin_api::EquationSystemSolver::forces) and nothing
-//! else, and it means motion has one implementation instead of one per plugin.
+//! [`add_forces`](fieldcad_plugin_api::EquationSystemSolver::add_forces) and
+//! nothing else, and it means motion has one implementation instead of one
+//! per plugin.
 //!
 //! Inertial mass is the only property this system reads. It does not know what
 //! charge is, and it must not: the moment it did, a gravity plugin would be
@@ -210,31 +211,26 @@ pub fn universe_summary(world: &WorldSnapshot) -> Option<fieldcad_core::Universe
     })
 }
 
-/// Sum one force contribution per field system into a total per body.
+/// Confirm that every entry a plugin's `add_forces` call just accumulated
+/// into `out` is still finite.
 ///
-/// Each contribution must have one entry per body; a mismatch means a system
-/// answered a different question from the one it was asked, which is rejected
-/// here rather than silently mis-attributing a force to the wrong object.
-pub fn accumulate_forces(
-    bodies: usize,
-    contributions: &[Vec<DVec3>],
-) -> Result<Vec<DVec3>, DynamicsError> {
-    let mut total = vec![DVec3::ZERO; bodies];
-    for contribution in contributions {
-        if contribution.len() != bodies {
-            return Err(DynamicsError::ForceCountMismatch {
-                expected: bodies,
-                actual: contribution.len(),
-            });
-        }
-        for (sum, force) in total.iter_mut().zip(contribution) {
-            if !force.is_finite() {
-                return Err(DynamicsError::NonFiniteForce);
-            }
-            *sum += *force;
-        }
+/// Called once per enabled plugin, immediately after its contribution has
+/// been added in place — see
+/// [`add_forces`](fieldcad_plugin_api::EquationSystemSolver::add_forces) —
+/// so a system whose result overflowed or divided by zero is caught at the
+/// plugin that produced it, rather than laundered into a body's position
+/// several steps later.
+///
+/// There is no length to check here the way summing separate per-plugin
+/// contributions once had to: `out` is a slice sized once by the caller
+/// before any plugin runs, and a plugin has no way to grow or shrink it, so
+/// a wrong body count is a caller bug the type system already prevents, not
+/// a condition this needs to guard against at runtime.
+pub fn validate_forces_finite(out: &[DVec3]) -> Result<(), DynamicsError> {
+    if out.iter().any(|force| !force.is_finite()) {
+        return Err(DynamicsError::NonFiniteForce);
     }
-    Ok(total)
+    Ok(())
 }
 
 /// Advance every dynamic body by one fixed step under its total force.
@@ -304,12 +300,12 @@ fn advance_body(
 /// The Velocity Verlet half-kick and drift: advance every body's position to
 /// `x_(n+1)` using its *previous* tick's cached force, and its velocity to the
 /// half-step `v_(n+1/2)` a caller feeds back into
-/// [`forces`](fieldcad_plugin_api::EquationSystemSolver::forces) for the one
-/// new evaluation this tick.
+/// [`add_forces`](fieldcad_plugin_api::EquationSystemSolver::add_forces) for
+/// the one new evaluation this tick.
 ///
 /// The returned bodies are a legitimate `DynamicBody` list in their own
 /// right — `position` is `x_(n+1)`, `velocity` is `v_(n+1/2)` — so they can be
-/// passed straight to a plugin's `forces` and then on to
+/// passed straight to a plugin's `add_forces` and then on to
 /// [`verlet_finish_step`] with no extra bookkeeping in between.
 pub fn verlet_half_step(
     bodies: &[DynamicBody],
@@ -544,36 +540,40 @@ mod tests {
 
     #[test]
     fn forces_from_several_systems_sum_before_the_body_is_moved() {
-        // The whole point of the accumulator: gravity and electromagnetism act
-        // on one body as a single resultant, not as two competing pushes.
-        let total = accumulate_forces(
-            2,
-            &[
-                vec![DVec3::new(1.0, 0.0, 0.0), DVec3::ZERO],
-                vec![DVec3::new(0.0, 2.0, 0.0), DVec3::new(0.0, 0.0, -3.0)],
-            ],
-        )
-        .unwrap();
+        // The whole point of in-place accumulation: gravity and
+        // electromagnetism act on one body as a single resultant, not as two
+        // competing pushes. `add_forces` implementations add into `out`
+        // rather than returning their own vector (see
+        // `fieldcad_plugin_api::EquationSystemSolver::add_forces`); this
+        // reproduces that contract against a shared buffer, the way
+        // `SimulationRuntime::eval_forces` drives real plugins.
+        let mut total = vec![DVec3::ZERO; 2];
+
+        for (out_force, force) in total
+            .iter_mut()
+            .zip([DVec3::new(1.0, 0.0, 0.0), DVec3::ZERO])
+        {
+            *out_force += force;
+        }
+        validate_forces_finite(&total).unwrap();
+
+        // Second system's contribution, added on top rather than overwriting.
+        for (out_force, force) in total
+            .iter_mut()
+            .zip([DVec3::new(0.0, 2.0, 0.0), DVec3::new(0.0, 0.0, -3.0)])
+        {
+            *out_force += force;
+        }
+        validate_forces_finite(&total).unwrap();
 
         assert_eq!(total[0], DVec3::new(1.0, 2.0, 0.0));
         assert_eq!(total[1], DVec3::new(0.0, 0.0, -3.0));
     }
 
     #[test]
-    fn a_system_answering_for_the_wrong_number_of_bodies_is_rejected() {
-        assert_eq!(
-            accumulate_forces(2, &[vec![DVec3::X]]),
-            Err(DynamicsError::ForceCountMismatch {
-                expected: 2,
-                actual: 1
-            })
-        );
-    }
-
-    #[test]
     fn a_non_finite_force_is_refused_rather_than_moving_a_body_to_nowhere() {
         assert_eq!(
-            accumulate_forces(1, &[vec![DVec3::new(f64::NAN, 0.0, 0.0)]]),
+            validate_forces_finite(&[DVec3::new(f64::NAN, 0.0, 0.0)]),
             Err(DynamicsError::NonFiniteForce)
         );
     }

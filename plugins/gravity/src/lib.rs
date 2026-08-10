@@ -197,30 +197,28 @@ impl EquationSystemSolver for NewtonianGravitySolver {
         }
     }
 
-    fn forces(&self, bodies: &[DynamicBody]) -> Result<Vec<DVec3>, PluginError> {
-        bodies
-            .iter()
-            .map(|body| {
-                let mass = self
-                    .sources
-                    .get(body.object)
-                    .map(|source| source.coupling_value.into_si())
-                    .unwrap_or(0.0);
-                if mass == 0.0 {
-                    return Ok(DVec3::ZERO);
-                }
-                let acceleration = evaluate_acceleration_excluding(
-                    self.sources.iter_excluding(body.object),
-                    body.position,
+    fn add_forces(&self, bodies: &[DynamicBody], out: &mut [DVec3]) -> Result<(), PluginError> {
+        for (body, out_force) in bodies.iter().zip(out) {
+            let mass = self
+                .sources
+                .get(body.object)
+                .map(|source| source.coupling_value.into_si())
+                .unwrap_or(0.0);
+            if mass == 0.0 {
+                continue;
+            }
+            let acceleration = evaluate_acceleration_excluding(
+                self.sources.iter_excluding(body.object),
+                body.position,
+            )
+            .ok_or_else(|| {
+                PluginError::Solver(
+                    "gravitational acceleration overflowed to a non-finite value".to_owned(),
                 )
-                .ok_or_else(|| {
-                    PluginError::Solver(
-                        "gravitational acceleration overflowed to a non-finite value".to_owned(),
-                    )
-                })?;
-                Ok(acceleration * mass)
-            })
-            .collect()
+            })?;
+            *out_force += acceleration * mass;
+        }
+        Ok(())
     }
 
     fn diagnostics(&self) -> Vec<SolverDiagnostic> {
@@ -417,13 +415,17 @@ mod tests {
             })
             .unwrap();
 
-        let forces = solver
-            .forces(&[DynamicBody {
-                object: body_id,
-                inertial_mass_kg: MassKg::new::<kilogram>(1.0),
-                position: DVec3::ZERO,
-                velocity: DVec3::ZERO,
-            }])
+        let mut forces = [DVec3::ZERO];
+        solver
+            .add_forces(
+                &[DynamicBody {
+                    object: body_id,
+                    inertial_mass_kg: MassKg::new::<kilogram>(1.0),
+                    position: DVec3::ZERO,
+                    velocity: DVec3::ZERO,
+                }],
+                &mut forces,
+            )
             .unwrap();
 
         assert!(

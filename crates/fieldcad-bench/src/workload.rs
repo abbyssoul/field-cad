@@ -439,9 +439,11 @@ fn gravity_forces(scene: &Scene, config: &MeasureConfig) -> Timing {
         config,
         || gravity_solver(scene, &world),
         |solver, _| {
+            let mut out = [DVec3::ZERO];
             solver
-                .forces(&[body])
-                .expect("force calculation from a valid scene is defined")
+                .add_forces(&[body], &mut out)
+                .expect("force calculation from a valid scene is defined");
+            out[0]
         },
     )
 }

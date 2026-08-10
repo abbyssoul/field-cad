@@ -336,11 +336,16 @@ pub trait EquationSystemSolver: Send {
         ))
     }
 
-    /// The total force this system exerts on each dynamic body, in newtons.
+    /// Add this system's force on each dynamic body into `out`, in newtons.
     ///
-    /// One entry per body, in the order given. A system that exerts no force on
-    /// a body returns zero for it rather than omitting it, so the runtime can
-    /// sum contributions positionally without matching identifiers per body.
+    /// `out` has one entry per body, in the order given, already zeroed by
+    /// the caller for this call. A plugin adds its own contribution into it
+    /// (`out[i] += force`) rather than overwriting or returning one, so the
+    /// runtime can sum every enabled system's contribution into the same
+    /// buffer without allocating a fresh one per plugin per tick. A system
+    /// that exerts no force on a body simply adds nothing to that entry,
+    /// rather than special-casing it; a system that exerts no force on any
+    /// body at all is exactly today's default trait body: a no-op.
     ///
     /// This is where coupling happens. Each field system converts its own field
     /// and its own coupling charge into a force — `qE` for an electric field,
@@ -353,9 +358,15 @@ pub trait EquationSystemSolver: Send {
     /// collapsing it into a single vector here is what costs the exact magnetic
     /// rotation a Boris push would have given ([ADR 0022]).
     ///
+    /// `out.len()` always equals `bodies.len()` — the caller sizes it once,
+    /// before any plugin is asked to add to it, and it cannot change
+    /// afterward: it is a slice, not a `Vec`, precisely so a plugin has no
+    /// way to answer with the wrong number of forces.
+    ///
     /// [ADR 0022]: ../../../docs/adr/0022-dynamics-is-a-first-party-system.md
-    fn forces(&self, bodies: &[DynamicBody]) -> Result<Vec<glam::DVec3>, PluginError> {
-        Ok(vec![glam::DVec3::ZERO; bodies.len()])
+    fn add_forces(&self, bodies: &[DynamicBody], out: &mut [DVec3]) -> Result<(), PluginError> {
+        let _ = (bodies, out);
+        Ok(())
     }
 
     /// Advance internal state by one fixed step. Analytic solvers need not

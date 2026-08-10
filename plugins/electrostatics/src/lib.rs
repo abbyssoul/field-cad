@@ -302,7 +302,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
         }
     }
 
-    /// The Coulomb force on each dynamic body: `F = qE`.
+    /// Add the Coulomb force on each dynamic body into `out`: `F = qE`.
     ///
     /// Note the field, not the potential. `qφ` is the potential *energy* in
     /// joules; the force is the charge times the field, which is minus the
@@ -312,31 +312,20 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     /// A body's own charge is excluded from the field acting on it — a point
     /// charge does not accelerate itself, and its own Coulomb singularity would
     /// dominate everything else if it were included.
-    fn forces(&self, bodies: &[DynamicBody]) -> Result<Vec<DVec3>, PluginError> {
-        if bodies.is_empty() {
-            return Ok(Vec::new());
+    fn add_forces(&self, bodies: &[DynamicBody], out: &mut [DVec3]) -> Result<(), PluginError> {
+        for (body, out_force) in bodies.iter().zip(out) {
+            let charge = self
+                .sources
+                .get(body.object)
+                .map_or(0.0, |source| source.coupling_value.into_si());
+            if charge == 0.0 {
+                // Uncharged: this field does not act on it at all.
+                continue;
+            }
+            let field = self.field_excluding(body.object, body.position)?;
+            *out_force += field * charge;
         }
-        let charges: Vec<f64> = bodies
-            .iter()
-            .map(|body| {
-                self.sources
-                    .get(body.object)
-                    .map_or(0.0, |source| source.coupling_value.into_si())
-            })
-            .collect();
-
-        bodies
-            .iter()
-            .zip(&charges)
-            .map(|(body, charge)| {
-                if *charge == 0.0 {
-                    // Uncharged: this field does not act on it at all.
-                    return Ok(DVec3::ZERO);
-                }
-                let field = self.field_excluding(body.object, body.position)?;
-                Ok(field * *charge)
-            })
-            .collect()
+        Ok(())
     }
 
     fn diagnostics(&self) -> Vec<SolverDiagnostic> {
@@ -629,13 +618,17 @@ mod tests {
             .unwrap();
         solver.on_world_changed(&world.snapshot()).unwrap();
 
-        let forces = solver
-            .forces(&[DynamicBody {
-                object: probe_id,
-                inertial_mass_kg: MassKg::new::<kilogram>(1.0),
-                position: DVec3::X * 0.4,
-                velocity: DVec3::ZERO,
-            }])
+        let mut forces = [DVec3::ZERO];
+        solver
+            .add_forces(
+                &[DynamicBody {
+                    object: probe_id,
+                    inertial_mass_kg: MassKg::new::<kilogram>(1.0),
+                    position: DVec3::X * 0.4,
+                    velocity: DVec3::ZERO,
+                }],
+                &mut forces,
+            )
             .unwrap();
 
         assert!(forces[0].x.is_finite());

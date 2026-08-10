@@ -515,6 +515,14 @@ pub struct SimulationRuntime {
     /// see `crate::body_history`'s module docs for why it lives here rather
     /// than being assembled from published snapshots.
     body_history: BodyHistory,
+    /// Scratch buffer for `eval_forces`: resized (never reallocated once a
+    /// session's body count has stabilized) and zeroed once per force
+    /// evaluation, then handed to every enabled plugin in turn as
+    /// `&mut [DVec3]` for it to add its own contribution into — see
+    /// `fieldcad_plugin_api::EquationSystemSolver::add_forces`. Replaces the
+    /// per-tick `contributions: Vec<Vec<DVec3>>` this used to build and the
+    /// `total: Vec<DVec3>` summing it used to allocate.
+    force_scratch: Vec<DVec3>,
     /// Wall-clock time `apply_tick` took to complete its most recent tick,
     /// in milliseconds — everything a fixed step actually costs: force
     /// collection, every time-stepped solver's own advance, dynamics
@@ -789,6 +797,7 @@ impl SimulationRuntime {
             integration_scheme,
             last_forces: BTreeMap::new(),
             body_history: BodyHistory::default(),
+            force_scratch: Vec::new(),
             last_tick_compute_ms: 0.0,
             center_of_mass_object,
         };
@@ -1600,6 +1609,33 @@ impl SimulationRuntime {
         result
     }
 
+    /// Evaluate every enabled plugin's force contribution on `bodies` into
+    /// `self.force_scratch`, replacing whatever it held from the previous
+    /// call.
+    ///
+    /// `force_scratch` is resized (never reallocated once a session's body
+    /// count and enabled-plugin set have stabilized — they change only on an
+    /// authored edit, not every tick) and zeroed once here, then handed to
+    /// every enabled plugin in turn as `&mut [DVec3]` for it to add its own
+    /// contribution into. Because it's a slice, not a `Vec`, no plugin can
+    /// answer with the wrong number of forces — the assertion below is the
+    /// one length check that invariant still leaves to make, run once before
+    /// any plugin runs rather than once per plugin.
+    fn eval_forces(&mut self, bodies: &[DynamicBody]) -> Result<(), RuntimeError> {
+        self.force_scratch.resize(bodies.len(), DVec3::ZERO);
+        self.force_scratch.fill(DVec3::ZERO);
+        assert_eq!(
+            self.force_scratch.len(),
+            bodies.len(),
+            "force_scratch must have exactly one entry per body before any plugin adds to it"
+        );
+        for slot in self.plugins.iter().filter(|slot| slot.enabled) {
+            slot.solver().add_forces(bodies, &mut self.force_scratch)?;
+            dynamics::validate_forces_finite(&self.force_scratch)?;
+        }
+        Ok(())
+    }
+
     fn apply_tick_inner(&mut self, context: StepContext) -> Result<(), RuntimeError> {
         // Resolve motion ownership before any solver advances. Discovering a
         // conflict after a field/particle integrator mutated its private state
@@ -1645,24 +1681,18 @@ impl SimulationRuntime {
             .collect();
 
         let seconds = context.time_step.seconds();
-        let eval_forces = |bodies: &[DynamicBody]| -> Result<Vec<DVec3>, RuntimeError> {
-            let mut contributions = Vec::new();
-            for slot in self.plugins.iter().filter(|slot| slot.enabled) {
-                contributions.push(slot.solver().forces(bodies)?);
-            }
-            Ok(dynamics::accumulate_forces(bodies.len(), &contributions)?)
-        };
 
         // How a summed force becomes motion is a per-session choice (see
         // `IntegrationScheme`'s module docs). Symplectic Euler costs one force
         // evaluation at the pre-tick state; Velocity Verlet costs one at the
         // post-half-drift state, with the previous tick's force standing in
         // for this tick's half-kick — one new evaluation per tick either way.
-        let (dynamics_updates, new_forces): (Vec<_>, Vec<_>) = match self.integration_scheme {
+        // `self.force_scratch` holds whichever state's forces were evaluated
+        // below for the rest of this method.
+        let dynamics_updates: Vec<_> = match self.integration_scheme {
             IntegrationScheme::SymplecticEuler => {
-                let forces = eval_forces(&bodies)?;
-                let updates = dynamics::integrate(&bodies, &forces, seconds)?;
-                (updates, forces)
+                self.eval_forces(&bodies)?;
+                dynamics::integrate(&bodies, &self.force_scratch, seconds)?
             }
             IntegrationScheme::VelocityVerlet => {
                 let cached: Vec<DVec3> = bodies
@@ -1675,17 +1705,20 @@ impl SimulationRuntime {
                     })
                     .collect();
                 let half_bodies = dynamics::verlet_half_step(&bodies, &cached, seconds)?;
-                let new_forces = eval_forces(&half_bodies)?;
-                let updates = dynamics::verlet_finish_step(&half_bodies, &new_forces, seconds)?;
-                (updates, new_forces)
+                self.eval_forces(&half_bodies)?;
+                dynamics::verlet_finish_step(&half_bodies, &self.force_scratch, seconds)?
             }
         };
         self.last_forces = bodies
             .iter()
-            .zip(&new_forces)
+            .zip(&self.force_scratch)
             .map(|(body, force)| (body.object, *force))
             .collect();
-        for ((body, update), force) in bodies.iter().zip(&dynamics_updates).zip(&new_forces) {
+        for ((body, update), force) in bodies
+            .iter()
+            .zip(&dynamics_updates)
+            .zip(&self.force_scratch)
+        {
             self.body_history.record(
                 body.object,
                 BodySample {
