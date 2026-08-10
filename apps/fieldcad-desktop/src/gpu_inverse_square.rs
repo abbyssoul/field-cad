@@ -78,6 +78,13 @@ struct GpuScratchBuffers {
     output_buffer: wgpu::Buffer,
     staging_capacity: usize,
     staging_buffer: wgpu::Buffer,
+    /// The bind group over `params_buffer`/`source_buffer`/`position_buffer`/
+    /// `output_buffer`, cached across `evaluate` calls instead of being
+    /// recreated every dispatch. `None` whenever one of those four buffers
+    /// was just (re)created by `ensure_capacity` and needs a bind group
+    /// pointing at the new one; `staging_buffer` is not bound to the shader,
+    /// so resizing it alone does not invalidate this.
+    bind_group: Option<wgpu::BindGroup>,
 }
 
 impl GpuScratchBuffers {
@@ -109,6 +116,7 @@ impl GpuScratchBuffers {
                 device,
                 wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             ),
+            bind_group: None,
         }
     }
 }
@@ -126,7 +134,9 @@ fn placeholder_buffer(device: &wgpu::Device, usage: wgpu::BufferUsages) -> wgpu:
 
 /// Grows `buffer` to hold at least `needed` elements, only when it doesn't
 /// already. A no-op recreate-free path is the common case once buffers have
-/// warmed up to the scene's usual source/sample counts.
+/// warmed up to the scene's usual source/sample counts. Returns whether it
+/// actually recreated `buffer` — a caller whose buffer feeds a cached bind
+/// group needs to know when that binding is now stale.
 fn ensure_capacity(
     device: &wgpu::Device,
     buffer: &mut wgpu::Buffer,
@@ -135,9 +145,9 @@ fn ensure_capacity(
     element_size: usize,
     usage: wgpu::BufferUsages,
     label: &'static str,
-) {
+) -> bool {
     if needed <= *capacity {
-        return;
+        return false;
     }
     *buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -146,6 +156,7 @@ fn ensure_capacity(
         mapped_at_creation: false,
     });
     *capacity = needed;
+    true
 }
 
 /// Batched pairwise inverse-square-law evaluator, shared by electrostatics
@@ -229,7 +240,7 @@ impl GpuInverseSquareEvaluator {
         self.queue
             .write_buffer(&scratch.params_buffer, 0, bytemuck::bytes_of(&params));
 
-        ensure_capacity(
+        let source_resized = ensure_capacity(
             &self.device,
             &mut scratch.source_buffer,
             &mut scratch.source_capacity,
@@ -244,7 +255,7 @@ impl GpuInverseSquareEvaluator {
             bytemuck::cast_slice(&gpu_sources),
         );
 
-        ensure_capacity(
+        let position_resized = ensure_capacity(
             &self.device,
             &mut scratch.position_buffer,
             &mut scratch.position_capacity,
@@ -260,7 +271,7 @@ impl GpuInverseSquareEvaluator {
         );
 
         let output_size = (geometry.len() * size_of::<GpuOutput>()) as wgpu::BufferAddress;
-        ensure_capacity(
+        let output_resized = ensure_capacity(
             &self.device,
             &mut scratch.output_buffer,
             &mut scratch.output_capacity,
@@ -279,28 +290,38 @@ impl GpuInverseSquareEvaluator {
             "inverse-square readback",
         );
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("inverse-square compute bindings"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: scratch.params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: scratch.source_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scratch.position_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: scratch.output_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        if source_resized || position_resized || output_resized {
+            scratch.bind_group = None;
+        }
+        if scratch.bind_group.is_none() {
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("inverse-square compute bindings"),
+                layout: &self.pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: scratch.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: scratch.source_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: scratch.position_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: scratch.output_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            scratch.bind_group = Some(bind_group);
+        }
+        let bind_group = scratch
+            .bind_group
+            .as_ref()
+            .expect("just ensured Some above");
 
         let mut encoder = self
             .device
@@ -313,7 +334,7 @@ impl GpuInverseSquareEvaluator {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(sample_count.div_ceil(WORKGROUP_SIZE), 1, 1);
         }
         encoder.copy_buffer_to_buffer(

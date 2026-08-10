@@ -31,11 +31,17 @@ The concrete sample types never leave the plugin boundary anyway — they're
 converted to generic `FieldColumn` at `sample()`.
 
 A single `InverseSquareSample` (with `gradient: Option<DMat3>`) and a single
-`InverseSquareBatchEvaluator` trait replace all four types. The CPU path always
-reports `gradient: Some(...)` (the closed-form Jacobian is cheap); the GPU path
-reports `gradient: None` (the WGSL shader does not compute it), and the
-`sample()` method uses the presence of the gradient to decide whether to attach
-a `GradientColumn`.
+`InverseSquareBatchEvaluator` trait replace all four types. The CPU path
+advertises a batch gradient (the closed-form Jacobian is cheap); the GPU path
+does not (the WGSL shader does not compute it). Gradient availability is a
+per-evaluator, per-batch capability, not a property that an undefined point may
+silently withdraw from the rest of the batch. `sample()` uses that capability to
+decide whether to attach a `GradientColumn`.
+
+The desktop also has one GPU adapter, `GpuInverseSquareEvaluator`, directly
+implementing the shared trait. The electrostatic and gravity GPU wrappers are
+deleted: after source conversion and coupling selection move to the plugins,
+they contain no equation-system-specific behaviour.
 
 ## Files affected
 
@@ -47,18 +53,22 @@ a `GradientColumn`.
 | `plugins/electrostatics/Cargo.toml` | No changes needed (already depends on `fieldcad-superposition`) |
 | `plugins/gravity/src/lib.rs` | Remove `NewtonianSample`, use `InverseSquareSample`; remove `GravityBatchEvaluator`, use `InverseSquareBatchEvaluator`; add source-conversion fn; add `fieldcad-superposition` dep; update solver |
 | `plugins/gravity/Cargo.toml` | Remove `fieldcad-newtonian-gravity`, add `fieldcad-superposition` |
-| `apps/fieldcad-desktop/src/electrostatics_gpu.rs` | Implement `InverseSquareBatchEvaluator` instead of `ElectrostaticBatchEvaluator`; update return mapping |
-| `apps/fieldcad-desktop/src/gravity_gpu.rs` | Implement `InverseSquareBatchEvaluator` instead of `GravityBatchEvaluator`; update return mapping; use plugin's `inverse_square_source` |
-| `apps/fieldcad-desktop/src/gpu_inverse_square.rs` | Optionally return `Vec<InverseSquareSample>` directly (or keep `GpuInverseSquareSample` and map at wrapper) |
+| `apps/fieldcad-desktop/src/electrostatics_gpu.rs` | Delete — its adapter has no remaining electrostatics-specific behaviour |
+| `apps/fieldcad-desktop/src/gravity_gpu.rs` | Delete — its adapter has no remaining gravity-specific behaviour |
+| `apps/fieldcad-desktop/src/gpu_inverse_square.rs` | Implement `InverseSquareBatchEvaluator` directly; return `InverseSquareSample` with `gradient: None` |
 | `apps/fieldcad-desktop/src/app.rs` | Update evaluator creation and plugin wiring to use unified trait |
 | `apps/fieldcad-desktop/Cargo.toml` | Remove `fieldcad-newtonian-gravity` |
 | `crates/fieldcad-bench/Cargo.toml` | Remove `fieldcad-newtonian-gravity` |
-| `Cargo.toml` (workspace root) | Remove `crates/fieldcad-newtonian-gravity` from workspace members |
+| `Cargo.toml` (workspace root) | Remove `crates/fieldcad-newtonian-gravity` from workspace members and workspace dependencies |
+| `Cargo.lock` | Regenerate after deleting the crate |
+| `PLAN.md`, `docs/orishu-integration-plan.md` | Update current-state references to the deleted crate; preserve dated review records as history |
 
 **Deleted:**
 | Path | Reason |
 |------|--------|
 | `crates/fieldcad-newtonian-gravity/` | Entire crate — responsibility absorbed into `plugins/gravity` + `fieldcad-superposition` |
+| `apps/fieldcad-desktop/src/electrostatics_gpu.rs` | Duplicate GPU adapter absorbed into `gpu_inverse_square.rs` |
+| `apps/fieldcad-desktop/src/gravity_gpu.rs` | Duplicate GPU adapter absorbed into `gpu_inverse_square.rs` |
 
 ## Migration sequence
 
@@ -66,16 +76,23 @@ a `GradientColumn`.
 
 **1a. Change `InverseSquareSample.gradient` to `Option<DMat3>`**
 
-The CPU analytical solver always computes the closed-form Jacobian; `evaluate_sources()` wraps it in `Some(...)`. The `undefined()` constructor uses `None`. Doc comment explains the invariant:
+The CPU analytical solver always computes the closed-form Jacobian;
+`evaluate_sources()` wraps it in `Some(...)`. An undefined sample retains a
+finite placeholder (`Some(DMat3::ZERO)`): its derivative is not meaningful, but
+its `SampleValidity` already marks that and the placeholder prevents one
+undefined position from removing the CPU gradient capability from every other
+position in the batch. The GPU adapter alone reports `None` for every sample.
+Doc comment explains the invariant:
 
 ```rust
 /// The field's own Jacobian (`∂field_i/∂x_j` in column `j`).
 ///
-/// Always `Some` when produced by the CPU analytical solver
-/// (`evaluate_sources` in this crate). A GPU backend that has not
-/// implemented the derivative math yet reports `None`; the caller (the
-/// plugin's `sample()` method) uses this to decide whether to attach a
-/// `GradientColumn` to the published `SampledColumn`.
+/// `Some` for every sample from the CPU analytical solver
+/// (`evaluate_sources` in this crate), including an undefined sample whose
+/// validity makes its zero placeholder unusable. An evaluator without
+/// derivative support (the current GPU adapter) reports `None` for every
+/// sample in a batch. Callers use that batch-wide capability to decide whether
+/// to attach a `GradientColumn` to the published `SampledColumn`.
 pub gradient: Option<DMat3>,
 ```
 
@@ -85,7 +102,7 @@ fn undefined(reason: UndefinedReason) -> Self {
     Self {
         field: DVec3::ZERO,
         potential: 0.0,
-        gradient: None,
+        gradient: Some(DMat3::ZERO),
         validity: SampleValidity::Undefined(reason),
     }
 }
@@ -112,14 +129,18 @@ uses).
 ///
 /// A single evaluator can serve both electrostatic (Coulomb) and
 /// gravitational equation systems — the caller supplies the coupling
-/// constant (sign and magnitude) separately.
+/// constant (sign and magnitude) separately. A successful batch reports
+/// gradient availability uniformly: every sample has `Some(gradient)`, or
+/// every sample has `None`.
 pub trait InverseSquareBatchEvaluator: Send + Sync {
     /// The numerical precision this evaluator produces (e.g. `F64` for the
     /// CPU oracle, `F32` for the WGSL compute shader).
     fn precision(&self) -> Precision;
 
     /// Evaluate both vector and scalar (potential) channels at every sample
-    /// position described by `geometry`.
+    /// position described by `geometry`. On success, the returned vector has
+    /// exactly `geometry.len()` entries; a backend that cannot meet that
+    /// contract returns `Err`, never a partial result.
     fn evaluate(
         &self,
         coupling_constant: f64,
@@ -129,6 +150,9 @@ pub trait InverseSquareBatchEvaluator: Send + Sync {
     ) -> Result<Vec<InverseSquareSample>, String>;
 
     /// [`Self::evaluate`], writing into a caller-owned buffer.
+    ///
+    /// `out.len()` must equal `geometry.len()`. Implementations return `Err`
+    /// for a mismatch rather than panicking or leaving part of `out` stale.
     fn evaluate_into(
         &self,
         coupling_constant: f64,
@@ -137,7 +161,22 @@ pub trait InverseSquareBatchEvaluator: Send + Sync {
         geometry: &SampleGeometry,
         out: &mut [InverseSquareSample],
     ) -> Result<(), String> {
-        out.copy_from_slice(&self.evaluate(coupling_constant, sources, domain, geometry)?);
+        if out.len() != geometry.len() {
+            return Err(format!(
+                "inverse-square output buffer has length {}, expected {}",
+                out.len(),
+                geometry.len()
+            ));
+        }
+        let evaluated = self.evaluate(coupling_constant, sources, domain, geometry)?;
+        if evaluated.len() != geometry.len() {
+            return Err(format!(
+                "inverse-square evaluator returned {} samples for a geometry of length {}",
+                evaluated.len(),
+                geometry.len()
+            ));
+        }
+        out.copy_from_slice(&evaluated);
         Ok(())
     }
 }
@@ -182,6 +221,13 @@ impl InverseSquareBatchEvaluator for CpuInverseSquareEvaluator {
         geometry: &SampleGeometry,
         out: &mut [InverseSquareSample],
     ) -> Result<(), String> {
+        if out.len() != geometry.len() {
+            return Err(format!(
+                "inverse-square output buffer has length {}, expected {}",
+                out.len(),
+                geometry.len()
+            ));
+        }
         for (position, out) in geometry.positions().zip(out) {
             *out = evaluate_sources(coupling_constant, sources.iter().copied(), position);
         }
@@ -291,24 +337,31 @@ struct ElectrostaticsSolver {
 
 // After
 struct ElectrostaticsSolver {
+    // Rebuilt with the object-indexed sources on creation/world changes; this
+    // is the cache-local input shape for the shared evaluator.
+    inverse_square_sources: Vec<InverseSquareSource>,
     evaluator: Arc<dyn InverseSquareBatchEvaluator>,
     cache: SampleCache<InverseSquareSample>,
     // ...
 }
 ```
 
+Build `inverse_square_sources` when constructing the solver and rebuild it in
+`on_world_changed`, immediately after replacing `self.sources`. Do not convert
+inside `samples_for`: that method runs for both channels even when the sample
+cache is a hit.
+
 **2f. Update `samples_for`**
 
 Source conversion happens at the plugin level now:
 ```rust
 fn samples_for(&self, geometry: &SampleGeometry) -> Result<Arc<[InverseSquareSample]>, PluginError> {
-    let sources: Vec<InverseSquareSource> = self.sources.iter().map(inverse_square_source).collect();
     self.cache.get_or_try_insert_with(
         geometry,
         || {
             let evaluated = self
                 .evaluator
-                .evaluate(COULOMB_CONSTANT, &sources, &self.domain, geometry)
+                .evaluate(COULOMB_CONSTANT, &self.inverse_square_sources, &self.domain, geometry)
                 .map_err(PluginError::Solver)?;
             if evaluated.len() != geometry.len() {
                 return Err(PluginError::Solver(/* length mismatch */));
@@ -317,7 +370,7 @@ fn samples_for(&self, geometry: &SampleGeometry) -> Result<Arc<[InverseSquareSam
         },
         |out| {
             self.evaluator
-                .evaluate_into(COULOMB_CONSTANT, &sources, &self.domain, geometry, out)
+                .evaluate_into(COULOMB_CONSTANT, &self.inverse_square_sources, &self.domain, geometry, out)
                 .map_err(PluginError::Solver)
         },
     )
@@ -518,6 +571,9 @@ impl NewtonianGravityPlugin {
 // Before
 struct NewtonianGravitySolver {
     sources: ObjectIndex<CoupledSource<MassKg>>,
+    // Rebuilt with the object-indexed sources on creation/world changes; this
+    // is the cache-local input shape for the shared evaluator.
+    inverse_square_sources: Vec<InverseSquareSource>,
     evaluator: Arc<dyn GravityBatchEvaluator>,
     cache: SampleCache<NewtonianSample>,
     // ...
@@ -532,18 +588,22 @@ struct NewtonianGravitySolver {
 }
 ```
 
+Build `inverse_square_sources` when constructing the solver and rebuild it in
+`on_world_changed`, immediately after replacing `self.sources`. The
+object-indexed sources remain necessary for force ownership/exclusion; the
+converted vector is the evaluator's cache-local input shape.
+
 **3f. Update `samples_for`**
 
 Same pattern as electrostatics — convert sources at plugin level:
 
 ```rust
 fn samples_for(&self, geometry: &SampleGeometry) -> Result<Arc<[InverseSquareSample]>, PluginError> {
-    let sources: Vec<InverseSquareSource> = self.sources.iter().map(inverse_square_source).collect();
     self.cache.get_or_try_insert_with(geometry, || {
-        self.evaluator.evaluate(-GRAVITATIONAL_CONSTANT, &sources, &self.domain, geometry)
+        self.evaluator.evaluate(-GRAVITATIONAL_CONSTANT, &self.inverse_square_sources, &self.domain, geometry)
             .map_err(PluginError::Solver)
     }, |out| {
-        self.evaluator.evaluate_into(-GRAVITATIONAL_CONSTANT, &sources, &self.domain, geometry, out)
+        self.evaluator.evaluate_into(-GRAVITATIONAL_CONSTANT, &self.inverse_square_sources, &self.domain, geometry, out)
             .map_err(PluginError::Solver)
     })
 }
@@ -619,11 +679,10 @@ let acceleration = fieldcad_superposition::field_excluding(
 **3i. Remove the `f32` quantization function**
 
 The gravity plugin currently has a `quantize()` function that converts
-`NewtonianSample` fields to `f32` and back. After unifying to
-`InverseSquareSample`, this function is only useful if the evaluator produces
-f64 and the plugin needs f32 output. Since `CpuInverseSquareEvaluator` reports
-`Precision::F64` and the host decides precision through the evaluator, this
-function is no longer needed. Remove it.
+`NewtonianSample` fields to `f32` and back. Remove it only together with a
+precision validator matching electrostatics: an `F64` CPU evaluator on an `F32`
+domain must now be rejected, rather than silently quantized. This is an
+intentional behaviour change, not merely cleanup.
 
 **3j. Update `create_solver`**
 
@@ -636,17 +695,22 @@ if context.domain.precision() != self.evaluator.precision() {
 
 ### Phase 4 — Desktop GPU code
 
-**4a. `electrostatics_gpu.rs`**
+**4a. Delete the equation-system GPU wrappers**
 
-Implement `InverseSquareBatchEvaluator` instead of
-`ElectrostaticBatchEvaluator`:
+Delete `electrostatics_gpu.rs` and `gravity_gpu.rs`, remove their module
+declarations, and move their tests to `gpu_inverse_square.rs`. Neither wrapper
+has a remaining source conversion, fixed coupling constant, or result type that
+differs from the other; retaining two adapters would preserve a shallow seam
+with no independent responsibility.
+
+**4b. Implement the shared trait directly in `gpu_inverse_square.rs`**
+
+Keep `GpuInverseSquareSample` private if it helps isolate raw GPU readback, but
+implement the public evaluator interface on `GpuInverseSquareEvaluator` and map
+the private values there:
 
 ```rust
-// Before
-impl ElectrostaticBatchEvaluator for GpuElectrostaticEvaluator { ... }
-
-// After
-impl InverseSquareBatchEvaluator for GpuElectrostaticEvaluator {
+impl InverseSquareBatchEvaluator for GpuInverseSquareEvaluator {
     fn precision(&self) -> Precision {
         Precision::F32
     }
@@ -658,7 +722,7 @@ impl InverseSquareBatchEvaluator for GpuElectrostaticEvaluator {
         _domain: &Domain,
         geometry: &SampleGeometry,
     ) -> Result<Vec<InverseSquareSample>, String> {
-        let samples = self.core.evaluate(coupling_constant, sources, geometry)?;
+        let samples = self.evaluate_raw(coupling_constant, sources, geometry)?;
         Ok(samples
             .into_iter()
             .map(|sample| InverseSquareSample {
@@ -672,79 +736,11 @@ impl InverseSquareBatchEvaluator for GpuElectrostaticEvaluator {
 }
 ```
 
-Note: source conversion (`ChargeSource` → `InverseSquareSource`) is now the
-plugin's responsibility, so the wrapper no longer calls
-`inverse_square_source` — it receives pre-converted `&[InverseSquareSource]`.
-
-Update imports:
-```rust
-// Before
-use fieldcad_electrostatics::{
-    ElectrostaticBatchEvaluator, ElectrostaticSample, inverse_square_source,
-};
-
-// After
-use fieldcad_superposition::{
-    InverseSquareBatchEvaluator, InverseSquareSample, InverseSquareSource,
-};
-```
-
-Update test code: `evaluate_sources` still comes from `fieldcad_electrostatics`
-but now returns `InverseSquareSample`. Test assertions change:
-```rust
-// Before
-assert_eq!(gpu.electric_field.x, ...);
-// After
-assert_eq!(gpu.field.x, ...);
-```
-
-**4b. `gravity_gpu.rs`**
-
-Same changes as `electrostatics_gpu.rs`:
-
-- Implement `InverseSquareBatchEvaluator` instead of `GravityBatchEvaluator`
-- Receive `&[InverseSquareSource]` instead of `&[CoupledSource<MassKg>]`
-- Map `GpuInverseSquareSample` → `InverseSquareSample { gradient: None, ... }`
-- Remove the private `inverse_square_source` function (now lives in the gravity plugin as `pub`)
-- Update tests
-
-Import change:
-```rust
-// Before
-use fieldcad_newtonian_gravity::{GRAVITATIONAL_CONSTANT, NewtonianSample, evaluate_sources};
-use fieldcad_gravity::GravityBatchEvaluator;
-
-// After
-use fieldcad_gravity::inverse_square_source;  // now pub in the plugin
-use fieldcad_superposition::{
-    InverseSquareBatchEvaluator, InverseSquareSample, InverseSquareSource,
-};
-```
-
-For tests that need the CPU oracle, import from the gravity plugin:
-```rust
-use fieldcad_gravity::evaluate_sources;  // convenience fn, returns InverseSquareSample
-```
-
-**4c. Option: eliminate `GpuInverseSquareSample` entirely**
-
-Since both wrappers map `GpuInverseSquareSample` → `InverseSquareSample` with
-`gradient: None`, consider whether `GpuInverseSquareEvaluator::evaluate`
-should return `Vec<InverseSquareSample>` directly. This would remove the
-intermediate type and the mapping loop in each wrapper.
-
-If we do this, each wrapper becomes even thinner — just a call to
-`self.core.evaluate(coupling_constant, sources, geometry)`.
-
-Decision: **keep `GpuInverseSquareSample`** as a private intermediate type for
-now. It separates the GPU-internal representation from the public API. Remove it
-in a follow-up if unnecessary complexity accumulates.
-
-**4d. `gpu_inverse_square.rs`** — no structural changes needed
-
-`GpuInverseSquareEvaluator::evaluate` already accepts `coupling_constant: f64`
-and `&[InverseSquareSource]`. It returns `Result<Vec<GpuInverseSquareSample>,
-String>`. The trait impl lives in the wrapper files.
+Rename the existing inherent `evaluate` to `evaluate_raw` to avoid recursive
+dispatch. This shared adapter receives already-converted generic sources and
+the caller's coupling constant, so one `Arc<dyn InverseSquareBatchEvaluator>`
+can be injected into both plugins. Update its module documentation to describe
+the direct shared adapter rather than two wrappers.
 
 ### Phase 5 — Remove `crates/fieldcad-newtonian-gravity`
 
@@ -756,7 +752,8 @@ rm -rf crates/fieldcad-newtonian-gravity/
 **5b. Remove from workspace Cargo.toml**
 
 In root `Cargo.toml`, remove `"crates/fieldcad-newtonian-gravity"` from the
-`members` list.
+`members` list **and** remove its `workspace.dependencies` entry. Regenerate
+`Cargo.lock` as part of the dependency update.
 
 **5c. Remove from desktop Cargo.toml**
 
@@ -777,6 +774,13 @@ fieldcad-newtonian-gravity = { workspace = true }
 ```
 (Confirmed unused — the bench crate never imports symbols from it.)
 
+**5e. Update current architecture documentation**
+
+Update `PLAN.md` and `docs/orishu-integration-plan.md`, which currently
+describe `fieldcad-newtonian-gravity` as a present reusable kernel. Do not edit
+dated reviews that mention it: those are historical evidence of the architecture
+at the time of review.
+
 ### Phase 6 — Wire desktop application
 
 **6a. Update evaluator creation in `app.rs`**
@@ -791,11 +795,11 @@ let gravity: Arc<dyn GravityBatchEvaluator> = Arc::new(GpuNewtonianGravityEvalua
     compute_queue.clone(),
 ));
 
-// After — both use the same trait
+// After — one shared GPU adapter type is injected into both plugins
 let evaluator: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
-    GpuElectrostaticEvaluator::new(compute_device.clone(), compute_queue.clone()),
+    GpuInverseSquareEvaluator::new(compute_device.clone(), compute_queue.clone()),
 );
-let gravity: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(GpuNewtonianGravityEvaluator::new(
+let gravity: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(GpuInverseSquareEvaluator::new(
     compute_device.clone(),
     compute_queue.clone(),
 ));
@@ -819,22 +823,20 @@ fn desktop_plugin_catalog(
 ) -> Vec<PluginRegistration>
 ```
 
-Note: if `GpuElectrostaticEvaluator` and `GpuNewtonianGravityEvaluator` become
-identical after all changes, they could potentially be replaced by a single
-`GpuInverseSquareEvaluator` directly. For now, keep both structs — they carry
-different test code and may diverge later.
+The source conversion and coupling constant now belong to the plugins, so the
+desktop has no reason to retain equation-system-specific GPU adapters.
 
 ### Phase 7 — Build and test
 
 **7a. Fix all compilation errors**
 
 The compiler will flag:
-- All `.electric_field` access → `.field` (in electrostatics tests and GPU code)
-- All `.acceleration` access → `.field` (in gravity tests and GPU code)
+- All `.electric_field` access → `.field` (in electrostatics tests)
+- All `.acceleration` access → `.field` (in gravity tests)
 - All `ElectrostaticBatchEvaluator`/`GravityBatchEvaluator` → `InverseSquareBatchEvaluator`
 - All `ElectrostaticSample`/`NewtonianSample` → `InverseSquareSample`
 - Missing imports (now from `fieldcad-superposition` for the kernel types)
-- Wrapper struct method signatures
+- Deleted GPU-wrapper module declarations/imports and the renamed raw GPU method
 
 **7b. Run existing tests**
 
@@ -845,18 +847,35 @@ cargo test -p fieldcad-gravity
 cargo test -p fieldcad-desktop -- --test-threads=1  # GPU tests
 ```
 
-The superposition tests continue to pass unchanged (they use
-`InverseSquareSample` directly).
+Update the superposition tests for `Option<DMat3>` and add coverage for the
+CPU gradient/undefined-sample invariant.
 
 The electrostatics tests change minimally (`.electric_field` → `.field`).
 
 The gravity plugin tests need more updates (new trait impls, source conversion,
 `evaluate_sources` call changes).
 
-The desktop GPU tests need source type changes (need to pass
-`&[InverseSquareSource]` instead of `&[ChargeSource]`/`&[CoupledSource<MassKg>]`).
+Move the desktop GPU tests beside the shared adapter. They pass
+`&[InverseSquareSource]` and both Coulomb and gravitational coupling constants
+to the same evaluator implementation.
 
-**7c. Verify no broken dependencies**
+**7c. Add contract and regression tests**
+
+- A CPU batch containing both exact and undefined positions still publishes a
+  gradient column; validity, not gradient availability, marks the undefined
+  entry unusable.
+- The GPU adapter returns `gradient: None` for every sample and both plugin
+  channels omit gradients consistently.
+- A deliberately malformed evaluator returning too few/many samples and an
+  `evaluate_into` call with a wrong-sized buffer return `Err` rather than panic
+  or retain stale output.
+- Gravity rejects a domain whose declared precision differs from its evaluator,
+  matching electrostatics; retain a test for an accepted F32 GPU evaluator and
+  F64 CPU evaluator.
+- Both plugins retain force results and CPU/GPU parity after receiving the same
+  generic sources and their respective coupling constants.
+
+**7d. Verify no broken dependencies**
 
 ```bash
 cargo check --workspace
@@ -869,53 +888,41 @@ Confirm the workspace compiles without the removed
 
 After each phase, confirm:
 
-- `InverseSquareSample.gradient` is `Some(...)` when produced by CPU,
-  `None` when produced by GPU. The `sample()` method handles both correctly.
+- CPU samples, including invalid placeholders, carry `Some(...)`; GPU samples
+  carry `None` for the whole batch. A CPU batch with one undefined position
+  still publishes gradients for its valid positions.
 - Force calculation (`add_forces`) produces identical results (uses
   `field_excluding` directly, same formula with same coupling constant).
-- No `ElectrostaticSample` or `NewtonianSample` types remain anywhere in the
-  codebase.
-- `Cargo.toml` no longer references `fieldcad-newtonian-gravity`.
+- No `ElectrostaticSample` or `NewtonianSample` definitions or production Rust
+  references remain; this task and dated review records may retain their names.
+- Active manifests, `Cargo.lock`, and current-state documentation no longer
+  reference `fieldcad-newtonian-gravity`; dated review records remain intact.
 - Bench crate links without the removed dependency (it never imported it).
 
 ## Edge cases and risks
 
-- **Source conversion allocation**: Each `samples_for()` call now converts
-  `Vec<ChargeSource/MassKg>` → `Vec<InverseSquareSource>` before calling the
-  evaluator. This is one extra `Vec` allocation per geometry evaluation (cache
-  miss or refresh). The conversion is O(sources) with trivial per-element cost
-  (copy 3 f64s + 1 f64 + 1 enum). The evaluator call itself is O(sources ×
-  positions), so this is negligible.
+- **Source conversion storage**: Convert `ChargeSource`/`CoupledSource<MassKg>`
+  into `InverseSquareSource` when the solver adopts a world and retain that
+  vector beside the object index. This avoids allocation and conversion on both
+  channel reads and cache hits while preserving object-indexed sources for
+  force exclusion.
 
-- **Gradient availability mismatch**: If a plugin is configured with a CPU
-  evaluator that always gives `Some(gradient)` but the renderer receives
-  `gradient: None` through some path, it falls back to trilinear interpolation.
-  This is safe — it just reduces visual smoothness. The `sample()` method
-  handles this correctly via the `collect::<Option<Vec<_>>>()` pattern.
+- **Gradient capability is batch-wide**: `SampledColumn` can only publish one
+  gradient-column decision for the batch. The shared evaluator interface must
+  therefore require a backend to report gradients for every sample in a batch
+  or none of them. Undefined CPU samples use finite placeholders and validity;
+  a GPU backend reports none for the whole batch.
 
-- **GPU test oracle import**: Tests in `electrostatics_gpu.rs` import
-  `evaluate_sources` from the electrostatics plugin. After refactoring, this fn
-  returns `InverseSquareSample` with `.field` instead of `.electric_field`. Test
-  assertions must be updated consistently.
-
-- **Crate removal from workspace**: `fieldcad-newtonian-gravity` appears in the
-  root Cargo.toml workspace `members` list. After removal, `cargo check
-  --workspace` must still resolve. If anything else depends on it transitively
-  (it shouldn't), the compiler will catch it.
+- **Crate removal from workspace**: Remove the crate from both root workspace
+  lists, regenerate the lockfile, and search production code/manifests before
+  deletion. `cargo check --workspace` then proves no live dependency remains.
 
 ## Later considerations
 
-- **Eliminate `GpuInverseSquareSample`**: After gravity and electrostatics use
-  the same `InverseSquareSample` return type, `GpuInverseSquareSample` is just
-  an intermediate that gets immediately mapped. Could fold it into
-  `InverseSquareSample` directly (with `gradient: None` for the GPU path).
-
-- **Replace wrapper structs with `GpuInverseSquareEvaluator` directly**: If both
-  `GpuElectrostaticEvaluator` and `GpuNewtonianGravityEvaluator` become identical
-  (same coupling constant pass-through, same source type, same result mapping),
-  they could be replaced by a single `GpuInverseSquareEvaluator` implementing
-  `InverseSquareBatchEvaluator` directly. The desktop would inject the same
-  `Arc<dyn InverseSquareBatchEvaluator>` into both plugins.
+- **Eliminate `GpuInverseSquareSample`**: It may remain as a private raw-readback
+  shape inside `gpu_inverse_square.rs`. If it becomes only a one-to-one mapping,
+  fold it into `InverseSquareSample` there; no equation-system wrapper should
+  be reintroduced for that purpose.
 
 - **Generic `field_excluding` helper in the gravity plugin**: Currently uses
   `fieldcad_superposition::field_excluding` directly. If the source conversion
