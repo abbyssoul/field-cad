@@ -44,6 +44,18 @@ pub struct FlowLineDisplayState {
     pub speed: f32,
 }
 
+/// Mirrors `scene::TrajectoryDisplay` — an object's recorded-history trail,
+/// not a `FlowLineDisplayState` (there is no `density`: a trajectory has
+/// nothing to seed, the trail is exactly the recorded path).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TrajectoryDisplayState {
+    pub visible: bool,
+    pub trail_seconds: f32,
+    pub thickness_px: f32,
+    pub animated: bool,
+    pub speed: f32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FieldLayerViewState {
     pub vectors: VectorDisplayState,
@@ -122,4 +134,6 @@ pub struct SceneViewState {
     pub view_options: Option<ViewOptionsState>,
     #[serde(default)]
     pub channels: BTreeMap<ChannelId, ChannelViewState>,
+    #[serde(default)]
+    pub objects: BTreeMap<ObjectId, TrajectoryDisplayState>,
 }

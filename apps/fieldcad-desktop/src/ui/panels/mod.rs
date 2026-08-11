@@ -30,7 +30,8 @@ pub use settings::settings_window;
 // ── Re-exports for sibling sub-modules ─────────────────────────────────────
 // Used via `super::section(...)` etc. in function-body path expressions.
 pub(super) use super::{
-    CameraAction, flow_line_display_controls, section, split_add_button, vector_display_controls,
+    CameraAction, flow_line_display_controls, section, split_add_button,
+    trajectory_display_controls, vector_display_controls,
 };
 
 // ── Helpers used by tests ──────────────────────────────────────────────────

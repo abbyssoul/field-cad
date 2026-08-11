@@ -10,13 +10,13 @@ use fieldcad_core::{ChannelId, ObjectId};
 use fieldcad_scene_document::{
     CameraProjection, CameraState, ChannelViewState, FieldLayerViewState, FlowLineDisplayState,
     GizmoDisplayState, PlaneVectorModeState, PlaneViewState, RegionViewState, SceneViewState,
-    VectorDisplayState, ViewOptionsState,
+    TrajectoryDisplayState, VectorDisplayState, ViewOptionsState,
 };
 
 use crate::camera::{OrbitCamera, Projection};
 use crate::scene::{
     BoxLayerSettings, FieldLayerSettings, FlowLineDisplay, GizmoDisplay, PlaneLayerSettings,
-    PlaneVectorMode, SphereLayerSettings, VectorDisplay,
+    PlaneVectorMode, SphereLayerSettings, TrajectoryDisplay, VectorDisplay,
 };
 use crate::ui::{ChannelLayerSettings, ViewOptions};
 
@@ -25,6 +25,7 @@ pub fn capture(
     following: Option<ObjectId>,
     view: &ViewOptions,
     field_layers: &BTreeMap<ChannelId, ChannelLayerSettings>,
+    object_trajectories: &BTreeMap<ObjectId, TrajectoryDisplay>,
 ) -> SceneViewState {
     SceneViewState {
         camera: Some(capture_camera(camera)),
@@ -34,6 +35,20 @@ pub fn capture(
             .iter()
             .map(|(id, settings)| (id.clone(), capture_channel(settings)))
             .collect(),
+        objects: object_trajectories
+            .iter()
+            .map(|(id, display)| (*id, capture_trajectory(*display)))
+            .collect(),
+    }
+}
+
+fn capture_trajectory(display: TrajectoryDisplay) -> TrajectoryDisplayState {
+    TrajectoryDisplayState {
+        visible: display.visible,
+        trail_seconds: display.trail_seconds,
+        thickness_px: display.thickness_px,
+        animated: display.animated,
+        speed: display.speed,
     }
 }
 
@@ -278,6 +293,25 @@ pub fn restore_field_layers(
         .collect()
 }
 
+fn restore_trajectory(state: TrajectoryDisplayState) -> TrajectoryDisplay {
+    TrajectoryDisplay {
+        visible: state.visible,
+        trail_seconds: state.trail_seconds,
+        thickness_px: state.thickness_px,
+        animated: state.animated,
+        speed: state.speed,
+    }
+}
+
+pub fn restore_object_trajectories(
+    objects: BTreeMap<ObjectId, TrajectoryDisplayState>,
+) -> BTreeMap<ObjectId, TrajectoryDisplay> {
+    objects
+        .into_iter()
+        .map(|(id, state)| (id, restore_trajectory(state)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,10 +396,38 @@ mod tests {
                 None,
                 &ViewOptions::default(),
                 &field_layers,
+                &BTreeMap::new(),
             )
             .channels,
         );
 
         assert_eq!(restored.get(&channel), Some(&settings));
+    }
+
+    #[test]
+    fn per_object_trajectory_display_round_trips_non_default_values() {
+        let object = fieldcad_core::ObjectId::new(4);
+        let display = TrajectoryDisplay {
+            visible: true,
+            trail_seconds: 12.5,
+            thickness_px: 3.0,
+            animated: true,
+            speed: 2.0,
+        };
+        let mut object_trajectories = BTreeMap::new();
+        object_trajectories.insert(object, display);
+
+        let restored = restore_object_trajectories(
+            capture(
+                &OrbitCamera::default(),
+                None,
+                &ViewOptions::default(),
+                &BTreeMap::new(),
+                &object_trajectories,
+            )
+            .objects,
+        );
+
+        assert_eq!(restored.get(&object), Some(&display));
     }
 }

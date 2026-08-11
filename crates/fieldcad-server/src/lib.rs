@@ -22,11 +22,11 @@ use fieldcad_core::{
 use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
 use fieldcad_simulation::{
-    AsyncLocalDataSource, Command, CommandDisposition, CommandEvent, CommandId, CommandPayload,
-    CommandReceipt, CommandSequencer, DataSourceStatus, EditHistoryStatus, FieldDataSource,
-    FieldSystemStatus, IntegrationScheme, LocalDataSource, PlaybackSpeed, PluginRegistration,
-    PollOutcome, QueueStatus, QueueSummary, RuntimeConfig, RuntimeError, SimulationRuntime,
-    SimulationStatus, SourceError, Subscription,
+    AsyncLocalDataSource, BodySample, Command, CommandDisposition, CommandEvent, CommandId,
+    CommandPayload, CommandReceipt, CommandSequencer, DataSourceStatus, EditHistoryStatus,
+    FieldDataSource, FieldSystemStatus, IntegrationScheme, LocalDataSource, PlaybackSpeed,
+    PluginRegistration, PollOutcome, QueueStatus, QueueSummary, RuntimeConfig, RuntimeError,
+    SimulationRuntime, SimulationStatus, SourceError, Subscription,
 };
 use glam::DVec3;
 use tokio::sync::oneshot;
@@ -291,6 +291,23 @@ impl HeadlessServer {
         self.source.capture_document()
     }
 
+    /// Ask the worker for `object`'s current recorded kinematics history —
+    /// see `AsyncLocalDataSource::request_body_history`. Not part of
+    /// `FieldDataSource`: it queues a fetch rather than reading anything,
+    /// so it does not belong next to that trait's other read-only
+    /// accessors (`body_history` among them).
+    pub fn request_body_history(&mut self, object: ObjectId) {
+        self.source.request_body_history(object);
+    }
+
+    /// Override how many samples `object`'s recorded history keeps — see
+    /// `AsyncLocalDataSource::set_body_history_capacity`. Same "not part of
+    /// `FieldDataSource`" reasoning as `request_body_history` above: this
+    /// sets something rather than reading it.
+    pub fn set_body_history_capacity(&mut self, object: ObjectId, capacity: usize) {
+        self.source.set_body_history_capacity(object, capacity);
+    }
+
     /// Replace the inner session in place — a new/loaded scene replaces the
     /// world, domain, and field-system composition without disturbing the
     /// `Arc<Mutex<HeadlessServer>>` every attached transport (desktop UI,
@@ -381,6 +398,11 @@ impl FieldDataSource for HeadlessServer {
     // Not the trait default, for the same reason as `body_forces` above.
     fn step_compute_ms(&self) -> f32 {
         self.source.step_compute_ms()
+    }
+
+    // Not the trait default, for the same reason as `body_forces` above.
+    fn body_history(&self, object: ObjectId) -> Vec<BodySample> {
+        self.source.body_history(object)
     }
 
     // Not `self.source.execute(command)` directly: this must go through

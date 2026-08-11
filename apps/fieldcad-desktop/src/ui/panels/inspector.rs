@@ -40,6 +40,7 @@ pub fn inspector(
                             frame.compute,
                             object,
                             model.following,
+                            &mut model.object_trajectories,
                             output,
                         );
                     } else if let Some(plane) = model

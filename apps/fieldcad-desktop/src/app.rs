@@ -33,7 +33,7 @@ use fieldcad_simulation::{
     SimulationRuntime, Subscription,
 };
 use fieldcad_superposition::InverseSquareBatchEvaluator;
-use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2};
+use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2, Vec4};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -685,6 +685,8 @@ impl WindowState {
                 .map(scene_view_state::restore_view_options)
                 .unwrap_or_default();
             ui_model.field_layers = scene_view_state::restore_field_layers(view.channels);
+            ui_model.object_trajectories =
+                scene_view_state::restore_object_trajectories(view.objects);
         }
         let data_source = Arc::new(Mutex::new(HeadlessServer::new(data_source)));
         // Replay a loaded document's paused-queue write-ahead log through the
@@ -1124,6 +1126,7 @@ impl WindowState {
         let next_frame_delay = if compute.mode == fieldcad_core::SimulationMode::Running
             || self.model().pending_command_count() > 0
             || self.ui_model.has_visible_animated_flow_lines()
+            || self.ui_model.has_visible_animated_trajectories()
             || self.saving_scene.is_some()
         {
             RUNNING_FRAME_INTERVAL.min(ui_repaint_delay)
@@ -1183,6 +1186,46 @@ impl WindowState {
                 .chain(self.pending_deferred_edit.iter().flatten())
                 .collect();
             scene::append_pending_edit_ghosts(&mut overlay, &self.world, &edits, scene_scale);
+        }
+        // Trajectory trails: selection/toggle-driven like the rest of
+        // `overlay`, and cheap to skip entirely when nothing has one turned
+        // on (the common case). `set_body_history_capacity` keeps the
+        // runtime's retention for this object sized to what `trail_seconds`
+        // actually needs at the session's current `dt` (deduped against the
+        // last value sent, so a steady state costs nothing); this is what
+        // lets a long trail on a coarse-`dt` scene span more than the
+        // runtime's flat default depth without raising it for every other
+        // body too. `request_body_history` fires (and dedupes) an async
+        // fetch for next frame; `body_history` reads back whatever the most
+        // recently completed fetch found, same one-round-trip staleness
+        // tolerance the field snapshot itself already has.
+        if show.objects {
+            for (&object_id, &display) in &self.ui_model.object_trajectories {
+                if !display.visible {
+                    continue;
+                }
+                let Some(object) = self.world.object(object_id) else {
+                    continue;
+                };
+                if !object.visible {
+                    continue;
+                }
+                let mut model = self.model();
+                model.set_body_history_capacity(
+                    object_id,
+                    display.required_body_history_capacity(compute.time_step_seconds),
+                );
+                model.request_body_history(object_id);
+                let history = model.body_history(object_id);
+                drop(model);
+                scene::append_trajectory_geometry(
+                    &mut overlay,
+                    &history,
+                    display,
+                    Vec4::ONE,
+                    scene_scale,
+                );
+            }
         }
         // Kept for next frame's `ComputeView::build` to reuse whatever is
         // still current — every other use of `compute` above is a borrow, so
@@ -1326,6 +1369,13 @@ impl WindowState {
                 .spheres
                 .retain(|id, _| self.world.spheres().contains_key(id));
         }
+        // Object identifiers are never reused, so a deleted object's
+        // trajectory-display entry would otherwise linger for the rest of
+        // the session — same reasoning as `BodyHistory::retain_objects` on
+        // the runtime side.
+        self.ui_model
+            .object_trajectories
+            .retain(|id, _| self.world.object(*id).is_some());
         // Each series is bounded, but the set of them is not: probe IDs are
         // never reused, so deleted probes would accumulate for the session.
         self.probe_history
@@ -2194,12 +2244,15 @@ impl WindowState {
                     .map(scene_view_state::restore_view_options)
                     .unwrap_or_default();
                 self.ui_model.field_layers = scene_view_state::restore_field_layers(view.channels);
+                self.ui_model.object_trajectories =
+                    scene_view_state::restore_object_trajectories(view.objects);
             }
             None => {
                 self.camera = OrbitCamera::default();
                 self.ui_model.following = None;
                 self.ui_model.view = ui::ViewOptions::default();
                 self.ui_model.field_layers.clear();
+                self.ui_model.object_trajectories.clear();
             }
         }
 
@@ -2257,6 +2310,7 @@ impl WindowState {
                     self.ui_model.following,
                     &self.ui_model.view,
                     &self.ui_model.field_layers,
+                    &self.ui_model.object_trajectories,
                 ),
                 probe_history: probe_history_state::capture_probe_history(&self.probe_history),
                 distance_history: probe_history_state::capture_distance_history(

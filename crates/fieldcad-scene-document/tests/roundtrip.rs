@@ -238,6 +238,16 @@ fn view_state_round_trips_camera_follow_and_channel_settings() {
         following: Some(object_id),
         view_options: None,
         channels,
+        objects: BTreeMap::from([(
+            object_id,
+            fieldcad_scene_document::TrajectoryDisplayState {
+                visible: true,
+                trail_seconds: 7.5,
+                thickness_px: 2.0,
+                animated: true,
+                speed: 0.5,
+            },
+        )]),
     };
 
     let mut inputs = inputs(&runtime, QueueDocument::default());

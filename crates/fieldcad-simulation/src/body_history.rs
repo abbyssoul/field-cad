@@ -32,29 +32,64 @@ pub struct BodySample {
 }
 
 /// Bounded history for every dynamic body the runtime has advanced.
+///
+/// Bounded per-object, not just overall: most bodies in a scene never have a
+/// trajectory display asking for their history at all, so they stay at
+/// `default_capacity` — cheap. A body a trajectory display *is* watching can
+/// have its own capacity raised (see [`Self::set_capacity`]) to cover
+/// however long a trail was actually asked for, without paying that same
+/// memory cost on every other body in the scene.
 #[derive(Clone, Debug)]
 pub struct BodyHistory {
-    capacity: usize,
+    default_capacity: usize,
+    /// Explicit per-object overrides. Absent means `default_capacity`.
+    capacities: BTreeMap<ObjectId, usize>,
     series: BTreeMap<ObjectId, VecDeque<BodySample>>,
 }
 
 impl BodyHistory {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(default_capacity: usize) -> Self {
         Self {
-            capacity: capacity.max(1),
+            default_capacity: default_capacity.max(1),
+            capacities: BTreeMap::new(),
             series: BTreeMap::new(),
         }
     }
 
-    pub const fn capacity(&self) -> usize {
-        self.capacity
+    pub const fn default_capacity(&self) -> usize {
+        self.default_capacity
+    }
+
+    /// The capacity `object` currently records against — its own override if
+    /// one was ever set via [`Self::set_capacity`], otherwise
+    /// [`Self::default_capacity`].
+    pub fn capacity(&self, object: ObjectId) -> usize {
+        self.capacities
+            .get(&object)
+            .copied()
+            .unwrap_or(self.default_capacity)
+    }
+
+    /// Override how many samples `object` keeps, independent of every other
+    /// body's. Takes effect immediately: samples already past the new
+    /// capacity are dropped right away rather than left to age out on the
+    /// next `record`, so lowering a capacity frees the memory promptly.
+    pub fn set_capacity(&mut self, object: ObjectId, capacity: usize) {
+        let capacity = capacity.max(1);
+        self.capacities.insert(object, capacity);
+        if let Some(series) = self.series.get_mut(&object) {
+            while series.len() > capacity {
+                series.pop_front();
+            }
+        }
     }
 
     /// Record one sample for `object`, dropping the oldest sample first if the
-    /// series is already at capacity.
+    /// series is already at its (possibly overridden) capacity.
     pub fn record(&mut self, object: ObjectId, sample: BodySample) {
+        let capacity = self.capacity(object);
         let series = self.series.entry(object).or_default();
-        if series.len() == self.capacity {
+        while series.len() >= capacity {
             series.pop_front();
         }
         series.push_back(sample);
@@ -76,7 +111,8 @@ impl BodyHistory {
         self.series.clear();
     }
 
-    /// Drop the series of objects that no longer exist.
+    /// Drop the series (and any capacity override) of objects that no longer
+    /// exist.
     ///
     /// Each series is bounded, but the set of series is not: object
     /// identifiers are minted monotonically and never reused, so a session
@@ -84,6 +120,7 @@ impl BodyHistory {
     /// every one of them.
     pub fn retain_objects(&mut self, live: impl Fn(ObjectId) -> bool) {
         self.series.retain(|object, _| live(*object));
+        self.capacities.retain(|object, _| live(*object));
     }
 
     /// Objects that have at least one recorded sample.
@@ -143,5 +180,76 @@ mod tests {
         assert_eq!(history.len(kept), 1);
         assert_eq!(history.len(removed), 0);
         assert_eq!(history.tracked().count(), 1);
+    }
+
+    /// A raised per-object capacity lets that one body keep deeper history —
+    /// e.g. to cover a trajectory display's requested trail length — without
+    /// changing what any other body records against.
+    #[test]
+    fn a_raised_capacity_applies_to_only_the_one_object_it_was_set_for() {
+        let watched = ObjectId::new(0);
+        let ordinary = ObjectId::new(1);
+        let mut history = BodyHistory::new(2);
+        history.set_capacity(watched, 5);
+
+        for tick in 0..5 {
+            history.record(watched, sample(tick));
+            history.record(ordinary, sample(tick));
+        }
+
+        assert_eq!(
+            history.len(watched),
+            5,
+            "the raised object keeps every sample"
+        );
+        assert_eq!(
+            history.len(ordinary),
+            2,
+            "an object with no override still uses the default capacity"
+        );
+    }
+
+    /// Lowering a capacity below what's already recorded frees the excess
+    /// immediately, rather than waiting for enough future `record` calls to
+    /// age it out — the memory a raised-then-lowered capacity used should be
+    /// given back promptly, not linger.
+    #[test]
+    fn lowering_a_capacity_trims_existing_samples_immediately() {
+        let object = ObjectId::new(0);
+        let mut history = BodyHistory::new(10);
+        for tick in 0..10 {
+            history.record(object, sample(tick));
+        }
+        assert_eq!(history.len(object), 10);
+
+        history.set_capacity(object, 3);
+
+        let ticks: Vec<u64> = history.readings(object).map(|s| s.tick).collect();
+        assert_eq!(
+            ticks,
+            vec![7, 8, 9],
+            "trimming down keeps the newest samples, oldest first"
+        );
+    }
+
+    /// `retain_objects` must forget a deleted object's capacity override too
+    /// — otherwise a reused-looking (but never actually reused, since
+    /// identifiers are monotonic) map entry would just accumulate forever
+    /// alongside the series it used to size.
+    #[test]
+    fn deleted_objects_do_not_retain_their_capacity_override_forever() {
+        let removed = ObjectId::new(0);
+        let mut history = BodyHistory::new(2);
+        history.set_capacity(removed, 100);
+        history.record(removed, sample(0));
+
+        history.retain_objects(|_| false);
+
+        // Re-recording after the override was dropped must fall back to the
+        // default capacity, not silently keep honouring the old override.
+        for tick in 0..5 {
+            history.record(removed, sample(tick));
+        }
+        assert_eq!(history.len(removed), 2);
     }
 }

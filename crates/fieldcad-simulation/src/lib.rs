@@ -753,6 +753,35 @@ mod tests {
         assert_eq!(runtime.body_history(free).count(), 0);
     }
 
+    /// `LocalDataSource::body_history` (the `FieldDataSource` accessor a
+    /// trajectory display reads through) must report exactly what the
+    /// runtime it wraps recorded — same samples, same order, oldest first —
+    /// not a reimplementation of the recording.
+    #[test]
+    fn local_data_source_body_history_matches_the_runtime_it_wraps() {
+        let (mut runtime, free) = repelling_charges_scene(IntegrationScheme::SymplecticEuler);
+        runtime.step_once().unwrap();
+        runtime.step_once().unwrap();
+
+        let expected: Vec<_> = runtime.body_history(free).copied().collect();
+        assert_eq!(expected.len(), 2, "one recorded sample per tick");
+        assert!(
+            expected[0].time_seconds < expected[1].time_seconds,
+            "oldest sample first"
+        );
+        // Like charges repel: the free body's recorded velocity should agree
+        // with the direction `a_field_moves_a_body_through_the_dynamics_system`
+        // already established it actually moves in.
+        assert!(expected[1].velocity.x > 0.0);
+
+        let source = LocalDataSource::new(runtime);
+        assert_eq!(source.body_history(free), expected);
+        assert!(
+            source.body_history(ObjectId::new(9_999)).is_empty(),
+            "an object with no recorded history reports an empty trail, not an error"
+        );
+    }
+
     /// The force an inspector would show for a body is a byproduct of the same
     /// tick that moved it, not a second computation — so it has to agree with
     /// the direction the body actually accelerated in, and be absent before

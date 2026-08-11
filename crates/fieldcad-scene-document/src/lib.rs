@@ -36,7 +36,7 @@ pub use history::{
 pub use view::{
     CameraProjection, CameraState, ChannelViewState, FieldLayerViewState, FlowLineDisplayState,
     GizmoDisplayState, PlaneVectorModeState, PlaneViewState, RegionViewState, SceneViewState,
-    VectorDisplayState, ViewOptionsState,
+    TrajectoryDisplayState, VectorDisplayState, ViewOptionsState,
 };
 
 /// Identifies this document format. Anything else in a candidate file is

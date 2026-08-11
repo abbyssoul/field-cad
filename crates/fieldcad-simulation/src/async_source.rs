@@ -6,7 +6,7 @@
 //! boundary, not a second implementation of simulation semantics.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -22,10 +22,10 @@ use fieldcad_plugin_api::SolverCancellation;
 use glam::DVec3;
 
 use crate::{
-    Command, CommandDisposition, CommandId, CommandKind, CommandPayload, CommandReceipt,
-    CommandRecord, DataSourceStatus, EditHistoryStatus, FieldDataSource, FieldSystemStatus,
-    LocalDataSource, PlaybackSpeed, PollOutcome, QueueDocument, QueueStatus, QueueSummary,
-    SimulationStatus, SnapshotMailbox, SourceError, Subscription,
+    BodySample, Command, CommandDisposition, CommandId, CommandKind, CommandPayload,
+    CommandReceipt, CommandRecord, DataSourceStatus, EditHistoryStatus, FieldDataSource,
+    FieldSystemStatus, LocalDataSource, PlaybackSpeed, PollOutcome, QueueDocument, QueueStatus,
+    QueueSummary, SimulationStatus, SnapshotMailbox, SourceError, Subscription,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +56,17 @@ enum WorkerRequest {
     /// state as of everything already submitted before it, not jump ahead of
     /// a backlog the way a queue-control command does.
     CaptureDocument,
+    /// A one-off fetch of one body's recorded kinematics history — see
+    /// [`AsyncLocalDataSource::request_body_history`]. Unlike `Poll`, this
+    /// does not carry a fresh [`SourceState`]: it exists precisely to keep
+    /// history off that always-synced path (see `body_history`'s doc
+    /// comment on [`crate::FieldDataSource`]).
+    BodyHistory(ObjectId),
+    /// Fire-and-forget: override one body's recorded-history depth — see
+    /// [`AsyncLocalDataSource::set_body_history_capacity`]. No answering
+    /// event; the next `BodyHistory`/`Poll` a caller happens to make will
+    /// simply reflect it.
+    SetBodyHistoryCapacity(ObjectId, usize),
     Stop,
 }
 
@@ -93,6 +104,11 @@ enum WorkerEvent {
     DocumentCaptured {
         world: fieldcad_core::WorldDocument,
         queue: QueueDocument,
+    },
+    /// Answer to [`WorkerRequest::BodyHistory`].
+    BodyHistoryCaptured {
+        object: ObjectId,
+        samples: Vec<BodySample>,
     },
 }
 
@@ -164,6 +180,21 @@ pub struct AsyncLocalDataSource {
     step_compute_ms: f32,
     mailbox: SnapshotMailbox,
     poll_in_flight: bool,
+    /// Latest fetched history per object, populated on demand by
+    /// [`Self::request_body_history`] — never by [`Self::adopt`], since
+    /// history is deliberately not part of the per-poll `SourceState` sync
+    /// (see `FieldDataSource::body_history`'s doc comment).
+    body_history_cache: BTreeMap<ObjectId, Vec<BodySample>>,
+    /// Objects with a `WorkerRequest::BodyHistory` already sent but not yet
+    /// answered, so [`Self::request_body_history`] doesn't flood the worker
+    /// channel with a duplicate request every frame while one is in flight.
+    body_history_in_flight: BTreeSet<ObjectId>,
+    /// The capacity most recently sent to the worker for each object via
+    /// [`Self::set_body_history_capacity`], so a caller that recomputes and
+    /// re-requests it every frame (as the desktop's trajectory display does,
+    /// sized to `trail_seconds / dt`) only actually sends a
+    /// `WorkerRequest::SetBodyHistoryCapacity` when the value has changed.
+    body_history_capacity: BTreeMap<ObjectId, usize>,
     accumulated_elapsed: Duration,
     /// Monotonically increasing counter assigned as `sequence` on synthetic
     /// `Submitted` records so external sorters (MCP clients) see them in
@@ -226,6 +257,9 @@ impl AsyncLocalDataSource {
             step_compute_ms: initial.step_compute_ms,
             mailbox,
             poll_in_flight: false,
+            body_history_cache: BTreeMap::new(),
+            body_history_in_flight: BTreeSet::new(),
+            body_history_capacity: BTreeMap::new(),
             accumulated_elapsed: Duration::ZERO,
             command_events: Vec::new(),
             failure: None,
@@ -371,6 +405,11 @@ impl AsyncLocalDataSource {
                 // anything else through here.
                 Ok(None)
             }
+            WorkerEvent::BodyHistoryCaptured { object, samples } => {
+                self.body_history_in_flight.remove(&object);
+                self.body_history_cache.insert(object, samples);
+                Ok(None)
+            }
         }
     }
 
@@ -400,6 +439,46 @@ impl AsyncLocalDataSource {
                 }
             }
         }
+    }
+
+    /// Ask the worker for `object`'s current recorded history, non-blocking
+    /// — the answer arrives as a `WorkerEvent::BodyHistoryCaptured`, drained
+    /// on a later `drain_worker_events`/`poll` call same as any other event,
+    /// and read back through [`FieldDataSource::body_history`]. Safe (and
+    /// cheap) to call every frame for every object a trajectory display is
+    /// currently on for: a repeat call while a request is already in
+    /// flight for the same object is a no-op rather than a second send.
+    pub fn request_body_history(&mut self, object: ObjectId) {
+        if self.failure.is_some() || !self.body_history_in_flight.insert(object) {
+            return;
+        }
+        if self
+            .requests
+            .send(WorkerRequest::BodyHistory(object))
+            .is_err()
+        {
+            self.body_history_in_flight.remove(&object);
+        }
+    }
+
+    /// Override how many samples `object`'s recorded history keeps — see
+    /// [`crate::body_history::BodyHistory::set_capacity`]. Safe (and cheap)
+    /// to call every frame with a freshly recomputed value, the way the
+    /// desktop's trajectory display does (sized to `trail_seconds / dt`):
+    /// a call that repeats the capacity already sent is a no-op rather than
+    /// a second send.
+    pub fn set_body_history_capacity(&mut self, object: ObjectId, capacity: usize) {
+        if self.failure.is_some() || self.body_history_capacity.get(&object) == Some(&capacity) {
+            return;
+        }
+        if self
+            .requests
+            .send(WorkerRequest::SetBodyHistoryCapacity(object, capacity))
+            .is_err()
+        {
+            return;
+        }
+        self.body_history_capacity.insert(object, capacity);
     }
 
     fn submit_poll_if_idle(&mut self) -> Result<(), SourceError> {
@@ -504,6 +583,13 @@ impl FieldDataSource for AsyncLocalDataSource {
 
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         self.forces.clone()
+    }
+
+    fn body_history(&self, object: ObjectId) -> Vec<BodySample> {
+        self.body_history_cache
+            .get(&object)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn step_compute_ms(&self) -> f32 {
@@ -675,6 +761,20 @@ fn worker_loop(
                     break;
                 }
             }
+            Ok(WorkerRequest::BodyHistory(object)) => {
+                let event = WorkerEvent::BodyHistoryCaptured {
+                    object,
+                    samples: source.runtime().body_history(object).copied().collect(),
+                };
+                if events.send(event).is_err() {
+                    break;
+                }
+            }
+            Ok(WorkerRequest::SetBodyHistoryCapacity(object, capacity)) => {
+                source
+                    .runtime_mut()
+                    .set_body_history_capacity(object, capacity);
+            }
             Ok(WorkerRequest::Stop) => break,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -687,16 +787,16 @@ mod tests {
     use std::time::Duration;
 
     use fieldcad_core::{
-        BoundaryCondition, BoundaryConditions, Domain, DomainBounds, Precision, Resolution,
-        SessionId, TimeStep,
+        BoundaryCondition, BoundaryConditions, Domain, DomainBounds, ObjectId, Precision,
+        Resolution, SessionId, TimeStep, WorldRevision,
     };
     use fieldcad_electromagnetism::courant_limit;
     use fieldcad_test_field::TestFieldPlugin;
     use glam::DVec3;
 
     use crate::{
-        CommandPayload, CommandSequencer, DataSourceStatus, FieldDataSource, LocalDataSource,
-        RuntimeConfig, SimulationRuntime, SourceError,
+        BodySample, CommandPayload, CommandSequencer, DataSourceStatus, FieldDataSource,
+        LocalDataSource, RuntimeConfig, SimulationRuntime, SourceError,
     };
 
     use super::{AsyncLocalDataSource, WorkerEvent, WorkerRequest, worker_loop};
@@ -714,6 +814,118 @@ mod tests {
                 .with_plugin(Box::new(TestFieldPlugin)),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn requesting_body_history_dedupes_in_flight_and_populates_the_cache_once_answered() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        let object = ObjectId::new(7);
+        assert!(source.body_history(object).is_empty());
+
+        source.request_body_history(object);
+        assert!(source.body_history_in_flight.contains(&object));
+
+        // A second request for the same object while one is already in
+        // flight must not queue a duplicate — the worker channel would
+        // otherwise be spammed once per frame for every trajectory-enabled
+        // object.
+        source.request_body_history(object);
+        assert_eq!(source.body_history_in_flight.len(), 1);
+
+        let sample = BodySample {
+            tick: 3,
+            time_seconds: 0.75,
+            world_revision: WorldRevision::INITIAL,
+            position: DVec3::new(1.0, 2.0, 3.0),
+            velocity: DVec3::new(0.1, 0.0, 0.0),
+            force: DVec3::ZERO,
+        };
+        source
+            .test_events_tx
+            .send(WorkerEvent::BodyHistoryCaptured {
+                object,
+                samples: vec![sample],
+            })
+            .unwrap();
+        source.drain_worker_events().unwrap();
+
+        assert!(!source.body_history_in_flight.contains(&object));
+        assert_eq!(source.body_history(object), vec![sample]);
+    }
+
+    /// End-to-end regression for the desktop's per-frame trajectory-trail
+    /// path (`app.rs`'s `request_body_history` + `body_history` pair): a
+    /// real ticking body's recorded history must actually round-trip
+    /// through the worker, the same way `app.rs` reads it every frame.
+    #[test]
+    fn a_moving_body_s_recorded_history_round_trips_through_the_worker() {
+        use fieldcad_core::{ObjectShape, ObjectSpec, Transform, Velocity, WorldCommand};
+        use fieldcad_sources::{inertial_mass_component_id, mass_component_schemas};
+
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+
+        let mut sequencer = CommandSequencer::default();
+        let object = ObjectId::new(0);
+        let mut commands: Vec<WorldCommand> = mass_component_schemas()
+            .into_iter()
+            .map(WorldCommand::RegisterComponentSchema)
+            .collect();
+        commands.push(
+            WorldCommand::CreateObject(
+                ObjectSpec::new("free")
+                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_shape(ObjectShape::point(0.05).unwrap())
+                    .with_component(
+                        inertial_mass_component_id(),
+                        fieldcad_sources::inertial_mass_properties(
+                            fieldcad_core::quantities::MassKg::new::<
+                                fieldcad_core::quantities::kilogram,
+                            >(1.0),
+                        )
+                        .unwrap(),
+                    ),
+            ),
+        );
+        commands.push(WorldCommand::SetVelocity {
+            object,
+            velocity: Velocity::new(DVec3::new(1.0, 0.0, 0.0), DVec3::ZERO).unwrap(),
+        });
+        source
+            .execute(sequencer.issue(CommandPayload::CommitWorld(commands)))
+            .unwrap();
+        source
+            .execute(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        // Advance real ticks, the same way the desktop's per-frame `poll`
+        // does — not a single zero-elapsed poll, which would never cross a
+        // tick boundary.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            source.poll(Duration::from_millis(50)).unwrap();
+            source.request_body_history(object);
+            source.poll(Duration::ZERO).unwrap();
+            if source.body_history(object).len() >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a moving, unpinned, mass-bearing body never accumulated recorded history"
+            );
+            std::thread::yield_now();
+        }
+
+        let history = source.body_history(object);
+        assert!(
+            history
+                .windows(2)
+                .all(|pair| pair[0].time_seconds < pair[1].time_seconds),
+            "oldest sample first, strictly increasing time"
+        );
+        assert!(
+            history.last().unwrap().position.x > history.first().unwrap().position.x,
+            "a body moving at +x should show increasing x across recorded samples: {history:?}"
+        );
     }
 
     #[test]

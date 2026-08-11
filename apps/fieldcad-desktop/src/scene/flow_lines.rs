@@ -18,7 +18,7 @@ use super::interpolation::{
     MagnitudeScale, box_interpolation, field_color, grid_interpolation, plane_interpolation,
     uniform_axis, uniform_box_spacing, uniform_domain_spacing, uniform_glyph_spacing,
 };
-use super::{FlowLineDisplay, FlowRibbonVertex};
+use super::{FlowLineDisplay, FlowRibbonVertex, RibbonStyle};
 
 /// Hard cap on a streamline's reach in one direction from a seed, measured in
 /// units of the *nominal* (seed-spacing-derived) step length rather than a
@@ -277,13 +277,17 @@ fn index_in_bounds(index: &[f64], counts: &[u32]) -> bool {
 /// end vertices' `side` is therefore authored with the opposite sign of the
 /// edge they represent, which cancels the flip and keeps both ends of an
 /// edge expanding the same way.
-fn build_flow_ribbon(
+pub(super) fn build_flow_ribbon(
     polyline: &[DVec3],
-    magnitudes: &[f64],
-    scale: MagnitudeScale,
-    display: FlowLineDisplay,
+    colors: &[glam::Vec4],
+    style: RibbonStyle,
     scene_scale: SceneScale,
 ) -> Vec<FlowRibbonVertex> {
+    debug_assert_eq!(
+        polyline.len(),
+        colors.len(),
+        "one colour per polyline vertex"
+    );
     if polyline.len() < 2 {
         return Vec::new();
     }
@@ -291,11 +295,7 @@ fn build_flow_ribbon(
         .iter()
         .map(|&point| scene_scale.to_render_vec3(point))
         .collect();
-    let colors: Vec<glam::Vec4> = magnitudes
-        .iter()
-        .map(|&magnitude| field_color(scale.normalized(magnitude)).extend(1.0))
-        .collect();
-    let speed = if display.animated { display.speed } else { 0.0 };
+    let speed = if style.animated { style.speed } else { 0.0 };
 
     let mut vertices = Vec::with_capacity((render.len() - 1) * 6);
     let mut arclength = 0.0_f32;
@@ -315,7 +315,7 @@ fn build_flow_ribbon(
                     neighbor,
                     side,
                     arclength,
-                    thickness_px: display.thickness_px,
+                    thickness_px: style.thickness_px,
                     speed,
                     color,
                 }
@@ -420,15 +420,17 @@ pub(super) fn trace_domain_streamlines(
                 if polyline.len() < 2 {
                     continue;
                 }
-                let magnitudes: Vec<f64> = polyline
+                let colors: Vec<glam::Vec4> = polyline
                     .iter()
-                    .map(|&point| sample(point).map_or(0.0, |value| value.length()))
+                    .map(|&point| {
+                        let magnitude = sample(point).map_or(0.0, |value| value.length());
+                        field_color(scale.normalized(magnitude)).extend(1.0)
+                    })
                     .collect();
                 vertices.extend(build_flow_ribbon(
                     &polyline,
-                    &magnitudes,
-                    scale,
-                    display,
+                    &colors,
+                    display.into(),
                     scene_scale,
                 ));
                 if vertices.len() >= MAX_RIBBON_VERTICES {
@@ -496,15 +498,17 @@ pub(super) fn trace_box_streamlines(
                 if polyline.len() < 2 {
                     continue;
                 }
-                let magnitudes: Vec<f64> = polyline
+                let colors: Vec<glam::Vec4> = polyline
                     .iter()
-                    .map(|&point| sample(point).map_or(0.0, |value| value.length()))
+                    .map(|&point| {
+                        let magnitude = sample(point).map_or(0.0, |value| value.length());
+                        field_color(scale.normalized(magnitude)).extend(1.0)
+                    })
                     .collect();
                 vertices.extend(build_flow_ribbon(
                     &polyline,
-                    &magnitudes,
-                    scale,
-                    display,
+                    &colors,
+                    display.into(),
                     scene_scale,
                 ));
                 if vertices.len() >= MAX_RIBBON_VERTICES {
@@ -573,15 +577,17 @@ pub(super) fn trace_sphere_streamlines(
                 if polyline.len() < 2 {
                     continue;
                 }
-                let magnitudes: Vec<f64> = polyline
+                let colors: Vec<glam::Vec4> = polyline
                     .iter()
-                    .map(|&point| sample(point).map_or(0.0, |value| value.length()))
+                    .map(|&point| {
+                        let magnitude = sample(point).map_or(0.0, |value| value.length());
+                        field_color(scale.normalized(magnitude)).extend(1.0)
+                    })
                     .collect();
                 vertices.extend(build_flow_ribbon(
                     &polyline,
-                    &magnitudes,
-                    scale,
-                    display,
+                    &colors,
+                    display.into(),
                     scene_scale,
                 ));
                 if vertices.len() >= MAX_RIBBON_VERTICES {
@@ -647,15 +653,17 @@ pub(super) fn trace_plane_streamlines(
             if polyline.len() < 2 {
                 continue;
             }
-            let magnitudes: Vec<f64> = polyline
+            let colors: Vec<glam::Vec4> = polyline
                 .iter()
-                .map(|&point| sample(point).map_or(0.0, |value| value.length()))
+                .map(|&point| {
+                    let magnitude = sample(point).map_or(0.0, |value| value.length());
+                    field_color(scale.normalized(magnitude)).extend(1.0)
+                })
                 .collect();
             vertices.extend(build_flow_ribbon(
                 &polyline,
-                &magnitudes,
-                scale,
-                display,
+                &colors,
+                display.into(),
                 scene_scale,
             ));
             if vertices.len() >= MAX_RIBBON_VERTICES {
@@ -1025,12 +1033,11 @@ mod tests {
     #[test]
     fn build_flow_ribbon_alternates_sides_and_accumulates_arclength() {
         let polyline = vec![DVec3::ZERO, DVec3::X, DVec3::new(2.0, 0.0, 0.0)];
-        let magnitudes = vec![1.0, 1.0, 1.0];
+        let colors = vec![glam::Vec4::ONE; 3];
         let vertices = build_flow_ribbon(
             &polyline,
-            &magnitudes,
-            MagnitudeScale { maximum: 1.0 },
-            FlowLineDisplay::new(true, 4),
+            &colors,
+            FlowLineDisplay::new(true, 4).into(),
             SceneScale::metre(),
         );
 
@@ -1055,9 +1062,8 @@ mod tests {
         assert!(
             build_flow_ribbon(
                 &[DVec3::ZERO],
-                &[1.0],
-                MagnitudeScale { maximum: 1.0 },
-                FlowLineDisplay::new(true, 4),
+                &[glam::Vec4::ONE],
+                FlowLineDisplay::new(true, 4).into(),
                 SceneScale::metre(),
             )
             .is_empty()

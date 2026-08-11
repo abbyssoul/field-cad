@@ -16,6 +16,7 @@ mod flow_lines;
 mod gizmo;
 mod interpolation;
 mod pick;
+mod trajectory;
 
 pub use authoring::{
     SceneVisibility, append_authoring_geometry, append_compute_bounds, append_pending_edit_ghosts,
@@ -30,6 +31,7 @@ pub use gizmo::{
     selection_gizmo_length_with_display, selection_origin, view_plane_translation,
 };
 pub use pick::pick_scene;
+pub use trajectory::append_trajectory_geometry;
 
 use fieldcad_core::{
     BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SampleGeometry, SceneScale, SphereId,
@@ -190,6 +192,140 @@ impl FlowLineDisplay {
 impl Default for FlowLineDisplay {
     fn default() -> Self {
         Self::new(false, 12)
+    }
+}
+
+/// The subset of a ribbon layer's settings [`build_flow_ribbon`] actually
+/// needs to expand a polyline into a ribbon and drive its animation —
+/// shared between [`FlowLineDisplay`] (seeded through a field) and
+/// [`TrajectoryDisplay`] (traced from recorded history) so both can build
+/// ribbons through the same code without either display type carrying
+/// fields the other has no use for (a trajectory has no seed `density`, a
+/// streamline layer has no `trail_seconds`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RibbonStyle {
+    pub thickness_px: f32,
+    pub animated: bool,
+    pub speed: f32,
+}
+
+impl From<FlowLineDisplay> for RibbonStyle {
+    fn from(display: FlowLineDisplay) -> Self {
+        Self {
+            thickness_px: display.thickness_px,
+            animated: display.animated,
+            speed: display.speed,
+        }
+    }
+}
+
+impl From<TrajectoryDisplay> for RibbonStyle {
+    fn from(display: TrajectoryDisplay) -> Self {
+        Self {
+            thickness_px: display.thickness_px,
+            animated: display.animated,
+            speed: display.speed,
+        }
+    }
+}
+
+/// How one object's recent motion is drawn as a trailing ribbon, traced from
+/// its recorded [`fieldcad_simulation::BodySample`] history rather than
+/// seeded through a field — the object-trajectory counterpart to
+/// [`FlowLineDisplay`]. No `density`: there is nothing to seed, the trail is
+/// exactly the recorded path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrajectoryDisplay {
+    pub visible: bool,
+    /// How far back in time to draw, in *simulated* seconds — not a sample
+    /// count, since how many recorded samples that spans depends on the
+    /// simulation's own time step. `app.rs` converts this to a sample count
+    /// every frame (see [`Self::required_body_history_capacity`]) and asks
+    /// the runtime to keep that many for this specific object via
+    /// `AsyncLocalDataSource::set_body_history_capacity` — the runtime's
+    /// default retention (`fieldcad_core::DEFAULT_BODY_HISTORY` samples)
+    /// only applies to a body nothing has asked to raise.
+    pub trail_seconds: f32,
+    pub thickness_px: f32,
+    pub animated: bool,
+    /// Scroll rate along the ribbon, in ribbon-lengths per second. Only
+    /// meaningful while `animated` is set.
+    pub speed: f32,
+}
+
+/// Hard ceiling on what [`TrajectoryDisplay::required_body_history_capacity`]
+/// will ever ask the runtime to retain for one body, regardless of how large
+/// `trail_seconds` is set against how small the session's `dt` is. Without
+/// this, an astronomical-scale trail (hours or days) requested against a
+/// lab-scale time step (fractions of a second) would divide out to millions
+/// of samples for a single watched body. 200,000 samples is already ~19 MB
+/// of `BodySample` per body at that ceiling — generous for what this feature
+/// is for, and a body actually needing more than that many recorded points
+/// to read as a trail is not a case raising the ceiling further would fix.
+const MAX_BODY_HISTORY_CAPACITY: usize = 200_000;
+
+/// The sample count `trail_seconds` would need at `time_step_seconds` to be
+/// covered exactly, *before* [`MAX_BODY_HISTORY_CAPACITY`] clamps it — shared
+/// by [`TrajectoryDisplay::required_body_history_capacity`] (which needs the
+/// clamped value to actually request) and
+/// [`TrajectoryDisplay::capacity_is_clamped`] (which needs to know whether
+/// clamping happened at all), so the two can't drift apart on the margin or
+/// rounding they use.
+///
+/// One tick of margin over the raw division covers
+/// `append_trajectory_geometry`'s own "always keep at least the two most
+/// recent samples" floor landing exactly on a tick boundary. Never below 2:
+/// nothing shorter can draw a line at all.
+///
+/// `time_step_seconds` is taken as given, not validated: an invalid value
+/// (zero, negative, `NaN`, infinite) divides out to a `ticks` that is itself
+/// zero, negative, `NaN`, or infinite, and Rust's `as usize` float cast
+/// already saturates every one of those to a safe in-range value —
+/// `0`/negative/`NaN` to `0`, infinity to `usize::MAX` — before the final
+/// `max` runs, so no separate check is needed here.
+fn unclamped_required_ticks(trail_seconds: f32, time_step_seconds: f64) -> usize {
+    let ticks = (f64::from(trail_seconds.max(0.0)) / time_step_seconds).ceil();
+    (ticks as usize).saturating_add(1).max(2)
+}
+
+impl TrajectoryDisplay {
+    pub const fn new(visible: bool, trail_seconds: f32) -> Self {
+        Self {
+            visible,
+            trail_seconds,
+            thickness_px: 1.5,
+            animated: false,
+            speed: 1.0,
+        }
+    }
+
+    /// How many samples the runtime needs to retain for this display's
+    /// object to cover its own `trail_seconds` at the session's current
+    /// `time_step_seconds` — what `app.rs` sends through
+    /// `AsyncLocalDataSource::set_body_history_capacity` every frame this
+    /// display is on.
+    pub fn required_body_history_capacity(self, time_step_seconds: f64) -> usize {
+        unclamped_required_ticks(self.trail_seconds, time_step_seconds)
+            .min(MAX_BODY_HISTORY_CAPACITY)
+    }
+
+    /// Whether [`MAX_BODY_HISTORY_CAPACITY`] — not `trail_seconds` itself —
+    /// is what would keep this display's trail from ever reaching as far
+    /// back as requested, at the session's current `time_step_seconds`. For
+    /// a UI hint explaining a shorter-than-asked-for trail.
+    ///
+    /// Independent of how long the session has actually been running:
+    /// `false` here means capacity isn't the limiting factor, not that the
+    /// trail is already that long — a fresh session still needs simulated
+    /// time to pass before `trail_seconds` of history exists to show at all.
+    pub fn capacity_is_clamped(self, time_step_seconds: f64) -> bool {
+        unclamped_required_ticks(self.trail_seconds, time_step_seconds) > MAX_BODY_HISTORY_CAPACITY
+    }
+}
+
+impl Default for TrajectoryDisplay {
+    fn default() -> Self {
+        Self::new(false, 5.0)
     }
 }
 
@@ -784,5 +920,75 @@ mod tests {
 
         assert_eq!(centre, Vec3::new(0.0, -3.0, 0.0));
         assert!(radius >= 0.5);
+    }
+
+    /// Regression for the follow-up report: an astronomical-scale session
+    /// (`dt = 30 s`) asking for a multi-hour trail used to be capped at
+    /// `DEFAULT_BODY_HISTORY` (2048) samples regardless of what it actually
+    /// needed — visibly short of a full orbit. This is the arithmetic behind
+    /// the per-object `set_body_history_capacity` request that replaces that
+    /// fixed cap: a 17-hour trail at a 30-second time step needs the trail
+    /// span divided by the tick length, not a constant.
+    #[test]
+    fn required_body_history_capacity_covers_the_requested_trail_at_the_current_time_step() {
+        let display = TrajectoryDisplay::new(true, 17.0 * 3_600.0);
+        let capacity = display.required_body_history_capacity(30.0);
+        // 17h / 30s = 2040 ticks, plus this function's one-tick margin.
+        assert_eq!(capacity, 2041);
+    }
+
+    #[test]
+    fn required_body_history_capacity_never_drops_below_two() {
+        let display = TrajectoryDisplay::new(true, 0.0);
+        assert_eq!(display.required_body_history_capacity(1.0), 2);
+    }
+
+    /// An extreme trail-length-versus-time-step combination (an
+    /// astronomical trail against a lab-scale `dt`) must clamp to a bounded
+    /// amount of memory rather than dividing out to millions of samples for
+    /// one body.
+    #[test]
+    fn required_body_history_capacity_clamps_to_the_defensive_ceiling() {
+        let display = TrajectoryDisplay::new(true, 1.0e7);
+        assert_eq!(
+            display.required_body_history_capacity(1.0e-6),
+            MAX_BODY_HISTORY_CAPACITY
+        );
+    }
+
+    /// `capacity_is_clamped` is the inspector hint's way of telling "the
+    /// trail is short because the ceiling was hit" apart from "the trail is
+    /// short because the sim hasn't run long enough yet" — it must agree
+    /// with whichever case `required_body_history_capacity` actually landed
+    /// in for the same inputs.
+    #[test]
+    fn capacity_is_clamped_agrees_with_whether_required_capacity_hit_the_ceiling() {
+        let unclamped = TrajectoryDisplay::new(true, 17.0 * 3_600.0);
+        assert!(!unclamped.capacity_is_clamped(30.0));
+        assert!(unclamped.required_body_history_capacity(30.0) < MAX_BODY_HISTORY_CAPACITY);
+
+        let clamped = TrajectoryDisplay::new(true, 1.0e7);
+        assert!(clamped.capacity_is_clamped(1.0e-6));
+        assert_eq!(
+            clamped.required_body_history_capacity(1.0e-6),
+            MAX_BODY_HISTORY_CAPACITY
+        );
+    }
+
+    /// A degenerate `time_step_seconds` (zero, negative, non-finite — should
+    /// never happen, but this function takes it as given rather than
+    /// validating it) must still return an in-range capacity instead of
+    /// panicking or producing a nonsensical one.
+    #[test]
+    fn required_body_history_capacity_tolerates_a_degenerate_time_step() {
+        let display = TrajectoryDisplay::new(true, 30.0);
+        for time_step_seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let capacity = display.required_body_history_capacity(time_step_seconds);
+            assert!(
+                (2..=MAX_BODY_HISTORY_CAPACITY).contains(&capacity),
+                "time_step_seconds={time_step_seconds} produced out-of-range capacity \
+                 {capacity}"
+            );
+        }
     }
 }

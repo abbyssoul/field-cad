@@ -249,6 +249,13 @@ pub struct UiModel {
     pub distance_probe_series: BTreeMap<DistanceProbeId, DistanceProbeSeries>,
     /// Independent visualization state for every published vector channel.
     pub field_layers: BTreeMap<ChannelId, ChannelLayerSettings>,
+    /// Per-object motion-trail display, keyed by the object it traces.
+    /// Absent means off, matching `FlowLineDisplay::default()`'s
+    /// off-by-default convention for anything heavier than an arrow glyph.
+    /// Pruned in `App::refresh_world` against the live world, the same
+    /// reasoning `fieldcad_simulation::BodyHistory::retain_objects`
+    /// documents for its own per-object map.
+    pub object_trajectories: BTreeMap<ObjectId, crate::scene::TrajectoryDisplay>,
     /// Most recent asynchronous command rejection, retained until a later
     /// command succeeds so the user can act on it rather than consult a log.
     pub command_error: Option<String>,
@@ -310,6 +317,7 @@ impl UiModel {
             distance_probe_plots: BTreeSet::new(),
             distance_probe_series: BTreeMap::new(),
             field_layers: BTreeMap::new(),
+            object_trajectories: BTreeMap::new(),
             command_error: None,
             domain_draft: None,
             mcp_panel_open: false,
@@ -358,6 +366,18 @@ impl UiModel {
                         .values()
                         .any(|settings| settings.visible && animated(settings.flow_lines)))
         })
+    }
+
+    /// Whether any object trajectory trail is both visible and animated —
+    /// the trajectory counterpart to [`Self::has_visible_animated_flow_lines`],
+    /// for the same reason: a paused simulation with an animated trail still
+    /// needs the render loop to keep waking up on its own for the scroll to
+    /// read as motion. A *running* simulation already forces redraws every
+    /// tick regardless, which is when a trail's shape is actually changing.
+    pub fn has_visible_animated_trajectories(&self) -> bool {
+        self.object_trajectories
+            .values()
+            .any(|display| display.visible && display.animated)
     }
 
     /// The staged domain edit, kept only while the authoritative domain it
@@ -844,6 +864,117 @@ fn flow_line_display_controls(
     });
 }
 
+/// Trail-length, thickness, and animation controls for one object's motion
+/// trajectory — the recorded-history counterpart to
+/// [`flow_line_display_controls`]. No density control: a trajectory has
+/// nothing to seed, the trail is exactly the recorded path.
+fn trajectory_display_controls(
+    ui: &mut egui::Ui,
+    display: &mut crate::scene::TrajectoryDisplay,
+    label: &str,
+    hover: &str,
+    compute: &ComputeView,
+) {
+    ui.checkbox(&mut display.visible, label)
+        .on_hover_text(hover);
+    ui.add_enabled_ui(display.visible, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Trail length");
+            // `trail_seconds` is *simulated* seconds (`BodySample::time_seconds`,
+            // driven by the session's own `dt`), not wall-clock ones — an
+            // astronomical-scale scene routinely ticks in tens of seconds,
+            // hours, or days per step, so a fixed numeric range here would
+            // either be unusable for such a session (too low a cap) or force
+            // typing an awkward number of zeroes (too high a bare-`f64` one).
+            // Reusing `TimeStep`'s own parser/formatter — the same one the
+            // transport bar's `dt` field already uses — gets both `min`/`h`
+            // suffixes and no real upper bound for free, and keeps "how you
+            // type a duration" consistent across the two controls. The real
+            // ceiling is already how deep the simulation's own recorded
+            // history goes (see the hover text below and
+            // `append_trajectory_geometry`'s doc comment), not anything this
+            // range needs to guess.
+            let mut seconds = f64::from(display.trail_seconds);
+            let drag_speed = compute::time_step_drag_speed(seconds);
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut seconds)
+                        .speed(drag_speed)
+                        .range(f64::from_bits(1)..=f64::from(f32::MAX))
+                        .custom_formatter(|seconds, _| compute::format_time_step(seconds))
+                        .custom_parser(|text| {
+                            text.parse::<fieldcad_core::TimeStep>()
+                                .ok()
+                                .map(fieldcad_core::TimeStep::seconds)
+                        })
+                        .update_while_editing(false),
+                )
+                .on_hover_text(
+                    "How far back in time to draw, in *simulated* seconds (not wall-clock \
+                     ones) — driven by the session's own time step. Capped in practice by \
+                     how deep the simulation's own recorded history goes. Drag to adjust, \
+                     or click to enter text; examples: 4.43e-3, 1.23ns, 30min, 17h.",
+                );
+            if response.changed() {
+                display.trail_seconds = seconds as f32;
+            }
+
+            ui.label("Thickness");
+            ui.add(
+                egui::DragValue::new(&mut display.thickness_px)
+                    .speed(0.05)
+                    .range(0.5..=24.0)
+                    .suffix(" px"),
+            )
+            .on_hover_text("Ribbon width, in screen pixels, independent of zoom.");
+        });
+        // Both conditions below are cheap, purely local comparisons against
+        // `ComputeView` fields the panel already has — no extra plumbing —
+        // so this can run every frame without waiting on a round trip to the
+        // worker. They're mutually exclusive in what they report on
+        // purpose: a trail that's currently short could be short because it
+        // hasn't had time to grow yet, or because it never can grow past the
+        // capacity ceiling — conflating the two would tell a user to "just
+        // wait" for something that will never arrive, or vice versa.
+        let dt = compute.time_step_seconds;
+        let requested = f64::from(display.trail_seconds);
+        if display.capacity_is_clamped(dt) {
+            let capacity = display.required_body_history_capacity(dt);
+            let capacity_seconds = capacity as f64 * dt;
+            ui.weak(format!(
+                "Capped at {capacity} recorded samples (~{}) at the current time step — \
+                 the requested {} can't be reached without a coarser time step or a \
+                 shorter trail.",
+                compute::format_time_step(capacity_seconds),
+                compute::format_time_step(requested),
+            ))
+            .on_hover_text(
+                "Each watched object's history buffer has a fixed ceiling to bound \
+                 memory use, however long the simulation keeps running.",
+            );
+        } else if compute.time_seconds < requested {
+            ui.weak(format!(
+                "Still filling in — only {} of simulated time has run so far, of the {} \
+                 trail requested.",
+                compute::format_time_step(compute.time_seconds.max(0.0)),
+                compute::format_time_step(requested),
+            ));
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut display.animated, "Animated")
+                .on_hover_text("Scroll a moving pattern along the trail to show travel direction.");
+            ui.add_enabled(
+                display.animated,
+                egui::DragValue::new(&mut display.speed)
+                    .speed(0.02)
+                    .range(0.0..=10.0)
+                    .suffix(" /s"),
+            )
+            .on_hover_text("Animation speed.");
+        });
+    });
+}
+
 /// One foldable group, in the single style both side panels use.
 ///
 /// A scene grows without bound and an inspected subject can carry more than
@@ -1075,6 +1206,30 @@ mod tests {
         layer.visible = false;
         model.field_layers.insert(channel, layer);
         assert!(!model.has_visible_animated_flow_lines());
+    }
+
+    #[test]
+    fn has_visible_animated_trajectories_requires_visible_and_animated_together() {
+        let mut model = UiModel::new();
+        assert!(!model.has_visible_animated_trajectories());
+
+        let object = fieldcad_core::ObjectId::new(0);
+        model
+            .object_trajectories
+            .insert(object, crate::scene::TrajectoryDisplay::new(true, 5.0));
+        assert!(
+            !model.has_visible_animated_trajectories(),
+            "visible but not animated must not force redraws"
+        );
+
+        model.object_trajectories.get_mut(&object).unwrap().animated = true;
+        assert!(model.has_visible_animated_trajectories());
+
+        model.object_trajectories.get_mut(&object).unwrap().visible = false;
+        assert!(
+            !model.has_visible_animated_trajectories(),
+            "animated but hidden must not force redraws either"
+        );
     }
 
     pub(super) fn seeded_world() -> World {

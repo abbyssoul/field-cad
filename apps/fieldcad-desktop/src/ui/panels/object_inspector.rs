@@ -1,6 +1,8 @@
 //! Inspector sections for editing an object's properties: placement, shape,
 //! motion, components, and derived values.
 
+use std::collections::BTreeMap;
+
 use fieldcad_core::{
     Dimension, ObjectId, ObjectShape, PropertyBag, PropertyKind, PropertySchema, PropertyValue,
     Quantity, Transform, VectorQuantity, Velocity, WorldCommand, WorldObject, WorldSnapshot,
@@ -11,6 +13,7 @@ use glam::DVec3;
 
 use super::scene_tree::DEFAULT_AUTHORING_RADIUS;
 use super::{coordinate_editor, name_editor, note_held_edit};
+use crate::scene::TrajectoryDisplay;
 use crate::ui::compute::{ComputeView, format_engineering};
 use crate::ui::{CameraAction, UiFrameOutput};
 
@@ -20,6 +23,7 @@ pub(super) fn object_properties(
     compute: &ComputeView,
     object: &WorldObject,
     following: Option<ObjectId>,
+    object_trajectories: &mut BTreeMap<ObjectId, TrajectoryDisplay>,
     output: &mut UiFrameOutput,
 ) {
     if let Some(name) = name_editor(ui, ("object_name", object.id), &object.name) {
@@ -39,6 +43,17 @@ pub(super) fn object_properties(
             derived_values(ui, compute, object, mass_kg);
         });
     }
+    super::section(ui, "inspector_trajectory", "Trajectory", false, |ui| {
+        let display = object_trajectories.entry(object.id).or_default();
+        super::trajectory_display_controls(
+            ui,
+            display,
+            "Show trail",
+            "Trace this object's recent motion as a flow-line-style trail, built \
+             from its recorded position/velocity history.",
+            compute,
+        );
+    });
 
     ui.add_space(10.0);
     ui.horizontal(|ui| {

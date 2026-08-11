@@ -22,6 +22,7 @@ use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 use crate::async_source::CommandEvent;
+use crate::body_history::BodySample;
 use crate::runtime::{
     EditHistoryStatus, FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus,
     Subscription, TickPacer,
@@ -544,6 +545,20 @@ pub trait FieldDataSource: Send {
     /// the rest of this trait: nothing reads this to decide a physical result.
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         BTreeMap::new()
+    }
+
+    /// One body's recent kinematics history, oldest sample first — for an
+    /// optional trajectory-trail display, not for anything a physical result
+    /// depends on. Unlike `body_forces`, deliberately *not* synced
+    /// unconditionally on every poll: a history can be
+    /// `DEFAULT_BODY_HISTORY` (2048) samples deep, so a source backed by a
+    /// background worker (see `AsyncLocalDataSource`) fetches this on
+    /// demand instead of cloning it into every per-frame state sync.  Empty
+    /// for an object with no recorded history (never advanced, already
+    /// deleted, or a source that hasn't fetched it yet).
+    fn body_history(&self, object: ObjectId) -> Vec<BodySample> {
+        let _ = object;
+        Vec::new()
     }
 
     /// Wall-clock milliseconds the most recent simulation tick took to
@@ -1285,6 +1300,10 @@ impl FieldDataSource for LocalDataSource {
 
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         self.core.runtime.body_forces()
+    }
+
+    fn body_history(&self, object: ObjectId) -> Vec<BodySample> {
+        self.core.runtime.body_history(object).copied().collect()
     }
 
     fn step_compute_ms(&self) -> f32 {

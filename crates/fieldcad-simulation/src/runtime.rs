@@ -1462,6 +1462,15 @@ impl SimulationRuntime {
         self.body_history.readings(object)
     }
 
+    /// Override how many samples `object`'s history keeps, independent of
+    /// every other body's — see [`BodyHistory::set_capacity`]. A trajectory
+    /// display asking for a longer trail than the default depth affords
+    /// raises this for just the object it's watching, rather than paying
+    /// that memory cost on every body in the scene.
+    pub fn set_body_history_capacity(&mut self, object: ObjectId, capacity: usize) {
+        self.body_history.set_capacity(object, capacity);
+    }
+
     /// Wall-clock milliseconds `apply_tick` took to complete the most recent
     /// tick. Zero before the first tick runs.
     pub fn last_tick_compute_ms(&self) -> f32 {
