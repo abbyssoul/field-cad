@@ -1192,6 +1192,14 @@ impl WindowState {
         if self.ui_model.view.compute_bounds {
             scene::append_compute_bounds(&mut overlay, compute.domain.bounds(), scene_scale);
         }
+        if self.ui_model.view.show_cells {
+            scene::append_domain_cells(
+                &mut overlay,
+                compute.domain.bounds(),
+                compute.domain.resolution().cells(),
+                scene_scale,
+            );
+        }
         if !self.deferred_edits.is_empty() || self.pending_deferred_edit.is_some() {
             let edits: Vec<&WorldCommand> = self
                 .deferred_edits

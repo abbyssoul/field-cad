@@ -9,7 +9,7 @@ use fieldcad_core::{
     DEFAULT_PROXY_RADIUS, DomainBounds, FieldBox, FieldSphere, MassAggregateProbeId,
     MassAggregateSample, ProbePosition, SceneScale, SlicePlane, WorldCommand, WorldSnapshot,
 };
-use glam::{DVec3, Quat, Vec3, Vec4};
+use glam::{DVec3, Quat, UVec3, Vec3, Vec4};
 
 use super::{
     FieldGeometry, SceneSelection, push_circle, push_dashed_line, push_line, push_quad,
@@ -509,6 +509,92 @@ pub fn append_compute_bounds(
     );
 }
 
+/// Grid lines on the compute bounds' six faces, marking where the solver
+/// subdivides the domain into `cells`. Draws only on the outer faces rather
+/// than a full volumetric grid: together the three opposing face pairs
+/// already show cell spacing along all three axes, at a cost that scales
+/// with `cells.x + cells.y + cells.z` rather than their product — a full
+/// interior grid would be mostly lines occluded by the very faces this
+/// draws, for orders of magnitude more geometry.
+pub fn append_domain_cells(
+    geometry: &mut FieldGeometry,
+    bounds: DomainBounds,
+    cells: UVec3,
+    scene_scale: SceneScale,
+) {
+    let min = scene_scale.to_render_vec3(bounds.min());
+    let max = scene_scale.to_render_vec3(bounds.max());
+    let color = Vec4::new(0.25, 0.75, 1.0, 0.4);
+
+    let lerp = |from: f32, to: f32, count: u32, index: u32| {
+        from + (to - from) * (index as f32 / count as f32)
+    };
+
+    // Faces perpendicular to X: a Y/Z grid at x = min.x and x = max.x.
+    for x in [min.x, max.x] {
+        for j in 0..=cells.y {
+            let y = lerp(min.y, max.y, cells.y, j);
+            push_line(
+                &mut geometry.vector_lines,
+                Vec3::new(x, y, min.z),
+                Vec3::new(x, y, max.z),
+                color,
+            );
+        }
+        for k in 0..=cells.z {
+            let z = lerp(min.z, max.z, cells.z, k);
+            push_line(
+                &mut geometry.vector_lines,
+                Vec3::new(x, min.y, z),
+                Vec3::new(x, max.y, z),
+                color,
+            );
+        }
+    }
+    // Faces perpendicular to Y: an X/Z grid at y = min.y and y = max.y.
+    for y in [min.y, max.y] {
+        for i in 0..=cells.x {
+            let x = lerp(min.x, max.x, cells.x, i);
+            push_line(
+                &mut geometry.vector_lines,
+                Vec3::new(x, y, min.z),
+                Vec3::new(x, y, max.z),
+                color,
+            );
+        }
+        for k in 0..=cells.z {
+            let z = lerp(min.z, max.z, cells.z, k);
+            push_line(
+                &mut geometry.vector_lines,
+                Vec3::new(min.x, y, z),
+                Vec3::new(max.x, y, z),
+                color,
+            );
+        }
+    }
+    // Faces perpendicular to Z: an X/Y grid at z = min.z and z = max.z.
+    for z in [min.z, max.z] {
+        for i in 0..=cells.x {
+            let x = lerp(min.x, max.x, cells.x, i);
+            push_line(
+                &mut geometry.vector_lines,
+                Vec3::new(x, min.y, z),
+                Vec3::new(x, max.y, z),
+                color,
+            );
+        }
+        for j in 0..=cells.y {
+            let y = lerp(min.y, max.y, cells.y, j);
+            push_line(
+                &mut geometry.vector_lines,
+                Vec3::new(min.x, y, z),
+                Vec3::new(max.x, y, z),
+                color,
+            );
+        }
+    }
+}
+
 fn append_box_visual(
     geometry: &mut FieldGeometry,
     origin: Vec3,
@@ -769,6 +855,28 @@ mod tests {
 
         assert!(!geometry.surface_triangles.is_empty());
         assert!(!geometry.vector_lines.is_empty());
+    }
+
+    #[test]
+    fn domain_cells_draw_only_the_six_face_grids_not_a_full_interior_lattice() {
+        let mut geometry = FieldGeometry::default();
+        let cells = UVec3::new(2, 3, 4);
+        append_domain_cells(
+            &mut geometry,
+            fieldcad_core::DomainBounds::centred_cube(2.0).unwrap(),
+            cells,
+            SceneScale::metre(),
+        );
+
+        // Pure wireframe: no filled geometry, unlike `append_compute_bounds`.
+        assert!(geometry.surface_triangles.is_empty());
+        // Cost scales with the sum of the per-axis cell counts, not their
+        // product: 2 vertices per `push_line`, 4 face-grid lines per
+        // subdivision on each axis (see `append_domain_cells`'s doc
+        // comment) — not `O(cells.x * cells.y * cells.z)`, which a full
+        // interior grid would cost instead.
+        let expected_lines = 4 * (cells.x + 1 + cells.y + 1 + cells.z + 1);
+        assert_eq!(geometry.vector_lines.len(), (expected_lines * 2) as usize);
     }
 
     #[test]

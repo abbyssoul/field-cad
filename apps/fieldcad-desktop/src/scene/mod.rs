@@ -19,7 +19,8 @@ mod pick;
 mod trajectory;
 
 pub use authoring::{
-    SceneVisibility, append_authoring_geometry, append_compute_bounds, append_pending_edit_ghosts,
+    SceneVisibility, append_authoring_geometry, append_compute_bounds, append_domain_cells,
+    append_pending_edit_ghosts,
 };
 pub use field::field_geometry;
 pub(crate) use field::region_geometry;

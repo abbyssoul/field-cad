@@ -113,6 +113,14 @@ pub struct ViewOptionsState {
     pub objects: bool,
     pub auxiliary_objects: bool,
     pub compute_bounds: bool,
+    /// `#[serde(default)]`: a document saved before this field existed
+    /// already has a `view_options` object in its JSON (unlike a document
+    /// that predates `ViewOptionsState` entirely, which the outer
+    /// `Option<ViewOptionsState>` on `SceneViewState::view_options`
+    /// handles) — just without this one key, which must not fail the whole
+    /// object's deserialization.
+    #[serde(default)]
+    pub show_cells: bool,
     pub gizmo_display: GizmoDisplayState,
     pub probes: bool,
     pub planes: bool,

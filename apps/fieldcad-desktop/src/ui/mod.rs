@@ -132,6 +132,11 @@ pub struct ViewOptions {
     /// The region the active solver discretizes. This is not an authored scene
     /// object, so it remains independent of auxiliary-object visibility.
     pub compute_bounds: bool,
+    /// Grid lines on the compute bounds' six faces marking where the solver
+    /// subdivides the domain into cells — troubleshooting aid for cell size
+    /// and spacing, independent of `compute_bounds` itself so either can be
+    /// shown without the other.
+    pub show_cells: bool,
     pub gizmo_display: GizmoDisplay,
     pub probes: bool,
     pub planes: bool,
@@ -147,6 +152,7 @@ impl Default for ViewOptions {
             objects: true,
             auxiliary_objects: true,
             compute_bounds: false,
+            show_cells: false,
             gizmo_display: GizmoDisplay::default(),
             probes: true,
             planes: true,

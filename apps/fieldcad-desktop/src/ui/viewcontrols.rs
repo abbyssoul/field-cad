@@ -322,6 +322,8 @@ fn display_toggles(ui: &mut egui::Ui, view: &mut ViewOptions) {
         .show(ui, |ui| {
             ui.checkbox(&mut view.compute_bounds, "Bounds")
                 .on_hover_text("The spatial extent of the active computation; this does not change the solver domain");
+            ui.checkbox(&mut view.show_cells, "Cells")
+                .on_hover_text("Grid lines on the domain's faces marking cell size and spacing, for troubleshooting");
         });
     egui::CollapsingHeader::new("Transform gizmo")
         .default_open(false)

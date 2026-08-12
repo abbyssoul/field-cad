@@ -73,6 +73,7 @@ fn capture_view_options(view: &ViewOptions) -> ViewOptionsState {
         objects: view.objects,
         auxiliary_objects: view.auxiliary_objects,
         compute_bounds: view.compute_bounds,
+        show_cells: view.show_cells,
         gizmo_display: capture_gizmo_display(view.gizmo_display),
         probes: view.probes,
         planes: view.planes,
@@ -191,6 +192,7 @@ pub fn restore_view_options(state: ViewOptionsState) -> ViewOptions {
         objects: state.objects,
         auxiliary_objects: state.auxiliary_objects,
         compute_bounds: state.compute_bounds,
+        show_cells: state.show_cells,
         gizmo_display: restore_gizmo_display(state.gizmo_display),
         probes: state.probes,
         planes: state.planes,
@@ -341,6 +343,7 @@ mod tests {
     fn view_options_round_trip_through_capture_and_restore() {
         let view = ViewOptions {
             grid: false,
+            show_cells: true,
             gizmo_display: GizmoDisplay {
                 axis_length_px: 99.0,
                 ..GizmoDisplay::default()
