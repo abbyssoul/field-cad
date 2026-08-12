@@ -145,6 +145,7 @@ fn inputs(runtime: &SimulationRuntime, queue: QueueDocument) -> SceneDocumentInp
         view: SceneViewState::default(),
         probe_history: fieldcad_scene_document::ProbeHistoryState::default(),
         distance_history: fieldcad_scene_document::DistanceHistoryState::default(),
+        mass_aggregate_history: fieldcad_scene_document::MassAggregateHistoryState::default(),
     }
 }
 
@@ -279,10 +280,13 @@ fn playback_speed_round_trips() {
 
 #[test]
 fn probe_and_distance_history_round_trip() {
-    use fieldcad_core::{Dimension, DistanceProbeId, ProbeId, SampleValidity, WorldRevision};
+    use fieldcad_core::{
+        Dimension, DistanceProbeId, MassAggregateProbeId, ProbeId, SampleValidity, WorldRevision,
+    };
     use fieldcad_scene_document::{
-        DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, ProbeHistoryState,
-        ProbeReadingRecord, ProbeSeriesRecord,
+        DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord,
+        MassAggregateHistoryState, MassAggregateReadingRecord, MassAggregateSeriesRecord,
+        ProbeHistoryState, ProbeReadingRecord, ProbeSeriesRecord,
     };
 
     let runtime = build_runtime(World::new());
@@ -315,6 +319,23 @@ fn probe_and_distance_history_round_trip() {
             }],
         }],
     };
+    inputs.mass_aggregate_history = MassAggregateHistoryState {
+        series: vec![MassAggregateSeriesRecord {
+            probe: MassAggregateProbeId::new(0),
+            readings: vec![MassAggregateReadingRecord {
+                tick: 1,
+                time_seconds: 0.5,
+                world_revision: WorldRevision::INITIAL,
+                snapshot_sequence: 1,
+                center_of_mass: DVec3::new(1.0, 2.0, 3.0),
+                velocity: DVec3::new(0.1, 0.0, 0.0),
+                total_momentum: DVec3::new(4.0, 0.0, 0.0),
+                total_kinetic_energy_j: 5.0,
+                total_mass_kg: 6.0,
+                member_count: 2,
+            }],
+        }],
+    };
     let document = SceneDocument::capture(inputs, "test", None);
 
     let dir = tempfile::tempdir().unwrap();
@@ -324,6 +345,35 @@ fn probe_and_distance_history_round_trip() {
 
     assert_eq!(outcome.document.probe_history, document.probe_history);
     assert_eq!(outcome.document.distance_history, document.distance_history);
+    assert_eq!(
+        outcome.document.mass_aggregate_history,
+        document.mass_aggregate_history
+    );
+}
+
+/// A document saved before mass-aggregate probes existed (`format_version`
+/// 3, no `mass_aggregate_history` key in the JSON at all) must still load —
+/// with an empty history — rather than being rejected as malformed.
+#[test]
+fn document_without_a_mass_aggregate_history_section_loads_with_it_defaulted() {
+    let runtime = build_runtime(World::new());
+    let document = SceneDocument::capture(inputs(&runtime, QueueDocument::default()), "test", None);
+    let mut value = serde_json::to_value(&document).unwrap();
+    value["format_version"] = serde_json::json!(3);
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("mass_aggregate_history");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scene.fcscene");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
+    assert_eq!(
+        outcome.document.mass_aggregate_history,
+        fieldcad_scene_document::MassAggregateHistoryState::default()
+    );
 }
 
 /// A document saved before `view` existed (`format_version` 1, no `view` key

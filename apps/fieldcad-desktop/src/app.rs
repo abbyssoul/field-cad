@@ -29,8 +29,8 @@ use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
     AsyncLocalDataSource, CommandEvent, CommandId, CommandPayload, DistanceHistory,
-    FieldDataSource, LocalDataSource, PluginRegistration, ProbeHistory, RuntimeConfig,
-    SimulationRuntime, Subscription,
+    FieldDataSource, LocalDataSource, MassAggregateHistory, PluginRegistration, ProbeHistory,
+    RuntimeConfig, SimulationRuntime, Subscription,
 };
 use fieldcad_superposition::InverseSquareBatchEvaluator;
 use glam::{DQuat, DVec2, DVec3, UVec2, UVec3, Vec2, Vec4};
@@ -479,6 +479,7 @@ struct WindowState {
     cached_field_layer_geometry: Option<Arc<scene::FieldGeometry>>,
     probe_history: ProbeHistory,
     distance_history: DistanceHistory,
+    mass_aggregate_history: MassAggregateHistory,
     /// The numerical run generation whose recorder data is currently held.
     /// A domain reset creates a fresh t=0 run and must not join its samples to
     /// the previous lattice's history.
@@ -617,6 +618,7 @@ impl WindowState {
             playback_speed,
             probe_history,
             distance_history,
+            mass_aggregate_history,
         ) = match open_path {
             None => {
                 let (source, warnings) = build_session(
@@ -624,7 +626,9 @@ impl WindowState {
                     None,
                     true,
                 )?;
-                (source, warnings, None, None, None, None, None, None, None)
+                (
+                    source, warnings, None, None, None, None, None, None, None, None,
+                )
             }
             Some(path) => {
                 let outcome = fieldcad_scene_document::load_newest_valid(&path)
@@ -635,6 +639,7 @@ impl WindowState {
                 let playback_speed = outcome.document.playback_speed;
                 let probe_history = outcome.document.probe_history.clone();
                 let distance_history = outcome.document.distance_history.clone();
+                let mass_aggregate_history = outcome.document.mass_aggregate_history.clone();
                 let (source, warnings) = build_session(
                     desktop_plugin_catalog(evaluator, gravity, maxwell),
                     Some(outcome.document),
@@ -650,6 +655,7 @@ impl WindowState {
                     Some(playback_speed),
                     Some(probe_history),
                     Some(distance_history),
+                    Some(mass_aggregate_history),
                 )
             }
         };
@@ -764,6 +770,15 @@ impl WindowState {
                     fieldcad_core::DEFAULT_PROBE_HISTORY,
                 )
             }),
+            mass_aggregate_history: mass_aggregate_history.map_or_else(
+                MassAggregateHistory::default,
+                |state| {
+                    probe_history_state::restore_mass_aggregate_history(
+                        state,
+                        fieldcad_core::DEFAULT_PROBE_HISTORY,
+                    )
+                },
+            ),
             run_generation,
             active_transform: None,
             active_field_brush: None,
@@ -1029,6 +1044,7 @@ impl WindowState {
                     world: &world,
                     probe_history: &self.probe_history,
                     distance_history: &self.distance_history,
+                    mass_aggregate_history: &self.mass_aggregate_history,
                     adapter_name: &self.adapter_name,
                     frame_time_ms,
                     frame_history,
@@ -1171,9 +1187,7 @@ impl WindowState {
             self.ui_model.scene_selection(),
             show,
             scene_scale,
-            field_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.universe),
+            &compute.mass_aggregates,
         );
         if self.ui_model.view.compute_bounds {
             scene::append_compute_bounds(&mut overlay, compute.domain.bounds(), scene_scale);
@@ -1296,11 +1310,14 @@ impl WindowState {
         if generation != self.run_generation {
             self.probe_history = ProbeHistory::new(self.probe_history.capacity());
             self.distance_history = DistanceHistory::new(self.distance_history.capacity());
+            self.mass_aggregate_history =
+                MassAggregateHistory::new(self.mass_aggregate_history.capacity());
             self.run_generation = generation;
         }
         if let Some(snapshot) = model.latest_snapshot() {
             self.probe_history.record(&snapshot);
             self.distance_history.record(&snapshot);
+            self.mass_aggregate_history.record(&snapshot);
         }
         self.world = model.world();
         drop(model);
@@ -1382,6 +1399,8 @@ impl WindowState {
             .retain_probes(|probe| self.world.probe(probe).is_some());
         self.distance_history
             .retain_probes(|probe| self.world.distance_probe(probe).is_some());
+        self.mass_aggregate_history
+            .retain_probes(|probe| self.world.mass_aggregate_probe(probe).is_some());
         self.ui_model
             .distance_probe_plots
             .retain(|probe| self.world.distance_probe(*probe).is_some());
@@ -1837,6 +1856,13 @@ impl WindowState {
                             .map_err(|error| error.to_string())?,
                     }
                 }
+                // A mass-aggregate probe's anchor is repositioned every tick
+                // from the live centroid (`adopt_world_commands`), never
+                // authored — `gizmo::selection_origin` returns `None` for it,
+                // so no drag gesture can ever reach here in practice.
+                scene::SceneSelection::MassAggregateProbe(_) => {
+                    return Err("a center of mass position is computed, not draggable".to_owned());
+                }
             };
         if let Some(current) = self.active_transform.as_mut() {
             current.origin = next_origin;
@@ -2138,10 +2164,11 @@ impl WindowState {
             playback_speed,
             probe_history,
             distance_history,
+            mass_aggregate_history,
         ) = match source {
             SessionSource::New { template } => {
                 let (source, warnings) = build_session(catalog, None, template)?;
-                (source, warnings, None, None, None, None, None, None)
+                (source, warnings, None, None, None, None, None, None, None)
             }
             SessionSource::Load(path) => {
                 let outcome = fieldcad_scene_document::load_newest_valid(&path)
@@ -2151,6 +2178,7 @@ impl WindowState {
                 let playback_speed = outcome.document.playback_speed;
                 let probe_history = outcome.document.probe_history.clone();
                 let distance_history = outcome.document.distance_history.clone();
+                let mass_aggregate_history = outcome.document.mass_aggregate_history.clone();
                 let (source, warnings) = build_session(catalog, Some(outcome.document), false)?;
                 (
                     source,
@@ -2161,6 +2189,7 @@ impl WindowState {
                     Some(playback_speed),
                     Some(probe_history),
                     Some(distance_history),
+                    Some(mass_aggregate_history),
                 )
             }
         };
@@ -2220,6 +2249,8 @@ impl WindowState {
         self.ui_model.probe_plots.clear();
         self.ui_model.distance_probe_plots.clear();
         self.ui_model.distance_probe_series.clear();
+        self.ui_model.mass_aggregate_probe_plots.clear();
+        self.ui_model.mass_aggregate_probe_series.clear();
         self.ui_model.domain_draft = None;
         self.ui_model.command_error = if warnings.is_empty() {
             None
@@ -2271,6 +2302,12 @@ impl WindowState {
                 self.distance_history.capacity(),
             );
         }
+        if let Some(state) = mass_aggregate_history {
+            self.mass_aggregate_history = probe_history_state::restore_mass_aggregate_history(
+                state,
+                self.mass_aggregate_history.capacity(),
+            );
+        }
         self.last_saved_revision = Some(self.world.revision());
         Ok(())
     }
@@ -2315,6 +2352,9 @@ impl WindowState {
                 probe_history: probe_history_state::capture_probe_history(&self.probe_history),
                 distance_history: probe_history_state::capture_distance_history(
                     &self.distance_history,
+                ),
+                mass_aggregate_history: probe_history_state::capture_mass_aggregate_history(
+                    &self.mass_aggregate_history,
                 ),
             }
         };
@@ -2540,6 +2580,17 @@ impl WindowState {
                     scene_scale.to_render_vec3(sphere.origin),
                     scene_scale.to_render(sphere.radius),
                 );
+            }
+            scene::SceneSelection::MassAggregateProbe(id) => {
+                let Some(probe) = self.world.mass_aggregate_probe(id) else {
+                    return;
+                };
+                if let Some(anchor) = self.world.object(probe.anchor) {
+                    self.camera.focus(
+                        scene_scale.to_render_vec3(anchor.transform.translation),
+                        0.2,
+                    );
+                }
             }
         };
     }
@@ -3470,7 +3521,7 @@ mod tests {
                 )]),
                 diagnostics: Arc::from([]),
                 distances: Arc::from([]),
-                universe: None,
+                mass_aggregates: Arc::from([]),
             }
         }
 

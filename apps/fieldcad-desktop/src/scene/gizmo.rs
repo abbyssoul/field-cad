@@ -354,6 +354,11 @@ fn selection_origin_point(
             let sphere = world.spheres().get(&id).filter(|sphere| sphere.visible)?;
             world.resolve_sphere_origin(sphere).ok()?
         }
+        // No gizmo: a mass-aggregate probe's anchor is computed every tick
+        // from the live centroid, never authored — same reasoning a
+        // distance probe has no gizmo at all (`SceneSelection` doesn't even
+        // include one).
+        SceneSelection::MassAggregateProbe(_) => return None,
     };
     Some(scene_scale.to_render_vec3(origin))
 }

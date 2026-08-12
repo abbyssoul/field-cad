@@ -47,5 +47,49 @@ experiments, and inspecting/exporting reproducible observations.
 - Measure meaningful performance changes with `fieldcad-bench`.
 - Record expensive-to-reverse architecture decisions in `docs/adr/`.
 
+## Working conventions
+
+- Desktop UI and rendering changes have no driven GUI harness. Run the smoke
+  check as well as automated checks, and state when manual in-app verification
+  remains necessary. See `apps/fieldcad-desktop/AGENTS.md` for lifecycle rules.
+- Capture a legitimate but out-of-scope follow-up in `docs/tasks/` using its
+  established goal, limitation, behaviour, tests, and relevant-code structure.
+  Re-check file references in older tasks before relying on them.
+- Treat `docs/perf/` findings as a revalidated backlog, not permanent truth:
+  confirm each claim against current code before acting on it.
+
+## Code conventions
+
+- **Errors:** `thiserror` derive with `#[error("...")]` / `#[error(transparent)]`.
+- **Serialization:** `#[derive(Serialize, Deserialize)]` on every persisted or
+  command-carried type, via `serde`.
+- **Math:** `glam::DVec3`, `DVec2`, `DQuat` for authoritative `f64` work;
+  `glam::UVec2`/`UVec3` for grid dimensions. Use `DMat3` for 3×3 matrices.
+- **Units:** `uom` SI quantities (`LengthMetres`, `MassKg`, etc.) on every
+  schema boundary. Dimensions are checked at the command boundary.
+- **Common derives:** `#[derive(Clone, Debug, PartialEq)]` on most value types;
+  add `Serialize, Deserialize` when the type crosses a persist or transport seam.
+- **Channel handles:** use `ChannelHandle(u16)` (not `ChannelId`, which is a
+  string) wherever a channel is looked up per sample — the hot path compares
+  `u16`, not `String`.
+- **Shared immutable data:** `Arc<[T]>` for buffers shared across snapshot
+  consumers. Use `SampleCache` in plugins to reuse allocations across ticks
+  and channels.
+- **Crate naming:** `fieldcad-{noun}` for library crates; plugin crates in
+  `plugins/` follow the `fieldcad-{adjective}` pattern.
+- **Workspace deps:** pin every shared dependency version in the root
+  `Cargo.toml` `[workspace.dependencies]` table. Never duplicate a version
+  in a child `Cargo.toml`.
+- **Test placement:** `#[cfg(test)] mod tests { ... }` at the bottom of the
+  source file containing the code being tested.
+- **Doc comments:** `///` on every public item. Internal comments inside
+  function bodies are sparse — prefer expressive types and naming.
+- **WGSL:** validated at compile time by a Naga unit test in
+  `fieldcad-desktop`. Add a test case when a new shader or entry point is
+  introduced.
+- **No-alloc hot paths:** structure tight loops to reuse buffers. Accept a
+  `&mut [T]` or `&mut Vec<T>` parameter rather than returning a newly
+  allocated collection.
+
 See `CONTRIBUTING.md` for setup, verification commands, and documentation
 conventions. See `docs/architecture.md` for the client/server model.

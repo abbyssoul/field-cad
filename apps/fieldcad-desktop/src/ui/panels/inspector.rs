@@ -113,6 +113,21 @@ pub fn inspector(
                             frame.distance_history,
                             output,
                         );
+                    } else if let Some(probe) = model
+                        .mass_aggregate_probe_selection
+                        .and_then(|id| frame.world.mass_aggregate_probe(id))
+                    {
+                        ui.heading("Center of mass");
+                        ui.separator();
+                        super::mass_aggregate_probe_inspector::mass_aggregate_probe_properties(
+                            ui,
+                            model,
+                            probe,
+                            frame.world,
+                            frame.compute,
+                            frame.mass_aggregate_history,
+                            output,
+                        );
                     } else {
                         ui.heading("Inspector");
                         ui.separator();

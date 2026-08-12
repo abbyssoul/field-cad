@@ -12,11 +12,11 @@ use std::{
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelId, ChannelSchema, ChannelSnapshot, ClockSnapshot, CommitReport, ComponentSchema,
-    ComponentTypeId, DiagnosticSeverity, Domain, FieldBatch, FieldBox, FieldSphere, ObjectId,
-    ObjectSpec, PluginId, PluginProvenance, PropertyBag, SampleGeometry, SamplingError, SceneScale,
-    SchemaError, SessionId, SimulationClock, SimulationMode, SlicePlane, SnapshotCompleteness,
-    SnapshotIdentity, SolverDiagnostic, StepContext, TimeStep, Transform, World, WorldCheckpoint,
-    WorldCommand, WorldDocument, WorldError, WorldRevision, WorldSnapshot,
+    ComponentTypeId, DiagnosticSeverity, Domain, FieldBatch, FieldBox, FieldSphere,
+    MassAggregateSample, ObjectId, PluginId, PluginProvenance, PropertyBag, SampleGeometry,
+    SamplingError, SceneScale, SchemaError, SessionId, SimulationClock, SimulationMode, SlicePlane,
+    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, StepContext, TimeStep, Transform,
+    World, WorldCheckpoint, WorldCommand, WorldDocument, WorldError, WorldRevision, WorldSnapshot,
 };
 use fieldcad_dynamics::{self as dynamics, DynamicsError, IntegrationScheme};
 use fieldcad_plugin_api::{
@@ -531,12 +531,6 @@ pub struct SimulationRuntime {
     /// to decide a physical result, only to tell a user whether their
     /// machine can keep up with the configured dt.
     last_tick_compute_ms: f32,
-    /// The runtime-owned object whose transform tracks the live centre of
-    /// mass, once one exists — see `adopt_world_commands` for how it's
-    /// created (lazily, the first time any object carries mass) and kept in
-    /// sync, and `WorldObject::derived` for why the desktop UI never lists
-    /// or lets a user move it.
-    center_of_mass_object: Option<ObjectId>,
 }
 
 /// Everything needed to stand up a runtime.
@@ -769,15 +763,14 @@ impl SimulationRuntime {
             });
         }
 
-        // Reuse an existing derived object rather than minting a second one —
-        // relevant if `RuntimeConfig::with_world` was handed a world that
-        // already went through this constructor once (tests do this).
-        let center_of_mass_object = world
-            .snapshot()
-            .objects()
-            .values()
-            .find(|object| object.derived)
-            .map(|object| object.id);
+        // A document saved before mass-aggregate probes existed may still
+        // carry the old hidden singleton "Center of mass" object — adopt it
+        // as a fresh probe's anchor rather than leaving it orphaned. A no-op
+        // for any world that doesn't have one (the common case) or whose
+        // derived object is already probe-owned (`RuntimeConfig::with_world`
+        // handed a world that already went through this constructor once —
+        // tests do this).
+        world.adopt_legacy_center_of_mass();
 
         let mut runtime = Self {
             world,
@@ -799,13 +792,12 @@ impl SimulationRuntime {
             body_history: BodyHistory::default(),
             force_scratch: Vec::new(),
             last_tick_compute_ms: 0.0,
-            center_of_mass_object,
         };
         runtime.check_single_provider_per_field()?;
-        // A no-op unless the world this runtime was handed already has mass
-        // in it (`RuntimeConfig::with_world`) — in the far more common case
-        // of starting from an empty world, `universe_summary` is `None` and
-        // this never touches `world`/`plugins` at all.
+        // A no-op unless the world this runtime was handed already has a
+        // mass-aggregate probe with a stale anchor position in it
+        // (`RuntimeConfig::with_world`) — in the far more common case of
+        // starting fresh, there is nothing yet for this to reposition.
         runtime.adopt_world_commands(Vec::new())?;
         let world_snapshot = runtime.world.snapshot();
         for slot in runtime.plugins.iter_mut().filter(|slot| slot.enabled) {
@@ -1928,55 +1920,37 @@ impl SimulationRuntime {
         &mut self,
         mut commands: Vec<WorldCommand>,
     ) -> Result<CommitReport, RuntimeError> {
-        // Keep the derived centre-of-mass object positioned at the live
-        // centroid, creating it the first time any object has mass. Computed
-        // from `self.world` — the state *before* this edit lands — so the
-        // position lags whatever this same commit does to a mass-bearing
-        // object by one commit: imperceptible during continuous ticking, and
-        // simpler than atomically recomputing against the post-edit state
-        // for a value that exists purely for display (see the plan doc for
-        // this feature). Lazy rather than always-present so an empty world
-        // has exactly zero objects, matching every caller's expectations.
+        // Keep every mass-aggregate probe's anchor positioned at its live
+        // centroid. Computed from `self.world` — the state *before* this
+        // edit lands — so the position lags whatever this same commit does
+        // to a mass-bearing object by one commit: imperceptible during
+        // continuous ticking, and simpler than atomically recomputing
+        // against the post-edit state for a value that exists purely for
+        // display. Creation itself no longer happens here — a probe only
+        // exists once a user (or `World::adopt_legacy_center_of_mass`)
+        // explicitly creates one — so an empty world still has exactly zero
+        // objects.
         let world = self.world.snapshot();
-        let mut creating_center_of_mass = false;
-        match (
-            self.center_of_mass_object,
-            dynamics::universe_summary(&world),
-        ) {
-            (Some(com_id), Some(summary)) => {
-                if let Some(object) = world.object(com_id)
-                    && object.transform.translation != summary.center_of_mass
-                    && let Ok(transform) = Transform::at(summary.center_of_mass)
+        if !world.mass_aggregate_probes().is_empty() {
+            let bodies = dynamics::collect_mass_bearing_bodies(&world).unwrap_or_default();
+            for probe in world.mass_aggregate_probes().values() {
+                let Some(sample) = dynamics::mass_aggregate(bodies.iter(), &probe.selection) else {
+                    continue;
+                };
+                if let Some(anchor) = world.object(probe.anchor)
+                    && anchor.transform.translation != sample.center_of_mass
+                    && let Ok(transform) = Transform::at(sample.center_of_mass)
                 {
                     commands.push(WorldCommand::SetTransform {
-                        object: com_id,
+                        object: probe.anchor,
                         transform,
                     });
                 }
             }
-            (None, Some(summary)) => {
-                if let Ok(transform) = Transform::at(summary.center_of_mass) {
-                    commands.push(WorldCommand::CreateObject(
-                        ObjectSpec::new("Center of mass")
-                            .with_pinned(true)
-                            .with_transform(transform)
-                            .derived(),
-                    ));
-                    creating_center_of_mass = true;
-                }
-            }
-            (_, None) => {}
         }
 
         let mut candidate = self.world.clone();
         let report = candidate.commit(commands)?;
-        if creating_center_of_mass && let Some(&id) = report.created_objects.last() {
-            // `.last()`, not `.first()`: the centre-of-mass `CreateObject` is
-            // always appended after the caller's own commands, so if this
-            // same batch also created a user's object, that one committed
-            // first and the derived one is last.
-            self.center_of_mass_object = Some(id);
-        }
         if report.revision == self.world.revision() {
             return Ok(report);
         }
@@ -2229,6 +2203,18 @@ impl SimulationRuntime {
             })
             .collect();
 
+        let mass_aggregates: Vec<(fieldcad_core::MassAggregateProbeId, MassAggregateSample)> = {
+            let bodies = dynamics::collect_mass_bearing_bodies(&world).unwrap_or_default();
+            world
+                .mass_aggregate_probes()
+                .values()
+                .filter_map(|probe| {
+                    dynamics::mass_aggregate(bodies.iter(), &probe.selection)
+                        .map(|sample| (probe.id, sample))
+                })
+                .collect()
+        };
+
         self.latest = Arc::new(fieldcad_core::FieldSnapshot {
             identity: SnapshotIdentity {
                 session: self.session,
@@ -2244,7 +2230,7 @@ impl SimulationRuntime {
             channels,
             diagnostics: diagnostics.into(),
             distances: distances.into(),
-            universe: dynamics::universe_summary(&world),
+            mass_aggregates: mass_aggregates.into(),
         });
         self.next_sequence += 1;
         Ok(())
@@ -2279,7 +2265,7 @@ fn empty_snapshot(session: SessionId, domain: Domain) -> fieldcad_core::FieldSna
         channels: BTreeMap::new(),
         diagnostics: Arc::from([]),
         distances: Arc::from([]),
-        universe: None,
+        mass_aggregates: Arc::from([]),
     }
 }
 
@@ -2732,15 +2718,24 @@ mod tests {
         SimulationRuntime::new(config).unwrap()
     }
 
-    #[test]
-    fn an_empty_world_has_no_center_of_mass_object() {
-        let runtime = runtime_with_mass_schema(World::new(), 0x300);
-        assert!(runtime.world.snapshot().objects().is_empty());
-        assert_eq!(runtime.latest_snapshot().universe, None);
+    fn universe_probe() -> WorldCommand {
+        WorldCommand::CreateMassAggregateProbe(fieldcad_core::MassAggregateProbeSpec::new(
+            "System",
+            fieldcad_core::MassSelection::Universe {
+                excluded: BTreeSet::new(),
+            },
+        ))
     }
 
     #[test]
-    fn the_center_of_mass_object_is_created_once_mass_appears_and_never_duplicated() {
+    fn an_empty_world_publishes_no_mass_aggregates() {
+        let runtime = runtime_with_mass_schema(World::new(), 0x300);
+        assert!(runtime.world.snapshot().objects().is_empty());
+        assert!(runtime.latest_snapshot().mass_aggregates.is_empty());
+    }
+
+    #[test]
+    fn creating_a_mass_aggregate_probe_mints_exactly_one_anchor_object() {
         let mut world = World::new();
         world
             .commit(
@@ -2752,16 +2747,12 @@ mod tests {
         let mut runtime = runtime_with_mass_schema(world, 0x301);
         assert!(runtime.world.snapshot().objects().is_empty());
 
-        // The sync reads *pre*-commit state (see `adopt_world_commands`), so
-        // creating the first mass object and creating the derived object lag
-        // by one commit each other, same as ongoing position sync does.
+        // Unlike the old lazy singleton, the anchor is minted immediately by
+        // `CreateMassAggregateProbe` itself — no one-commit lag to create it,
+        // only to reposition it once mass moves.
         runtime
-            .adopt_world_commands(vec![mass_object("a", DVec3::ZERO)])
+            .adopt_world_commands(vec![universe_probe()])
             .unwrap();
-        assert_eq!(runtime.world.snapshot().objects().len(), 1);
-        runtime.adopt_world_commands(Vec::new()).unwrap();
-        let objects = runtime.world.snapshot().objects().len();
-        assert_eq!(objects, 2, "the authored object plus the derived one");
         let derived: Vec<_> = runtime
             .world
             .snapshot()
@@ -2772,9 +2763,9 @@ mod tests {
             .collect();
         assert_eq!(derived.len(), 1);
 
-        // A second edit must reuse the same derived object, not mint another.
+        // Adding a mass-bearing object afterward must not mint a second one.
         runtime
-            .adopt_world_commands(vec![mass_object("b", DVec3::new(2.0, 0.0, 0.0))])
+            .adopt_world_commands(vec![mass_object("a", DVec3::ZERO)])
             .unwrap();
         let derived_after: Vec<_> = runtime
             .world
@@ -2788,7 +2779,7 @@ mod tests {
     }
 
     #[test]
-    fn the_center_of_mass_object_tracks_a_moving_mass_and_publishes_universe_summary() {
+    fn a_mass_aggregate_probes_anchor_tracks_a_moving_mass_and_publishes_a_sample() {
         let mut world = World::new();
         world
             .commit(
@@ -2799,23 +2790,29 @@ mod tests {
             .unwrap();
         let mut runtime = runtime_with_mass_schema(world, 0x302);
 
-        runtime
-            .adopt_world_commands(vec![mass_object("a", DVec3::ZERO)])
+        let report = runtime
+            .adopt_world_commands(vec![universe_probe()])
             .unwrap();
-        runtime.adopt_world_commands(Vec::new()).unwrap();
-        let com_id = runtime
+        let probe_id = report.created_mass_aggregate_probes[0];
+        let anchor = runtime
             .world
             .snapshot()
-            .objects()
-            .values()
-            .find(|object| object.derived)
+            .mass_aggregate_probe(probe_id)
             .unwrap()
-            .id;
+            .anchor;
+
+        let report = runtime
+            .adopt_world_commands(vec![mass_object("a", DVec3::ZERO)])
+            .unwrap();
+        // The anchor claimed id 0 when the probe was created above, so the
+        // mass object created here is not `ObjectId::new(0)`.
+        let mass_object_id = report.created_objects[0];
+        runtime.adopt_world_commands(Vec::new()).unwrap();
         assert_eq!(
             runtime
                 .world
                 .snapshot()
-                .object(com_id)
+                .object(anchor)
                 .unwrap()
                 .transform
                 .translation,
@@ -2824,18 +2821,18 @@ mod tests {
 
         runtime
             .adopt_world_commands(vec![WorldCommand::SetTransform {
-                object: ObjectId::new(0),
+                object: mass_object_id,
                 transform: Transform::at(DVec3::new(4.0, 0.0, 0.0)).unwrap(),
             }])
             .unwrap();
         // Lags by one commit (see `adopt_world_commands`): this commit moved
-        // the mass but the centre-of-mass sync inside it read the *previous*
-        // state, so it's still at the old position immediately afterward...
+        // the mass but the sync inside it read the *previous* state, so the
+        // anchor is still at the old position immediately afterward...
         assert_eq!(
             runtime
                 .world
                 .snapshot()
-                .object(com_id)
+                .object(anchor)
                 .unwrap()
                 .transform
                 .translation,
@@ -2847,7 +2844,7 @@ mod tests {
             runtime
                 .world
                 .snapshot()
-                .object(com_id)
+                .object(anchor)
                 .unwrap()
                 .transform
                 .translation,
@@ -2855,8 +2852,13 @@ mod tests {
         );
 
         runtime.publish_snapshot(SamplingPolicy::All).unwrap();
-        let universe = runtime.latest_snapshot().universe.unwrap();
-        assert!((universe.center_of_mass - DVec3::new(4.0, 0.0, 0.0)).length() < 1.0e-9);
+        let snapshot = runtime.latest_snapshot();
+        let (_, sample) = snapshot
+            .mass_aggregates
+            .iter()
+            .find(|(id, _)| *id == probe_id)
+            .unwrap();
+        assert!((sample.center_of_mass - DVec3::new(4.0, 0.0, 0.0)).length() < 1.0e-9);
     }
 
     #[test]

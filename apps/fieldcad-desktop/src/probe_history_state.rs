@@ -7,10 +7,14 @@
 use std::collections::VecDeque;
 
 use fieldcad_scene_document::{
-    DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, ProbeHistoryState,
-    ProbeReadingRecord, ProbeSeriesRecord,
+    DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, MassAggregateHistoryState,
+    MassAggregateReadingRecord, MassAggregateSeriesRecord, ProbeHistoryState, ProbeReadingRecord,
+    ProbeSeriesRecord,
 };
-use fieldcad_simulation::{DistanceHistory, DistanceReading, ProbeHistory, ProbeReading};
+use fieldcad_simulation::{
+    DistanceHistory, DistanceReading, MassAggregateHistory, MassAggregateReading, ProbeHistory,
+    ProbeReading,
+};
 
 pub fn capture_probe_history(history: &ProbeHistory) -> ProbeHistoryState {
     ProbeHistoryState {
@@ -116,6 +120,68 @@ fn restore_distance_reading(record: DistanceReadingRecord) -> DistanceReading {
     }
 }
 
+pub fn capture_mass_aggregate_history(history: &MassAggregateHistory) -> MassAggregateHistoryState {
+    MassAggregateHistoryState {
+        series: history
+            .entries()
+            .map(|(probe, readings)| MassAggregateSeriesRecord {
+                probe,
+                readings: readings
+                    .iter()
+                    .copied()
+                    .map(capture_mass_aggregate_reading)
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn capture_mass_aggregate_reading(reading: MassAggregateReading) -> MassAggregateReadingRecord {
+    MassAggregateReadingRecord {
+        tick: reading.tick,
+        time_seconds: reading.time_seconds,
+        world_revision: reading.world_revision,
+        snapshot_sequence: reading.snapshot_sequence,
+        center_of_mass: reading.center_of_mass,
+        velocity: reading.velocity,
+        total_momentum: reading.total_momentum,
+        total_kinetic_energy_j: reading.total_kinetic_energy_j,
+        total_mass_kg: reading.total_mass_kg,
+        member_count: reading.member_count,
+    }
+}
+
+pub fn restore_mass_aggregate_history(
+    state: MassAggregateHistoryState,
+    capacity: usize,
+) -> MassAggregateHistory {
+    let mut history = MassAggregateHistory::new(capacity);
+    for series in state.series {
+        let readings: VecDeque<MassAggregateReading> = series
+            .readings
+            .into_iter()
+            .map(restore_mass_aggregate_reading)
+            .collect();
+        history.insert_series(series.probe, readings);
+    }
+    history
+}
+
+fn restore_mass_aggregate_reading(record: MassAggregateReadingRecord) -> MassAggregateReading {
+    MassAggregateReading {
+        tick: record.tick,
+        time_seconds: record.time_seconds,
+        world_revision: record.world_revision,
+        snapshot_sequence: record.snapshot_sequence,
+        center_of_mass: record.center_of_mass,
+        velocity: record.velocity,
+        total_momentum: record.total_momentum,
+        total_kinetic_energy_j: record.total_kinetic_energy_j,
+        total_mass_kg: record.total_mass_kg,
+        member_count: record.member_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +240,35 @@ mod tests {
         let readings: Vec<_> = restored.readings(DistanceProbeId::new(0)).collect();
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].distance, 42.0);
+    }
+
+    #[test]
+    fn mass_aggregate_history_round_trips_through_capture_and_restore() {
+        use fieldcad_core::MassAggregateProbeId;
+        use glam::DVec3;
+
+        let mut history = MassAggregateHistory::new(8);
+        history.insert_series(
+            MassAggregateProbeId::new(0),
+            VecDeque::from([MassAggregateReading {
+                tick: 1,
+                time_seconds: 0.5,
+                world_revision: WorldRevision::INITIAL,
+                snapshot_sequence: 1,
+                center_of_mass: DVec3::new(1.0, 2.0, 3.0),
+                velocity: DVec3::new(0.1, 0.0, 0.0),
+                total_momentum: DVec3::new(4.0, 0.0, 0.0),
+                total_kinetic_energy_j: 5.0,
+                total_mass_kg: 6.0,
+                member_count: 2,
+            }]),
+        );
+
+        let restored = restore_mass_aggregate_history(capture_mass_aggregate_history(&history), 8);
+
+        let readings: Vec<_> = restored.readings(MassAggregateProbeId::new(0)).collect();
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].center_of_mass, DVec3::new(1.0, 2.0, 3.0));
+        assert_eq!(readings[0].member_count, 2);
     }
 }

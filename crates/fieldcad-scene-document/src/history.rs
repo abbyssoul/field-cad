@@ -7,8 +7,10 @@
 //! strings; each series is a flat `Vec` entry instead of a map).
 
 use fieldcad_core::{
-    ChannelId, DistanceProbeId, FieldValue, ProbeId, SampleValidity, WorldRevision,
+    ChannelId, DistanceProbeId, FieldValue, MassAggregateProbeId, ProbeId, SampleValidity,
+    WorldRevision,
 };
+use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,4 +56,30 @@ pub struct DistanceSeriesRecord {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DistanceHistoryState {
     pub series: Vec<DistanceSeriesRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MassAggregateReadingRecord {
+    pub tick: u64,
+    pub time_seconds: f64,
+    pub world_revision: WorldRevision,
+    pub snapshot_sequence: u64,
+    pub center_of_mass: DVec3,
+    pub velocity: DVec3,
+    pub total_momentum: DVec3,
+    pub total_kinetic_energy_j: f64,
+    pub total_mass_kg: f64,
+    pub member_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MassAggregateSeriesRecord {
+    pub probe: MassAggregateProbeId,
+    pub readings: Vec<MassAggregateReadingRecord>,
+}
+
+/// A saved mass-aggregate-probe recording — see [`ProbeHistoryState`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MassAggregateHistoryState {
+    pub series: Vec<MassAggregateSeriesRecord>,
 }

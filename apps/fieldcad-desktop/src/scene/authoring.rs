@@ -3,9 +3,11 @@
 //! Planes and probes have no rendered body of their own, so they need one to be
 //! visible and selectable — independently of whether any field layer is on.
 
+use std::collections::BTreeMap;
+
 use fieldcad_core::{
-    DEFAULT_PROXY_RADIUS, DomainBounds, FieldBox, FieldSphere, ProbePosition, SceneScale,
-    SlicePlane, WorldCommand, WorldSnapshot,
+    DEFAULT_PROXY_RADIUS, DomainBounds, FieldBox, FieldSphere, MassAggregateProbeId,
+    MassAggregateSample, ProbePosition, SceneScale, SlicePlane, WorldCommand, WorldSnapshot,
 };
 use glam::{DVec3, Quat, Vec3, Vec4};
 
@@ -60,7 +62,7 @@ impl SceneVisibility {
     pub const fn shows(self, selection: SceneSelection) -> bool {
         match selection {
             SceneSelection::Object(_) => self.objects,
-            SceneSelection::Probe(_) => self.probes,
+            SceneSelection::Probe(_) | SceneSelection::MassAggregateProbe(_) => self.probes,
             SceneSelection::Plane(_) => self.planes,
             SceneSelection::Box(_) => self.boxes,
             SceneSelection::Sphere(_) => self.spheres,
@@ -77,7 +79,7 @@ pub fn append_authoring_geometry(
     selection: Option<SceneSelection>,
     show: SceneVisibility,
     scene_scale: SceneScale,
-    universe: Option<fieldcad_core::UniverseSummary>,
+    mass_aggregates: &BTreeMap<MassAggregateProbeId, MassAggregateSample>,
 ) {
     if show.planes {
         for plane in world.planes().values().filter(|plane| plane.visible) {
@@ -112,47 +114,61 @@ pub fn append_authoring_geometry(
             );
         }
     }
-    // Always drawn, independent of `show`: the centre of mass isn't a
-    // `SceneVisibility` class of its own (it's not user-authored, so there's
-    // nothing for a visibility toggle to hide), and it's the one derived
-    // object in `world.objects()` — see `WorldObject::derived`.
-    if let Some(center_of_mass) = world.objects().values().find(|object| object.derived) {
-        let position = scene_scale.to_render_vec3(center_of_mass.transform.translation);
-        let radius = 0.1;
-        let color = Vec4::new(1.0, 0.82, 0.2, 1.0);
-        push_circle(
-            &mut geometry.vector_lines,
-            position,
-            Vec3::X,
-            Vec3::Y,
-            radius,
-            color,
-        );
-        push_circle(
-            &mut geometry.vector_lines,
-            position,
-            Vec3::Y,
-            Vec3::Z,
-            radius,
-            color,
-        );
-        push_circle(
-            &mut geometry.vector_lines,
-            position,
-            Vec3::Z,
-            Vec3::X,
-            radius,
-            color,
-        );
-
-        if let Some(universe) = universe {
-            super::append_arrow(
+    // Drawn under the same `show.probes` toggle as an ordinary probe: a
+    // mass-aggregate probe is a question asked about the world, not part of
+    // it, same category as `Probe` (ADR-0021) — but always drawn regardless
+    // of `show.probes` would let it survive a user hiding every other
+    // measurement, so it's gated below alongside them instead.
+    if show.probes {
+        for probe in world
+            .mass_aggregate_probes()
+            .values()
+            .filter(|probe| probe.visible)
+        {
+            let Some(anchor) = world.object(probe.anchor) else {
+                continue;
+            };
+            let position = scene_scale.to_render_vec3(anchor.transform.translation);
+            let radius = 0.1;
+            let color = if selection == Some(SceneSelection::MassAggregateProbe(probe.id)) {
+                Vec4::new(1.0, 0.55, 0.08, 1.0)
+            } else {
+                Vec4::new(1.0, 0.82, 0.2, 1.0)
+            };
+            push_circle(
                 &mut geometry.vector_lines,
                 position,
-                universe.total_momentum.as_vec3(),
-                0.25,
-                Vec4::new(0.4, 0.85, 1.0, 1.0),
+                Vec3::X,
+                Vec3::Y,
+                radius,
+                color,
             );
+            push_circle(
+                &mut geometry.vector_lines,
+                position,
+                Vec3::Y,
+                Vec3::Z,
+                radius,
+                color,
+            );
+            push_circle(
+                &mut geometry.vector_lines,
+                position,
+                Vec3::Z,
+                Vec3::X,
+                radius,
+                color,
+            );
+
+            if let Some(sample) = mass_aggregates.get(&probe.id) {
+                super::append_arrow(
+                    &mut geometry.vector_lines,
+                    position,
+                    sample.total_momentum.as_vec3(),
+                    0.25,
+                    Vec4::new(0.4, 0.85, 1.0, 1.0),
+                );
+            }
         }
     }
 
@@ -549,7 +565,7 @@ fn append_sphere_visual(
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{
-        BoxId, FieldBoxSpec, FieldSphereSpec, ObjectId, ObjectSpec, PlaneId, ProbeId, SphereId,
+        BoxId, FieldBoxSpec, FieldSphereSpec, ObjectId, PlaneId, ProbeId, SphereId,
         Transform as CoreTransform, World, WorldCommand,
     };
     use glam::DVec3;
@@ -610,7 +626,7 @@ mod tests {
             None,
             SceneVisibility::ALL,
             SceneScale::metre(),
-            None,
+            &BTreeMap::new(),
         );
         assert!(!geometry.surface_triangles.is_empty());
         assert!(!geometry.vector_lines.is_empty());
@@ -626,52 +642,70 @@ mod tests {
                 ..SceneVisibility::ALL
             },
             SceneScale::metre(),
-            None,
+            &BTreeMap::new(),
         );
         assert!(hidden.surface_triangles.is_empty());
         assert!(hidden.vector_lines.is_empty());
     }
 
     #[test]
-    fn a_derived_object_gets_a_marker_and_a_momentum_arrow_when_universe_is_known() {
+    fn a_mass_aggregate_probes_anchor_gets_a_marker_and_a_momentum_arrow_when_a_sample_is_known() {
         let mut world = World::new();
-        world
-            .commit([WorldCommand::CreateObject(
-                ObjectSpec::new("Center of mass")
-                    .with_transform(CoreTransform::at(DVec3::new(1.0, 2.0, 3.0)).unwrap())
-                    .derived(),
+        let report = world
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                fieldcad_core::MassAggregateProbeSpec::new(
+                    "System",
+                    fieldcad_core::MassSelection::Universe {
+                        excluded: std::collections::BTreeSet::new(),
+                    },
+                ),
             )])
             .unwrap();
+        let probe_id = report.created_mass_aggregate_probes[0];
+        let anchor = world
+            .snapshot()
+            .mass_aggregate_probe(probe_id)
+            .unwrap()
+            .anchor;
+        world
+            .commit([WorldCommand::SetTransform {
+                object: anchor,
+                transform: CoreTransform::at(DVec3::new(1.0, 2.0, 3.0)).unwrap(),
+            }])
+            .unwrap();
         let snapshot = world.snapshot();
-        let universe = fieldcad_core::UniverseSummary {
+        let sample = fieldcad_core::MassAggregateSample {
             center_of_mass: DVec3::new(1.0, 2.0, 3.0),
+            velocity: DVec3::ZERO,
             total_momentum: DVec3::new(1.0, 0.0, 0.0),
             total_kinetic_energy_j: 4.0,
+            total_mass_kg: 2.0,
+            member_count: 1,
         };
 
-        let mut without_universe = FieldGeometry::default();
+        let mut without_sample = FieldGeometry::default();
         append_authoring_geometry(
-            &mut without_universe,
+            &mut without_sample,
             &snapshot,
             None,
             SceneVisibility::ALL,
             SceneScale::metre(),
-            None,
+            &BTreeMap::new(),
         );
-        // The marker itself doesn't need `universe` — only the arrow does.
-        assert!(!without_universe.vector_lines.is_empty());
-        let marker_only_lines = without_universe.vector_lines.len();
+        // The marker itself doesn't need a sample — only the arrow does.
+        assert!(!without_sample.vector_lines.is_empty());
+        let marker_only_lines = without_sample.vector_lines.len();
 
-        let mut with_universe = FieldGeometry::default();
+        let mut with_sample = FieldGeometry::default();
         append_authoring_geometry(
-            &mut with_universe,
+            &mut with_sample,
             &snapshot,
             None,
             SceneVisibility::ALL,
             SceneScale::metre(),
-            Some(universe),
+            &BTreeMap::from([(probe_id, sample)]),
         );
-        assert!(with_universe.vector_lines.len() > marker_only_lines);
+        assert!(with_sample.vector_lines.len() > marker_only_lines);
     }
 
     #[test]

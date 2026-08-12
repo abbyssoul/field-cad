@@ -33,9 +33,10 @@ use std::{
 
 use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, DistanceProbeId, Domain,
-    DomainBounds, ObjectShape, ObjectSpec, PluginId, PluginProvenance, Precision, ProbeSpec,
-    Resolution, SceneScale, SessionId, SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic,
-    TimeStep, Transform, UniverseSummary, World, WorldCommand,
+    DomainBounds, MassAggregateProbeId, MassAggregateSample, ObjectShape, ObjectSpec, PluginId,
+    PluginProvenance, Precision, ProbeSpec, Resolution, SceneScale, SessionId,
+    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, TimeStep, Transform, World,
+    WorldCommand,
     quantities::{ChargeCoulombs, coulomb},
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
@@ -504,7 +505,7 @@ struct SnapshotView<'a> {
     channels: BTreeMap<ChannelId, &'a ChannelSnapshot>,
     diagnostics: &'a [SolverDiagnostic],
     distances: &'a [(DistanceProbeId, f64)],
-    universe: Option<UniverseSummary>,
+    mass_aggregates: &'a [(MassAggregateProbeId, MassAggregateSample)],
 }
 
 /// The MCP-facing handle onto one session's model.
@@ -641,7 +642,7 @@ impl McpServer {
             channels,
             diagnostics: &snapshot.diagnostics,
             distances: &snapshot.distances,
-            universe: snapshot.universe,
+            mass_aggregates: &snapshot.mass_aggregates,
         })
     }
 
@@ -1029,6 +1030,8 @@ impl McpServer {
                 // see this crate's module doc.
                 probe_history: fieldcad_scene_document::ProbeHistoryState::default(),
                 distance_history: fieldcad_scene_document::DistanceHistoryState::default(),
+                mass_aggregate_history: fieldcad_scene_document::MassAggregateHistoryState::default(
+                ),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(
@@ -1323,7 +1326,7 @@ impl McpServer {
                             .collect(),
                         diagnostics: &snapshot.diagnostics,
                         distances: &snapshot.distances,
-                        universe: snapshot.universe,
+                        mass_aggregates: &snapshot.mass_aggregates,
                     },
                 ),
                 None => resource_text(uri, &Option::<()>::None),

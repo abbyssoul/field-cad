@@ -128,6 +128,9 @@ This document serves as the target benchmark list of foundational physics experi
 - **Description**: Relativistic propagation delay of electromagnetic signals passing near massive gravitating bodies.
 - **Reference**: Shapiro, I. I. (1964), "Fourth Test of General Relativity", *Physical Review Letters*, 13(26), 789-791.
 
+### Einstain cross
+TBD
+
 ---
 
 ## 7. Gravitational Waves & Coupled EM-Gravity Dynamics

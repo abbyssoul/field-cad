@@ -153,6 +153,7 @@ fn measurement_section(
 ) {
     let instruments = frame.world.probes().len()
         + frame.world.distance_probes().len()
+        + frame.world.mass_aggregate_probes().len()
         + frame.world.planes().len()
         + frame.world.boxes().len()
         + frame.world.spheres().len();
@@ -211,6 +212,28 @@ fn measurement_section(
             ) {
                 output.edit(vec![measurement_command(frame.world, preset)]);
             }
+            if let Some(selection) = super::split_add_button(
+                ui,
+                "Center of mass",
+                "Track the centroid of every mass-bearing object, minus an exclusion list",
+                fieldcad_core::MassSelection::Universe {
+                    excluded: std::collections::BTreeSet::new(),
+                },
+                &[(
+                    "Selection of objects",
+                    fieldcad_core::MassSelection::Selection {
+                        included: std::collections::BTreeSet::new(),
+                    },
+                )],
+            ) {
+                let name = format!(
+                    "Center of mass {}",
+                    frame.world.mass_aggregate_probes().len() + 1
+                );
+                output.edit(vec![fieldcad_core::WorldCommand::CreateMassAggregateProbe(
+                    fieldcad_core::MassAggregateProbeSpec::new(name, selection),
+                )]);
+            }
         });
 
         if !frame.world.probes().is_empty() {
@@ -267,6 +290,44 @@ fn measurement_section(
                     }
                     Some(EntityRowAction::Delete) => {
                         output.edit(vec![fieldcad_core::WorldCommand::RemoveDistanceProbe(
+                            probe.id,
+                        )]);
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        if !frame.world.mass_aggregate_probes().is_empty() {
+            ui.add_space(8.0);
+            ui.label("Center of mass");
+            for probe in frame.world.mass_aggregate_probes().values() {
+                match entity_row(
+                    ui,
+                    // ●, not the astronomical/physics "circled dot" glyph:
+                    // unverified against egui's bundled fonts, same tofu-box
+                    // risk noted elsewhere in this file.
+                    "●",
+                    &probe.name,
+                    probe.visible,
+                    model.mass_aggregate_probe_selection == Some(probe.id),
+                    "Delete center of mass",
+                ) {
+                    Some(EntityRowAction::ToggleVisibility) => {
+                        output.edit(vec![
+                            fieldcad_core::WorldCommand::SetMassAggregateProbeVisible {
+                                probe: probe.id,
+                                visible: !probe.visible,
+                            },
+                        ]);
+                    }
+                    Some(EntityRowAction::Select) => {
+                        model.set_scene_selection(Some(SceneSelection::MassAggregateProbe(
+                            probe.id,
+                        )));
+                    }
+                    Some(EntityRowAction::Delete) => {
+                        output.edit(vec![fieldcad_core::WorldCommand::RemoveMassAggregateProbe(
                             probe.id,
                         )]);
                     }

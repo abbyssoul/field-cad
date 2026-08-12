@@ -1,12 +1,15 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use glam::{DQuat, DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BoxId, BoxLattice, ChannelId, ComponentSchema, ComponentTypeId, DistanceProbeId, ObjectId,
-    PlaneId, PlaneLattice, ProbeId, PropertyBag, SchemaError, SphereId, SphereLattice,
-    WorldRevision,
+    BoxId, BoxLattice, ChannelId, ComponentSchema, ComponentTypeId, DistanceProbeId,
+    MassAggregateProbeId, ObjectId, PlaneId, PlaneLattice, ProbeId, PropertyBag, SchemaError,
+    SphereId, SphereLattice, WorldRevision,
 };
 
 /// A finite, non-degenerate direction. Used for plane normals and in-plane axes.
@@ -947,10 +950,77 @@ pub struct DistanceProbe {
     pub visible: bool,
 }
 
+/// Which mass-bearing objects a [`MassAggregateProbe`] sums over.
+///
+/// `Universe` follows every mass-bearing object except the ones named in
+/// `excluded`; `Selection` follows only the objects named in `included`. An
+/// id that stops carrying mass, or is deleted, simply drops out of the
+/// computed aggregate — membership here is a *reference*, not a claim that
+/// the object currently exists or is dynamic.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MassSelection {
+    Universe { excluded: BTreeSet<ObjectId> },
+    Selection { included: BTreeSet<ObjectId> },
+}
+
+impl MassSelection {
+    /// Whether `id` counts toward this selection's aggregate. Used by
+    /// `fieldcad_dynamics::mass_aggregate`'s per-body filter, so the
+    /// computation crate never has to duplicate this match.
+    pub fn includes(&self, id: ObjectId) -> bool {
+        match self {
+            Self::Universe { excluded } => !excluded.contains(&id),
+            Self::Selection { included } => included.contains(&id),
+        }
+    }
+}
+
+/// A live centre-of-mass/momentum/energy measurement over a set of
+/// mass-bearing objects — the generalised, user-added counterpart to the
+/// old hidden, whole-universe-only "Center of mass" object. Kept separate
+/// from [`Probe`] for the same reason [`DistanceProbe`] is: this has no
+/// [`ChannelId`] or plugin behind it, it's a pure computed quantity (see
+/// `fieldcad_dynamics::mass_aggregate`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MassAggregateProbeSpec {
+    pub name: String,
+    pub selection: MassSelection,
+    pub visible: bool,
+}
+
+impl MassAggregateProbeSpec {
+    pub fn new(name: impl Into<String>, selection: MassSelection) -> Self {
+        Self {
+            name: name.into(),
+            selection,
+            visible: true,
+        }
+    }
+
+    pub fn with_visibility(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MassAggregateProbe {
+    pub id: MassAggregateProbeId,
+    pub name: String,
+    pub selection: MassSelection,
+    pub visible: bool,
+    /// The derived, pinned object this probe's live centroid drives, so a
+    /// plane/box/sphere/probe can attach to it like any other object. Created
+    /// and removed together with the probe — see
+    /// [`WorldCommand::CreateMassAggregateProbe`]/
+    /// [`WorldCommand::RemoveMassAggregateProbe`].
+    pub anchor: ObjectId,
+}
+
 /// Each map is `Arc`-wrapped so `WorldState::clone()` — taken on every
-/// [`World::commit`] and [`World::restore`] — is six refcount bumps rather
-/// than a deep copy of the whole scene. A command only ever writes one map
-/// (see `apply_command`'s `*_mut` helpers, which go through
+/// [`World::commit`] and [`World::restore`] — is a handful of refcount bumps
+/// rather than a deep copy of the whole scene. A command only ever writes one
+/// map (see `apply_command`'s `*_mut` helpers, which go through
 /// [`Arc::make_mut`]), so a commit that touches, say, only `probes` clones
 /// just that one map and shares the rest with the revision it started from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -962,6 +1032,12 @@ pub struct WorldState {
     spheres: Arc<BTreeMap<SphereId, FieldSphere>>,
     probes: Arc<BTreeMap<ProbeId, Probe>>,
     distance_probes: Arc<BTreeMap<DistanceProbeId, DistanceProbe>>,
+    /// `#[serde(default)]`: a document saved before mass-aggregate probes
+    /// existed has no `mass_aggregate_probes` key in its JSON at all —
+    /// without this, `World::from_document` would fail to deserialize every
+    /// scene ever saved before today, not just decline to load one.
+    #[serde(default)]
+    mass_aggregate_probes: Arc<BTreeMap<MassAggregateProbeId, MassAggregateProbe>>,
     component_schemas: Arc<BTreeMap<ComponentTypeId, ComponentSchema>>,
 }
 
@@ -1020,6 +1096,14 @@ impl WorldSnapshot {
 
     pub fn distance_probe(&self, id: DistanceProbeId) -> Option<&DistanceProbe> {
         self.0.distance_probes.get(&id)
+    }
+
+    pub fn mass_aggregate_probes(&self) -> &BTreeMap<MassAggregateProbeId, MassAggregateProbe> {
+        &self.0.mass_aggregate_probes
+    }
+
+    pub fn mass_aggregate_probe(&self, id: MassAggregateProbeId) -> Option<&MassAggregateProbe> {
+        self.0.mass_aggregate_probes.get(&id)
     }
 
     pub fn component_schemas(&self) -> &BTreeMap<ComponentTypeId, ComponentSchema> {
@@ -1182,6 +1266,7 @@ impl World {
                 spheres: Arc::new(BTreeMap::new()),
                 probes: Arc::new(BTreeMap::new()),
                 distance_probes: Arc::new(BTreeMap::new()),
+                mass_aggregate_probes: Arc::new(BTreeMap::new()),
                 component_schemas: Arc::new(BTreeMap::new()),
             }),
             counters: Counters::default(),
@@ -1283,6 +1368,56 @@ impl World {
         self.state = Arc::new(candidate);
         self.counters = counters;
         Ok(report)
+    }
+
+    /// One-time migration for a document saved before mass-aggregate probes
+    /// existed. Adopts a legacy, unowned `derived` object (the old hidden,
+    /// whole-universe-only "Center of mass" singleton) as a fresh
+    /// [`MassAggregateProbe`]'s anchor, instead of leaving it stuck forever:
+    /// `RemoveObject` rejects any `derived` object still owned by a probe,
+    /// and there is deliberately no command that lets a user delete an
+    /// *unowned* one either, so a document this old must not be left with an
+    /// orphan that is neither exposed nor removable.
+    ///
+    /// Not a [`WorldCommand`]: reusing an already-existing object as a new
+    /// probe's anchor is a one-time reinterpretation of already-durable
+    /// state at load time, not an edit a user or plugin ever authors — every
+    /// other path always mints a fresh anchor
+    /// ([`WorldCommand::CreateMassAggregateProbe`]). A no-op if no such
+    /// orphan exists.
+    pub fn adopt_legacy_center_of_mass(&mut self) -> Option<MassAggregateProbeId> {
+        let owned: BTreeSet<ObjectId> = self
+            .state
+            .mass_aggregate_probes
+            .values()
+            .map(|probe| probe.anchor)
+            .collect();
+        let (anchor, name, visible) = self
+            .state
+            .objects
+            .values()
+            .find(|object| object.derived && !owned.contains(&object.id))
+            .map(|object| (object.id, object.name.clone(), object.visible))?;
+
+        let mut candidate = (*self.state).clone();
+        let mut counters = self.counters;
+        let id = counters.next_mass_aggregate_probe();
+        mass_aggregate_probes_mut(&mut candidate).insert(
+            id,
+            MassAggregateProbe {
+                id,
+                name,
+                selection: MassSelection::Universe {
+                    excluded: BTreeSet::new(),
+                },
+                visible,
+                anchor,
+            },
+        );
+        candidate.revision = candidate.revision.next();
+        self.state = Arc::new(candidate);
+        self.counters = counters;
+        Some(id)
     }
 }
 
@@ -1406,6 +1541,20 @@ pub enum WorldCommand {
         visible: bool,
     },
     RemoveDistanceProbe(DistanceProbeId),
+    CreateMassAggregateProbe(MassAggregateProbeSpec),
+    SetMassAggregateProbeName {
+        probe: MassAggregateProbeId,
+        name: String,
+    },
+    SetMassAggregateProbeSelection {
+        probe: MassAggregateProbeId,
+        selection: MassSelection,
+    },
+    SetMassAggregateProbeVisible {
+        probe: MassAggregateProbeId,
+        visible: bool,
+    },
+    RemoveMassAggregateProbe(MassAggregateProbeId),
 }
 
 impl WorldCommand {
@@ -1454,6 +1603,11 @@ impl WorldCommand {
             Self::SetDistanceProbeObjects { .. } => "Change distance probe objects",
             Self::SetDistanceProbeVisible { .. } => "Show or hide distance probe",
             Self::RemoveDistanceProbe(_) => "Remove distance probe",
+            Self::CreateMassAggregateProbe(_) => "Add center of mass",
+            Self::SetMassAggregateProbeName { .. } => "Rename center of mass",
+            Self::SetMassAggregateProbeSelection { .. } => "Change center of mass membership",
+            Self::SetMassAggregateProbeVisible { .. } => "Show or hide center of mass",
+            Self::RemoveMassAggregateProbe(_) => "Remove center of mass",
         }
     }
 
@@ -1479,6 +1633,11 @@ pub struct CommitReport {
     pub created_spheres: Vec<SphereId>,
     pub created_probes: Vec<ProbeId>,
     pub created_distance_probes: Vec<DistanceProbeId>,
+    /// Deliberately excludes the anchor object `CreateMassAggregateProbe`
+    /// also creates: that anchor is `derived`, so it must never win
+    /// `first_created`'s "what should the editor auto-select" role over the
+    /// probe itself.
+    pub created_mass_aggregate_probes: Vec<MassAggregateProbeId>,
 }
 
 /// One entity a [`CommitReport`] says was created, tagged with its kind.
@@ -1497,6 +1656,7 @@ pub enum CreatedEntity {
     Sphere(SphereId),
     Probe(ProbeId),
     DistanceProbe(DistanceProbeId),
+    MassAggregateProbe(MassAggregateProbeId),
 }
 
 impl CommitReport {
@@ -1509,6 +1669,7 @@ impl CommitReport {
             created_spheres: Vec::new(),
             created_probes: Vec::new(),
             created_distance_probes: Vec::new(),
+            created_mass_aggregate_probes: Vec::new(),
         }
     }
 
@@ -1557,6 +1718,12 @@ impl CommitReport {
                     .copied()
                     .map(CreatedEntity::DistanceProbe)
             })
+            .or_else(|| {
+                self.created_mass_aggregate_probes
+                    .first()
+                    .copied()
+                    .map(CreatedEntity::MassAggregateProbe)
+            })
     }
 }
 
@@ -1568,6 +1735,10 @@ struct Counters {
     sphere: u64,
     probe: u64,
     distance_probe: u64,
+    /// `#[serde(default)]` for the same reason as `WorldState::mass_aggregate_probes`
+    /// — absent in any document saved before mass-aggregate probes existed.
+    #[serde(default)]
+    mass_aggregate_probe: u64,
 }
 
 impl Counters {
@@ -1606,6 +1777,12 @@ impl Counters {
         self.distance_probe += 1;
         id
     }
+
+    fn next_mass_aggregate_probe(&mut self) -> MassAggregateProbeId {
+        let id = MassAggregateProbeId::new(self.mass_aggregate_probe);
+        self.mass_aggregate_probe += 1;
+        id
+    }
 }
 
 /// `Arc::make_mut`, one per map — see the note on [`WorldState`]. Every
@@ -1633,6 +1810,12 @@ fn probes_mut(state: &mut WorldState) -> &mut BTreeMap<ProbeId, Probe> {
 
 fn distance_probes_mut(state: &mut WorldState) -> &mut BTreeMap<DistanceProbeId, DistanceProbe> {
     Arc::make_mut(&mut state.distance_probes)
+}
+
+fn mass_aggregate_probes_mut(
+    state: &mut WorldState,
+) -> &mut BTreeMap<MassAggregateProbeId, MassAggregateProbe> {
+    Arc::make_mut(&mut state.mass_aggregate_probes)
 }
 
 fn component_schemas_mut(
@@ -1720,6 +1903,13 @@ fn apply_command(
             {
                 return Err(WorldError::ObjectHasAttachedDistanceProbe { id });
             }
+            // Deliberately no guard for `mass_aggregate_probes`: unlike every
+            // check above, a probe's included/excluded set is N-of-M
+            // membership, not a required 1:1/2:2 target. Losing a member
+            // gracefully shrinks the aggregate (or leaves an inert stale id
+            // in `excluded`, which never resolves to anything once the
+            // object is gone) rather than breaking a resolution the probe
+            // can't function without.
             objects_mut(state).remove(&id);
         }
         WorldCommand::SetObjectName { object, name } => {
@@ -2024,6 +2214,70 @@ fn apply_command(
                 return Err(WorldError::DistanceProbeNotFound { id });
             }
         }
+        WorldCommand::CreateMassAggregateProbe(spec) => {
+            validate_mass_aggregate_probe(state, &spec.selection)?;
+            let id = counters.next_mass_aggregate_probe();
+            let anchor = counters.next_object();
+            objects_mut(state).insert(
+                anchor,
+                WorldObject {
+                    id: anchor,
+                    name: spec.name.clone(),
+                    transform: Transform::default(),
+                    velocity: Velocity::default(),
+                    shape: None,
+                    visible: spec.visible,
+                    pinned: true,
+                    components: BTreeMap::new(),
+                    derived: true,
+                },
+            );
+            mass_aggregate_probes_mut(state).insert(
+                id,
+                MassAggregateProbe {
+                    id,
+                    name: spec.name,
+                    selection: spec.selection,
+                    visible: spec.visible,
+                    anchor,
+                },
+            );
+            report.created_mass_aggregate_probes.push(id);
+        }
+        WorldCommand::SetMassAggregateProbeName { probe, name } => {
+            mass_aggregate_probes_mut(state)
+                .get_mut(&probe)
+                .ok_or(WorldError::MassAggregateProbeNotFound { id: probe })?
+                .name = name;
+        }
+        WorldCommand::SetMassAggregateProbeSelection { probe, selection } => {
+            validate_mass_aggregate_probe(state, &selection)?;
+            mass_aggregate_probes_mut(state)
+                .get_mut(&probe)
+                .ok_or(WorldError::MassAggregateProbeNotFound { id: probe })?
+                .selection = selection;
+        }
+        WorldCommand::SetMassAggregateProbeVisible { probe, visible } => {
+            let anchor = {
+                let current = mass_aggregate_probes_mut(state)
+                    .get_mut(&probe)
+                    .ok_or(WorldError::MassAggregateProbeNotFound { id: probe })?;
+                current.visible = visible;
+                current.anchor
+            };
+            if let Some(object) = objects_mut(state).get_mut(&anchor) {
+                object.visible = visible;
+            }
+        }
+        WorldCommand::RemoveMassAggregateProbe(id) => {
+            let probe = mass_aggregate_probes_mut(state)
+                .remove(&id)
+                .ok_or(WorldError::MassAggregateProbeNotFound { id })?;
+            // The one legitimate path that deletes a `derived` object:
+            // `RemoveObject` itself keeps rejecting them so a user can never
+            // orphan an anchor by targeting it directly.
+            objects_mut(state).remove(&probe.anchor);
+        }
     }
     Ok(())
 }
@@ -2086,6 +2340,22 @@ fn validate_probe(state: &WorldState, probe: &ProbeSpec) -> Result<(), WorldErro
     Ok(())
 }
 
+fn validate_mass_aggregate_probe(
+    state: &WorldState,
+    selection: &MassSelection,
+) -> Result<(), WorldError> {
+    let ids = match selection {
+        MassSelection::Universe { excluded } => excluded,
+        MassSelection::Selection { included } => included,
+    };
+    for &id in ids {
+        if !state.objects.contains_key(&id) {
+            return Err(WorldError::ObjectNotFound { id });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum WorldError {
     #[error("transform contains non-finite values or an invalid rotation")]
@@ -2128,6 +2398,8 @@ pub enum WorldError {
     SphereNotFound { id: SphereId },
     #[error("probe {id} does not exist")]
     ProbeNotFound { id: ProbeId },
+    #[error("center-of-mass probe {id} does not exist")]
+    MassAggregateProbeNotFound { id: MassAggregateProbeId },
     #[error("component schema '{id}' is not registered")]
     ComponentSchemaNotFound { id: ComponentTypeId },
     #[error("component schema '{id}' is already registered")]
@@ -2985,6 +3257,225 @@ mod tests {
                 .translation,
             DVec3::new(1.0, 2.0, 3.0)
         );
+    }
+
+    #[test]
+    fn adopt_legacy_center_of_mass_turns_an_orphaned_derived_object_into_a_probe() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("Center of mass").derived(),
+            )])
+            .unwrap();
+        let anchor = ObjectId::new(0);
+        let before = world.revision();
+
+        let probe_id = world.adopt_legacy_center_of_mass().unwrap();
+
+        assert!(world.revision() > before);
+        let snapshot = world.snapshot();
+        let probe = snapshot.mass_aggregate_probe(probe_id).unwrap();
+        assert_eq!(probe.anchor, anchor);
+        assert_eq!(
+            probe.selection,
+            MassSelection::Universe {
+                excluded: BTreeSet::new()
+            }
+        );
+        // Calling this again must not mint a second probe for the same
+        // now-owned anchor.
+        assert_eq!(world.adopt_legacy_center_of_mass(), None);
+        assert_eq!(snapshot.mass_aggregate_probes().len(), 1);
+    }
+
+    #[test]
+    fn adopt_legacy_center_of_mass_is_a_no_op_without_an_orphan() {
+        let mut world = World::new();
+        let before = world.revision();
+
+        assert_eq!(world.adopt_legacy_center_of_mass(), None);
+        assert_eq!(world.revision(), before);
+    }
+
+    #[test]
+    fn adopt_legacy_center_of_mass_ignores_an_anchor_a_probe_already_owns() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                MassAggregateProbeSpec::new(
+                    "System",
+                    MassSelection::Universe {
+                        excluded: BTreeSet::new(),
+                    },
+                ),
+            )])
+            .unwrap();
+
+        assert_eq!(world.adopt_legacy_center_of_mass(), None);
+    }
+
+    #[test]
+    fn a_world_document_saved_before_mass_aggregate_probes_existed_still_loads() {
+        // Regression test: a document saved before mass-aggregate probes
+        // existed has neither `WorldState::mass_aggregate_probes` nor
+        // `Counters::mass_aggregate_probe` in its JSON at all —
+        // `#[serde(default)]` (or its absence) on *each* is the only thing
+        // standing between "old scenes keep loading" and "every scene saved
+        // before today fails to open" (a real regression this test would
+        // have caught: `Counters::mass_aggregate_probe` originally shipped
+        // without it). Simulates both gaps by round-tripping through JSON
+        // and deleting the keys an old file would never have had, rather
+        // than asserting on a document built by today's own code (which
+        // always writes both keys, just possibly empty/zero, and so would
+        // never catch this).
+        let world = World::new();
+        let mut value = serde_json::to_value(world.to_document()).unwrap();
+        value["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mass_aggregate_probes");
+        value["counters"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mass_aggregate_probe");
+
+        let document: WorldDocument = serde_json::from_value(value).unwrap();
+        let mut restored = World::from_document(document);
+
+        assert!(restored.snapshot().mass_aggregate_probes().is_empty());
+        // The counter must still mint id 0 for the first probe created after
+        // loading, not panic or silently start from a poisoned default.
+        let report = restored
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                MassAggregateProbeSpec::new(
+                    "System",
+                    MassSelection::Universe {
+                        excluded: BTreeSet::new(),
+                    },
+                ),
+            )])
+            .unwrap();
+        assert_eq!(
+            report.created_mass_aggregate_probes[0],
+            MassAggregateProbeId::new(0)
+        );
+    }
+
+    #[test]
+    fn creating_a_mass_aggregate_probe_mints_a_derived_anchor() {
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                MassAggregateProbeSpec::new(
+                    "System",
+                    MassSelection::Universe {
+                        excluded: BTreeSet::new(),
+                    },
+                ),
+            )])
+            .unwrap();
+
+        let probe_id = report.created_mass_aggregate_probes[0];
+        let snapshot = world.snapshot();
+        let probe = snapshot.mass_aggregate_probe(probe_id).unwrap();
+        let anchor = snapshot.object(probe.anchor).unwrap();
+        assert!(anchor.derived);
+        assert!(anchor.pinned);
+        assert_eq!(
+            report.first_created(),
+            Some(CreatedEntity::MassAggregateProbe(probe_id))
+        );
+    }
+
+    #[test]
+    fn creating_a_mass_aggregate_probe_rejects_an_unknown_excluded_object() {
+        let mut world = World::new();
+        assert!(
+            world
+                .commit([WorldCommand::CreateMassAggregateProbe(
+                    MassAggregateProbeSpec::new(
+                        "System",
+                        MassSelection::Universe {
+                            excluded: BTreeSet::from([ObjectId::new(99)]),
+                        },
+                    ),
+                )])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn creating_a_mass_aggregate_probe_rejects_an_unknown_included_object() {
+        let mut world = World::new();
+        assert!(
+            world
+                .commit([WorldCommand::CreateMassAggregateProbe(
+                    MassAggregateProbeSpec::new(
+                        "Planets",
+                        MassSelection::Selection {
+                            included: BTreeSet::from([ObjectId::new(99)]),
+                        },
+                    ),
+                )])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn removing_a_mass_aggregate_probe_also_removes_its_anchor() {
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                MassAggregateProbeSpec::new(
+                    "System",
+                    MassSelection::Universe {
+                        excluded: BTreeSet::new(),
+                    },
+                ),
+            )])
+            .unwrap();
+        let probe_id = report.created_mass_aggregate_probes[0];
+        let anchor = world
+            .snapshot()
+            .mass_aggregate_probe(probe_id)
+            .unwrap()
+            .anchor;
+
+        world
+            .commit([WorldCommand::RemoveMassAggregateProbe(probe_id)])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        assert!(snapshot.mass_aggregate_probe(probe_id).is_none());
+        assert!(snapshot.object(anchor).is_none());
+    }
+
+    #[test]
+    fn removing_an_object_named_by_a_mass_aggregate_probes_selection_still_succeeds() {
+        // Unlike a distance probe's two required endpoints, a mass-aggregate
+        // probe's included/excluded set is N-of-M membership: losing one
+        // member gracefully shrinks the aggregate rather than breaking a
+        // resolution the probe can't function without, so `RemoveObject`
+        // must not reject this the way it rejects a distance-probe endpoint.
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("star"))])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                MassAggregateProbeSpec::new(
+                    "Planets",
+                    MassSelection::Selection {
+                        included: BTreeSet::from([ObjectId::new(0)]),
+                    },
+                ),
+            )])
+            .unwrap();
+
+        world
+            .commit([WorldCommand::RemoveObject(ObjectId::new(0))])
+            .unwrap();
+        assert!(world.snapshot().object(ObjectId::new(0)).is_none());
     }
 
     #[test]

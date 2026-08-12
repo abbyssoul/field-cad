@@ -4,11 +4,15 @@
 //! the axes must state simulation time and units exactly, so the small amount of
 //! drawing here is cheaper than adapting a general-purpose plot widget.
 
-use fieldcad_core::{ChannelId, DistanceProbeId, FieldValue, ProbeId, SampleValidity};
-use fieldcad_simulation::{DistanceHistory, DistanceReading, ProbeHistory};
+use fieldcad_core::{
+    ChannelId, DistanceProbeId, FieldValue, MassAggregateProbeId, ProbeId, SampleValidity,
+};
+use fieldcad_simulation::{
+    DistanceHistory, DistanceReading, MassAggregateHistory, MassAggregateReading, ProbeHistory,
+};
 
 use super::compute::ComputeView;
-use super::{DistanceProbeSeries, FrameContext, UiModel};
+use super::{DistanceProbeSeries, FrameContext, MassAggregateProbeSeries, UiModel};
 
 pub(super) fn probe_history_plots(
     ui: &mut egui::Ui,
@@ -217,6 +221,112 @@ fn distance_rate_of_change(readings: &[DistanceReading]) -> Vec<f32> {
             (dt > 0.0).then(|| ((pair[1].distance - pair[0].distance) / dt) as f32)
         })
         .collect()
+}
+
+/// Draw every pinned mass-aggregate-probe recorder independently of current
+/// scene selection — see [`floating_probe_plots`].
+pub(super) fn floating_mass_aggregate_probe_plots(
+    context: &egui::Context,
+    model: &mut UiModel,
+    frame: &FrameContext<'_>,
+) {
+    let probe_ids: Vec<MassAggregateProbeId> =
+        model.mass_aggregate_probe_plots.iter().copied().collect();
+    let mut closed = Vec::new();
+    for probe_id in probe_ids {
+        let Some(probe) = frame.world.mass_aggregate_probe(probe_id) else {
+            closed.push(probe_id);
+            continue;
+        };
+        let mut open = true;
+        let series = model
+            .mass_aggregate_probe_series
+            .entry(probe_id)
+            .or_default();
+        egui::Window::new(format!("Center of mass plot · {}", probe.name))
+            .id(egui::Id::new(("mass_aggregate_probe_plot", probe.id)))
+            .open(&mut open)
+            .default_size(egui::vec2(460.0, 320.0))
+            .resizable(true)
+            .collapsible(true)
+            .show(context, |ui| {
+                mass_aggregate_history_plot(ui, probe.id, frame.mass_aggregate_history, series);
+            });
+        if !open {
+            closed.push(probe_id);
+        }
+    }
+    for probe in closed {
+        model.mass_aggregate_probe_plots.remove(&probe);
+    }
+}
+
+/// A mass-aggregate probe's history as up to four scalar traces — the
+/// centroid's distance from the origin, and the magnitudes of velocity and
+/// momentum, plus kinetic energy directly. Same shape as
+/// [`distance_history_plot`]: draws its own checkboxes and mutates `series`
+/// directly, so the inline inspector plot and the floating window share one
+/// implementation.
+pub(super) fn mass_aggregate_history_plot(
+    ui: &mut egui::Ui,
+    probe: MassAggregateProbeId,
+    history: &MassAggregateHistory,
+    series: &mut MassAggregateProbeSeries,
+) {
+    ui.small(format!("Bounded to {} samples", history.capacity()));
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut series.center_of_mass, "Position");
+        ui.checkbox(&mut series.velocity, "Velocity");
+        ui.checkbox(&mut series.momentum, "Momentum");
+        ui.checkbox(&mut series.kinetic_energy, "Kinetic energy");
+    });
+    if !series.center_of_mass && !series.velocity && !series.momentum && !series.kinetic_energy {
+        ui.weak("Select at least one series.");
+        return;
+    }
+    let readings: Vec<MassAggregateReading> = history.readings(probe).copied().collect();
+    if readings.is_empty() {
+        ui.weak("No samples yet");
+        return;
+    }
+    if series.center_of_mass {
+        let values: Vec<f32> = readings
+            .iter()
+            .map(|reading| reading.center_of_mass.length() as f32)
+            .collect();
+        ui.label(format!(
+            "Distance from origin · {:.4} m",
+            values.last().unwrap()
+        ));
+        history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75));
+    }
+    if series.velocity {
+        let values: Vec<f32> = readings
+            .iter()
+            .map(|reading| reading.velocity.length() as f32)
+            .collect();
+        ui.label(format!("Speed · {:.4} m/s", values.last().unwrap()));
+        history_plot(ui, &values, egui::Color32::from_rgb(100, 155, 245));
+    }
+    if series.momentum {
+        let values: Vec<f32> = readings
+            .iter()
+            .map(|reading| reading.total_momentum.length() as f32)
+            .collect();
+        ui.label(format!(
+            "Momentum magnitude · {:.4} kg·m/s",
+            values.last().unwrap()
+        ));
+        history_plot(ui, &values, egui::Color32::from_rgb(120, 220, 150));
+    }
+    if series.kinetic_energy {
+        let values: Vec<f32> = readings
+            .iter()
+            .map(|reading| reading.total_kinetic_energy_j as f32)
+            .collect();
+        ui.label(format!("Kinetic energy · {:.4} J", values.last().unwrap()));
+        history_plot(ui, &values, egui::Color32::from_rgb(220, 130, 220));
+    }
 }
 
 fn channel_label(channel: &ChannelId, compute: &ComputeView) -> String {

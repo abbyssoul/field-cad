@@ -30,8 +30,9 @@ use serde::{Deserialize, Serialize};
 mod history;
 mod view;
 pub use history::{
-    DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, ProbeHistoryState,
-    ProbeReadingRecord, ProbeSeriesRecord,
+    DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, MassAggregateHistoryState,
+    MassAggregateReadingRecord, MassAggregateSeriesRecord, ProbeHistoryState, ProbeReadingRecord,
+    ProbeSeriesRecord,
 };
 pub use view::{
     CameraProjection, CameraState, ChannelViewState, FieldLayerViewState, FlowLineDisplayState,
@@ -45,13 +46,13 @@ pub use view::{
 pub const FORMAT_ID: &str = "fieldcad.scene/v1";
 /// The highest `format_version` this build can load. A document reporting a
 /// higher version is rejected outright rather than partially interpreted.
-/// Bumped 1 → 2 when `SceneDocument::view` was added, and 2 → 3 when
-/// `playback_speed`/`probe_history`/`distance_history` were added: each
-/// field's own file still loads fine on an older-format read (all
-/// `#[serde(default)]`), but a build that only knows the prior version must
-/// refuse a newer file outright rather than silently dropping that content
-/// on the next resave.
-pub const FORMAT_VERSION: u32 = 3;
+/// Bumped 1 → 2 when `SceneDocument::view` was added, 2 → 3 when
+/// `playback_speed`/`probe_history`/`distance_history` were added, and 3 → 4
+/// when `mass_aggregate_history` was added: each field's own file still
+/// loads fine on an older-format read (all `#[serde(default)]`), but a build
+/// that only knows the prior version must refuse a newer file outright
+/// rather than silently dropping that content on the next resave.
+pub const FORMAT_VERSION: u32 = 4;
 /// File extension for a saved scene document (without the leading dot).
 pub const EXTENSION: &str = "fcscene";
 
@@ -101,6 +102,9 @@ pub struct SceneDocument {
     /// Recorded distance-probe history — see `probe_history`.
     #[serde(default)]
     pub distance_history: DistanceHistoryState,
+    /// Recorded center-of-mass-probe history — see `probe_history`.
+    #[serde(default)]
+    pub mass_aggregate_history: MassAggregateHistoryState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,6 +154,7 @@ pub struct SceneDocumentInputs {
     pub view: SceneViewState,
     pub probe_history: ProbeHistoryState,
     pub distance_history: DistanceHistoryState,
+    pub mass_aggregate_history: MassAggregateHistoryState,
 }
 
 impl SceneDocument {
@@ -193,6 +198,7 @@ impl SceneDocument {
             view: inputs.view,
             probe_history: inputs.probe_history,
             distance_history: inputs.distance_history,
+            mass_aggregate_history: inputs.mass_aggregate_history,
         }
     }
 }

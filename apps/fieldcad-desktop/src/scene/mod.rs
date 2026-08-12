@@ -34,8 +34,8 @@ pub use pick::pick_scene;
 pub use trajectory::append_trajectory_geometry;
 
 use fieldcad_core::{
-    BoxId, ObjectId, ObjectShape, PlaneId, ProbeId, SampleGeometry, SceneScale, SphereId,
-    WorldObject, WorldSnapshot,
+    BoxId, MassAggregateProbeId, ObjectId, ObjectShape, PlaneId, ProbeId, SampleGeometry,
+    SceneScale, SphereId, WorldObject, WorldSnapshot,
 };
 use glam::{DQuat, DVec3, Mat4, Quat, Vec3, Vec4};
 
@@ -110,6 +110,7 @@ pub enum SceneSelection {
     Box(BoxId),
     Sphere(SphereId),
     Probe(ProbeId),
+    MassAggregateProbe(MassAggregateProbeId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -70,7 +70,8 @@
 
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
-    ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError, WorldSnapshot, relativistic_momentum,
+    MassAggregateSample, MassSelection, ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError,
+    WorldSnapshot, relativistic_momentum,
 };
 use fieldcad_plugin_api::{DynamicBody, ObjectKinematicsUpdate};
 use fieldcad_sources::{SourceError, inertial_mass_component_id, inertial_mass_of};
@@ -166,36 +167,55 @@ pub fn collect_mass_bearing_bodies(
         .collect()
 }
 
-/// Live totals over every mass-bearing object — center of mass, total
-/// momentum, and total kinetic energy. `None` when nothing in the world
-/// carries mass (a zero or negative total is otherwise impossible: mass is
-/// validated positive wherever it is attached).
+/// Live totals over the mass-bearing bodies a [`MassSelection`] names —
+/// center of mass, its own velocity, total momentum, and total kinetic
+/// energy. `None` when no member currently carries mass (a zero or negative
+/// total is otherwise impossible: mass is validated positive wherever it is
+/// attached).
+///
+/// Takes an already-collected body slice rather than a [`WorldSnapshot`] so a
+/// caller computing this for several probes in the same tick — as
+/// `SimulationRuntime` does — pays for [`collect_mass_bearing_bodies`]'s
+/// world walk once, not once per probe.
 ///
 /// Momentum and kinetic energy use the same relativistic formulas as a
 /// single object's own derived-values display (`relativistic_momentum`/
 /// `relativistic_kinetic_energy`), so this total never quietly disagrees
-/// with the per-object numbers it's summed from.
-pub fn universe_summary(world: &WorldSnapshot) -> Option<fieldcad_core::UniverseSummary> {
-    let bodies = collect_mass_bearing_bodies(world).ok()?;
-    let total_mass_kg: f64 = bodies
+/// with the per-object numbers it's summed from. `velocity` is deliberately
+/// *not* derived from `total_momentum`: it uses the same rest-mass weighting
+/// as `center_of_mass`, so it is that point's own time-derivative rather
+/// than a relativistic quantity with a different physical meaning.
+pub fn mass_aggregate<'a>(
+    bodies: impl Iterator<Item = &'a DynamicBody>,
+    selection: &MassSelection,
+) -> Option<MassAggregateSample> {
+    let members: Vec<&DynamicBody> = bodies
+        .filter(|body| selection.includes(body.object))
+        .collect();
+    let total_mass_kg: f64 = members
         .iter()
         .map(|body| body.inertial_mass_kg.into_si())
         .sum();
     if total_mass_kg <= 0.0 {
         return None;
     }
-    let center_of_mass = bodies
+    let center_of_mass = members
         .iter()
         .map(|body| body.position * body.inertial_mass_kg.into_si())
         .sum::<DVec3>()
         / total_mass_kg;
-    let total_momentum = bodies
+    let velocity = members
+        .iter()
+        .map(|body| body.velocity * body.inertial_mass_kg.into_si())
+        .sum::<DVec3>()
+        / total_mass_kg;
+    let total_momentum = members
         .iter()
         .map(|body| {
             fieldcad_core::relativistic_momentum(body.velocity, body.inertial_mass_kg.into_si())
         })
         .sum();
-    let total_kinetic_energy_j = bodies
+    let total_kinetic_energy_j = members
         .iter()
         .map(|body| {
             fieldcad_core::relativistic_kinetic_energy(
@@ -204,10 +224,13 @@ pub fn universe_summary(world: &WorldSnapshot) -> Option<fieldcad_core::Universe
             )
         })
         .sum();
-    Some(fieldcad_core::UniverseSummary {
+    Some(MassAggregateSample {
         center_of_mass,
+        velocity,
         total_momentum,
         total_kinetic_energy_j,
+        total_mass_kg,
+        member_count: members.len(),
     })
 }
 
@@ -456,6 +479,8 @@ pub enum DynamicsError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use fieldcad_core::{
         ObjectSpec, Transform as CoreTransform, World, WorldCommand,
         quantities::{MassKg, kilogram},
@@ -634,14 +659,11 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
-    #[test]
-    fn universe_summary_is_none_without_any_mass() {
-        let world = World::new();
-        assert_eq!(universe_summary(&world.snapshot()), None);
-    }
-
-    #[test]
-    fn universe_summary_computes_center_of_mass_momentum_and_energy() {
+    /// Three equal-mass bodies: `a` at x=0 (stationary), `b` at x=4 moving at
+    /// (1,0,0), `c` at x=100 (stationary) — `c` is placed far away so a test
+    /// that excludes/omits it can tell at a glance whether it was actually
+    /// dropped from the sum. Returns `(world, [a, b, c] object ids)`.
+    fn three_body_world() -> (World, [ObjectId; 3]) {
         let mut world = World::new();
         let commands = mass_component_schemas()
             .into_iter()
@@ -664,17 +686,92 @@ mod tests {
                             inertial_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap(),
                         ),
                 ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("c")
+                        .with_transform(CoreTransform::at(DVec3::new(100.0, 0.0, 0.0)).unwrap())
+                        .with_component(
+                            inertial_mass_component_id(),
+                            inertial_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap(),
+                        ),
+                ),
             ]);
-        world.commit(commands).unwrap();
+        let report = world.commit(commands).unwrap();
+        let ids: [ObjectId; 3] = report.created_objects.try_into().unwrap();
+        (world, ids)
+    }
 
-        let summary = universe_summary(&world.snapshot()).unwrap();
+    #[test]
+    fn mass_aggregate_is_none_without_any_mass() {
+        let world = World::new();
+        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let selection = MassSelection::Universe {
+            excluded: BTreeSet::new(),
+        };
+        assert_eq!(mass_aggregate(bodies.iter(), &selection), None);
+    }
+
+    #[test]
+    fn mass_aggregate_computes_center_of_mass_velocity_momentum_and_energy() {
+        let (world, [a, b, _c]) = three_body_world();
+        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let selection = MassSelection::Selection {
+            included: BTreeSet::from([a, b]),
+        };
+
+        let summary = mass_aggregate(bodies.iter(), &selection).unwrap();
 
         // Equal masses at x=0 and x=4: centroid at x=2.
         assert!((summary.center_of_mass - DVec3::new(2.0, 0.0, 0.0)).length() < 1.0e-12);
+        // v_com = (m_a*0 + m_b*(1,0,0)) / (m_a+m_b) = (0.5, 0, 0).
+        assert!((summary.velocity - DVec3::new(0.5, 0.0, 0.0)).length() < 1.0e-12);
         // p = m*v, only "b" moves: 2 kg * (1, 0, 0) m/s.
         assert!((summary.total_momentum - DVec3::new(2.0, 0.0, 0.0)).length() < 1.0e-12);
         // KE = 1/2 * 2 * 1^2 = 1 J.
         assert!((summary.total_kinetic_energy_j - 1.0).abs() < 1.0e-12);
+        assert!((summary.total_mass_kg - 4.0).abs() < 1.0e-12);
+        assert_eq!(summary.member_count, 2);
+    }
+
+    #[test]
+    fn mass_aggregate_universe_mode_drops_an_excluded_object() {
+        let (world, [_a, _b, c]) = three_body_world();
+        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let selection = MassSelection::Universe {
+            excluded: BTreeSet::from([c]),
+        };
+
+        let summary = mass_aggregate(bodies.iter(), &selection).unwrap();
+
+        // Same result as the two-body (a, b) case above: excluding "c" at
+        // x=100 must pull the centroid back from wherever including it would
+        // put it.
+        assert!((summary.center_of_mass - DVec3::new(2.0, 0.0, 0.0)).length() < 1.0e-9);
+        assert_eq!(summary.member_count, 2);
+    }
+
+    #[test]
+    fn mass_aggregate_selection_mode_ignores_unlisted_objects() {
+        let (world, [a, b, _c]) = three_body_world();
+        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let selection = MassSelection::Selection {
+            included: BTreeSet::from([a, b]),
+        };
+
+        let summary = mass_aggregate(bodies.iter(), &selection).unwrap();
+
+        assert!((summary.center_of_mass - DVec3::new(2.0, 0.0, 0.0)).length() < 1.0e-9);
+        assert_eq!(summary.member_count, 2);
+    }
+
+    #[test]
+    fn mass_aggregate_selection_mode_with_no_members_is_none() {
+        let (world, _ids) = three_body_world();
+        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let selection = MassSelection::Selection {
+            included: BTreeSet::new(),
+        };
+
+        assert_eq!(mass_aggregate(bodies.iter(), &selection), None);
     }
 
     #[test]

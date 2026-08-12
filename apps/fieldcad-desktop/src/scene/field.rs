@@ -737,7 +737,7 @@ mod tests {
             )]),
             diagnostics: Arc::from([]),
             distances: Arc::from([]),
-            universe: None,
+            mass_aggregates: Arc::from([]),
         };
         (snapshot, channel)
     }

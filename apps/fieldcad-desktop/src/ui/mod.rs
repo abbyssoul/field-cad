@@ -21,16 +21,19 @@ use panels::{
     diagnostics_window, field_brush_dialog, inspector, mcp_window, menu_bar, queue_window,
     scene_tree, settings_window,
 };
-use plot::{floating_distance_probe_plots, floating_probe_plots};
+use plot::{
+    floating_distance_probe_plots, floating_mass_aggregate_probe_plots, floating_probe_plots,
+};
 use viewcontrols::view_controls;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcad_core::{
-    BoundaryConditions, BoxId, ChannelId, DistanceProbeId, Domain, DomainBounds, ObjectId, PlaneId,
-    Precision, ProbeId, Resolution, SphereId, WorldCommand, WorldSnapshot,
+    BoundaryConditions, BoxId, ChannelId, DistanceProbeId, Domain, DomainBounds,
+    MassAggregateProbeId, ObjectId, PlaneId, Precision, ProbeId, Resolution, SphereId,
+    WorldCommand, WorldSnapshot,
 };
-use fieldcad_simulation::{CommandPayload, DistanceHistory, ProbeHistory};
+use fieldcad_simulation::{CommandPayload, DistanceHistory, MassAggregateHistory, ProbeHistory};
 use glam::{DVec3, UVec3};
 
 use crate::{
@@ -235,6 +238,10 @@ pub struct UiModel {
     /// has no viewport gizmo or pick target — only a scene-tree row and an
     /// inspector panel.
     pub distance_probe_selection: Option<DistanceProbeId>,
+    /// A mass-aggregate probe *does* live at a point of its own (its
+    /// anchor), so — unlike a distance probe — it has a viewport gizmo and
+    /// pick target and is part of [`SceneSelection`].
+    pub mass_aggregate_probe_selection: Option<MassAggregateProbeId>,
     /// Non-modal plot windows pinned independently of scene selection.
     pub probe_plots: BTreeMap<ProbeId, ProbePlotWindow>,
     /// Distance probes with an open floating plot window. A `BTreeSet`, not
@@ -247,6 +254,13 @@ pub struct UiModel {
     /// and the floating window. Absent means the default,
     /// [`DistanceProbeSeries::default`] (distance only).
     pub distance_probe_series: BTreeMap<DistanceProbeId, DistanceProbeSeries>,
+    /// Mass-aggregate probes with an open floating plot window — see
+    /// `distance_probe_plots`.
+    pub mass_aggregate_probe_plots: BTreeSet<MassAggregateProbeId>,
+    /// Which series each mass-aggregate probe's plot currently shows — see
+    /// `distance_probe_series`. Absent means
+    /// [`MassAggregateProbeSeries::default`].
+    pub mass_aggregate_probe_series: BTreeMap<MassAggregateProbeId, MassAggregateProbeSeries>,
     /// Independent visualization state for every published vector channel.
     pub field_layers: BTreeMap<ChannelId, ChannelLayerSettings>,
     /// Per-object motion-trail display, keyed by the object it traces.
@@ -313,9 +327,12 @@ impl UiModel {
             sphere_selection: None,
             probe_selection: None,
             distance_probe_selection: None,
+            mass_aggregate_probe_selection: None,
             probe_plots: BTreeMap::new(),
             distance_probe_plots: BTreeSet::new(),
             distance_probe_series: BTreeMap::new(),
+            mass_aggregate_probe_plots: BTreeSet::new(),
+            mass_aggregate_probe_series: BTreeMap::new(),
             field_layers: BTreeMap::new(),
             object_trajectories: BTreeMap::new(),
             command_error: None,
@@ -411,6 +428,10 @@ impl UiModel {
         self.distance_probe_plots.insert(probe);
     }
 
+    pub fn open_mass_aggregate_probe_plot(&mut self, probe: MassAggregateProbeId) {
+        self.mass_aggregate_probe_plots.insert(probe);
+    }
+
     /// Select a distance probe in the inspector. Separate from
     /// [`Self::set_scene_selection`] since a distance probe isn't a
     /// [`SceneSelection`] variant — see the field doc on
@@ -438,6 +459,9 @@ impl UiModel {
             }
             CreatedEntity::Probe(id) => self.set_scene_selection(Some(SceneSelection::Probe(id))),
             CreatedEntity::DistanceProbe(id) => self.select_distance_probe(id),
+            CreatedEntity::MassAggregateProbe(id) => {
+                self.set_scene_selection(Some(SceneSelection::MassAggregateProbe(id)));
+            }
         }
     }
 
@@ -472,6 +496,10 @@ impl UiModel {
             .or_else(|| self.box_selection.map(SceneSelection::Box))
             .or_else(|| self.sphere_selection.map(SceneSelection::Sphere))
             .or_else(|| self.probe_selection.map(SceneSelection::Probe))
+            .or_else(|| {
+                self.mass_aggregate_probe_selection
+                    .map(SceneSelection::MassAggregateProbe)
+            })
     }
 
     pub fn set_scene_selection(&mut self, selection: Option<SceneSelection>) {
@@ -481,6 +509,7 @@ impl UiModel {
         self.sphere_selection = None;
         self.probe_selection = None;
         self.distance_probe_selection = None;
+        self.mass_aggregate_probe_selection = None;
         // Selecting anything in the scene — including nothing — takes the
         // inspector off the world node, so the two can never both look selected.
         self.world_selected = false;
@@ -490,6 +519,9 @@ impl UiModel {
             Some(SceneSelection::Box(id)) => self.box_selection = Some(id),
             Some(SceneSelection::Sphere(id)) => self.sphere_selection = Some(id),
             Some(SceneSelection::Probe(id)) => self.probe_selection = Some(id),
+            Some(SceneSelection::MassAggregateProbe(id)) => {
+                self.mass_aggregate_probe_selection = Some(id);
+            }
             None => {}
         }
     }
@@ -553,6 +585,30 @@ impl Default for DistanceProbeSeries {
         Self {
             distance: true,
             rate_of_change: false,
+        }
+    }
+}
+
+/// Which series a mass-aggregate ("center of mass") probe's plot currently
+/// shows. Each vector quantity plots as its magnitude — same reasoning as
+/// [`DistanceProbeSeries`]: one scalar series per toggle, unit-safe, shared
+/// between the inline inspector plot and the floating window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MassAggregateProbeSeries {
+    /// Distance of the centroid from the world origin.
+    pub center_of_mass: bool,
+    pub velocity: bool,
+    pub momentum: bool,
+    pub kinetic_energy: bool,
+}
+
+impl Default for MassAggregateProbeSeries {
+    fn default() -> Self {
+        Self {
+            center_of_mass: true,
+            velocity: false,
+            momentum: false,
+            kinetic_energy: false,
         }
     }
 }
@@ -681,6 +737,7 @@ pub struct FrameContext<'a> {
     pub world: &'a WorldSnapshot,
     pub probe_history: &'a ProbeHistory,
     pub distance_history: &'a DistanceHistory,
+    pub mass_aggregate_history: &'a MassAggregateHistory,
     pub adapter_name: &'a str,
     pub frame_time_ms: f32,
     /// Oldest first, newest last — every history slice on this context
@@ -1036,6 +1093,7 @@ pub fn show(
     settings_window(&context, model, profile);
     floating_probe_plots(&context, model, &frame);
     floating_distance_probe_plots(&context, model, &frame);
+    floating_mass_aggregate_probe_plots(&context, model, &frame);
     field_brush_dialog(&context, model, frame.compute);
     if model.save_in_progress {
         saving_window(&context);
@@ -1290,6 +1348,7 @@ mod tests {
         let compute = ComputeView::build(&source(), &snapshot, None);
         let history = ProbeHistory::default();
         let distance_history = DistanceHistory::default();
+        let mass_aggregate_history = MassAggregateHistory::default();
 
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1308,6 +1367,7 @@ mod tests {
                     world: &snapshot,
                     probe_history: &history,
                     distance_history: &distance_history,
+                    mass_aggregate_history: &mass_aggregate_history,
                     adapter_name: "Test adapter",
                     frame_time_ms: 16.0,
                     active_translation: None,
@@ -1367,6 +1427,7 @@ mod tests {
         let compute = ComputeView::build(&source(), &snapshot, None);
         let history = ProbeHistory::default();
         let distance_history = DistanceHistory::default();
+        let mass_aggregate_history = MassAggregateHistory::default();
         let mut output = UiFrameOutput::default();
 
         let input = egui::RawInput {
@@ -1384,6 +1445,7 @@ mod tests {
                     world: &snapshot,
                     probe_history: &history,
                     distance_history: &distance_history,
+                    mass_aggregate_history: &mass_aggregate_history,
                     adapter_name: "Test adapter",
                     frame_time_ms: 16.0,
                     active_translation: None,
@@ -1659,6 +1721,16 @@ mod tests {
         model.set_scene_selection(Some(SceneSelection::Probe(probe)));
         assert_eq!(model.plane_selection, None);
         assert_eq!(model.scene_selection(), Some(SceneSelection::Probe(probe)));
+
+        let mass_aggregate_probe = MassAggregateProbeId::new(4);
+        model.set_scene_selection(Some(SceneSelection::MassAggregateProbe(
+            mass_aggregate_probe,
+        )));
+        assert_eq!(model.probe_selection, None);
+        assert_eq!(
+            model.scene_selection(),
+            Some(SceneSelection::MassAggregateProbe(mass_aggregate_probe))
+        );
     }
 
     #[test]
@@ -1697,6 +1769,14 @@ mod tests {
 
         model.select_created(fieldcad_core::CreatedEntity::Probe(ProbeId::new(5)));
         assert_eq!(model.probe_selection, Some(ProbeId::new(5)));
+
+        model.select_created(fieldcad_core::CreatedEntity::MassAggregateProbe(
+            MassAggregateProbeId::new(6),
+        ));
+        assert_eq!(
+            model.mass_aggregate_probe_selection,
+            Some(MassAggregateProbeId::new(6))
+        );
     }
 
     #[test]

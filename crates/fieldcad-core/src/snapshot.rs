@@ -4,8 +4,8 @@ use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChannelId, ChannelSchema, DistanceProbeId, Domain, FieldBatch, PluginId, PluginVersion,
-    ProbeId, Sample, WorldRevision,
+    ChannelId, ChannelSchema, DistanceProbeId, Domain, FieldBatch, MassAggregateProbeId, PluginId,
+    PluginVersion, ProbeId, Sample, WorldRevision,
 };
 
 #[derive(
@@ -142,19 +142,29 @@ pub struct FieldSnapshot {
     /// `ChannelSnapshot`: a distance is a pure geometric measurement with no
     /// `ChannelId` or plugin behind it.
     pub distances: Arc<[(DistanceProbeId, f64)]>,
-    /// Live totals over every mass-bearing object. `None` when nothing in
-    /// the world carries mass. Sibling to `distances` for the same reason —
-    /// these are pure computed quantities with no `ChannelId` or plugin
-    /// behind them.
-    pub universe: Option<UniverseSummary>,
+    /// Live readings for every [`crate::MassAggregateProbe`], `None` for a
+    /// probe whose selection currently has no mass-bearing member. Sibling to
+    /// `distances` for the same reason — these are pure computed quantities
+    /// with no `ChannelId` or plugin behind them.
+    pub mass_aggregates: Arc<[(MassAggregateProbeId, MassAggregateSample)]>,
 }
 
-/// Live totals computed over every object carrying inertial mass.
+/// A live centre-of-mass/momentum/energy measurement, computed by
+/// `fieldcad_dynamics::mass_aggregate` over one [`crate::MassAggregateProbe`]'s
+/// selection.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UniverseSummary {
+pub struct MassAggregateSample {
     pub center_of_mass: DVec3,
+    /// Σ mᵢvᵢ / Σ mᵢ — the same rest-mass weighting as `center_of_mass`,
+    /// *not* derived from `total_momentum` (which is relativistic): this is
+    /// the ordinary time-derivative of the mass-weighted centroid.
+    pub velocity: DVec3,
+    /// Σ γmv over every member.
     pub total_momentum: DVec3,
+    /// Σ (γ−1)mc² over every member.
     pub total_kinetic_energy_j: f64,
+    pub total_mass_kg: f64,
+    pub member_count: usize,
 }
 
 impl FieldSnapshot {

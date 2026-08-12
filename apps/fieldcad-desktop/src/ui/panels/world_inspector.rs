@@ -44,51 +44,6 @@ pub(super) fn world_properties(
     super::section(ui, "inspector_compute", "Compute", true, |ui| {
         compute_panel(ui, compute);
     });
-    super::section(
-        ui,
-        "inspector_universe_summary",
-        "Center of mass",
-        true,
-        |ui| universe_summary_panel(ui, compute),
-    );
-}
-
-fn universe_summary_panel(ui: &mut egui::Ui, compute: &ComputeView) {
-    let Some(universe) = compute.universe else {
-        ui.weak("No mass-bearing objects yet.");
-        return;
-    };
-    egui::Grid::new("universe_summary")
-        .num_columns(2)
-        .spacing([12.0, 6.0])
-        .show(ui, |ui| {
-            ui.label("Position").on_hover_text(
-                "The mass-weighted centroid of every object carrying inertial mass. \
-                 Drawn in the viewport as a small gold ring; attach a plane, box, or \
-                 sphere to it like any other object to follow it.",
-            );
-            ui.label(super::object_inspector::format_vector(
-                universe.center_of_mass,
-                "m",
-            ));
-            ui.end_row();
-
-            ui.label("Total momentum")
-                .on_hover_text("Σ γmv over every mass-bearing object.");
-            ui.label(super::object_inspector::format_vector(
-                universe.total_momentum,
-                "kg·m/s",
-            ));
-            ui.end_row();
-
-            ui.label("Total kinetic energy")
-                .on_hover_text("Σ (γ−1)mc² over every mass-bearing object.");
-            ui.label(format!(
-                "{} J",
-                crate::ui::compute::format_engineering(universe.total_kinetic_energy_j)
-            ));
-            ui.end_row();
-        });
 }
 
 fn numerical_domain_editor(

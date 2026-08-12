@@ -7,6 +7,7 @@
 mod diagnostics;
 mod distance_probe_inspector;
 mod inspector;
+mod mass_aggregate_probe_inspector;
 mod mcp;
 mod menu_bar;
 mod object_inspector;
@@ -138,7 +139,7 @@ mod tests {
     };
     use crate::camera::Projection;
     use crate::mcp::McpSession;
-    use fieldcad_simulation::{DistanceHistory, ProbeHistory};
+    use fieldcad_simulation::{DistanceHistory, MassAggregateHistory, ProbeHistory};
 
     // Import test-referenced functions from sibling modules
     use super::distance_probe_inspector::distance_probe_properties;
@@ -277,6 +278,7 @@ mod tests {
         let world = seeded_world().snapshot();
         let history = ProbeHistory::default();
         let distance_history = DistanceHistory::default();
+        let mass_aggregate_history = MassAggregateHistory::default();
 
         let run = |events: Vec<egui::Event>| {
             let mut output = UiFrameOutput::default();
@@ -298,6 +300,7 @@ mod tests {
                             world: &world,
                             probe_history: &history,
                             distance_history: &distance_history,
+                            mass_aggregate_history: &mass_aggregate_history,
                             adapter_name: "Test adapter",
                             frame_time_ms: 16.0,
                             active_translation: None,

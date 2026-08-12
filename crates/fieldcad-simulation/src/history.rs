@@ -7,8 +7,10 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use fieldcad_core::{
-    ChannelId, DistanceProbeId, FieldSnapshot, FieldValue, ProbeId, SampleValidity, WorldRevision,
+    ChannelId, DistanceProbeId, FieldSnapshot, FieldValue, MassAggregateProbeId,
+    MassAggregateSample, ProbeId, SampleValidity, WorldRevision,
 };
+use glam::DVec3;
 
 /// One recorded probe sample, with everything needed to say where it came from.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -278,6 +280,153 @@ impl Default for DistanceHistory {
     }
 }
 
+/// One recorded mass-aggregate-probe reading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MassAggregateReading {
+    pub tick: u64,
+    pub time_seconds: f64,
+    pub world_revision: WorldRevision,
+    pub snapshot_sequence: u64,
+    pub center_of_mass: DVec3,
+    pub velocity: DVec3,
+    pub total_momentum: DVec3,
+    pub total_kinetic_energy_j: f64,
+    pub total_mass_kg: f64,
+    pub member_count: usize,
+}
+
+/// Bounded history for every mass-aggregate probe seen so far.
+///
+/// A mass-aggregate sample has no [`ChannelId`] — it isn't a field sample —
+/// so this mirrors [`DistanceHistory`]'s shape but keys directly on
+/// [`MassAggregateProbeId`] and reads `snapshot.mass_aggregates` instead of
+/// `snapshot.distances`.
+#[derive(Clone, Debug)]
+pub struct MassAggregateHistory {
+    capacity: usize,
+    series: BTreeMap<MassAggregateProbeId, VecDeque<MassAggregateReading>>,
+}
+
+impl MassAggregateHistory {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            series: BTreeMap::new(),
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Record every mass-aggregate reading in a snapshot.
+    ///
+    /// Recording the same snapshot twice is a no-op, so a caller that polls more
+    /// often than the source produces data does not duplicate samples.
+    pub fn record(&mut self, snapshot: &FieldSnapshot) -> usize {
+        let mut recorded = 0;
+        for &(probe, sample) in snapshot.mass_aggregates.iter() {
+            let series = self.series.entry(probe).or_default();
+            if series
+                .back()
+                .is_some_and(|last| last.snapshot_sequence >= snapshot.identity.sequence)
+            {
+                continue;
+            }
+            if series.len() == self.capacity {
+                series.pop_front();
+            }
+            let MassAggregateSample {
+                center_of_mass,
+                velocity,
+                total_momentum,
+                total_kinetic_energy_j,
+                total_mass_kg,
+                member_count,
+            } = sample;
+            series.push_back(MassAggregateReading {
+                tick: snapshot.identity.tick,
+                time_seconds: snapshot.identity.time_seconds,
+                world_revision: snapshot.identity.world_revision,
+                snapshot_sequence: snapshot.identity.sequence,
+                center_of_mass,
+                velocity,
+                total_momentum,
+                total_kinetic_energy_j,
+                total_mass_kg,
+                member_count,
+            });
+            recorded += 1;
+        }
+        recorded
+    }
+
+    pub fn readings(
+        &self,
+        probe: MassAggregateProbeId,
+    ) -> impl Iterator<Item = &MassAggregateReading> {
+        self.series.get(&probe).into_iter().flatten()
+    }
+
+    pub fn len(&self, probe: MassAggregateProbeId) -> usize {
+        self.series.get(&probe).map_or(0, VecDeque::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.series.values().all(VecDeque::is_empty)
+    }
+
+    pub fn clear(&mut self) {
+        self.series.clear();
+    }
+
+    /// Drop the series of probes that no longer exist — see
+    /// [`ProbeHistory::retain_probes`] for why the set of series is
+    /// otherwise unbounded.
+    pub fn retain_probes(&mut self, live: impl Fn(MassAggregateProbeId) -> bool) {
+        self.series.retain(|probe, _| live(*probe));
+    }
+
+    /// Probes that have at least one reading.
+    pub fn tracked(&self) -> impl Iterator<Item = MassAggregateProbeId> {
+        self.series
+            .iter()
+            .filter(|(_, series)| !series.is_empty())
+            .map(|(probe, _)| *probe)
+    }
+
+    /// Every non-empty series, for a caller that persists the whole history
+    /// (a scene save) rather than reading one probe at a time.
+    pub fn entries(
+        &self,
+    ) -> impl Iterator<Item = (MassAggregateProbeId, &VecDeque<MassAggregateReading>)> {
+        self.series
+            .iter()
+            .filter(|(_, series)| !series.is_empty())
+            .map(|(probe, series)| (*probe, series))
+    }
+
+    /// Replace a whole series directly, dropping the oldest readings past
+    /// `capacity` — the counterpart to [`Self::entries`] for restoring a
+    /// history saved with a possibly different capacity than this one's.
+    pub fn insert_series(
+        &mut self,
+        probe: MassAggregateProbeId,
+        mut readings: VecDeque<MassAggregateReading>,
+    ) {
+        while readings.len() > self.capacity {
+            readings.pop_front();
+        }
+        self.series.insert(probe, readings);
+    }
+}
+
+impl Default for MassAggregateHistory {
+    fn default() -> Self {
+        Self::new(fieldcad_core::DEFAULT_PROBE_HISTORY)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{
@@ -330,7 +479,7 @@ mod tests {
             )]),
             diagnostics: Arc::from([]),
             distances: Arc::from([]),
-            universe: None,
+            mass_aggregates: Arc::from([]),
         }
     }
 
@@ -413,6 +562,102 @@ mod tests {
         let removed = DistanceProbeId::new(1);
         let mut history = DistanceHistory::new(8);
         history.record(&snapshot_with_distances(0, &[(kept, 1.0), (removed, 2.0)]));
+        assert_eq!(history.tracked().count(), 2);
+
+        history.retain_probes(|probe| probe == kept);
+
+        assert_eq!(history.len(kept), 1);
+        assert_eq!(history.len(removed), 0);
+        assert_eq!(history.tracked().count(), 1);
+    }
+
+    fn sample(center_of_mass_x: f64) -> MassAggregateSample {
+        MassAggregateSample {
+            center_of_mass: DVec3::new(center_of_mass_x, 0.0, 0.0),
+            velocity: DVec3::ZERO,
+            total_momentum: DVec3::ZERO,
+            total_kinetic_energy_j: 0.0,
+            total_mass_kg: 1.0,
+            member_count: 1,
+        }
+    }
+
+    fn snapshot_with_mass_aggregates(
+        sequence: u64,
+        readings: &[(MassAggregateProbeId, MassAggregateSample)],
+    ) -> FieldSnapshot {
+        let mut snapshot = snapshot_with(&[]);
+        snapshot.identity.sequence = sequence;
+        snapshot.mass_aggregates = Arc::from(readings.to_vec().into_boxed_slice());
+        snapshot
+    }
+
+    #[test]
+    fn mass_aggregate_history_records_every_probe_in_a_snapshot() {
+        let a = MassAggregateProbeId::new(0);
+        let b = MassAggregateProbeId::new(1);
+        let mut history = MassAggregateHistory::new(8);
+        history.record(&snapshot_with_mass_aggregates(
+            0,
+            &[(a, sample(1.5)), (b, sample(2.5))],
+        ));
+
+        assert_eq!(history.tracked().count(), 2);
+        assert_eq!(
+            history
+                .readings(a)
+                .next()
+                .map(|reading| reading.center_of_mass.x),
+            Some(1.5)
+        );
+        assert_eq!(
+            history
+                .readings(b)
+                .next()
+                .map(|reading| reading.center_of_mass.x),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn mass_aggregate_history_does_not_duplicate_the_same_snapshot() {
+        let probe = MassAggregateProbeId::new(0);
+        let mut history = MassAggregateHistory::new(8);
+        let snapshot = snapshot_with_mass_aggregates(0, &[(probe, sample(1.0))]);
+        history.record(&snapshot);
+        history.record(&snapshot);
+
+        assert_eq!(history.len(probe), 1);
+    }
+
+    #[test]
+    fn mass_aggregate_history_is_bounded_by_capacity() {
+        let probe = MassAggregateProbeId::new(0);
+        let mut history = MassAggregateHistory::new(2);
+        for sequence in 0..5 {
+            history.record(&snapshot_with_mass_aggregates(
+                sequence,
+                &[(probe, sample(sequence as f64))],
+            ));
+        }
+
+        assert_eq!(history.len(probe), 2);
+        let last: Vec<f64> = history
+            .readings(probe)
+            .map(|reading| reading.center_of_mass.x)
+            .collect();
+        assert_eq!(last, vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn deleted_mass_aggregate_probes_do_not_retain_their_history_forever() {
+        let kept = MassAggregateProbeId::new(0);
+        let removed = MassAggregateProbeId::new(1);
+        let mut history = MassAggregateHistory::new(8);
+        history.record(&snapshot_with_mass_aggregates(
+            0,
+            &[(kept, sample(1.0)), (removed, sample(2.0))],
+        ));
         assert_eq!(history.tracked().count(), 2);
 
         history.retain_probes(|probe| probe == kept);
