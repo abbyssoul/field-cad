@@ -130,11 +130,37 @@ pub fn append_authoring_geometry(
             };
             let position = scene_scale.to_render_vec3(anchor.transform.translation);
             let radius = 0.1;
-            let color = if selection == Some(SceneSelection::MassAggregateProbe(probe.id)) {
+            let is_selected = selection == Some(SceneSelection::MassAggregateProbe(probe.id));
+            let color = if is_selected {
                 Vec4::new(1.0, 0.55, 0.08, 1.0)
             } else {
                 Vec4::new(1.0, 0.82, 0.2, 1.0)
             };
+
+            // Dashed centroid-to-member links only while the probe itself is
+            // the active selection: cheap to compute (nothing every other
+            // frame) and reads as "here is what I'm currently pointing at"
+            // rather than permanent scene clutter. Walks the same
+            // mass-bearing filter `fieldcad_dynamics::mass_aggregate` sums
+            // over, so a line is drawn to every object — and only the
+            // objects — actually contributing to `sample.member_count`.
+            if is_selected && probe.show_member_lines {
+                for (member, _properties) in
+                    world.objects_with(&fieldcad_sources::inertial_mass_component_id())
+                {
+                    if !probe.selection.includes(member.id) {
+                        continue;
+                    }
+                    push_dashed_line(
+                        &mut geometry.vector_lines,
+                        position,
+                        scene_scale.to_render_vec3(member.transform.translation),
+                        Vec4::new(1.0, 0.82, 0.2, 0.55),
+                        0.08,
+                        0.05,
+                    );
+                }
+            }
             push_circle(
                 &mut geometry.vector_lines,
                 position,
@@ -174,6 +200,29 @@ pub fn append_authoring_geometry(
 
     if !show.probes {
         return;
+    }
+    // Unlike the mass-aggregate probe's member links, this isn't
+    // selection-gated: a distance measurement's whole point is showing what
+    // it's measuring, not just when it's the thing being inspected.
+    for probe in world
+        .distance_probes()
+        .values()
+        .filter(|probe| probe.visible && probe.show_line)
+    {
+        let Some(object_a) = world.object(probe.object_a) else {
+            continue;
+        };
+        let Some(object_b) = world.object(probe.object_b) else {
+            continue;
+        };
+        push_dashed_line(
+            &mut geometry.vector_lines,
+            scene_scale.to_render_vec3(object_a.transform.translation),
+            scene_scale.to_render_vec3(object_b.transform.translation),
+            Vec4::new(0.6, 0.85, 1.0, 0.7),
+            0.08,
+            0.05,
+        );
     }
     for probe in world.probes().values().filter(|probe| probe.visible) {
         let Ok(position) = world.resolve_probe_position(probe) else {
@@ -565,7 +614,7 @@ fn append_sphere_visual(
 #[cfg(test)]
 mod tests {
     use fieldcad_core::{
-        BoxId, FieldBoxSpec, FieldSphereSpec, ObjectId, PlaneId, ProbeId, SphereId,
+        BoxId, FieldBoxSpec, FieldSphereSpec, ObjectId, ObjectSpec, PlaneId, ProbeId, SphereId,
         Transform as CoreTransform, World, WorldCommand,
     };
     use glam::DVec3;
@@ -678,6 +727,7 @@ mod tests {
             center_of_mass: DVec3::new(1.0, 2.0, 3.0),
             velocity: DVec3::ZERO,
             total_momentum: DVec3::new(1.0, 0.0, 0.0),
+            angular_momentum: DVec3::ZERO,
             total_kinetic_energy_j: 4.0,
             total_mass_kg: 2.0,
             member_count: 1,
@@ -719,5 +769,75 @@ mod tests {
 
         assert!(!geometry.surface_triangles.is_empty());
         assert!(!geometry.vector_lines.is_empty());
+    }
+
+    #[test]
+    fn a_distance_probes_line_is_drawn_when_visible_and_toggled_on() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("a").with_transform(CoreTransform::at(DVec3::ZERO).unwrap()),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("b")
+                        .with_transform(CoreTransform::at(DVec3::new(3.0, 0.0, 0.0)).unwrap()),
+                ),
+            ])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateDistanceProbe(
+                fieldcad_core::DistanceProbeSpec::new("gap", ObjectId::new(0), ObjectId::new(1)),
+            )])
+            .unwrap();
+        let snapshot = world.snapshot();
+
+        let mut geometry = FieldGeometry::default();
+        append_authoring_geometry(
+            &mut geometry,
+            &snapshot,
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+            &BTreeMap::new(),
+        );
+
+        assert!(!geometry.vector_lines.is_empty());
+    }
+
+    #[test]
+    fn a_distance_probes_line_is_skipped_when_toggled_off() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(ObjectSpec::new("a")),
+                WorldCommand::CreateObject(ObjectSpec::new("b")),
+            ])
+            .unwrap();
+        let report = world
+            .commit([WorldCommand::CreateDistanceProbe(
+                fieldcad_core::DistanceProbeSpec::new("gap", ObjectId::new(0), ObjectId::new(1)),
+            )])
+            .unwrap();
+        let probe_id = report.created_distance_probes[0];
+        world
+            .commit([WorldCommand::SetDistanceProbeShowLine {
+                probe: probe_id,
+                show_line: false,
+            }])
+            .unwrap();
+        let snapshot = world.snapshot();
+
+        let mut geometry = FieldGeometry::default();
+        append_authoring_geometry(
+            &mut geometry,
+            &snapshot,
+            None,
+            SceneVisibility::ALL,
+            SceneScale::metre(),
+            &BTreeMap::new(),
+        );
+
+        assert!(geometry.vector_lines.is_empty());
     }
 }

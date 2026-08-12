@@ -145,6 +145,7 @@ fn capture_mass_aggregate_reading(reading: MassAggregateReading) -> MassAggregat
         center_of_mass: reading.center_of_mass,
         velocity: reading.velocity,
         total_momentum: reading.total_momentum,
+        angular_momentum: reading.angular_momentum,
         total_kinetic_energy_j: reading.total_kinetic_energy_j,
         total_mass_kg: reading.total_mass_kg,
         member_count: reading.member_count,
@@ -176,6 +177,7 @@ fn restore_mass_aggregate_reading(record: MassAggregateReadingRecord) -> MassAgg
         center_of_mass: record.center_of_mass,
         velocity: record.velocity,
         total_momentum: record.total_momentum,
+        angular_momentum: record.angular_momentum,
         total_kinetic_energy_j: record.total_kinetic_energy_j,
         total_mass_kg: record.total_mass_kg,
         member_count: record.member_count,
@@ -258,6 +260,7 @@ mod tests {
                 center_of_mass: DVec3::new(1.0, 2.0, 3.0),
                 velocity: DVec3::new(0.1, 0.0, 0.0),
                 total_momentum: DVec3::new(4.0, 0.0, 0.0),
+                angular_momentum: DVec3::new(0.0, 0.0, 7.0),
                 total_kinetic_energy_j: 5.0,
                 total_mass_kg: 6.0,
                 member_count: 2,
@@ -269,6 +272,7 @@ mod tests {
         let readings: Vec<_> = restored.readings(MassAggregateProbeId::new(0)).collect();
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0].center_of_mass, DVec3::new(1.0, 2.0, 3.0));
+        assert_eq!(readings[0].angular_momentum, DVec3::new(0.0, 0.0, 7.0));
         assert_eq!(readings[0].member_count, 2);
     }
 }

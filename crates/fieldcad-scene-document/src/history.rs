@@ -37,6 +37,18 @@ pub struct ProbeHistoryState {
     pub series: Vec<ProbeSeriesRecord>,
 }
 
+impl ProbeHistoryState {
+    /// The highest `snapshot_sequence` recorded in any series, if any —
+    /// see [`super::SceneDocument::next_snapshot_sequence`].
+    pub fn max_snapshot_sequence(&self) -> Option<u64> {
+        self.series
+            .iter()
+            .flat_map(|series| &series.readings)
+            .map(|reading| reading.snapshot_sequence)
+            .max()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DistanceReadingRecord {
     pub tick: u64,
@@ -58,6 +70,17 @@ pub struct DistanceHistoryState {
     pub series: Vec<DistanceSeriesRecord>,
 }
 
+impl DistanceHistoryState {
+    /// See [`ProbeHistoryState::max_snapshot_sequence`].
+    pub fn max_snapshot_sequence(&self) -> Option<u64> {
+        self.series
+            .iter()
+            .flat_map(|series| &series.readings)
+            .map(|reading| reading.snapshot_sequence)
+            .max()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MassAggregateReadingRecord {
     pub tick: u64,
@@ -67,6 +90,13 @@ pub struct MassAggregateReadingRecord {
     pub center_of_mass: DVec3,
     pub velocity: DVec3,
     pub total_momentum: DVec3,
+    /// `#[serde(default)]`: a scene saved before angular momentum was
+    /// tracked has no key for it in its JSON at all — this keeps such a
+    /// recording loadable instead of failing to deserialize, at the cost of
+    /// reporting a zero (not "unknown") value for readings that predate the
+    /// feature.
+    #[serde(default)]
+    pub angular_momentum: DVec3,
     pub total_kinetic_energy_j: f64,
     pub total_mass_kg: f64,
     pub member_count: usize,
@@ -82,4 +112,15 @@ pub struct MassAggregateSeriesRecord {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MassAggregateHistoryState {
     pub series: Vec<MassAggregateSeriesRecord>,
+}
+
+impl MassAggregateHistoryState {
+    /// See [`ProbeHistoryState::max_snapshot_sequence`].
+    pub fn max_snapshot_sequence(&self) -> Option<u64> {
+        self.series
+            .iter()
+            .flat_map(|series| &series.readings)
+            .map(|reading| reading.snapshot_sequence)
+            .max()
+    }
 }

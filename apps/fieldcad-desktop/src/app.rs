@@ -2968,7 +2968,7 @@ fn build_session(
     ),
     String,
 > {
-    let (domain, time_step, scene_scale, integration_scheme, world, plugins, warnings) =
+    let (domain, time_step, scene_scale, integration_scheme, world, plugins, warnings, initial_sequence) =
         match document {
             None => {
                 let domain = Domain::new(
@@ -2987,12 +2987,14 @@ fn build_session(
                     fieldcad_core::World::new(),
                     catalog,
                     Vec::new(),
+                    0,
                 )
             }
             Some(doc) => {
                 let (plugins, warnings) =
                     fieldcad_scene_document::resolve_plugins(catalog, &doc.field_systems)
                         .map_err(|error| error.to_string())?;
+                let initial_sequence = doc.next_snapshot_sequence();
                 (
                     doc.domain,
                     doc.time_step,
@@ -3001,6 +3003,7 @@ fn build_session(
                     fieldcad_core::World::from_document(doc.world),
                     plugins,
                     warnings,
+                    initial_sequence,
                 )
             }
         };
@@ -3008,6 +3011,11 @@ fn build_session(
         .with_world(world)
         .with_scene_scale(scene_scale)
         .with_integration_scheme(integration_scheme)
+        // A loaded document's own recorded histories (if any) must not
+        // poison `record`'s dedup guard once this runtime starts publishing
+        // new snapshots — see `SceneDocument::next_snapshot_sequence`. A
+        // new/demo scene has nothing to reconcile against, hence 0.
+        .with_initial_sequence(initial_sequence)
         .with_subscription(
             Subscription::PROBES_ONLY
                 .with_planes(UVec2::splat(33))

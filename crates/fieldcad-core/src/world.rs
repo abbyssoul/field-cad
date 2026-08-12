@@ -898,6 +898,8 @@ pub struct DistanceProbeSpec {
     object_a: ObjectId,
     object_b: ObjectId,
     visible: bool,
+    #[serde(default = "default_true")]
+    show_line: bool,
 }
 
 impl DistanceProbeSpec {
@@ -907,6 +909,7 @@ impl DistanceProbeSpec {
             object_a,
             object_b,
             visible: true,
+            show_line: true,
         }
     }
 
@@ -929,6 +932,7 @@ impl DistanceProbeSpec {
             object_a: probe.object_a,
             object_b: probe.object_b,
             visible: probe.visible,
+            show_line: probe.show_line,
         }
     }
 
@@ -948,6 +952,11 @@ pub struct DistanceProbe {
     pub object_a: ObjectId,
     pub object_b: ObjectId,
     pub visible: bool,
+    /// Whether a dashed line between `object_a` and `object_b` is drawn
+    /// whenever this probe is visible. Purely a display preference — never
+    /// affects the measured distance itself.
+    #[serde(default = "default_true")]
+    pub show_line: bool,
 }
 
 /// Which mass-bearing objects a [`MassAggregateProbe`] sums over.
@@ -981,11 +990,22 @@ impl MassSelection {
 /// from [`Probe`] for the same reason [`DistanceProbe`] is: this has no
 /// [`ChannelId`] or plugin behind it, it's a pure computed quantity (see
 /// `fieldcad_dynamics::mass_aggregate`).
+/// `#[serde(default = "default_true")]` for a display-toggle field added
+/// after its owning probe type already shipped: a document saved before the
+/// field existed has no key for it in its JSON at all, and defaulting to
+/// "on" keeps the visual behaving the way it did implicitly before the field
+/// existed to turn it off.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MassAggregateProbeSpec {
     pub name: String,
     pub selection: MassSelection,
     pub visible: bool,
+    #[serde(default = "default_true")]
+    pub show_member_lines: bool,
 }
 
 impl MassAggregateProbeSpec {
@@ -994,6 +1014,7 @@ impl MassAggregateProbeSpec {
             name: name.into(),
             selection,
             visible: true,
+            show_member_lines: true,
         }
     }
 
@@ -1009,6 +1030,11 @@ pub struct MassAggregateProbe {
     pub name: String,
     pub selection: MassSelection,
     pub visible: bool,
+    /// Whether a dashed line from the centroid to each current member is
+    /// drawn while this probe is the active selection. Purely a display
+    /// preference — never affects `mass_aggregate`'s computed totals.
+    #[serde(default = "default_true")]
+    pub show_member_lines: bool,
     /// The derived, pinned object this probe's live centroid drives, so a
     /// plane/box/sphere/probe can attach to it like any other object. Created
     /// and removed together with the probe — see
@@ -1411,6 +1437,7 @@ impl World {
                     excluded: BTreeSet::new(),
                 },
                 visible,
+                show_member_lines: true,
                 anchor,
             },
         );
@@ -1540,6 +1567,10 @@ pub enum WorldCommand {
         probe: DistanceProbeId,
         visible: bool,
     },
+    SetDistanceProbeShowLine {
+        probe: DistanceProbeId,
+        show_line: bool,
+    },
     RemoveDistanceProbe(DistanceProbeId),
     CreateMassAggregateProbe(MassAggregateProbeSpec),
     SetMassAggregateProbeName {
@@ -1553,6 +1584,10 @@ pub enum WorldCommand {
     SetMassAggregateProbeVisible {
         probe: MassAggregateProbeId,
         visible: bool,
+    },
+    SetMassAggregateProbeShowMemberLines {
+        probe: MassAggregateProbeId,
+        show_member_lines: bool,
     },
     RemoveMassAggregateProbe(MassAggregateProbeId),
 }
@@ -1602,11 +1637,15 @@ impl WorldCommand {
             Self::SetDistanceProbeName { .. } => "Rename distance probe",
             Self::SetDistanceProbeObjects { .. } => "Change distance probe objects",
             Self::SetDistanceProbeVisible { .. } => "Show or hide distance probe",
+            Self::SetDistanceProbeShowLine { .. } => "Show or hide distance probe line",
             Self::RemoveDistanceProbe(_) => "Remove distance probe",
             Self::CreateMassAggregateProbe(_) => "Add center of mass",
             Self::SetMassAggregateProbeName { .. } => "Rename center of mass",
             Self::SetMassAggregateProbeSelection { .. } => "Change center of mass membership",
             Self::SetMassAggregateProbeVisible { .. } => "Show or hide center of mass",
+            Self::SetMassAggregateProbeShowMemberLines { .. } => {
+                "Show or hide center-of-mass member lines"
+            }
             Self::RemoveMassAggregateProbe(_) => "Remove center of mass",
         }
     }
@@ -2178,6 +2217,7 @@ fn apply_command(
                     object_a: spec.object_a,
                     object_b: spec.object_b,
                     visible: spec.visible,
+                    show_line: spec.show_line,
                 },
             );
             report.created_distance_probes.push(id);
@@ -2209,6 +2249,12 @@ fn apply_command(
                 .ok_or(WorldError::DistanceProbeNotFound { id: probe })?
                 .visible = visible;
         }
+        WorldCommand::SetDistanceProbeShowLine { probe, show_line } => {
+            distance_probes_mut(state)
+                .get_mut(&probe)
+                .ok_or(WorldError::DistanceProbeNotFound { id: probe })?
+                .show_line = show_line;
+        }
         WorldCommand::RemoveDistanceProbe(id) => {
             if distance_probes_mut(state).remove(&id).is_none() {
                 return Err(WorldError::DistanceProbeNotFound { id });
@@ -2239,6 +2285,7 @@ fn apply_command(
                     name: spec.name,
                     selection: spec.selection,
                     visible: spec.visible,
+                    show_member_lines: spec.show_member_lines,
                     anchor,
                 },
             );
@@ -2268,6 +2315,15 @@ fn apply_command(
             if let Some(object) = objects_mut(state).get_mut(&anchor) {
                 object.visible = visible;
             }
+        }
+        WorldCommand::SetMassAggregateProbeShowMemberLines {
+            probe,
+            show_member_lines,
+        } => {
+            mass_aggregate_probes_mut(state)
+                .get_mut(&probe)
+                .ok_or(WorldError::MassAggregateProbeNotFound { id: probe })?
+                .show_member_lines = show_member_lines;
         }
         WorldCommand::RemoveMassAggregateProbe(id) => {
             let probe = mass_aggregate_probes_mut(state)
@@ -3155,6 +3211,90 @@ mod tests {
     }
 
     #[test]
+    fn setting_a_distance_probes_show_line_toggles_it() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(ObjectSpec::new("a")),
+                WorldCommand::CreateObject(ObjectSpec::new("b")),
+            ])
+            .unwrap();
+        let created = world
+            .commit([WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                "gap",
+                ObjectId::new(0),
+                ObjectId::new(1),
+            ))])
+            .unwrap();
+        let probe_id = created.created_distance_probes[0];
+        assert!(
+            world
+                .snapshot()
+                .distance_probe(probe_id)
+                .unwrap()
+                .show_line
+        );
+
+        world
+            .commit([WorldCommand::SetDistanceProbeShowLine {
+                probe: probe_id,
+                show_line: false,
+            }])
+            .unwrap();
+
+        assert!(
+            !world
+                .snapshot()
+                .distance_probe(probe_id)
+                .unwrap()
+                .show_line
+        );
+
+        let missing = DistanceProbeId::new(9999);
+        assert!(
+            world
+                .commit([WorldCommand::SetDistanceProbeShowLine {
+                    probe: missing,
+                    show_line: true,
+                }])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_distance_probe_saved_before_show_line_existed_still_loads_shown() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::CreateObject(ObjectSpec::new("a")),
+                WorldCommand::CreateObject(ObjectSpec::new("b")),
+            ])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                "gap",
+                ObjectId::new(0),
+                ObjectId::new(1),
+            ))])
+            .unwrap();
+
+        let mut value = serde_json::to_value(world.to_document()).unwrap();
+        for probe in value["state"]["distance_probes"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            probe.as_object_mut().unwrap().remove("show_line");
+        }
+
+        let document: WorldDocument = serde_json::from_value(value).unwrap();
+        let restored = World::from_document(document);
+        let snapshot = restored.snapshot();
+        let probe = snapshot.distance_probes().values().next().unwrap();
+        assert!(probe.show_line);
+    }
+
+    #[test]
     fn a_distance_probe_needs_two_distinct_objects() {
         let mut world = World::new();
         world
@@ -3385,6 +3525,89 @@ mod tests {
             report.first_created(),
             Some(CreatedEntity::MassAggregateProbe(probe_id))
         );
+    }
+
+    #[test]
+    fn setting_a_mass_aggregate_probes_show_member_lines_toggles_it() {
+        let mut world = World::new();
+        let report = world
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                MassAggregateProbeSpec::new(
+                    "System",
+                    MassSelection::Universe {
+                        excluded: BTreeSet::new(),
+                    },
+                ),
+            )])
+            .unwrap();
+        let probe_id = report.created_mass_aggregate_probes[0];
+        assert!(
+            world
+                .snapshot()
+                .mass_aggregate_probe(probe_id)
+                .unwrap()
+                .show_member_lines
+        );
+
+        world
+            .commit([WorldCommand::SetMassAggregateProbeShowMemberLines {
+                probe: probe_id,
+                show_member_lines: false,
+            }])
+            .unwrap();
+
+        assert!(
+            !world
+                .snapshot()
+                .mass_aggregate_probe(probe_id)
+                .unwrap()
+                .show_member_lines
+        );
+
+        let missing = MassAggregateProbeId::new(9999);
+        assert!(
+            world
+                .commit([WorldCommand::SetMassAggregateProbeShowMemberLines {
+                    probe: missing,
+                    show_member_lines: true,
+                }])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_mass_aggregate_probe_saved_before_show_member_lines_existed_still_loads_shown() {
+        // Same reasoning as the whole-map regression above, one field
+        // narrower: a probe saved before `show_member_lines` existed has no
+        // key for it in its JSON at all, and must default to `true` (the
+        // behaviour this display had implicitly before the field existed to
+        // turn it off) rather than fail to deserialize.
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::CreateMassAggregateProbe(
+                MassAggregateProbeSpec::new(
+                    "System",
+                    MassSelection::Universe {
+                        excluded: BTreeSet::new(),
+                    },
+                ),
+            )])
+            .unwrap();
+
+        let mut value = serde_json::to_value(world.to_document()).unwrap();
+        for probe in value["state"]["mass_aggregate_probes"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            probe.as_object_mut().unwrap().remove("show_member_lines");
+        }
+
+        let document: WorldDocument = serde_json::from_value(value).unwrap();
+        let restored = World::from_document(document);
+        let snapshot = restored.snapshot();
+        let probe = snapshot.mass_aggregate_probes().values().next().unwrap();
+        assert!(probe.show_member_lines);
     }
 
     #[test]

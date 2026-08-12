@@ -161,6 +161,10 @@ pub struct MassAggregateSample {
     pub velocity: DVec3,
     /// Σ γmv over every member.
     pub total_momentum: DVec3,
+    /// Σ (rᵢ−R_cm)×γmᵢvᵢ about the centroid — angular momentum, tracked
+    /// alongside `total_momentum` and `total_kinetic_energy_j` to watch
+    /// conservation under Noether's theorem as the simulation runs.
+    pub angular_momentum: DVec3,
     /// Σ (γ−1)mc² over every member.
     pub total_kinetic_energy_j: f64,
     pub total_mass_kg: f64,

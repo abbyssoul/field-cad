@@ -261,9 +261,10 @@ pub(super) fn floating_mass_aggregate_probe_plots(
     }
 }
 
-/// A mass-aggregate probe's history as up to four scalar traces — the
-/// centroid's distance from the origin, and the magnitudes of velocity and
-/// momentum, plus kinetic energy directly. Same shape as
+/// A mass-aggregate probe's history as up to five scalar traces — the
+/// centroid's distance from the origin, and the magnitudes of velocity,
+/// momentum, and angular momentum, plus kinetic energy directly. Same shape
+/// as
 /// [`distance_history_plot`]: draws its own checkboxes and mutates `series`
 /// directly, so the inline inspector plot and the floating window share one
 /// implementation.
@@ -278,9 +279,15 @@ pub(super) fn mass_aggregate_history_plot(
         ui.checkbox(&mut series.center_of_mass, "Position");
         ui.checkbox(&mut series.velocity, "Velocity");
         ui.checkbox(&mut series.momentum, "Momentum");
+        ui.checkbox(&mut series.angular_momentum, "Angular momentum");
         ui.checkbox(&mut series.kinetic_energy, "Kinetic energy");
     });
-    if !series.center_of_mass && !series.velocity && !series.momentum && !series.kinetic_energy {
+    if !series.center_of_mass
+        && !series.velocity
+        && !series.momentum
+        && !series.angular_momentum
+        && !series.kinetic_energy
+    {
         ui.weak("Select at least one series.");
         return;
     }
@@ -318,6 +325,17 @@ pub(super) fn mass_aggregate_history_plot(
             values.last().unwrap()
         ));
         history_plot(ui, &values, egui::Color32::from_rgb(120, 220, 150));
+    }
+    if series.angular_momentum {
+        let values: Vec<f32> = readings
+            .iter()
+            .map(|reading| reading.angular_momentum.length() as f32)
+            .collect();
+        ui.label(format!(
+            "Angular momentum magnitude · {:.4} kg·m²/s",
+            values.last().unwrap()
+        ));
+        history_plot(ui, &values, egui::Color32::from_rgb(235, 160, 60));
     }
     if series.kinetic_energy {
         let values: Vec<f32> = readings

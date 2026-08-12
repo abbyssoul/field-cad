@@ -99,6 +99,18 @@ fn distance_probe_object_pickers(
                 });
         });
     }
+
+    ui.add_space(6.0);
+    let mut show_line = probe.show_line;
+    if ui
+        .checkbox(&mut show_line, "Show line between objects")
+        .changed()
+    {
+        output.edit(vec![WorldCommand::SetDistanceProbeShowLine {
+            probe: probe.id,
+            show_line,
+        }]);
+    }
 }
 
 /// The objects offered as candidates for one endpoint's picker: every object

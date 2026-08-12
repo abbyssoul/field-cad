@@ -168,10 +168,10 @@ pub fn collect_mass_bearing_bodies(
 }
 
 /// Live totals over the mass-bearing bodies a [`MassSelection`] names —
-/// center of mass, its own velocity, total momentum, and total kinetic
-/// energy. `None` when no member currently carries mass (a zero or negative
-/// total is otherwise impossible: mass is validated positive wherever it is
-/// attached).
+/// center of mass, its own velocity, total momentum, angular momentum, and
+/// total kinetic energy. `None` when no member currently carries mass (a
+/// zero or negative total is otherwise impossible: mass is validated
+/// positive wherever it is attached).
 ///
 /// Takes an already-collected body slice rather than a [`WorldSnapshot`] so a
 /// caller computing this for several probes in the same tick — as
@@ -185,6 +185,10 @@ pub fn collect_mass_bearing_bodies(
 /// *not* derived from `total_momentum`: it uses the same rest-mass weighting
 /// as `center_of_mass`, so it is that point's own time-derivative rather
 /// than a relativistic quantity with a different physical meaning.
+/// `angular_momentum` is taken about the centroid itself (each body's `r` is
+/// its position relative to `center_of_mass`), giving the system's intrinsic
+/// angular momentum rather than a value that shifts with an arbitrary choice
+/// of origin.
 pub fn mass_aggregate<'a>(
     bodies: impl Iterator<Item = &'a DynamicBody>,
     selection: &MassSelection,
@@ -209,11 +213,17 @@ pub fn mass_aggregate<'a>(
         .map(|body| body.velocity * body.inertial_mass_kg.into_si())
         .sum::<DVec3>()
         / total_mass_kg;
-    let total_momentum = members
+    let momenta: Vec<DVec3> = members
         .iter()
         .map(|body| {
             fieldcad_core::relativistic_momentum(body.velocity, body.inertial_mass_kg.into_si())
         })
+        .collect();
+    let total_momentum: DVec3 = momenta.iter().copied().sum();
+    let angular_momentum: DVec3 = members
+        .iter()
+        .zip(&momenta)
+        .map(|(body, &momentum)| (body.position - center_of_mass).cross(momentum))
         .sum();
     let total_kinetic_energy_j = members
         .iter()
@@ -228,6 +238,7 @@ pub fn mass_aggregate<'a>(
         center_of_mass,
         velocity,
         total_momentum,
+        angular_momentum,
         total_kinetic_energy_j,
         total_mass_kg,
         member_count: members.len(),
@@ -730,6 +741,34 @@ mod tests {
         assert!((summary.total_kinetic_energy_j - 1.0).abs() < 1.0e-12);
         assert!((summary.total_mass_kg - 4.0).abs() < 1.0e-12);
         assert_eq!(summary.member_count, 2);
+    }
+
+    #[test]
+    fn mass_aggregate_computes_angular_momentum_about_the_centroid() {
+        // Two equal masses placed symmetrically about the origin, each with
+        // a tangential velocity: the origin is their centroid, so this is a
+        // hand-computable case. L = Σ r×p:
+        // (1,0,0)×(0,1,0) + (-1,0,0)×(0,-1,0) = (0,0,1) + (0,0,1) = (0,0,2).
+        let a = DynamicBody {
+            object: ObjectId::new(0),
+            inertial_mass_kg: MassKg::new::<kilogram>(1.0),
+            position: DVec3::new(1.0, 0.0, 0.0),
+            velocity: DVec3::new(0.0, 1.0, 0.0),
+        };
+        let b = DynamicBody {
+            object: ObjectId::new(1),
+            inertial_mass_kg: MassKg::new::<kilogram>(1.0),
+            position: DVec3::new(-1.0, 0.0, 0.0),
+            velocity: DVec3::new(0.0, -1.0, 0.0),
+        };
+        let selection = MassSelection::Universe {
+            excluded: BTreeSet::new(),
+        };
+
+        let summary = mass_aggregate([a, b].iter(), &selection).unwrap();
+
+        assert!(summary.center_of_mass.length() < 1.0e-12);
+        assert!((summary.angular_momentum - DVec3::new(0.0, 0.0, 2.0)).length() < 1.0e-9);
     }
 
     #[test]

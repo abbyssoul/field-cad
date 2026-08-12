@@ -330,6 +330,7 @@ fn probe_and_distance_history_round_trip() {
                 center_of_mass: DVec3::new(1.0, 2.0, 3.0),
                 velocity: DVec3::new(0.1, 0.0, 0.0),
                 total_momentum: DVec3::new(4.0, 0.0, 0.0),
+                angular_momentum: DVec3::new(0.0, 0.0, 7.0),
                 total_kinetic_energy_j: 5.0,
                 total_mass_kg: 6.0,
                 member_count: 2,
@@ -349,6 +350,110 @@ fn probe_and_distance_history_round_trip() {
         outcome.document.mass_aggregate_history,
         document.mass_aggregate_history
     );
+}
+
+#[test]
+fn next_snapshot_sequence_resumes_past_every_restored_historys_highest_reading() {
+    use fieldcad_core::{DistanceProbeId, MassAggregateProbeId, WorldRevision};
+    use fieldcad_scene_document::{
+        DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord,
+        MassAggregateHistoryState, MassAggregateReadingRecord, MassAggregateSeriesRecord,
+    };
+
+    let runtime = build_runtime(World::new());
+
+    // Nothing recorded: a fresh/demo scene has nothing to resume past.
+    let empty = SceneDocument::capture(inputs(&runtime, QueueDocument::default()), "test", None);
+    assert_eq!(empty.next_snapshot_sequence(), 0);
+
+    // Two different history types, two different highest sequences: the
+    // overall result must be one past the highest of *either*, not just
+    // whichever history happens to be checked first.
+    let mut inputs = inputs(&runtime, QueueDocument::default());
+    inputs.distance_history = DistanceHistoryState {
+        series: vec![DistanceSeriesRecord {
+            probe: DistanceProbeId::new(0),
+            readings: vec![DistanceReadingRecord {
+                tick: 1,
+                time_seconds: 0.5,
+                world_revision: WorldRevision::INITIAL,
+                snapshot_sequence: 300,
+                distance: 42.0,
+            }],
+        }],
+    };
+    inputs.mass_aggregate_history = MassAggregateHistoryState {
+        series: vec![MassAggregateSeriesRecord {
+            probe: MassAggregateProbeId::new(0),
+            readings: vec![MassAggregateReadingRecord {
+                tick: 1,
+                time_seconds: 0.5,
+                world_revision: WorldRevision::INITIAL,
+                snapshot_sequence: 500,
+                center_of_mass: DVec3::ZERO,
+                velocity: DVec3::ZERO,
+                total_momentum: DVec3::ZERO,
+                angular_momentum: DVec3::ZERO,
+                total_kinetic_energy_j: 0.0,
+                total_mass_kg: 1.0,
+                member_count: 1,
+            }],
+        }],
+    };
+    let document = SceneDocument::capture(inputs, "test", None);
+
+    assert_eq!(document.next_snapshot_sequence(), 501);
+}
+
+#[test]
+fn a_runtime_resumed_with_stale_history_publishes_snapshots_the_dedup_guard_accepts() {
+    // Regression for a reported bug: after loading a saved scene, a distance
+    // probe's live value updated correctly but its plot stayed frozen (until
+    // it eventually "caught up"). Root cause: `DistanceHistory::record`'s
+    // dedup guard (`last.snapshot_sequence >= incoming.sequence`) discarded
+    // every new reading, because a freshly built `SimulationRuntime` always
+    // started counting sequences from 0 — far below the sequence numbers the
+    // restored history already held from the previous session — until the
+    // live counter climbed back past the old value. `next_snapshot_sequence`
+    // plus `RuntimeConfig::with_initial_sequence` closes that gap; this
+    // proves the very first snapshot a resumed runtime publishes already
+    // clears a stale recorded sequence.
+    use fieldcad_core::{DistanceProbeId, WorldRevision};
+    use fieldcad_scene_document::{DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord};
+
+    let stale_sequence = 500;
+    let document = {
+        let runtime = build_runtime(World::new());
+        let mut inputs = inputs(&runtime, QueueDocument::default());
+        inputs.distance_history = DistanceHistoryState {
+            series: vec![DistanceSeriesRecord {
+                probe: DistanceProbeId::new(0),
+                readings: vec![DistanceReadingRecord {
+                    tick: 500,
+                    time_seconds: 50.0,
+                    world_revision: WorldRevision::INITIAL,
+                    snapshot_sequence: stale_sequence,
+                    distance: 42.0,
+                }],
+            }],
+        };
+        SceneDocument::capture(inputs, "test", None)
+    };
+    let initial_sequence = document.next_snapshot_sequence();
+
+    let config = RuntimeConfig::new(
+        domain(),
+        TimeStep::from_seconds(0.1).unwrap(),
+        SessionId::from_u128(2),
+    )
+    .with_world(World::from_document(document.world))
+    .with_initial_sequence(initial_sequence);
+    let config = catalog().into_iter().fold(config, |config, registration| {
+        config.with_plugin_registration(registration)
+    });
+    let resumed = SimulationRuntime::new(config).unwrap();
+
+    assert!(resumed.latest_snapshot().identity.sequence > stale_sequence);
 }
 
 /// A document saved before mass-aggregate probes existed (`format_version`

@@ -163,9 +163,14 @@ fn measurement_section(
             "Probes and slice planes sample the field for you.\n\
              They carry no charge or mass and never alter the result.",
         );
-        ui.horizontal_wrapped(|ui| {
+        let mut objects_iter = frame.world.objects().values();
+        let distance_pair = match (objects_iter.next(), objects_iter.next()) {
+            (Some(first), Some(second)) => Some((first.id, second.id)),
+            _ => None,
+        };
+        ui.menu_button("+ Measurement probe", |ui| {
             if ui
-                .button("+ Probe")
+                .button("Point probe")
                 .on_hover_text("Record field values at a point")
                 .clicked()
             {
@@ -183,243 +188,229 @@ fn measurement_section(
                         channels,
                     ),
                 )]);
+                ui.close();
             }
-            let mut objects = frame.world.objects().values();
-            if let (Some(first), Some(second)) = (objects.next(), objects.next())
-                && ui
-                    .button("+ Distance")
-                    .on_hover_text("Measure the live distance between two objects")
-                    .clicked()
+            if ui
+                .add_enabled(distance_pair.is_some(), egui::Button::new("Distance"))
+                .on_hover_text("Measure the live distance between two objects")
+                .clicked()
+                && let Some((first, second)) = distance_pair
             {
                 output.edit(vec![fieldcad_core::WorldCommand::CreateDistanceProbe(
                     fieldcad_core::DistanceProbeSpec::new(
                         format!("Distance {}", frame.world.distance_probes().len() + 1),
-                        first.id,
-                        second.id,
+                        first,
+                        second,
                     ),
                 )]);
+                ui.close();
             }
-            if let Some(preset) = super::split_add_button(
-                ui,
-                "Plane",
-                "Draw the field across a slice",
-                MeasurementPreset::Plane,
-                &[
-                    ("Plane", MeasurementPreset::Plane),
-                    ("Box", MeasurementPreset::Box),
-                    ("Sphere", MeasurementPreset::Sphere),
-                ],
-            ) {
-                output.edit(vec![measurement_command(frame.world, preset)]);
+            if ui
+                .button("Plane")
+                .on_hover_text("Draw the field across a slice")
+                .clicked()
+            {
+                output.edit(vec![measurement_command(
+                    frame.world,
+                    MeasurementPreset::Plane,
+                )]);
+                ui.close();
             }
-            if let Some(selection) = super::split_add_button(
-                ui,
-                "Center of mass",
-                "Track the centroid of every mass-bearing object, minus an exclusion list",
-                fieldcad_core::MassSelection::Universe {
-                    excluded: std::collections::BTreeSet::new(),
-                },
-                &[(
-                    "Selection of objects",
-                    fieldcad_core::MassSelection::Selection {
-                        included: std::collections::BTreeSet::new(),
-                    },
-                )],
-            ) {
+            if ui.button("Box").clicked() {
+                output.edit(vec![measurement_command(
+                    frame.world,
+                    MeasurementPreset::Box,
+                )]);
+                ui.close();
+            }
+            if ui.button("Sphere").clicked() {
+                output.edit(vec![measurement_command(
+                    frame.world,
+                    MeasurementPreset::Sphere,
+                )]);
+                ui.close();
+            }
+            if ui
+                .button("Center of mass")
+                .on_hover_text(
+                    "Track the centroid of every mass-bearing object, minus an exclusion list",
+                )
+                .clicked()
+            {
                 let name = format!(
                     "Center of mass {}",
                     frame.world.mass_aggregate_probes().len() + 1
                 );
                 output.edit(vec![fieldcad_core::WorldCommand::CreateMassAggregateProbe(
-                    fieldcad_core::MassAggregateProbeSpec::new(name, selection),
+                    fieldcad_core::MassAggregateProbeSpec::new(
+                        name,
+                        fieldcad_core::MassSelection::Universe {
+                            excluded: std::collections::BTreeSet::new(),
+                        },
+                    ),
                 )]);
+                ui.close();
             }
         });
 
-        if !frame.world.probes().is_empty() {
-            ui.add_space(8.0);
-            ui.label("Probes");
-            for probe in frame.world.probes().values() {
-                match entity_row(
-                    ui,
-                    // ◎, not ◉: the latter is missing from egui's bundled
-                    // fonts and renders as a tofu box.
-                    "◎",
-                    &probe.name,
-                    probe.visible,
-                    model.probe_selection == Some(probe.id),
-                    "Delete probe",
-                ) {
-                    Some(EntityRowAction::ToggleVisibility) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::SetProbeVisible {
+        for probe in frame.world.probes().values() {
+            match entity_row(
+                ui,
+                // ◎, not ◉: the latter is missing from egui's bundled
+                // fonts and renders as a tofu box.
+                "◎",
+                &probe.name,
+                probe.visible,
+                model.probe_selection == Some(probe.id),
+                "Delete probe",
+            ) {
+                Some(EntityRowAction::ToggleVisibility) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::SetProbeVisible {
+                        probe: probe.id,
+                        visible: !probe.visible,
+                    }]);
+                }
+                Some(EntityRowAction::Select) => {
+                    model.set_scene_selection(Some(SceneSelection::Probe(probe.id)));
+                }
+                Some(EntityRowAction::Delete) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::RemoveProbe(probe.id)]);
+                }
+                None => {}
+            }
+        }
+
+        for probe in frame.world.distance_probes().values() {
+            match entity_row(
+                ui,
+                "↔",
+                &probe.name,
+                probe.visible,
+                model.distance_probe_selection == Some(probe.id),
+                "Delete distance probe",
+            ) {
+                Some(EntityRowAction::ToggleVisibility) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::SetDistanceProbeVisible {
+                        probe: probe.id,
+                        visible: !probe.visible,
+                    }]);
+                }
+                Some(EntityRowAction::Select) => {
+                    model.select_distance_probe(probe.id);
+                }
+                Some(EntityRowAction::Delete) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::RemoveDistanceProbe(
+                        probe.id,
+                    )]);
+                }
+                None => {}
+            }
+        }
+
+        for probe in frame.world.mass_aggregate_probes().values() {
+            match entity_row(
+                ui,
+                // ●, not the astronomical/physics "circled dot" glyph:
+                // unverified against egui's bundled fonts, same tofu-box
+                // risk noted elsewhere in this file.
+                "●",
+                &probe.name,
+                probe.visible,
+                model.mass_aggregate_probe_selection == Some(probe.id),
+                "Delete center of mass",
+            ) {
+                Some(EntityRowAction::ToggleVisibility) => {
+                    output.edit(vec![
+                        fieldcad_core::WorldCommand::SetMassAggregateProbeVisible {
                             probe: probe.id,
                             visible: !probe.visible,
-                        }]);
-                    }
-                    Some(EntityRowAction::Select) => {
-                        model.set_scene_selection(Some(SceneSelection::Probe(probe.id)));
-                    }
-                    Some(EntityRowAction::Delete) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::RemoveProbe(probe.id)]);
-                    }
-                    None => {}
+                        },
+                    ]);
                 }
+                Some(EntityRowAction::Select) => {
+                    model.set_scene_selection(Some(SceneSelection::MassAggregateProbe(probe.id)));
+                }
+                Some(EntityRowAction::Delete) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::RemoveMassAggregateProbe(
+                        probe.id,
+                    )]);
+                }
+                None => {}
             }
         }
 
-        if !frame.world.distance_probes().is_empty() {
-            ui.add_space(8.0);
-            ui.label("Distance probes");
-            for probe in frame.world.distance_probes().values() {
-                match entity_row(
-                    ui,
-                    "↔",
-                    &probe.name,
-                    probe.visible,
-                    model.distance_probe_selection == Some(probe.id),
-                    "Delete distance probe",
-                ) {
-                    Some(EntityRowAction::ToggleVisibility) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::SetDistanceProbeVisible {
-                            probe: probe.id,
-                            visible: !probe.visible,
-                        }]);
-                    }
-                    Some(EntityRowAction::Select) => {
-                        model.select_distance_probe(probe.id);
-                    }
-                    Some(EntityRowAction::Delete) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::RemoveDistanceProbe(
-                            probe.id,
-                        )]);
-                    }
-                    None => {}
+        for plane in frame.world.planes().values() {
+            match entity_row(
+                ui,
+                "▦",
+                &plane.name,
+                plane.visible,
+                model.plane_selection == Some(plane.id),
+                "Delete plane",
+            ) {
+                Some(EntityRowAction::ToggleVisibility) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::SetPlaneVisible {
+                        plane: plane.id,
+                        visible: !plane.visible,
+                    }]);
                 }
+                Some(EntityRowAction::Select) => {
+                    model.set_scene_selection(Some(SceneSelection::Plane(plane.id)));
+                }
+                Some(EntityRowAction::Delete) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::RemovePlane(plane.id)]);
+                }
+                None => {}
             }
         }
 
-        if !frame.world.mass_aggregate_probes().is_empty() {
-            ui.add_space(8.0);
-            ui.label("Center of mass");
-            for probe in frame.world.mass_aggregate_probes().values() {
-                match entity_row(
-                    ui,
-                    // ●, not the astronomical/physics "circled dot" glyph:
-                    // unverified against egui's bundled fonts, same tofu-box
-                    // risk noted elsewhere in this file.
-                    "●",
-                    &probe.name,
-                    probe.visible,
-                    model.mass_aggregate_probe_selection == Some(probe.id),
-                    "Delete center of mass",
-                ) {
-                    Some(EntityRowAction::ToggleVisibility) => {
-                        output.edit(vec![
-                            fieldcad_core::WorldCommand::SetMassAggregateProbeVisible {
-                                probe: probe.id,
-                                visible: !probe.visible,
-                            },
-                        ]);
-                    }
-                    Some(EntityRowAction::Select) => {
-                        model.set_scene_selection(Some(SceneSelection::MassAggregateProbe(
-                            probe.id,
-                        )));
-                    }
-                    Some(EntityRowAction::Delete) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::RemoveMassAggregateProbe(
-                            probe.id,
-                        )]);
-                    }
-                    None => {}
+        for field_box in frame.world.boxes().values() {
+            match entity_row(
+                ui,
+                "▧",
+                &field_box.name,
+                field_box.visible,
+                model.box_selection == Some(field_box.id),
+                "Delete box",
+            ) {
+                Some(EntityRowAction::ToggleVisibility) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::SetBoxVisible {
+                        region: field_box.id,
+                        visible: !field_box.visible,
+                    }]);
                 }
+                Some(EntityRowAction::Select) => {
+                    model.set_scene_selection(Some(SceneSelection::Box(field_box.id)));
+                }
+                Some(EntityRowAction::Delete) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::RemoveBox(field_box.id)]);
+                }
+                None => {}
             }
         }
 
-        if !frame.world.planes().is_empty() {
-            ui.add_space(8.0);
-            ui.label("Slice planes");
-            for plane in frame.world.planes().values() {
-                match entity_row(
-                    ui,
-                    "▦",
-                    &plane.name,
-                    plane.visible,
-                    model.plane_selection == Some(plane.id),
-                    "Delete plane",
-                ) {
-                    Some(EntityRowAction::ToggleVisibility) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::SetPlaneVisible {
-                            plane: plane.id,
-                            visible: !plane.visible,
-                        }]);
-                    }
-                    Some(EntityRowAction::Select) => {
-                        model.set_scene_selection(Some(SceneSelection::Plane(plane.id)));
-                    }
-                    Some(EntityRowAction::Delete) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::RemovePlane(plane.id)]);
-                    }
-                    None => {}
+        for sphere in frame.world.spheres().values() {
+            match entity_row(
+                ui,
+                "◯",
+                &sphere.name,
+                sphere.visible,
+                model.sphere_selection == Some(sphere.id),
+                "Delete sphere",
+            ) {
+                Some(EntityRowAction::ToggleVisibility) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::SetSphereVisible {
+                        sphere: sphere.id,
+                        visible: !sphere.visible,
+                    }]);
                 }
-            }
-        }
-
-        if !frame.world.boxes().is_empty() {
-            ui.add_space(8.0);
-            ui.label("Field boxes");
-            for field_box in frame.world.boxes().values() {
-                match entity_row(
-                    ui,
-                    "▧",
-                    &field_box.name,
-                    field_box.visible,
-                    model.box_selection == Some(field_box.id),
-                    "Delete box",
-                ) {
-                    Some(EntityRowAction::ToggleVisibility) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::SetBoxVisible {
-                            region: field_box.id,
-                            visible: !field_box.visible,
-                        }]);
-                    }
-                    Some(EntityRowAction::Select) => {
-                        model.set_scene_selection(Some(SceneSelection::Box(field_box.id)));
-                    }
-                    Some(EntityRowAction::Delete) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::RemoveBox(field_box.id)]);
-                    }
-                    None => {}
+                Some(EntityRowAction::Select) => {
+                    model.set_scene_selection(Some(SceneSelection::Sphere(sphere.id)));
                 }
-            }
-        }
-
-        if !frame.world.spheres().is_empty() {
-            ui.add_space(8.0);
-            ui.label("Field spheres");
-            for sphere in frame.world.spheres().values() {
-                match entity_row(
-                    ui,
-                    "◯",
-                    &sphere.name,
-                    sphere.visible,
-                    model.sphere_selection == Some(sphere.id),
-                    "Delete sphere",
-                ) {
-                    Some(EntityRowAction::ToggleVisibility) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::SetSphereVisible {
-                            sphere: sphere.id,
-                            visible: !sphere.visible,
-                        }]);
-                    }
-                    Some(EntityRowAction::Select) => {
-                        model.set_scene_selection(Some(SceneSelection::Sphere(sphere.id)));
-                    }
-                    Some(EntityRowAction::Delete) => {
-                        output.edit(vec![fieldcad_core::WorldCommand::RemoveSphere(sphere.id)]);
-                    }
-                    None => {}
+                Some(EntityRowAction::Delete) => {
+                    output.edit(vec![fieldcad_core::WorldCommand::RemoveSphere(sphere.id)]);
                 }
+                None => {}
             }
         }
     });

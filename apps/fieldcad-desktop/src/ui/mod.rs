@@ -599,6 +599,7 @@ pub struct MassAggregateProbeSeries {
     pub center_of_mass: bool,
     pub velocity: bool,
     pub momentum: bool,
+    pub angular_momentum: bool,
     pub kinetic_energy: bool,
 }
 
@@ -608,6 +609,7 @@ impl Default for MassAggregateProbeSeries {
             center_of_mass: true,
             velocity: false,
             momentum: false,
+            angular_momentum: false,
             kinetic_energy: false,
         }
     }

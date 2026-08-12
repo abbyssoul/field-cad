@@ -201,6 +201,36 @@ impl SceneDocument {
             mass_aggregate_history: inputs.mass_aggregate_history,
         }
     }
+
+    /// The lowest `snapshot_sequence` a freshly resumed session's live
+    /// snapshot producer must start counting from, so that every snapshot it
+    /// publishes after a load has a sequence number greater than every
+    /// reading already recorded in this document's saved histories.
+    ///
+    /// A live history's `record` only accepts a reading whose incoming
+    /// snapshot sequence is strictly greater than the last one it already
+    /// holds (see `fieldcad_simulation::{ProbeHistory, DistanceHistory,
+    /// MassAggregateHistory}::record`) — a guard against double-recording a
+    /// snapshot polled more than once, not a save/load concern. A fresh
+    /// [`fieldcad_simulation::SimulationRuntime`] otherwise always starts
+    /// counting from 0 regardless of source, so without this, every reading
+    /// this document restores into a resumed session's histories poisons
+    /// that guard: every new snapshot's sequence is *lower* than the
+    /// restored max until the counter climbs back past it, and every
+    /// plot/live-value bound to history — though not a value read straight
+    /// off the latest snapshot, which is why only the plot appears frozen —
+    /// stalls for exactly that many ticks.
+    pub fn next_snapshot_sequence(&self) -> u64 {
+        [
+            self.probe_history.max_snapshot_sequence(),
+            self.distance_history.max_snapshot_sequence(),
+            self.mass_aggregate_history.max_snapshot_sequence(),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .map_or(0, |max| max + 1)
+    }
 }
 
 /// A whole-seconds-precision RFC 3339 UTC timestamp, without pulling in a

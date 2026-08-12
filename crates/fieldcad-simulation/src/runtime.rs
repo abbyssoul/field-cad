@@ -550,6 +550,14 @@ pub struct RuntimeConfig {
     /// Which numerical scheme advances a dynamic body from its summed force.
     /// Defaults to [`IntegrationScheme::default`].
     pub integration_scheme: IntegrationScheme,
+    /// The first `snapshot_sequence` this runtime's published snapshots will
+    /// use. Defaults to 0 for a brand-new session; a caller resuming a saved
+    /// document with its own recorded probe/distance/mass-aggregate history
+    /// must set this past that history's highest recorded sequence (see
+    /// `fieldcad_scene_document::SceneDocument::next_snapshot_sequence`), or
+    /// every history's `record` dedup guard silently discards new readings
+    /// until this runtime's own counter climbs back past the old one.
+    pub initial_sequence: u64,
 }
 
 /// Deep enough that a session's worth of authoring is reachable, shallow enough
@@ -569,7 +577,13 @@ impl RuntimeConfig {
             plugins: Vec::new(),
             undo_depth: DEFAULT_UNDO_DEPTH,
             integration_scheme: IntegrationScheme::default(),
+            initial_sequence: 0,
         }
+    }
+
+    pub const fn with_initial_sequence(mut self, initial_sequence: u64) -> Self {
+        self.initial_sequence = initial_sequence;
+        self
     }
 
     pub const fn with_undo_depth(mut self, undo_depth: usize) -> Self {
@@ -627,6 +641,7 @@ impl SimulationRuntime {
             plugins,
             undo_depth,
             integration_scheme,
+            initial_sequence,
         } = config;
 
         let mut plugin_ids = BTreeSet::new();
@@ -780,7 +795,7 @@ impl SimulationRuntime {
             subscription,
             sampling_budget,
             session,
-            next_sequence: 0,
+            next_sequence: initial_sequence,
             run_generation: 0,
             plugins: prepared,
             cancellation,

@@ -31,7 +31,20 @@ pub(super) fn mass_aggregate_probe_properties(
         "inspector_mass_aggregate_membership",
         "Membership",
         true,
-        |ui| membership_editor(ui, probe, world, output),
+        |ui| {
+            membership_editor(ui, probe, world, output);
+            ui.add_space(6.0);
+            let mut show_member_lines = probe.show_member_lines;
+            if ui
+                .checkbox(&mut show_member_lines, "Show lines to members when selected")
+                .changed()
+            {
+                output.edit(vec![WorldCommand::SetMassAggregateProbeShowMemberLines {
+                    probe: probe.id,
+                    show_member_lines,
+                }]);
+            }
+        },
     );
     super::section(
         ui,
@@ -170,6 +183,12 @@ fn live_values_panel(ui: &mut egui::Ui, probe: &MassAggregateProbe, compute: &Co
         ui.weak("No mass-bearing member yet.");
         return;
     };
+    ui.weak("ⓘ").on_hover_text(
+        "For an isolated system, these totals should hold steady over time — Noether's theorem \
+         ties conservation of momentum and angular momentum to space's translation and rotation \
+         symmetry, and conservation of energy to time symmetry. Plot them below (History) to \
+         watch whether they actually do.",
+    );
     egui::Grid::new(("mass_aggregate_probe_values", probe.id))
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -194,6 +213,14 @@ fn live_values_panel(ui: &mut egui::Ui, probe: &MassAggregateProbe, compute: &Co
             ui.label(super::object_inspector::format_vector(
                 sample.total_momentum,
                 "kg·m/s",
+            ));
+            ui.end_row();
+
+            ui.label("Angular momentum")
+                .on_hover_text("Σ (r−R_cm)×γmv about the centroid.");
+            ui.label(super::object_inspector::format_vector(
+                sample.angular_momentum,
+                "kg·m²/s",
             ));
             ui.end_row();
 
