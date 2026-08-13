@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "apps/fieldcad-desktop",
     "crates/fieldcad-bench",
+    "crates/fieldcad-catalog",
     "crates/fieldcad-core",
     "crates/fieldcad-dynamics",
     "crates/fieldcad-electromagnetic-sources",
@@ -56,6 +57,13 @@ rmcp = "3.1.0"
 schemars = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+# Maintained fork of the archived `serde_yaml`, same API surface. Used only by
+# the catalog crate, which is the first hand-authored, end-user-facing file
+# format in this workspace (everything else persists as JSON).
+serde_norway = "0.9"
+# Structured field-path diagnostics on top of any serde Deserializer, so a
+# catalog YAML error can point at e.g. `spec.components[0].properties.mass`.
+serde_path_to_error = "0.1"
 tempfile = "3"
 thiserror = "2"
 tokio = "1"
@@ -69,6 +77,7 @@ wgpu = "29"
 winit = "0.30.13"
 
 fieldcad-bench = { path = "crates/fieldcad-bench" }
+fieldcad-catalog = { path = "crates/fieldcad-catalog" }
 fieldcad-core = { path = "crates/fieldcad-core" }
 fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
