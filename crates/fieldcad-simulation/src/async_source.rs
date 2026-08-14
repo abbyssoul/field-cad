@@ -832,6 +832,21 @@ mod tests {
         source.request_body_history(object);
         assert_eq!(source.body_history_in_flight.len(), 1);
 
+        // Wait for the worker's real answer (an empty history — object 7
+        // doesn't exist) to drain before injecting the synthetic answer
+        // below: both travel the same event channel, and if the real answer
+        // landed *after* the synthetic one it would overwrite the cache
+        // with `[]`, making this test's outcome depend on thread scheduling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while source.body_history_in_flight.contains(&object) {
+            source.drain_worker_events().unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never answered the in-flight history request"
+            );
+            std::thread::yield_now();
+        }
+
         let sample = BodySample {
             tick: 3,
             time_seconds: 0.75,
