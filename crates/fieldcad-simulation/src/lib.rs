@@ -56,7 +56,6 @@ mod tests {
         COULOMB_CONSTANT, ElectrostaticsPlugin, electric_field_channel_id,
         electric_potential_channel_id, plugin_id as electrostatics_plugin_id,
     };
-    use fieldcad_particles::particle_component_id;
     use fieldcad_test_field::{TestFieldPlugin, scalar_channel_id, vector_channel_id};
     use glam::{DVec2, DVec3, UVec2};
 
@@ -526,9 +525,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(runtime.field_systems().len(), 2);
-        // Charge, inertial mass, gravitational mass, and catalog provenance.
+        // Charge, inertial mass, gravitational mass.
         // Charge is declared by both plugins and registered once.
-        assert_eq!(runtime.world_snapshot().component_schemas().len(), 4);
+        assert_eq!(runtime.world_snapshot().component_schemas().len(), 3);
         for shared in [
             fieldcad_sources::inertial_mass_component_id(),
             fieldcad_sources::gravitational_mass_component_id(),
@@ -546,12 +545,6 @@ mod tests {
                 .world_snapshot()
                 .component_schemas()
                 .contains_key(&charge_component_id())
-        );
-        assert!(
-            runtime
-                .world_snapshot()
-                .component_schemas()
-                .contains_key(&particle_component_id())
         );
     }
 

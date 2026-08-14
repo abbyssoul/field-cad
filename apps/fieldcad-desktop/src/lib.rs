@@ -1,5 +1,6 @@
 mod app;
 pub mod camera;
+mod catalog;
 mod electromagnetism_gpu;
 pub mod gpu;
 mod gpu_inverse_square;

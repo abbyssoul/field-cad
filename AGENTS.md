@@ -17,8 +17,9 @@ experiments, and inspecting/exporting reproducible observations.
 - `crates/fieldcad-simulation`: authoritative runtime, clock, commands, and
   `FieldDataSource` contract.
 - `crates/fieldcad-dynamics`: first-party force integration for dynamic bodies.
-- `crates/fieldcad-*-sources` and `fieldcad-particles`: shared source schemas
-  and particle catalog data used independently by equation systems.
+- `crates/fieldcad-*-sources`: shared source schemas used independently by
+  equation systems. Object templates are now user-configured YAML catalog
+  entries (see `crates/fieldcad-catalog`).
 - `crates/fieldcad-server`: headless owner of a session and its authoritative
   state; desktop and network transports drive the same server.
 - `crates/fieldcad-mcp`: thin MCP transport over `fieldcad-server`.

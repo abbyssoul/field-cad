@@ -5,19 +5,24 @@
 
 use std::collections::BTreeMap;
 
+use fieldcad_catalog::{
+    CatalogLoadReport, CatalogScopeName, LinkResolution, TemplateComponentInstance,
+    TemplateIdentity, TemplateMetadata, TemplateName, TemplatePropertyValue, TemplateSpec,
+};
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, ComponentTypeId, Dimension, Domain, DomainBounds,
-    FieldValueKind, ObjectSpec, PluginId, PluginVersion, Precision, ProbeSpec, PropertyBag,
-    Resolution, SessionId, TimeStep, World, WorldCommand,
+    CatalogEntryRef, CatalogOrigin, ChannelId, ChannelSchema, ComponentSchema, ComponentTypeId,
+    Dimension, Domain, DomainBounds, FieldValueKind, ObjectSpec, PluginId, PluginVersion,
+    Precision, ProbeSpec, PropertyBag, PropertyId, Resolution, SessionId, TimeStep, World,
+    WorldCommand,
 };
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginError, PluginMetadata,
     SampledColumn, SolverContext, SolverKind,
 };
 use fieldcad_scene_document::{
-    CameraProjection, CameraState, ChannelViewState, LoadError, LoadSource, PlaneViewState,
-    ResolveError, SceneDocument, SceneDocumentInputs, SceneViewState, resolve_plugins,
-    save_to_path,
+    CameraProjection, CameraState, ChannelViewState, DocumentCatalogEntry, LoadError, LoadSource,
+    PlaneViewState, ResolveError, SceneDocument, SceneDocumentInputs, SceneViewState,
+    resolve_plugins, save_to_path,
 };
 use fieldcad_simulation::{PluginRegistration, QueueDocument, RuntimeConfig, SimulationRuntime};
 use fieldcad_test_field::TestFieldPlugin;
@@ -146,6 +151,8 @@ fn inputs(runtime: &SimulationRuntime, queue: QueueDocument) -> SceneDocumentInp
         probe_history: fieldcad_scene_document::ProbeHistoryState::default(),
         distance_history: fieldcad_scene_document::DistanceHistoryState::default(),
         mass_aggregate_history: fieldcad_scene_document::MassAggregateHistoryState::default(),
+        document_entries: Vec::new(),
+        quick_add_hidden: Vec::new(),
     }
 }
 
@@ -419,7 +426,9 @@ fn a_runtime_resumed_with_stale_history_publishes_snapshots_the_dedup_guard_acce
     // proves the very first snapshot a resumed runtime publishes already
     // clears a stale recorded sequence.
     use fieldcad_core::{DistanceProbeId, WorldRevision};
-    use fieldcad_scene_document::{DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord};
+    use fieldcad_scene_document::{
+        DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord,
+    };
 
     let stale_sequence = 500;
     let document = {
@@ -700,4 +709,119 @@ fn paused_queue_round_trips_and_restores_unapplied() {
     issue(&mut reloaded, &mut next_id, CommandPayload::ResumeQueue);
     reloaded.poll(std::time::Duration::ZERO).unwrap();
     assert_eq!(reloaded.world().objects().len(), 1);
+}
+
+#[test]
+fn document_catalog_entries_and_preferences_round_trip() {
+    let runtime = build_runtime(World::new());
+
+    let identity = TemplateIdentity {
+        catalog: CatalogScopeName::new("test-templates".to_owned()).unwrap(),
+        template: TemplateName::new("test-entry".to_owned()).unwrap(),
+    };
+    let metadata = TemplateMetadata {
+        description: Some("a test catalog entry".to_owned()),
+        author: Some("test suite".to_owned()),
+        labels: BTreeMap::from([("topic".to_owned(), "testing".to_owned())]),
+        annotations: BTreeMap::new(),
+    };
+    let mass_id = PropertyId::new("mass").unwrap();
+    let mut properties = BTreeMap::new();
+    properties.insert(mass_id, TemplatePropertyValue::Scalar { si_value: 1.0 });
+    let component = TemplateComponentInstance {
+        component_type: mass_component_id(),
+        properties,
+    };
+    let spec = TemplateSpec {
+        object_kind: "world-object".to_owned(),
+        shape: None,
+        components: vec![component],
+    };
+    let entry = DocumentCatalogEntry {
+        entry_id: uuid::Uuid::new_v4(),
+        identity: identity.clone(),
+        metadata: metadata.clone(),
+        spec: spec.clone(),
+    };
+    let document_hidden = CatalogEntryRef {
+        catalog: "test-templates".to_owned(),
+        template: "test-entry".to_owned(),
+        origin: CatalogOrigin::Document {
+            entry_id: entry.entry_id,
+        },
+        api_version: fieldcad_catalog::API_VERSION.to_owned(),
+        fingerprint: "test".to_owned(),
+    };
+    let global_hidden = CatalogEntryRef {
+        catalog: "test-templates".to_owned(),
+        template: "test-entry".to_owned(),
+        origin: CatalogOrigin::Global {
+            relative_path: "personal.yaml".to_owned(),
+            document_ordinal: 1,
+        },
+        api_version: fieldcad_catalog::API_VERSION.to_owned(),
+        fingerprint: "different-source".to_owned(),
+    };
+    assert_ne!(document_hidden, global_hidden);
+
+    let mut inputs = inputs(&runtime, QueueDocument::default());
+    inputs.document_entries = vec![entry.clone()];
+    inputs.quick_add_hidden = vec![document_hidden.clone(), global_hidden.clone()];
+    let document = SceneDocument::capture(inputs, "test", None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scene.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
+
+    assert_eq!(outcome.document.document_entries.len(), 1);
+    let loaded = &outcome.document.document_entries[0];
+    assert_eq!(loaded.identity, identity);
+    assert_eq!(loaded.metadata, metadata);
+    assert_eq!(loaded.spec, spec);
+
+    assert_eq!(
+        outcome.document.quick_add_hidden,
+        vec![document_hidden, global_hidden]
+    );
+}
+
+#[test]
+fn objects_with_catalog_links_survive_round_trip() {
+    let mut runtime = build_runtime(World::new());
+    let object = ObjectSpec::new("linked-object").with_catalog_link(fieldcad_core::CatalogLink {
+        entry: Some(CatalogEntryRef {
+            catalog: "my-catalog".to_owned(),
+            template: "my-template".to_owned(),
+            origin: CatalogOrigin::Document {
+                entry_id: uuid::Uuid::new_v4(),
+            },
+            api_version: fieldcad_catalog::API_VERSION.to_owned(),
+            fingerprint: "test".to_owned(),
+        }),
+        mode: fieldcad_core::CatalogLinkMode::Tracking,
+        source_description: "test.yaml (document 1)".to_owned(),
+    });
+    runtime
+        .commit_world_commands(vec![WorldCommand::CreateObject(object)])
+        .unwrap();
+
+    let document = SceneDocument::capture(inputs(&runtime, QueueDocument::default()), "test", None);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scene.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let outcome = fieldcad_scene_document::load_newest_valid(&path).unwrap();
+
+    let world = World::from_document(outcome.document.world);
+    let snapshot = world.snapshot();
+    let objects: Vec<_> = snapshot.objects().values().collect();
+    assert_eq!(objects.len(), 1);
+    let link = objects[0].catalog_link.as_ref().unwrap();
+    assert_eq!(link.entry.as_ref().unwrap().catalog, "my-catalog");
+    assert_eq!(link.entry.as_ref().unwrap().template, "my-template");
+    assert_eq!(link.source_description, "test.yaml (document 1)");
+    assert!(matches!(
+        CatalogLoadReport::default().resolve_link(link.entry.as_ref().unwrap()),
+        LinkResolution::Unavailable
+    ));
 }

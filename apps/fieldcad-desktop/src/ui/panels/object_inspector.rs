@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    Dimension, ObjectId, ObjectShape, PropertyBag, PropertyKind, PropertySchema, PropertyValue,
-    Quantity, Transform, VectorQuantity, Velocity, WorldCommand, WorldObject, WorldSnapshot,
-    relativistic_kinetic_energy, relativistic_momentum,
+    CatalogLinkMode, Dimension, ObjectId, ObjectShape, PropertyBag, PropertyKind, PropertySchema,
+    PropertyValue, Quantity, Transform, VectorQuantity, Velocity, WorldCommand, WorldObject,
+    WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
 };
 use fieldcad_sources::{inertial_mass_component_id, mass_property_id};
 use glam::DVec3;
@@ -15,17 +15,109 @@ use super::scene_tree::DEFAULT_AUTHORING_RADIUS;
 use super::{coordinate_editor, name_editor, note_held_edit};
 use crate::scene::TrajectoryDisplay;
 use crate::ui::compute::{ComputeView, format_engineering};
-use crate::ui::{CameraAction, UiFrameOutput};
+use crate::ui::{CameraAction, CatalogAction, UiFrameOutput};
 
 pub(super) fn object_properties(
     ui: &mut egui::Ui,
     world: &WorldSnapshot,
+    catalog: &fieldcad_catalog::CatalogLoadReport,
     compute: &ComputeView,
     object: &WorldObject,
     following: Option<ObjectId>,
     object_trajectories: &mut BTreeMap<ObjectId, TrajectoryDisplay>,
     output: &mut UiFrameOutput,
 ) {
+    let tracking = object
+        .catalog_link
+        .as_ref()
+        .is_some_and(|link| link.mode == CatalogLinkMode::Tracking);
+    if let Some(link) = &object.catalog_link {
+        super::section(
+            ui,
+            "inspector_catalog_link",
+            "Catalog template",
+            true,
+            |ui| {
+                let mode = if tracking {
+                    "tracking"
+                } else {
+                    "custom (unlinked)"
+                };
+                ui.label(format!("{} — {mode}", link.source_description));
+                if let Some(reference) = &link.entry {
+                    let state = match catalog.resolve_link(reference) {
+                        fieldcad_catalog::LinkResolution::Exact(_) => "available",
+                        fieldcad_catalog::LinkResolution::RelinkCandidate(_) => {
+                            "moved; relink available"
+                        }
+                        fieldcad_catalog::LinkResolution::Unavailable => {
+                            "catalog unavailable or changed"
+                        }
+                        fieldcad_catalog::LinkResolution::Ambiguous => "ambiguous catalog match",
+                    };
+                    ui.weak(state);
+                    if ui.button("Open catalog entry").clicked() {
+                        output.catalog_action = Some(CatalogAction::Open(Some(reference.clone())));
+                    }
+                    if tracking {
+                        let current = catalog.entries.iter().find(|entry| {
+                            entry
+                                .reference
+                                .as_ref()
+                                .is_some_and(|candidate| candidate.same_source(reference))
+                        });
+                        let apply =
+                            current.and_then(|entry| match (&entry.reference, &entry.result) {
+                                (
+                                    Some(current_reference),
+                                    fieldcad_catalog::LoadResult::Available { spec, .. },
+                                ) => {
+                                    let placement = fieldcad_catalog::InstantiationPlacement {
+                                        display_name: object.name.clone(),
+                                        transform: object.transform,
+                                        velocity: object.velocity,
+                                        pinned: object.pinned,
+                                        fallback_shape_radius: DEFAULT_AUTHORING_RADIUS,
+                                    };
+                                    fieldcad_catalog::instantiate_template(
+                                        spec,
+                                        current_reference,
+                                        world.component_schemas(),
+                                        placement,
+                                    )
+                                    .ok()
+                                }
+                                _ => None,
+                            });
+                        if ui
+                            .add_enabled(
+                                apply.is_some(),
+                                egui::Button::new("Apply current template"),
+                            )
+                            .on_disabled_hover_text("The matching catalog entry is unavailable.")
+                            .clicked()
+                            && let Some(spec) = apply
+                        {
+                            output.edit(vec![WorldCommand::ApplyCatalogTemplate {
+                                object: object.id,
+                                expected_entry: reference.clone(),
+                                shape: spec.shape,
+                                components: spec.components,
+                                link: spec
+                                    .catalog_link
+                                    .expect("catalog instantiation stamps provenance"),
+                            }]);
+                        }
+                    }
+                }
+                if tracking && ui.button("Unlink from catalog").clicked() {
+                    output.edit(vec![WorldCommand::UnlinkCatalogTemplate {
+                        object: object.id,
+                    }]);
+                }
+            },
+        );
+    }
     if let Some(name) = name_editor(ui, ("object_name", object.id), &object.name) {
         output.edit(vec![WorldCommand::SetObjectName {
             object: object.id,
@@ -33,10 +125,10 @@ pub(super) fn object_properties(
         }]);
     }
     super::section(ui, "inspector_placement", "Placement", true, |ui| {
-        placement_editors(ui, object, output);
+        placement_editors(ui, object, tracking, output);
     });
     super::section(ui, "inspector_components", "Components", true, |ui| {
-        object_components(ui, world, object, output);
+        object_components(ui, world, object, tracking, output);
     });
     if let Some(mass_kg) = inertial_mass_kg(object) {
         super::section(ui, "inspector_derived", "Derived values", true, |ui| {
@@ -84,7 +176,12 @@ pub(super) fn object_properties(
     }
 }
 
-fn placement_editors(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFrameOutput) {
+fn placement_editors(
+    ui: &mut egui::Ui,
+    object: &WorldObject,
+    tracking: bool,
+    output: &mut UiFrameOutput,
+) {
     let mut position = object.transform.translation;
     let mut position_changed = false;
     egui::Grid::new("object_properties")
@@ -104,7 +201,7 @@ fn placement_editors(ui: &mut egui::Ui, object: &WorldObject, output: &mut UiFra
             ui.end_row();
 
             ui.label("Extent");
-            shape_editor(ui, object, output);
+            ui.add_enabled_ui(!tracking, |ui| shape_editor(ui, object, output));
             ui.end_row();
 
             let mut velocity = object.velocity.linear;
@@ -336,10 +433,18 @@ fn object_components(
     ui: &mut egui::Ui,
     world: &WorldSnapshot,
     object: &WorldObject,
+    tracking: bool,
     output: &mut UiFrameOutput,
 ) {
     let schemas = world.component_schemas();
-    add_component_menu(ui, world, object, output);
+    if tracking {
+        ui.weak(
+            "Template-owned components are read-only while this object tracks its catalog entry.",
+        );
+    }
+    ui.add_enabled_ui(!tracking, |ui| {
+        add_component_menu(ui, world, object, output)
+    });
 
     if object.components.is_empty() {
         ui.weak("None. This object has a position but no physics.");
@@ -359,40 +464,42 @@ fn object_components(
             .id_salt(("component", object.id, id))
             .default_open(true)
             .show(ui, |ui| {
-                let mut edited = properties.clone();
-                let mut changed = false;
-                for property in &schema.properties {
-                    if !property.is_relevant(&edited) {
-                        continue;
+                ui.add_enabled_ui(!tracking, |ui| {
+                    let mut edited = properties.clone();
+                    let mut changed = false;
+                    for property in &schema.properties {
+                        if !property.is_relevant(&edited) {
+                            continue;
+                        }
+                        changed |= property_editor(
+                            ui,
+                            object.id,
+                            property,
+                            &mut edited,
+                            &mut output.scene_edit_in_progress,
+                        );
                     }
-                    changed |= property_editor(
-                        ui,
-                        object.id,
-                        property,
-                        &mut edited,
-                        &mut output.scene_edit_in_progress,
-                    );
-                }
-                if changed && schema.validate(&edited).is_ok() {
-                    output.edit(vec![WorldCommand::AttachComponent {
-                        object: object.id,
-                        component: id.clone(),
-                        properties: edited,
-                    }]);
-                }
-                if ui
-                    .small_button("Remove component")
-                    .on_hover_text(format!(
-                        "Detach {} from this object",
-                        schema.display_name.to_lowercase()
-                    ))
-                    .clicked()
-                {
-                    output.edit(vec![WorldCommand::DetachComponent {
-                        object: object.id,
-                        component: id.clone(),
-                    }]);
-                }
+                    if changed && schema.validate(&edited).is_ok() {
+                        output.edit(vec![WorldCommand::AttachComponent {
+                            object: object.id,
+                            component: id.clone(),
+                            properties: edited,
+                        }]);
+                    }
+                    if ui
+                        .small_button("Remove component")
+                        .on_hover_text(format!(
+                            "Detach {} from this object",
+                            schema.display_name.to_lowercase()
+                        ))
+                        .clicked()
+                    {
+                        output.edit(vec![WorldCommand::DetachComponent {
+                            object: object.id,
+                            component: id.clone(),
+                        }]);
+                    }
+                });
             });
     }
 }

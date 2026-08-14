@@ -14,7 +14,7 @@
 //! own standalone binary and embedded inside the desktop app, sharing one
 //! session with the desktop UI's own commands.
 
-use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use fieldcad_core::{
     Domain, FieldSnapshot, ObjectId, SceneScale, SessionId, TimeStep, TimeStepError, WorldSnapshot,
@@ -30,6 +30,112 @@ use fieldcad_simulation::{
 };
 use glam::DVec3;
 use tokio::sync::oneshot;
+
+/// Return Field CAD's global catalog directory for this host.
+pub fn catalog_directory() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "fieldcad").map(|dirs| dirs.config_dir().join("catalog"))
+}
+
+/// Catalog state owned with a session, rather than by a particular transport.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogSession {
+    root: Option<PathBuf>,
+    report: fieldcad_catalog::CatalogLoadReport,
+    file_states: fieldcad_catalog::DirectoryState,
+    document_entries: Vec<fieldcad_scene_document::DocumentCatalogEntry>,
+    quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
+}
+
+impl CatalogSession {
+    fn new(root: Option<PathBuf>) -> Self {
+        Self {
+            root,
+            ..Self::default()
+        }
+    }
+
+    fn reload(
+        &mut self,
+        schemas: &BTreeMap<fieldcad_core::ComponentTypeId, fieldcad_core::ComponentSchema>,
+    ) {
+        let mut report = self
+            .root
+            .as_ref()
+            .map_or_else(fieldcad_catalog::CatalogLoadReport::default, |root| {
+                fieldcad_catalog::load_catalog_directory(root, schemas)
+            });
+        for entry in &self.document_entries {
+            let reference = document_entry_ref(entry);
+            let result = match fieldcad_catalog::resolve_availability(&entry.spec, schemas) {
+                fieldcad_catalog::AvailabilityOutcome::Available => {
+                    fieldcad_catalog::LoadResult::Available {
+                        metadata: entry.metadata.clone(),
+                        spec: entry.spec.clone(),
+                    }
+                }
+                fieldcad_catalog::AvailabilityOutcome::Unavailable(reasons) => {
+                    fieldcad_catalog::LoadResult::Unavailable {
+                        metadata: entry.metadata.clone(),
+                        spec: entry.spec.clone(),
+                        reasons,
+                    }
+                }
+            };
+            report.entries.push(fieldcad_catalog::CatalogEntry {
+                source: fieldcad_catalog::SourceLocation {
+                    file: PathBuf::from("<scene document>"),
+                    document_ordinal: fieldcad_catalog::DocumentOrdinal::new(0),
+                },
+                reference: Some(reference),
+                identity: Some(entry.identity.clone()),
+                result,
+            });
+        }
+        self.file_states = self
+            .root
+            .as_ref()
+            .map_or_else(fieldcad_catalog::DirectoryState::default, |root| {
+                fieldcad_catalog::directory_state(root)
+            });
+        self.report = report;
+    }
+}
+
+/// Build a durable catalog reference for a scene-local entry.
+pub fn document_entry_ref(
+    entry: &fieldcad_scene_document::DocumentCatalogEntry,
+) -> fieldcad_core::CatalogEntryRef {
+    fieldcad_core::CatalogEntryRef {
+        catalog: entry.identity.catalog.as_str().to_owned(),
+        template: entry.identity.template.as_str().to_owned(),
+        origin: fieldcad_core::CatalogOrigin::Document {
+            entry_id: entry.entry_id,
+        },
+        api_version: fieldcad_catalog::API_VERSION.to_owned(),
+        fingerprint: fieldcad_catalog::template_fingerprint(
+            &entry.identity,
+            &entry.metadata,
+            &entry.spec,
+        ),
+    }
+}
+
+/// Failure while changing a catalog source or its session-local entries.
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogError {
+    #[error("catalog configuration directory is unavailable")]
+    DirectoryUnavailable,
+    #[error("catalog entry disappeared")]
+    EntryNotFound,
+    #[error("{0} already exists in the effective catalog")]
+    IdentityCollision(fieldcad_catalog::TemplateIdentity),
+    #[error("catalog entry is invalid and cannot be edited structurally")]
+    InvalidEntry,
+    #[error("catalog source changed or disappeared: {0}")]
+    SourceUnavailable(PathBuf),
+    #[error(transparent)]
+    Write(#[from] fieldcad_catalog::WriteError),
+}
 
 mod event_hub;
 pub use event_hub::{EventHub, EventWatcher, SessionEvent, WatchEvent};
@@ -92,6 +198,7 @@ pub enum SessionError {
 /// transports are attached.
 pub struct HeadlessServer {
     source: AsyncLocalDataSource,
+    catalog: CatalogSession,
     sequencer: CommandSequencer,
     /// Registered by [`submit_and_await`](Self::submit_and_await), fulfilled
     /// by [`publish`](Self::publish) the moment a command actually goes
@@ -112,13 +219,265 @@ pub struct HeadlessServer {
 
 impl HeadlessServer {
     pub fn new(source: AsyncLocalDataSource) -> Self {
-        Self {
+        Self::with_catalog_root(source, catalog_directory())
+    }
+
+    /// Construct a session with an explicit global catalog root. Hosts use this
+    /// to share their normal user configuration directory without letting a
+    /// transport choose arbitrary filesystem locations.
+    pub fn with_catalog_root(source: AsyncLocalDataSource, root: Option<PathBuf>) -> Self {
+        let mut server = Self {
             source,
+            catalog: CatalogSession::new(root),
             sequencer: CommandSequencer::default(),
             waiters: HashMap::new(),
             hub: EventHub::default(),
             events: Vec::new(),
+        };
+        server.reload_catalog();
+        server
+    }
+
+    /// Snapshot of global plus document-scoped catalog entries.
+    pub fn catalog(&self) -> &fieldcad_catalog::CatalogLoadReport {
+        &self.catalog.report
+    }
+
+    /// Re-read the configured global source and re-resolve document entries.
+    pub fn reload_catalog(&mut self) {
+        self.catalog.reload(self.source.world().component_schemas());
+    }
+
+    /// Scene-local templates persisted with this session's scene document.
+    pub fn document_entries(&self) -> &[fieldcad_scene_document::DocumentCatalogEntry] {
+        &self.catalog.document_entries
+    }
+
+    /// Scene-local quick-add visibility preferences.
+    pub fn quick_add_hidden(&self) -> &[fieldcad_core::CatalogEntryRef] {
+        &self.catalog.quick_add_hidden
+    }
+
+    /// Replace scene-local catalog state after loading a document.
+    pub fn set_document_catalog(
+        &mut self,
+        entries: Vec<fieldcad_scene_document::DocumentCatalogEntry>,
+        quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
+    ) {
+        self.catalog.document_entries = entries;
+        self.catalog.quick_add_hidden = quick_add_hidden;
+        self.reload_catalog();
+    }
+
+    /// Create a template in the requested catalog scope.
+    pub fn create_catalog_entry(
+        &mut self,
+        document_scope: bool,
+        identity: fieldcad_catalog::TemplateIdentity,
+        metadata: fieldcad_catalog::TemplateMetadata,
+        spec: fieldcad_catalog::TemplateSpec,
+    ) -> Result<fieldcad_core::CatalogEntryRef, CatalogError> {
+        if self
+            .catalog
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.identity.as_ref() == Some(&identity))
+        {
+            return Err(CatalogError::IdentityCollision(identity));
         }
+        let reference = if document_scope {
+            let entry = fieldcad_scene_document::DocumentCatalogEntry {
+                entry_id: uuid::Uuid::new_v4(),
+                identity,
+                metadata,
+                spec,
+            };
+            let reference = document_entry_ref(&entry);
+            self.catalog.document_entries.push(entry);
+            reference
+        } else {
+            let root = self
+                .catalog
+                .root
+                .as_ref()
+                .ok_or(CatalogError::DirectoryUnavailable)?;
+            let path = root.join(format!("{}.yaml", identity.template.as_str()));
+            fieldcad_catalog::create_entry(&path, &identity, &metadata, &spec)?;
+            fieldcad_core::CatalogEntryRef {
+                catalog: identity.catalog.as_str().to_owned(),
+                template: identity.template.as_str().to_owned(),
+                origin: fieldcad_core::CatalogOrigin::Global {
+                    relative_path: path
+                        .file_name()
+                        .expect("catalog filename")
+                        .to_string_lossy()
+                        .into_owned(),
+                    document_ordinal: 1,
+                },
+                api_version: fieldcad_catalog::API_VERSION.to_owned(),
+                fingerprint: String::new(),
+            }
+        };
+        self.reload_catalog();
+        self.catalog
+            .report
+            .entries
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .reference
+                    .as_ref()
+                    .filter(|current| {
+                        current.origin == reference.origin
+                            && current.catalog == reference.catalog
+                            && current.template == reference.template
+                    })
+                    .cloned()
+            })
+            .ok_or(CatalogError::EntryNotFound)
+    }
+
+    /// Update one source-qualified template, preserving its source document
+    /// (and a document entry UUID) while allowing its identity to change.
+    pub fn update_catalog_entry(
+        &mut self,
+        entry: &fieldcad_core::CatalogEntryRef,
+        identity: fieldcad_catalog::TemplateIdentity,
+        metadata: fieldcad_catalog::TemplateMetadata,
+        spec: fieldcad_catalog::TemplateSpec,
+    ) -> Result<fieldcad_core::CatalogEntryRef, CatalogError> {
+        if self.catalog.report.entries.iter().any(|candidate| {
+            candidate.identity.as_ref() == Some(&identity)
+                && candidate.reference.as_ref() != Some(entry)
+        }) {
+            return Err(CatalogError::IdentityCollision(identity));
+        }
+        match &entry.origin {
+            fieldcad_core::CatalogOrigin::Document { entry_id } => {
+                let document = self
+                    .catalog
+                    .document_entries
+                    .iter_mut()
+                    .find(|document| document.entry_id == *entry_id)
+                    .ok_or(CatalogError::EntryNotFound)?;
+                document.identity = identity.clone();
+                document.metadata = metadata;
+                document.spec = spec;
+            }
+            fieldcad_core::CatalogOrigin::Global {
+                relative_path,
+                document_ordinal,
+            } => {
+                let root = self
+                    .catalog
+                    .root
+                    .as_ref()
+                    .ok_or(CatalogError::DirectoryUnavailable)?;
+                let path = root.join(relative_path);
+                let expected = self
+                    .catalog
+                    .file_states
+                    .files
+                    .get(&path)
+                    .and_then(|state| state.as_ref().ok())
+                    .ok_or_else(|| CatalogError::SourceUnavailable(path.clone()))?;
+                let old_identity = self
+                    .catalog
+                    .report
+                    .entries
+                    .iter()
+                    .find(|candidate| candidate.reference.as_ref() == Some(entry))
+                    .and_then(|candidate| candidate.identity.clone())
+                    .ok_or(CatalogError::EntryNotFound)?;
+                fieldcad_catalog::save_entry_at(
+                    &fieldcad_catalog::SourceTarget {
+                        path,
+                        document_ordinal: fieldcad_catalog::DocumentOrdinal::new(
+                            document_ordinal.saturating_sub(1),
+                        ),
+                        identity: old_identity,
+                    },
+                    &identity,
+                    &metadata,
+                    &spec,
+                    expected,
+                )?;
+            }
+        }
+        self.reload_catalog();
+        self.catalog
+            .report
+            .entries
+            .iter()
+            .find_map(|candidate| {
+                candidate
+                    .reference
+                    .as_ref()
+                    .filter(|current| {
+                        current.origin == entry.origin
+                            && current.catalog == identity.catalog.as_str()
+                            && current.template == identity.template.as_str()
+                    })
+                    .cloned()
+            })
+            .ok_or(CatalogError::EntryNotFound)
+    }
+
+    /// Delete one source-qualified template.
+    pub fn delete_catalog_entry(
+        &mut self,
+        entry: &fieldcad_core::CatalogEntryRef,
+    ) -> Result<(), CatalogError> {
+        match &entry.origin {
+            fieldcad_core::CatalogOrigin::Document { entry_id } => {
+                let before = self.catalog.document_entries.len();
+                self.catalog
+                    .document_entries
+                    .retain(|document| document.entry_id != *entry_id);
+                if self.catalog.document_entries.len() == before {
+                    return Err(CatalogError::EntryNotFound);
+                }
+            }
+            fieldcad_core::CatalogOrigin::Global {
+                relative_path,
+                document_ordinal,
+            } => {
+                let root = self
+                    .catalog
+                    .root
+                    .as_ref()
+                    .ok_or(CatalogError::DirectoryUnavailable)?;
+                let path = root.join(relative_path);
+                let expected = self
+                    .catalog
+                    .file_states
+                    .files
+                    .get(&path)
+                    .and_then(|state| state.as_ref().ok())
+                    .ok_or_else(|| CatalogError::SourceUnavailable(path.clone()))?;
+                let identity = self
+                    .catalog
+                    .report
+                    .entries
+                    .iter()
+                    .find(|candidate| candidate.reference.as_ref() == Some(entry))
+                    .and_then(|candidate| candidate.identity.clone())
+                    .ok_or(CatalogError::EntryNotFound)?;
+                fieldcad_catalog::remove_entry_at(
+                    &fieldcad_catalog::SourceTarget {
+                        path,
+                        document_ordinal: fieldcad_catalog::DocumentOrdinal::new(
+                            document_ordinal.saturating_sub(1),
+                        ),
+                        identity,
+                    },
+                    expected,
+                )?;
+            }
+        }
+        self.reload_catalog();
+        Ok(())
     }
 
     /// Mint a command identity and submit it. See
@@ -327,6 +686,7 @@ impl HeadlessServer {
         self.waiters.clear();
         self.events.clear();
         self.hub.reset();
+        self.reload_catalog();
         self.publish();
     }
 }
@@ -432,5 +792,85 @@ impl FieldDataSource for HeadlessServer {
     // prevent.
     fn drain_command_events(&mut self) -> Vec<CommandEvent> {
         self.drain_events()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(catalog: &str, template: &str) -> fieldcad_catalog::TemplateIdentity {
+        fieldcad_catalog::TemplateIdentity {
+            catalog: fieldcad_catalog::CatalogScopeName::new(catalog).unwrap(),
+            template: fieldcad_catalog::TemplateName::new(template).unwrap(),
+        }
+    }
+
+    fn empty_metadata() -> fieldcad_catalog::TemplateMetadata {
+        fieldcad_catalog::TemplateMetadata {
+            description: None,
+            author: None,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+        }
+    }
+
+    fn empty_spec() -> fieldcad_catalog::TemplateSpec {
+        fieldcad_catalog::TemplateSpec {
+            object_kind: "world-object".to_owned(),
+            shape: None,
+            components: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn document_catalog_edits_keep_the_entry_uuid_when_renamed() {
+        let source = default_session().unwrap();
+        let mut server = HeadlessServer::with_catalog_root(source, None);
+        let entry = server
+            .create_catalog_entry(
+                true,
+                identity("test", "alpha"),
+                empty_metadata(),
+                empty_spec(),
+            )
+            .unwrap();
+        let renamed = server
+            .update_catalog_entry(
+                &entry,
+                identity("test", "beta"),
+                empty_metadata(),
+                empty_spec(),
+            )
+            .unwrap();
+        assert_eq!(entry.origin, renamed.origin);
+        assert_eq!(renamed.template, "beta");
+        assert_eq!(server.document_entries().len(), 1);
+    }
+
+    #[test]
+    fn global_catalog_edits_retain_the_selected_yaml_document() {
+        let root = tempfile::tempdir().unwrap();
+        let source = default_session().unwrap();
+        let mut server = HeadlessServer::with_catalog_root(source, Some(root.path().to_path_buf()));
+        let entry = server
+            .create_catalog_entry(
+                false,
+                identity("test", "alpha"),
+                empty_metadata(),
+                empty_spec(),
+            )
+            .unwrap();
+        let renamed = server
+            .update_catalog_entry(
+                &entry,
+                identity("test", "beta"),
+                empty_metadata(),
+                empty_spec(),
+            )
+            .unwrap();
+        assert_eq!(entry.origin, renamed.origin);
+        assert_eq!(renamed.template, "beta");
+        assert!(root.path().join("alpha.yaml").exists());
     }
 }

@@ -14,10 +14,12 @@ use fieldcad_core::{ComponentTypeId, PluginId, PropertyId};
 use glam::DVec3;
 
 use crate::diagnostics::{Diagnostic, InvalidReason};
-use crate::document::{CatalogComponentInstance, CatalogEntryDocument, CatalogPropertyValue, CatalogShape};
+use crate::document::{
+    CatalogComponentInstance, CatalogEntryDocument, CatalogPropertyValue, CatalogShape,
+};
 use crate::ids::{CatalogScopeName, TemplateName};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TemplateSpec {
     /// Preserved verbatim, even if unrecognised — availability resolution
     /// decides instantiability, this type only decides parsability.
@@ -26,14 +28,14 @@ pub struct TemplateSpec {
     pub components: Vec<TemplateComponentInstance>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TemplateShape {
     Point { exclusion_radius: LengthMetres },
     Sphere { radius: LengthMetres },
     Box { half_extent: DVec3 },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TemplateComponentInstance {
     pub component_type: ComponentTypeId,
     pub properties: BTreeMap<PropertyId, TemplatePropertyValue>,
@@ -41,7 +43,7 @@ pub struct TemplateComponentInstance {
 
 /// Structurally-clean mirror of [`CatalogPropertyValue`] — same shape, but
 /// `si_value` is guaranteed finite.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TemplatePropertyValue {
     Scalar { si_value: f64 },
     Vector { si_value: DVec3 },
@@ -61,7 +63,9 @@ fn positive_finite(value: f64) -> Option<f64> {
 /// `ComponentTypeId`/`PropertyId` is registered, or whether a property's
 /// value-kind matches its schema — those depend on a live registry and
 /// belong to [`crate::availability::resolve_availability`].
-pub fn validate_structure(document: &CatalogEntryDocument) -> Result<TemplateSpec, Vec<Diagnostic>> {
+pub fn validate_structure(
+    document: &CatalogEntryDocument,
+) -> Result<TemplateSpec, Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
 
     if let Err(source) = CatalogScopeName::new(document.metadata.catalog.clone()) {
@@ -249,7 +253,9 @@ fn validate_property_value(
     match value {
         CatalogPropertyValue::Scalar { si_value } => {
             if si_value.is_finite() {
-                Some(TemplatePropertyValue::Scalar { si_value: *si_value })
+                Some(TemplatePropertyValue::Scalar {
+                    si_value: *si_value,
+                })
             } else {
                 diagnostics.push(Diagnostic {
                     field_path: Some(format!(
@@ -284,9 +290,7 @@ fn validate_property_value(
         CatalogPropertyValue::Choice(choice) => {
             if choice.is_empty() {
                 diagnostics.push(Diagnostic {
-                    field_path: Some(format!(
-                        "spec.components[{index}].properties.{key}.choice"
-                    )),
+                    field_path: Some(format!("spec.components[{index}].properties.{key}.choice")),
                     reason: InvalidReason::EmptyChoiceValue,
                 });
                 None
@@ -376,9 +380,11 @@ mod tests {
         });
 
         let diagnostics = validate_structure(&document).unwrap_err();
-        assert!(diagnostics
-            .iter()
-            .any(|d| matches!(d.reason, InvalidReason::NonFiniteValue { .. })));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| matches!(d.reason, InvalidReason::NonFiniteValue { .. }))
+        );
     }
 
     #[test]
@@ -394,12 +400,16 @@ mod tests {
         });
 
         let diagnostics = validate_structure(&document).unwrap_err();
-        assert!(diagnostics
-            .iter()
-            .any(|d| matches!(d.reason, InvalidReason::InvalidCatalogName { .. })));
-        assert!(diagnostics
-            .iter()
-            .any(|d| matches!(d.reason, InvalidReason::InvalidPluginId { .. })));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| matches!(d.reason, InvalidReason::InvalidCatalogName { .. }))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| matches!(d.reason, InvalidReason::InvalidPluginId { .. }))
+        );
     }
 
     #[test]
@@ -416,9 +426,11 @@ mod tests {
         }
 
         let diagnostics = validate_structure(&document).unwrap_err();
-        assert!(diagnostics
-            .iter()
-            .any(|d| matches!(d.reason, InvalidReason::DuplicateComponentInEntry { .. })));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| matches!(d.reason, InvalidReason::DuplicateComponentInEntry { .. }))
+        );
     }
 
     #[test]

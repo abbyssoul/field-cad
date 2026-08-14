@@ -36,7 +36,10 @@ pub(super) fn mass_aggregate_probe_properties(
             ui.add_space(6.0);
             let mut show_member_lines = probe.show_member_lines;
             if ui
-                .checkbox(&mut show_member_lines, "Show lines to members when selected")
+                .checkbox(
+                    &mut show_member_lines,
+                    "Show lines to members when selected",
+                )
                 .changed()
             {
                 output.edit(vec![WorldCommand::SetMassAggregateProbeShowMemberLines {

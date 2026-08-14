@@ -9,7 +9,6 @@ members = [
     "crates/fieldcad-electromagnetic-sources",
     "crates/fieldcad-sources",
     "crates/fieldcad-mcp",
-    "crates/fieldcad-particles",
     "crates/fieldcad-plugin-api",
     "crates/fieldcad-scene-document",
     "crates/fieldcad-server",
@@ -57,6 +56,7 @@ rmcp = "3.1.0"
 schemars = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+sha2 = "0.10"
 # Maintained fork of the archived `serde_yaml`, same API surface. Used only by
 # the catalog crate, which is the first hand-authored, end-user-facing file
 # format in this workspace (everything else persists as JSON).
@@ -72,7 +72,7 @@ tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uom = { version = "0.38", default-features = false, features = ["si", "f64", "autoconvert", "serde", "std"] }
-uuid = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
 wgpu = "29"
 winit = "0.30.13"
 
@@ -83,7 +83,6 @@ fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
 fieldcad-sources = { path = "crates/fieldcad-sources" }
 fieldcad-mcp = { path = "crates/fieldcad-mcp" }
-fieldcad-particles = { path = "crates/fieldcad-particles" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
 fieldcad-scene-document = { path = "crates/fieldcad-scene-document" }
 fieldcad-server = { path = "crates/fieldcad-server" }

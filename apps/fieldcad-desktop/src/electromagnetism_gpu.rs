@@ -707,11 +707,11 @@ fn finite_f32(value: f64, label: &str) -> Result<f32, String> {
 
 #[cfg(test)]
 mod tests {
-    use fieldcad_core::quantities::ChargeCoulombs;
+    use fieldcad_core::quantities::{ChargeCoulombs, MassKg, coulomb, kilogram};
     use fieldcad_core::{
         BoundaryCondition, BoundaryConditions, DomainBounds, FieldColumn, GridLattice, ObjectShape,
         ObjectSpec, Precision, ProbeId, Resolution, SampleGeometry, SimulationClock, Transform,
-        World, WorldCommand,
+        Velocity, World, WorldCommand,
     };
     use fieldcad_electromagnetic_sources::{
         charge_component_id, charge_component_schema, charge_properties,
@@ -721,9 +721,10 @@ mod tests {
         ElectromagnetismPlugin, MAGNETIC_DIVERGENCE_HANDLE, MAGNETIC_FIELD_HANDLE, courant_limit,
         prescribed_plane_wave_configuration,
     };
-    use fieldcad_particles::{ParticleTemplate, particle_component_schema, template_particle_spec};
     use fieldcad_plugin_api::{EquationSystemPlugin, SolverContext};
-    use fieldcad_sources::mass_component_schemas;
+    use fieldcad_sources::{
+        inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+    };
     use glam::UVec3;
 
     use super::*;
@@ -930,23 +931,30 @@ mod tests {
             let gpu_domain = Domain::new(bounds, resolution, boundaries, Precision::F32);
             let time_step = TimeStep::from_seconds(courant_limit(&cpu_domain) * 0.5).unwrap();
             let clock = SimulationClock::new(time_step);
+            const ELECTRON_MASS_KG: f64 = 9.109_383_713_9e-31;
+            const ELEMENTARY_CHARGE_COULOMBS: f64 = 1.602_176_634e-19;
+            let electron = ObjectSpec::new("Electron")
+                .with_transform(Transform::at(DVec3::new(-0.2, 0.0, 0.0)).unwrap())
+                .with_velocity(Velocity::new(DVec3::X * 1.0e8, DVec3::ZERO).unwrap())
+                .with_shape(ObjectShape::point(0.01).unwrap())
+                .with_pinned(true)
+                .with_component(
+                    inertial_mass_component_id(),
+                    inertial_mass_properties(MassKg::new::<kilogram>(ELECTRON_MASS_KG)).unwrap(),
+                )
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(-ELEMENTARY_CHARGE_COULOMBS))
+                        .unwrap(),
+                );
             let mut world = World::new();
             world
                 .commit(
-                    [charge_component_schema(), particle_component_schema()]
+                    [charge_component_schema()]
                         .into_iter()
                         .chain(mass_component_schemas())
                         .map(WorldCommand::RegisterComponentSchema)
-                        .chain([WorldCommand::CreateObject(
-                            template_particle_spec(
-                                ParticleTemplate::Catalog("Electron"),
-                                true,
-                                DVec3::new(-0.2, 0.0, 0.0),
-                                DVec3::X * 1.0e8,
-                                0.01,
-                            )
-                            .unwrap(),
-                        )]),
+                        .chain([WorldCommand::CreateObject(electron)]),
                 )
                 .unwrap();
             let world = world.snapshot();

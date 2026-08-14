@@ -9,17 +9,22 @@ name = "fieldcad-server"
 path = "src/main.rs"
 
 [dependencies]
+directories = { workspace = true }
+fieldcad-catalog = { workspace = true }
 fieldcad-core = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-electromagnetism = { workspace = true }
 fieldcad-electrostatics = { workspace = true }
 fieldcad-simulation = { workspace = true }
+fieldcad-scene-document = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 fieldcad-sources = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }

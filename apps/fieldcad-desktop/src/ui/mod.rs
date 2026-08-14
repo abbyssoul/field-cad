@@ -300,6 +300,18 @@ pub struct UiModel {
     /// Whether the app-settings panel is shown. Defaults closed, matching
     /// `mcp_panel_open`/`queue_panel_open`: there's nothing urgent to show.
     pub settings_visible: bool,
+    pub catalog_visible: bool,
+    pub catalog_filter: String,
+    pub catalog_selected: Option<fieldcad_core::CatalogEntryRef>,
+    pub catalog_new_catalog: String,
+    pub catalog_new_template: String,
+    /// Persistent, local edit buffer for the selected parseable catalog entry.
+    /// Selecting another entry intentionally replaces it rather than carrying
+    /// unsaved fields across source-qualified templates.
+    pub catalog_editor: Option<CatalogEditorDraft>,
+    /// Catalog file/action errors belong to the Catalog window, not to the
+    /// asynchronous authoritative-world command status.
+    pub catalog_status: Option<String>,
     /// The object the camera is locked onto, if any — independent of
     /// `selection`, so following one object while inspecting another is
     /// possible. `App::apply_camera_follow` re-targets the camera to this
@@ -346,6 +358,13 @@ impl UiModel {
             mcp_panel_open: false,
             queue_panel_open: false,
             settings_visible: false,
+            catalog_visible: false,
+            catalog_filter: String::new(),
+            catalog_selected: None,
+            catalog_new_catalog: "personal".to_owned(),
+            catalog_new_template: String::new(),
+            catalog_editor: None,
+            catalog_status: None,
             following: None,
             save_in_progress: false,
         }
@@ -533,6 +552,68 @@ impl UiModel {
     }
 }
 
+/// Editable representation of a structurally parseable catalog entry.
+#[derive(Clone, Debug)]
+pub struct CatalogEditorDraft {
+    pub source: fieldcad_core::CatalogEntryRef,
+    pub catalog: String,
+    pub template: String,
+    pub description: String,
+    pub author: String,
+    pub labels: Vec<(String, String)>,
+    pub annotations: Vec<(String, String)>,
+    pub object_kind: String,
+    pub shape: Option<fieldcad_catalog::TemplateShape>,
+    pub components: Vec<fieldcad_catalog::TemplateComponentInstance>,
+}
+
+impl CatalogEditorDraft {
+    pub fn seed(
+        source: fieldcad_core::CatalogEntryRef,
+        metadata: &fieldcad_catalog::TemplateMetadata,
+        spec: &fieldcad_catalog::TemplateSpec,
+    ) -> Self {
+        Self {
+            catalog: source.catalog.clone(),
+            template: source.template.clone(),
+            source,
+            description: metadata.description.clone().unwrap_or_default(),
+            author: metadata.author.clone().unwrap_or_default(),
+            labels: metadata
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            annotations: metadata
+                .annotations
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            object_kind: spec.object_kind.clone(),
+            shape: spec.shape.clone(),
+            components: spec.components.clone(),
+        }
+    }
+
+    pub fn metadata(&self) -> fieldcad_catalog::TemplateMetadata {
+        fieldcad_catalog::TemplateMetadata {
+            description: (!self.description.trim().is_empty())
+                .then(|| self.description.trim().to_owned()),
+            author: (!self.author.trim().is_empty()).then(|| self.author.trim().to_owned()),
+            labels: self.labels.iter().cloned().collect(),
+            annotations: self.annotations.iter().cloned().collect(),
+        }
+    }
+
+    pub fn spec(&self) -> fieldcad_catalog::TemplateSpec {
+        fieldcad_catalog::TemplateSpec {
+            object_kind: self.object_kind.clone(),
+            shape: self.shape.clone(),
+            components: self.components.clone(),
+        }
+    }
+}
+
 /// Editable representation of [`Domain`] which can temporarily contain values
 /// that do not make a valid domain (for example while a user is typing max x).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -648,6 +729,36 @@ pub enum AppAction {
     SaveScene,
     SaveSceneAs,
     OpenScene,
+    /// Re-read the user catalog directory from disk and rebuild the
+    /// effective catalog (global + document-scoped entries).
+    ReloadCatalog,
+}
+
+#[derive(Debug, Clone)]
+pub enum CatalogAction {
+    Open(Option<fieldcad_core::CatalogEntryRef>),
+    SetQuickAddHidden {
+        entry: fieldcad_core::CatalogEntryRef,
+        hidden: bool,
+    },
+    CreateGlobal {
+        catalog: String,
+        template: String,
+    },
+    CreateDocument {
+        catalog: String,
+        template: String,
+    },
+    SaveEntry {
+        entry: fieldcad_core::CatalogEntryRef,
+        catalog: String,
+        template: String,
+        metadata: fieldcad_catalog::TemplateMetadata,
+        spec: fieldcad_catalog::TemplateSpec,
+    },
+    DeleteEntry {
+        entry: fieldcad_core::CatalogEntryRef,
+    },
 }
 
 #[derive(Debug)]
@@ -675,6 +786,7 @@ pub struct UiFrameOutput {
     /// A one-shot request to replace or persist the whole session — see
     /// [`AppAction`].
     pub app_action: Option<AppAction>,
+    pub catalog_action: Option<CatalogAction>,
 }
 
 impl UiFrameOutput {
@@ -698,6 +810,7 @@ impl Default for UiFrameOutput {
             scene_edit_in_progress: false,
             mcp_action: None,
             app_action: None,
+            catalog_action: None,
         }
     }
 }
@@ -742,6 +855,8 @@ impl Default for DiagnosticsConfig {
 
 pub struct FrameContext<'a> {
     pub compute: &'a ComputeView,
+    pub catalog: &'a fieldcad_catalog::CatalogLoadReport,
+    pub quick_add_hidden: &'a [fieldcad_core::CatalogEntryRef],
     pub world: &'a WorldSnapshot,
     pub probe_history: &'a ProbeHistory,
     pub distance_history: &'a DistanceHistory,
@@ -1098,6 +1213,7 @@ pub fn show(
     if model.queue_panel_open {
         queue_window(&context, &frame, &mut output);
     }
+    panels::catalog_window(&context, model, &frame, &mut output);
     settings_window(&context, model, profile);
     floating_probe_plots(&context, model, &frame);
     floating_distance_probe_plots(&context, model, &frame);
@@ -1372,6 +1488,8 @@ mod tests {
                 model,
                 FrameContext {
                     compute: &compute,
+                    catalog: &fieldcad_catalog::CatalogLoadReport::default(),
+                    quick_add_hidden: &[],
                     world: &snapshot,
                     probe_history: &history,
                     distance_history: &distance_history,
@@ -1450,6 +1568,8 @@ mod tests {
                 model,
                 FrameContext {
                     compute: &compute,
+                    catalog: &fieldcad_catalog::CatalogLoadReport::default(),
+                    quick_add_hidden: &[],
                     world: &snapshot,
                     probe_history: &history,
                     distance_history: &distance_history,

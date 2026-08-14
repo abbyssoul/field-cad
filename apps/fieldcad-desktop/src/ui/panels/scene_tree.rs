@@ -1,8 +1,8 @@
 //! Scene tree panel (left side): list of simulation node, objects, and
 //! measurement instruments.
 
-use fieldcad_core::{ObjectShape, ObjectSpec, Transform, WorldCommand, WorldSnapshot};
-use fieldcad_particles::{ParticleTemplate, template_particle_spec};
+use fieldcad_catalog::instantiate_template;
+use fieldcad_core::{ObjectShape, ObjectSpec, Transform, Velocity, WorldCommand, WorldSnapshot};
 use fieldcad_simulation::CommandPayload;
 
 use crate::scene::SceneSelection;
@@ -87,12 +87,29 @@ fn object_section(
         .count();
     let title = format!("Objects ({object_count})");
     super::section(ui, "scene_objects_section", title, true, |ui| {
-        let choices: Vec<(&str, ObjectPreset)> = std::iter::once(("Empty", ObjectPreset::Empty))
-            .chain(
-                ParticleTemplate::all()
-                    .filter(|template| *template != ParticleTemplate::Custom)
-                    .map(|template| (template.label(), ObjectPreset::Particle(template))),
-            )
+        let choices: Vec<(String, ObjectPreset)> = {
+            let mut choices: Vec<(String, ObjectPreset)> =
+                vec![("Empty".to_owned(), ObjectPreset::Empty)];
+            for entry in &frame.catalog.entries {
+                let is_available = matches!(
+                    &entry.result,
+                    fieldcad_catalog::LoadResult::Available { .. }
+                );
+                if let (Some(reference), true) = (&entry.reference, is_available) {
+                    if frame.quick_add_hidden.contains(reference) {
+                        continue;
+                    }
+                    choices.push((
+                        quick_add_label(&frame.catalog.entries, reference),
+                        ObjectPreset::Catalog(reference.clone()),
+                    ));
+                }
+            }
+            choices
+        };
+        let ref_choices: Vec<(&str, ObjectPreset)> = choices
+            .iter()
+            .map(|(label, preset)| (label.as_str(), preset.clone()))
             .collect();
         if let Some(preset) = super::split_add_button(
             ui,
@@ -100,11 +117,11 @@ fn object_section(
             "Add an object at the origin.\n\
              Give it charge or mass in the inspector to couple it to a field.",
             ObjectPreset::Empty,
-            &choices,
+            &ref_choices,
         ) {
             output.submit(match preset {
                 ObjectPreset::Empty => new_object_command(frame.world),
-                ObjectPreset::Particle(template) => template_object_command(frame.world, template),
+                ObjectPreset::Catalog(reference) => catalog_object_command(frame, &reference),
             });
         }
         ui.add_space(4.0);
@@ -143,6 +160,33 @@ fn object_section(
         }
     });
     ui.add_space(6.0);
+}
+
+fn quick_add_label(
+    entries: &[fieldcad_catalog::CatalogEntry],
+    reference: &fieldcad_core::CatalogEntryRef,
+) -> String {
+    let collides = entries
+        .iter()
+        .filter_map(|entry| entry.reference.as_ref())
+        .any(|other| other != reference && other.template == reference.template);
+    if !collides {
+        return reference.template.clone();
+    }
+    match &reference.origin {
+        fieldcad_core::CatalogOrigin::Global {
+            relative_path,
+            document_ordinal,
+        } => {
+            format!(
+                "{} — user: {} #{}",
+                reference.template, relative_path, document_ordinal
+            )
+        }
+        fieldcad_core::CatalogOrigin::Document { .. } => {
+            format!("{} — document: {}", reference.template, reference.catalog)
+        }
+    }
 }
 
 fn measurement_section(
@@ -482,10 +526,10 @@ pub(super) fn entity_actions(
 /// The default radius for an object whose shape was just chosen.
 pub(super) const DEFAULT_AUTHORING_RADIUS: f64 = 0.15;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum ObjectPreset {
     Empty,
-    Particle(ParticleTemplate),
+    Catalog(fieldcad_core::CatalogEntryRef),
 }
 
 fn next_object_position(world: &WorldSnapshot) -> glam::DVec3 {
@@ -506,17 +550,38 @@ pub(super) fn new_object_command(world: &WorldSnapshot) -> CommandPayload {
     )])
 }
 
-fn template_object_command(world: &WorldSnapshot, template: ParticleTemplate) -> CommandPayload {
-    CommandPayload::CommitWorld(vec![fieldcad_core::WorldCommand::CreateObject(
-        template_particle_spec(
-            template,
-            false,
-            next_object_position(world),
-            glam::DVec3::ZERO,
-            DEFAULT_AUTHORING_RADIUS,
-        )
-        .expect("catalog template parameters are valid"),
-    )])
+pub(super) fn catalog_object_command(
+    frame: &FrameContext<'_>,
+    reference: &fieldcad_core::CatalogEntryRef,
+) -> CommandPayload {
+    let entry = frame
+        .catalog
+        .entries
+        .iter()
+        .find(|e| e.reference.as_ref() == Some(reference));
+    let Some(entry) = entry else {
+        return new_object_command(frame.world);
+    };
+    let spec = match &entry.result {
+        fieldcad_catalog::LoadResult::Available { spec, .. } => spec,
+        _ => return new_object_command(frame.world),
+    };
+    let existing_names = frame.world.objects().values().map(|o| o.name.as_str());
+    let display_name = fieldcad_catalog::suggest_display_name(&reference.template, existing_names);
+    let pos = next_object_position(frame.world);
+    let placement = fieldcad_catalog::InstantiationPlacement {
+        display_name,
+        transform: Transform::at(pos).expect("static position is finite"),
+        velocity: Velocity::default(),
+        pinned: false,
+        fallback_shape_radius: DEFAULT_AUTHORING_RADIUS,
+    };
+    let spec =
+        match instantiate_template(spec, reference, frame.world.component_schemas(), placement) {
+            Ok(spec) => spec,
+            Err(_) => return CommandPayload::CommitWorld(Vec::new()),
+        };
+    CommandPayload::CommitWorld(vec![fieldcad_core::WorldCommand::CreateObject(spec)])
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -557,5 +622,58 @@ fn measurement_command(
             )
             .expect("static sphere parameters are valid"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use fieldcad_catalog::{CatalogEntry, DocumentOrdinal, LoadResult, SourceLocation};
+    use fieldcad_core::{CatalogEntryRef, CatalogOrigin};
+
+    use super::quick_add_label;
+
+    fn entry(reference: CatalogEntryRef) -> CatalogEntry {
+        CatalogEntry {
+            source: SourceLocation {
+                file: PathBuf::from("catalog.yaml"),
+                document_ordinal: DocumentOrdinal::new(0),
+            },
+            reference: Some(reference),
+            identity: None,
+            result: LoadResult::Invalid {
+                diagnostics: Vec::new(),
+            },
+        }
+    }
+
+    fn global_reference(path: &str) -> CatalogEntryRef {
+        CatalogEntryRef {
+            catalog: "personal".to_owned(),
+            template: "particle-a".to_owned(),
+            origin: CatalogOrigin::Global {
+                relative_path: path.to_owned(),
+                document_ordinal: 1,
+            },
+            api_version: "fieldcad.catalog/v1".to_owned(),
+            fingerprint: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn colliding_quick_add_entries_include_their_source() {
+        let first = global_reference("one.yaml");
+        let second = global_reference("two.yaml");
+        let entries = vec![entry(first.clone()), entry(second.clone())];
+
+        assert_eq!(
+            quick_add_label(&entries, &first),
+            "particle-a — user: one.yaml #1"
+        );
+        assert_eq!(
+            quick_add_label(&entries, &second),
+            "particle-a — user: two.yaml #1"
+        );
     }
 }

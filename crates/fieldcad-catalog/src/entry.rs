@@ -8,8 +8,10 @@ use crate::diagnostics::{Diagnostic, InvalidReason};
 use crate::document::CatalogMetadata;
 use crate::source::{SourceLocation, TemplateIdentity};
 use crate::structure::TemplateSpec;
+use fieldcad_core::CatalogEntryRef;
+use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TemplateMetadata {
     pub description: Option<String>,
     pub author: Option<String>,
@@ -33,6 +35,9 @@ impl TemplateMetadata {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogEntry {
     pub source: SourceLocation,
+    /// Source-qualified durable identity when the YAML supplied a valid
+    /// catalog/template name and a structurally valid template.
+    pub reference: Option<CatalogEntryRef>,
     /// `Some` as soon as `metadata.catalog`/`metadata.name` themselves
     /// validate, independent of whether the rest of the entry later turns
     /// out `Invalid` — a duplicate-detection or catalog-browsing layer
@@ -41,6 +46,19 @@ pub struct CatalogEntry {
     /// error.
     pub identity: Option<TemplateIdentity>,
     pub result: LoadResult,
+}
+
+/// SHA-256 over serde's deterministic encoding of BTreeMap-backed resolved
+/// template data. This deliberately excludes source location so moving a file
+/// produces an explicit relink candidate rather than a different template.
+pub fn template_fingerprint(
+    identity: &TemplateIdentity,
+    metadata: &TemplateMetadata,
+    spec: &TemplateSpec,
+) -> String {
+    let bytes = serde_json::to_vec(&(identity, metadata, spec))
+        .expect("catalog template types are serializable");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,4 +93,47 @@ pub struct CatalogFileError {
 pub struct CatalogLoadReport {
     pub entries: Vec<CatalogEntry>,
     pub file_errors: Vec<CatalogFileError>,
+}
+
+/// Relationship between a persisted catalog link and the currently loaded
+/// catalog. A moved entry is deliberately not rebound automatically: callers
+/// must offer an explicit relink action.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkResolution<'a> {
+    Exact(&'a CatalogEntry),
+    RelinkCandidate(&'a CatalogEntry),
+    Unavailable,
+    Ambiguous,
+}
+
+impl CatalogLoadReport {
+    /// Resolve a link by exact source first. If that source disappeared, one
+    /// content-identical entry is an explicit relink candidate; more than one
+    /// is ambiguous and none means unavailable.
+    pub fn resolve_link(&self, link: &CatalogEntryRef) -> LinkResolution<'_> {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.reference.as_ref() == Some(link))
+        {
+            return LinkResolution::Exact(entry);
+        }
+        let candidates: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry.result, LoadResult::Available { .. })
+                    && entry.reference.as_ref().is_some_and(|reference| {
+                        reference.fingerprint == link.fingerprint
+                            && reference.catalog == link.catalog
+                            && reference.template == link.template
+                    })
+            })
+            .collect();
+        match candidates.as_slice() {
+            [] => LinkResolution::Unavailable,
+            [entry] => LinkResolution::RelinkCandidate(entry),
+            _ => LinkResolution::Ambiguous,
+        }
+    }
 }

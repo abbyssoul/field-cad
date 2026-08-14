@@ -35,7 +35,7 @@ use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, DistanceProbeId, Domain,
     DomainBounds, MassAggregateProbeId, MassAggregateSample, ObjectShape, ObjectSpec, PluginId,
     PluginProvenance, Precision, ProbeSpec, Resolution, SceneScale, SessionId,
-    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, TimeStep, Transform, World,
+    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, TimeStep, Transform, Velocity, World,
     WorldCommand,
     quantities::{ChargeCoulombs, coulomb},
 };
@@ -217,6 +217,125 @@ struct CommitWorldParams {
     /// Component-property values are plugin-defined; use `get_world` and
     /// `list_field_systems` to discover their schemas before authoring them.
     commands: Vec<serde_json::Value>,
+}
+
+/// A catalog reference and template payload are ordinary JSON because catalog
+/// schemas are intentionally extensible independently of this transport.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CatalogReferenceParams {
+    /// Source-qualified `CatalogEntryRef` JSON returned by list_catalog_entries.
+    entry: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CatalogInstanceParams {
+    /// Source-qualified `CatalogEntryRef` JSON returned by list_catalog_entries.
+    entry: serde_json::Value,
+    /// Optional scene display name. Omit to use the template name with a
+    /// collision-avoiding suffix.
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CatalogObjectParams {
+    object_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CatalogPropagationParams {
+    /// Source-qualified entry reference for the current template revision.
+    entry: serde_json::Value,
+    /// Empty means every matching tracking object; otherwise update only these IDs.
+    #[serde(default)]
+    object_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CatalogMutationParams {
+    /// `global` writes below the configured catalog directory; `document`
+    /// persists with the current scene.
+    scope: String,
+    /// Required for update; omit for create.
+    #[serde(default)]
+    entry: Option<serde_json::Value>,
+    catalog: String,
+    template: String,
+    metadata: serde_json::Value,
+    spec: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogEntryView {
+    reference: Option<fieldcad_core::CatalogEntryRef>,
+    identity: Option<fieldcad_catalog::TemplateIdentity>,
+    source: String,
+    state: &'static str,
+    detail: Vec<String>,
+}
+
+fn parse_catalog_reference(
+    value: serde_json::Value,
+) -> Result<fieldcad_core::CatalogEntryRef, String> {
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid catalog entry reference: {error}"))
+}
+
+fn parse_catalog_payload(
+    catalog: String,
+    template: String,
+    metadata: serde_json::Value,
+    spec: serde_json::Value,
+) -> Result<
+    (
+        fieldcad_catalog::TemplateIdentity,
+        fieldcad_catalog::TemplateMetadata,
+        fieldcad_catalog::TemplateSpec,
+    ),
+    String,
+> {
+    let identity = fieldcad_catalog::TemplateIdentity {
+        catalog: fieldcad_catalog::CatalogScopeName::new(catalog)
+            .map_err(|error| error.to_string())?,
+        template: fieldcad_catalog::TemplateName::new(template)
+            .map_err(|error| error.to_string())?,
+    };
+    let metadata = serde_json::from_value(metadata)
+        .map_err(|error| format!("invalid catalog metadata: {error}"))?;
+    let spec =
+        serde_json::from_value(spec).map_err(|error| format!("invalid catalog spec: {error}"))?;
+    Ok((identity, metadata, spec))
+}
+
+fn catalog_entry_views(report: &fieldcad_catalog::CatalogLoadReport) -> Vec<CatalogEntryView> {
+    report
+        .entries
+        .iter()
+        .map(|entry| {
+            let (state, detail) = match &entry.result {
+                fieldcad_catalog::LoadResult::Available { .. } => ("available", Vec::new()),
+                fieldcad_catalog::LoadResult::Unavailable { reasons, .. } => (
+                    "unavailable",
+                    reasons.iter().map(ToString::to_string).collect(),
+                ),
+                fieldcad_catalog::LoadResult::Invalid { diagnostics } => (
+                    "invalid",
+                    diagnostics.iter().map(ToString::to_string).collect(),
+                ),
+            };
+            CatalogEntryView {
+                reference: entry.reference.clone(),
+                identity: entry.identity.clone(),
+                source: format!(
+                    "{} (document #{})",
+                    entry.source.file.display(),
+                    entry.source.document_ordinal
+                ),
+                state,
+                detail,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -544,6 +663,342 @@ impl McpServer {
 
 #[tool_router]
 impl McpServer {
+    #[tool(
+        description = "List every global and document-scoped catalog entry, including unavailable/invalid entries and their source-qualified diagnostics."
+    )]
+    async fn list_catalog_entries(&self) -> Result<CallToolResult, ErrorData> {
+        ok_json(&catalog_entry_views(lock(&self.model).catalog()))
+    }
+
+    #[tool(
+        description = "Read one parseable catalog entry's source-qualified identity, metadata, spec, and current availability diagnostics."
+    )]
+    async fn get_catalog_entry(
+        &self,
+        Parameters(params): Parameters<CatalogReferenceParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = match parse_catalog_reference(params.entry) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        let server = lock(&self.model);
+        let Some(candidate) = server
+            .catalog()
+            .entries
+            .iter()
+            .find(|candidate| candidate.reference.as_ref() == Some(&entry))
+        else {
+            return tool_error("catalog entry disappeared");
+        };
+        let value = match &candidate.result {
+            fieldcad_catalog::LoadResult::Available { metadata, spec } => {
+                serde_json::json!({ "reference": candidate.reference, "metadata": metadata, "spec": spec, "state": "available" })
+            }
+            fieldcad_catalog::LoadResult::Unavailable {
+                metadata,
+                spec,
+                reasons,
+            } => {
+                serde_json::json!({ "reference": candidate.reference, "metadata": metadata, "spec": spec, "state": "unavailable", "detail": reasons.iter().map(ToString::to_string).collect::<Vec<_>>() })
+            }
+            fieldcad_catalog::LoadResult::Invalid { diagnostics } => {
+                serde_json::json!({ "reference": candidate.reference, "state": "invalid", "detail": diagnostics.iter().map(ToString::to_string).collect::<Vec<_>>() })
+            }
+        };
+        ok_json(&value)
+    }
+
+    #[tool(
+        description = "Reload the configured global YAML catalog. Reloading changes catalog offers only; it never changes tracked world objects."
+    )]
+    async fn reload_catalog(&self) -> Result<CallToolResult, ErrorData> {
+        let mut server = lock(&self.model);
+        server.reload_catalog();
+        ok_json(&catalog_entry_views(server.catalog()))
+    }
+
+    #[tool(
+        description = "Create a schema-driven catalog template. scope is global or document; metadata and spec use the catalog's persisted JSON shape."
+    )]
+    async fn create_catalog_entry(
+        &self,
+        Parameters(params): Parameters<CatalogMutationParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let document_scope = match params.scope.as_str() {
+            "global" => false,
+            "document" => true,
+            other => {
+                return tool_error(format!(
+                    "unknown catalog scope '{other}'; expected global or document"
+                ));
+            }
+        };
+        if params.entry.is_some() {
+            return tool_error("create_catalog_entry does not accept entry");
+        }
+        let (identity, metadata, spec) = match parse_catalog_payload(
+            params.catalog,
+            params.template,
+            params.metadata,
+            params.spec,
+        ) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        match lock(&self.model).create_catalog_entry(document_scope, identity, metadata, spec) {
+            Ok(reference) => ok_json(&reference),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Update or rename one source-qualified catalog entry while preserving its YAML document position or document-entry UUID."
+    )]
+    async fn update_catalog_entry(
+        &self,
+        Parameters(params): Parameters<CatalogMutationParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(entry) = params.entry else {
+            return tool_error("update_catalog_entry requires entry");
+        };
+        let entry = match parse_catalog_reference(entry) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        let expected_scope = match &entry.origin {
+            fieldcad_core::CatalogOrigin::Global { .. } => "global",
+            fieldcad_core::CatalogOrigin::Document { .. } => "document",
+        };
+        if params.scope != expected_scope {
+            return tool_error(format!(
+                "entry belongs to {expected_scope} scope, not {}",
+                params.scope
+            ));
+        }
+        let (identity, metadata, spec) = match parse_catalog_payload(
+            params.catalog,
+            params.template,
+            params.metadata,
+            params.spec,
+        ) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        match lock(&self.model).update_catalog_entry(&entry, identity, metadata, spec) {
+            Ok(reference) => ok_json(&reference),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Delete one source-qualified global YAML document or document-scoped catalog entry."
+    )]
+    async fn delete_catalog_entry(
+        &self,
+        Parameters(params): Parameters<CatalogReferenceParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = match parse_catalog_reference(params.entry) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        match lock(&self.model).delete_catalog_entry(&entry) {
+            Ok(()) => ok_json(&serde_json::json!({"deleted": true})),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Instantiate one available catalog entry through the normal authoritative CreateObject transaction. The template supplies only shape/components; placement remains an instance concern and defaults to the origin."
+    )]
+    async fn instantiate_catalog_entry(
+        &self,
+        Parameters(params): Parameters<CatalogInstanceParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = match parse_catalog_reference(params.entry) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        let object = {
+            let server = lock(&self.model);
+            let Some(candidate) = server
+                .catalog()
+                .entries
+                .iter()
+                .find(|candidate| candidate.reference.as_ref() == Some(&entry))
+            else {
+                return tool_error("catalog entry disappeared");
+            };
+            let fieldcad_catalog::LoadResult::Available { spec, .. } = &candidate.result else {
+                return tool_error("catalog entry is unavailable or invalid");
+            };
+            let world = server.world();
+            let name = params.display_name.unwrap_or_else(|| {
+                fieldcad_catalog::suggest_display_name(
+                    &entry.template,
+                    world.objects().values().map(|object| object.name.as_str()),
+                )
+            });
+            match fieldcad_catalog::instantiate_template(
+                spec,
+                &entry,
+                world.component_schemas(),
+                fieldcad_catalog::InstantiationPlacement {
+                    display_name: name,
+                    transform: Transform::default(),
+                    velocity: Velocity::default(),
+                    pinned: false,
+                    fallback_shape_radius: 0.15,
+                },
+            ) {
+                Ok(object) => object,
+                Err(reasons) => {
+                    return tool_error(
+                        reasons
+                            .into_iter()
+                            .map(|reason| reason.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    );
+                }
+            }
+        };
+        submit_world_commands(&self.model, vec![WorldCommand::CreateObject(object)]).await
+    }
+
+    #[tool(
+        description = "Preserve catalog provenance but make a tracking object's shape and components editable locally."
+    )]
+    async fn unlink_catalog_instance(
+        &self,
+        Parameters(params): Parameters<CatalogObjectParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        submit_world_commands(
+            &self.model,
+            vec![WorldCommand::UnlinkCatalogTemplate {
+                object: fieldcad_core::ObjectId::new(params.object_id),
+            }],
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Report tracking objects sourced from a catalog entry. This is informational: it never changes the world."
+    )]
+    async fn preview_catalog_propagation(
+        &self,
+        Parameters(params): Parameters<CatalogReferenceParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = match parse_catalog_reference(params.entry) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        let objects = lock(&self.model)
+            .world()
+            .objects()
+            .values()
+            .filter_map(|object| {
+                object
+                    .catalog_link
+                    .as_ref()
+                    .filter(|link| {
+                        link.mode == fieldcad_core::CatalogLinkMode::Tracking
+                            && link
+                                .entry
+                                .as_ref()
+                                .is_some_and(|linked| linked.origin == entry.origin)
+                    })
+                    .map(|_| object.id.get())
+            })
+            .collect::<Vec<_>>();
+        ok_json(&serde_json::json!({ "object_ids": objects, "count": objects.len() }))
+    }
+
+    #[tool(
+        description = "Explicitly apply the current template to matching tracked objects in one authoritative transaction. Call preview_catalog_propagation first; saving or reloading a catalog never invokes this automatically."
+    )]
+    async fn apply_catalog_propagation(
+        &self,
+        Parameters(params): Parameters<CatalogPropagationParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = match parse_catalog_reference(params.entry) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        let commands = {
+            let server = lock(&self.model);
+            let Some(candidate) = server
+                .catalog()
+                .entries
+                .iter()
+                .find(|candidate| candidate.reference.as_ref() == Some(&entry))
+            else {
+                return tool_error("catalog entry disappeared");
+            };
+            let fieldcad_catalog::LoadResult::Available { spec, .. } = &candidate.result else {
+                return tool_error("catalog entry is unavailable or invalid");
+            };
+            let world = server.world();
+            let requested: BTreeSet<u64> = params.object_ids.into_iter().collect();
+            let mut commands = Vec::new();
+            for object in world.objects().values() {
+                let Some(link) = &object.catalog_link else {
+                    continue;
+                };
+                if link.mode != fieldcad_core::CatalogLinkMode::Tracking
+                    || !link
+                        .entry
+                        .as_ref()
+                        .is_some_and(|linked| linked.origin == entry.origin)
+                {
+                    continue;
+                }
+                if !requested.is_empty() && !requested.contains(&object.id.get()) {
+                    continue;
+                }
+                let replacement = match fieldcad_catalog::instantiate_template(
+                    spec,
+                    &entry,
+                    world.component_schemas(),
+                    fieldcad_catalog::InstantiationPlacement {
+                        display_name: object.name.clone(),
+                        transform: object.transform,
+                        velocity: object.velocity,
+                        pinned: object.pinned,
+                        fallback_shape_radius: 0.15,
+                    },
+                ) {
+                    Ok(value) => value,
+                    Err(reasons) => {
+                        return tool_error(
+                            reasons
+                                .into_iter()
+                                .map(|reason| reason.to_string())
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        );
+                    }
+                };
+                commands.push(WorldCommand::ApplyCatalogTemplate {
+                    object: object.id,
+                    expected_entry: link
+                        .entry
+                        .clone()
+                        .expect("tracking links from catalog have an entry"),
+                    shape: replacement.shape,
+                    components: replacement.components,
+                    link: replacement
+                        .catalog_link
+                        .expect("catalog instantiation stamps provenance"),
+                });
+            }
+            commands
+        };
+        if commands.is_empty() {
+            return tool_error("no matching tracking objects");
+        }
+        submit_world_commands(&self.model, commands).await
+    }
+
     #[tool(description = "The full authored world: objects, planes, probes, and its revision.")]
     async fn get_world(&self) -> Result<CallToolResult, ErrorData> {
         ok_json(&lock(&self.model).world())
@@ -1032,6 +1487,8 @@ impl McpServer {
                 distance_history: fieldcad_scene_document::DistanceHistoryState::default(),
                 mass_aggregate_history: fieldcad_scene_document::MassAggregateHistoryState::default(
                 ),
+                document_entries: server.document_entries().to_vec(),
+                quick_add_hidden: server.quick_add_hidden().to_vec(),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(
@@ -1058,6 +1515,8 @@ impl McpServer {
                 Err(error) => return tool_error(error.to_string()),
             };
         let queue = outcome.document.queue.clone();
+        let document_entries = outcome.document.document_entries.clone();
+        let quick_add_hidden = outcome.document.quick_add_hidden.clone();
         let source_label = format!("{:?}", outcome.source);
         let (new_source, warnings) =
             match build_session((self.plugin_catalog)(), Some(outcome.document)) {
@@ -1066,6 +1525,7 @@ impl McpServer {
             };
         let mut server = lock(&self.model);
         server.replace_source(new_source);
+        server.set_document_catalog(document_entries, quick_add_hidden);
         if queue.paused
             && let Err(error) = server.submit(CommandPayload::PauseQueue)
         {
@@ -1095,7 +1555,9 @@ impl McpServer {
                 Ok(result) => result,
                 Err(error) => return tool_error(error),
             };
-        lock(&self.model).replace_source(new_source);
+        let mut server = lock(&self.model);
+        server.replace_source(new_source);
+        server.set_document_catalog(Vec::new(), Vec::new());
         ok_json(&OpenOrCreateSceneResult {
             source: "new".to_owned(),
             warnings: warnings.iter().map(format_resolve_warning).collect(),

@@ -65,6 +65,14 @@ pub fn menu_bar(
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Reload Catalog").clicked() {
+                    output.app_action = Some(AppAction::ReloadCatalog);
+                    ui.close();
+                }
+                if ui.button("Catalog…").clicked() {
+                    model.catalog_visible = true;
+                    ui.close();
+                }
                 if ui.checkbox(&mut model.settings_visible, "Settings…").clicked() {
                     ui.close();
                 }

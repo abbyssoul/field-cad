@@ -34,7 +34,8 @@ fn validate_name(value: &str) -> Result<(), NameError> {
 
 macro_rules! catalog_name {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+        #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {

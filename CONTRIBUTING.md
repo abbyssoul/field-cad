@@ -12,7 +12,7 @@ The workspace is organised by responsibility:
 - `fieldcad-core`: domain, world, units, sampling, snapshots.
 - `fieldcad-simulation`: runtime, command handling, and `FieldDataSource`.
 - `fieldcad-dynamics`: first-party force integration for dynamic bodies.
-- `fieldcad-*-sources` and `fieldcad-particles`: shared physical-source
+- `fieldcad-*-sources`: shared physical-source
   schemas and particle catalogue data.
 - `fieldcad-server`: headless authoritative session owner.
 - `fieldcad-mcp`: MCP transport over the server.

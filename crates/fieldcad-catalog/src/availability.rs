@@ -10,7 +10,10 @@
 
 use std::collections::BTreeMap;
 
-use fieldcad_core::{ComponentSchema, ComponentTypeId, PropertyBag, PropertyKind, PropertyValue, Quantity, SchemaError, VectorQuantity};
+use fieldcad_core::{
+    ComponentSchema, ComponentTypeId, PropertyBag, PropertyKind, PropertyValue, Quantity,
+    SchemaError, VectorQuantity,
+};
 
 use crate::structure::{TemplatePropertyValue, TemplateSpec};
 
@@ -53,13 +56,38 @@ pub fn resolve_availability(
     spec: &TemplateSpec,
     component_schemas: &BTreeMap<ComponentTypeId, ComponentSchema>,
 ) -> AvailabilityOutcome {
-    let mut reasons = Vec::new();
-
-    if !KNOWN_OBJECT_KINDS.contains(&spec.object_kind.as_str()) {
-        reasons.push(AvailabilityReason::UnknownObjectKind {
-            kind: spec.object_kind.clone(),
-        });
+    let mut reasons: Vec<AvailabilityReason> = resolve_object_kind(spec).into_iter().collect();
+    if let Err(component_reasons) = resolve_components(spec, component_schemas) {
+        reasons.extend(component_reasons);
     }
+
+    if reasons.is_empty() {
+        AvailabilityOutcome::Available
+    } else {
+        AvailabilityOutcome::Unavailable(reasons)
+    }
+}
+
+/// Whether `spec`'s object kind is one this build knows how to instantiate.
+pub(crate) fn resolve_object_kind(spec: &TemplateSpec) -> Option<AvailabilityReason> {
+    (!KNOWN_OBJECT_KINDS.contains(&spec.object_kind.as_str())).then(|| {
+        AvailabilityReason::UnknownObjectKind {
+            kind: spec.object_kind.clone(),
+        }
+    })
+}
+
+/// Resolve every declared component's property bag against the live
+/// registry. `Ok` carries the fully-converted, dimensioned bags in template
+/// order — shared by [`crate::instantiate::instantiate_template`] so
+/// availability checking and instantiation can never disagree about what
+/// "available" means.
+pub(crate) fn resolve_components(
+    spec: &TemplateSpec,
+    component_schemas: &BTreeMap<ComponentTypeId, ComponentSchema>,
+) -> Result<Vec<(ComponentTypeId, PropertyBag)>, Vec<AvailabilityReason>> {
+    let mut reasons = Vec::new();
+    let mut resolved = Vec::new();
 
     for component in &spec.components {
         let Some(schema) = component_schemas.get(&component.component_type) else {
@@ -69,15 +97,14 @@ pub fn resolve_availability(
             continue;
         };
 
-        match resolve_component_bag(schema, &component.properties) {
-            Ok(bag) => {
-                if let Err(source) = schema.validate(&bag) {
-                    reasons.push(AvailabilityReason::ComponentSchema {
-                        component: component.component_type.clone(),
-                        source,
-                    });
-                }
-            }
+        match template_properties_to_bag(schema, &component.properties) {
+            Ok(bag) => match schema.validate(&bag) {
+                Ok(()) => resolved.push((component.component_type.clone(), bag)),
+                Err(source) => reasons.push(AvailabilityReason::ComponentSchema {
+                    component: component.component_type.clone(),
+                    source,
+                }),
+            },
             Err(errors) => reasons.extend(errors.into_iter().map(|source| {
                 AvailabilityReason::ComponentSchema {
                     component: component.component_type.clone(),
@@ -88,16 +115,19 @@ pub fn resolve_availability(
     }
 
     if reasons.is_empty() {
-        AvailabilityOutcome::Available
+        Ok(resolved)
     } else {
-        AvailabilityOutcome::Unavailable(reasons)
+        Err(reasons)
     }
 }
 
 /// Convert a template's raw properties into a schema-checkable
 /// [`PropertyBag`], reusing `fieldcad_core::SchemaError`'s vocabulary rather
 /// than inventing a parallel one.
-fn resolve_component_bag(
+/// Convert a catalog property's raw, dimensionless representation into the
+/// runtime bag prescribed by `schema`. This is public so authoring clients use
+/// exactly the same conversion and error vocabulary as availability checks.
+pub fn template_properties_to_bag(
     schema: &ComponentSchema,
     raw: &BTreeMap<fieldcad_core::PropertyId, TemplatePropertyValue>,
 ) -> Result<PropertyBag, Vec<SchemaError>> {
@@ -123,7 +153,11 @@ fn resolve_component_bag(
         }
     }
 
-    if errors.is_empty() { Ok(bag) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(bag)
+    } else {
+        Err(errors)
+    }
 }
 
 /// `si_value` finiteness is already guaranteed by
@@ -132,18 +166,18 @@ fn resolve_component_bag(
 /// only fail here on a logic error in that invariant, hence the `expect`.
 fn convert_value(value: &TemplatePropertyValue, kind: &PropertyKind) -> Option<PropertyValue> {
     match (value, kind) {
-        (TemplatePropertyValue::Scalar { si_value }, PropertyKind::Scalar(dimension)) => Some(
-            PropertyValue::Scalar(
+        (TemplatePropertyValue::Scalar { si_value }, PropertyKind::Scalar(dimension)) => {
+            Some(PropertyValue::Scalar(
                 Quantity::new(*si_value, *dimension)
                     .expect("finiteness already checked by validate_structure"),
-            ),
-        ),
-        (TemplatePropertyValue::Vector { si_value }, PropertyKind::Vector(dimension)) => Some(
-            PropertyValue::Vector(
+            ))
+        }
+        (TemplatePropertyValue::Vector { si_value }, PropertyKind::Vector(dimension)) => {
+            Some(PropertyValue::Vector(
                 VectorQuantity::new(*si_value, *dimension)
                     .expect("finiteness already checked by validate_structure"),
-            ),
-        ),
+            ))
+        }
         (TemplatePropertyValue::Boolean(flag), PropertyKind::Boolean) => {
             Some(PropertyValue::Boolean(*flag))
         }
@@ -157,16 +191,73 @@ fn convert_value(value: &TemplatePropertyValue, kind: &PropertyKind) -> Option<P
     }
 }
 
+/// Convert schema-backed runtime values to the raw catalog representation.
+/// Values not described by `schema` are deliberately omitted; callers that
+/// edit a loaded template should overlay this result onto its original bag so
+/// unavailable raw properties survive an otherwise ordinary edit.
+pub fn property_bag_to_template(
+    schema: &ComponentSchema,
+    bag: &PropertyBag,
+) -> Result<BTreeMap<fieldcad_core::PropertyId, TemplatePropertyValue>, Vec<SchemaError>> {
+    let mut result = BTreeMap::new();
+    let mut errors = Vec::new();
+    for property in &schema.properties {
+        let Some(value) = bag.get(&property.id) else {
+            continue;
+        };
+        let converted = match (value, &property.kind) {
+            (PropertyValue::Scalar(value), PropertyKind::Scalar(_)) => {
+                Some(TemplatePropertyValue::Scalar {
+                    si_value: value.si_value(),
+                })
+            }
+            (PropertyValue::Vector(value), PropertyKind::Vector(_)) => {
+                Some(TemplatePropertyValue::Vector {
+                    si_value: value.si_value(),
+                })
+            }
+            (PropertyValue::Boolean(value), PropertyKind::Boolean) => {
+                Some(TemplatePropertyValue::Boolean(*value))
+            }
+            (PropertyValue::Text(value), PropertyKind::Text) => {
+                Some(TemplatePropertyValue::Text(value.clone()))
+            }
+            (PropertyValue::Choice(value), PropertyKind::Choice(_)) => {
+                Some(TemplatePropertyValue::Choice(value.clone()))
+            }
+            _ => None,
+        };
+        if let Some(value) = converted {
+            result.insert(property.id.clone(), value);
+        } else {
+            errors.push(SchemaError::ValueMismatch {
+                property: property.id.clone(),
+                expected: property.kind.clone(),
+            });
+        }
+    }
+    if errors.is_empty() {
+        Ok(result)
+    } else {
+        Err(errors)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::structure::TemplateComponentInstance;
-    use fieldcad_sources::{inertial_mass_component_id, inertial_mass_component_schema, mass_property_id};
+    use fieldcad_sources::{
+        inertial_mass_component_id, inertial_mass_component_schema, mass_property_id,
+    };
 
     fn registry_with_mass() -> BTreeMap<ComponentTypeId, ComponentSchema> {
-        [(inertial_mass_component_id(), inertial_mass_component_schema())]
-            .into_iter()
-            .collect()
+        [(
+            inertial_mass_component_id(),
+            inertial_mass_component_schema(),
+        )]
+        .into_iter()
+        .collect()
     }
 
     fn spec_with_mass(si_value: f64) -> TemplateSpec {
@@ -175,9 +266,12 @@ mod tests {
             shape: None,
             components: vec![TemplateComponentInstance {
                 component_type: inertial_mass_component_id(),
-                properties: [(mass_property_id(), TemplatePropertyValue::Scalar { si_value })]
-                    .into_iter()
-                    .collect(),
+                properties: [(
+                    mass_property_id(),
+                    TemplatePropertyValue::Scalar { si_value },
+                )]
+                .into_iter()
+                .collect(),
             }],
         }
     }

@@ -6,13 +6,13 @@
 //! positions; every path satisfies the discrete continuity equation exactly,
 //! and their average removes a preferred coordinate ordering.
 
+use crate::particle::{Particle, collect_particles};
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     Domain, ObjectId, ObjectShape, Transform, Velocity, WorldSnapshot, lorentz_factor,
     relativistic_kinetic_energy,
 };
 use fieldcad_electromagnetic_sources::ChargeSource;
-use fieldcad_particles::{Particle, collect_particles};
 use fieldcad_plugin_api::{ObjectKinematicsUpdate, PluginError, SolverStepOutcome};
 use glam::{DVec3, UVec3};
 

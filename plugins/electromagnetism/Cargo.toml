@@ -7,9 +7,9 @@ edition = "2024"
 fieldcad-core = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-sources = { workspace = true }
-fieldcad-particles = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 glam = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 fieldcad-electrostatics = { workspace = true }

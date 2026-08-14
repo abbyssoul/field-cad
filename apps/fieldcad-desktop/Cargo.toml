@@ -20,10 +20,10 @@ fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-electromagnetism = { workspace = true }
 fieldcad-electrostatics = { workspace = true }
 fieldcad-gravity = { workspace = true }
+fieldcad-catalog = { workspace = true }
 fieldcad-scene-document = { workspace = true }
 fieldcad-sources = { workspace = true }
 fieldcad-mcp = { workspace = true }
-fieldcad-particles = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 fieldcad-server = { workspace = true }
 fieldcad-simulation = { workspace = true }
@@ -40,6 +40,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 # Parses `scene.wgsl` in a unit test so a broken shader fails the build rather

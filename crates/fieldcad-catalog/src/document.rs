@@ -67,7 +67,11 @@ pub struct CatalogSpec {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CatalogShape {
     Point { exclusion_radius_metres: f64 },
     Sphere { radius_metres: f64 },

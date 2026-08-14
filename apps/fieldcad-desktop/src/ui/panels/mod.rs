@@ -4,6 +4,7 @@
 //! individual panel files and provides shared helper functions used across
 //! multiple panel sub-modules.
 
+mod catalog;
 mod diagnostics;
 mod distance_probe_inspector;
 mod inspector;
@@ -20,6 +21,7 @@ mod world_inspector;
 
 // ── Public surface for ui/mod.rs ───────────────────────────────────────────
 
+pub use catalog::catalog_window;
 pub use diagnostics::diagnostics_window;
 pub use inspector::inspector;
 pub use mcp::mcp_window;
@@ -297,6 +299,8 @@ mod tests {
                         ui,
                         &FrameContext {
                             compute,
+                            catalog: &fieldcad_catalog::CatalogLoadReport::default(),
+                            quick_add_hidden: &[],
                             world: &world,
                             probe_history: &history,
                             distance_history: &distance_history,
@@ -917,7 +921,6 @@ mod tests {
         for schema in [
             fieldcad_electromagnetic_sources::charge_component_schema(),
             fieldcad_sources::inertial_mass_component_schema(),
-            fieldcad_particles::particle_component_schema(),
         ] {
             let properties = schema
                 .default_properties()

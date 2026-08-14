@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 glam = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
+uuid = { workspace = true }
 thiserror = { workspace = true }
 uom = { workspace = true }
 

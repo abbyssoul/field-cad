@@ -45,21 +45,23 @@ by the running application.
   values into ordinary YAML catalog entries, preserving their published source
   metadata. They are sample/user catalog data, not privileged application
   behaviour.
-- Update scene-document migration/loading so old particle-specific provenance
-  becomes an informative generic catalog-origin note where possible. It must
-  never require a current catalog to load an old scene. Retire the old
-  serialized component only after a versioned migration and fixture coverage.
+- The catalog-link and document-entry fields are introduced before Field CAD
+  has released scene documents that contain the retired particle-provenance
+  component. No compatibility migration or scene-format bump is required for
+  this replacement. The first persisted contract is the source-qualified
+  generic link format.
 
 ## Current state
 
-- `fieldcad-particles` contains a compiled, particle-only `CATALOG`, and the
-  desktop creates its objects by assembling `ObjectSpec` directly.
+- `fieldcad-particles` has been removed. The desktop instantiates ordinary
+  YAML templates through the generic catalog path; starter particle values are
+  configuration data rather than compiled offers.
 - The generic inspector can attach and edit registered component schemas, so
   the world model already supports composition independent of a particle type
   (ADR 0021).
-- A scene document persists resolved world component values, template
-  provenance, and scene-local view state, but it has no user catalog source or
-  live-link model.
+- Scene documents persist resolved world component values, source-qualified
+  catalog links, document-scoped templates, and scene-local quick-add
+  preferences. They remain self-contained when a catalog is unavailable.
 - The desktop already uses `directories::ProjectDirs` for user configuration.
   On Unix the catalog directory belongs beneath its XDG configuration directory
   (for example `$XDG_CONFIG_HOME/fieldcad/catalog/`), with the equivalent
@@ -262,22 +264,32 @@ spec:
    checks, size limits, diagnostics, and availability resolution against the
    registered kind/component schemas. Add a focused catalog crate or module;
    do not put filesystem/UI logic in `fieldcad-core`.
-2. Add generic authoritative catalog-template instantiation and durable
+2. **Complete.** Add generic authoritative catalog-template instantiation and durable
    object-link/provenance data. Replace desktop-side particle-specific
    `ObjectSpec` assembly; migrate the particle values to YAML; move any
    remaining non-catalog particle logic to its appropriate shared boundary;
    then remove `fieldcad-particles` and its compiled offer/provenance model.
-3. Extend `fieldcad-scene-document` with document-scoped entries, catalog-link
+3. **Complete.** Extend `fieldcad-scene-document` with document-scoped entries, catalog-link
    records, and scene-local quick-add preferences. Establish round-trip and
    catalog-absent behaviour before building the UI.
-4. Implement catalog source editing, atomic writes, source read-only handling,
+4. **Complete.** Implement catalog source editing, atomic writes, source read-only handling,
    reload/conflict detection, and hot reload.
-5. Build the catalog/search/editor and linked-instance inspector workflows.
+5. **Complete.** Build the catalog/search/editor and linked-instance inspector workflows.
    Run the desktop smoke check; manual in-app verification remains necessary
    for modal, reload, and linked-instance interaction.
-6. Expose the same discover/instantiate/link/unlink operations through the
-   server/MCP command boundary after the durable model is complete. Do not
-   create an MCP-only catalog representation or validation path.
+6. **In progress.** Move the effective catalog (global source report,
+   document-scoped entries, quick-add preferences, and source fingerprints)
+   behind `fieldcad-server`, so desktop and MCP consume one source of truth.
+   Expose list/reload/create/update/delete/instantiate/unlink through MCP,
+   constrained to the configured catalog root for global writes. Catalog
+   edits and reloads only change offers: propagation remains a separate,
+   explicit authoritative operation with a preview/count and all-or-selected
+   linked tracking objects. Do not create an MCP-only catalog representation
+   or validation path.
+
+   Follow-up: [server-authoritative-catalog.md](server-authoritative-catalog.md)
+   closes the remaining desktop-local mirrors, centralizes propagation, and
+   adds the required embedded desktop/MCP synchronization coverage.
 
 ## Tests and acceptance
 
@@ -293,6 +305,9 @@ spec:
 - UI-created same-scope/document-scope collisions are refused; filesystem
   collisions display both candidates with no implicit winner and do not block
   document load.
+- Same-named quick-add choices carry a stable source/scope disambiguator, so
+  each action selects its intended resolved template rather than a load-order
+  winner.
 - Editing an entry in a multi-document source preserves the other documents;
   write failure, external modification, and read-only source result in clear,
   non-destructive errors.
@@ -315,9 +330,6 @@ spec:
 
 ## Relevant code
 
-- `crates/fieldcad-particles/src/lib.rs` — current compiled particle preset
-  data, provenance semantics, and any remaining non-catalog logic to migrate
-  before removing the crate.
 - `crates/fieldcad-core/src/world.rs` and `crates/fieldcad-core/src/schema.rs`
   — generic object/component world model and schema validation.
 - `crates/fieldcad-simulation/src/source.rs` and `runtime.rs` — authoritative

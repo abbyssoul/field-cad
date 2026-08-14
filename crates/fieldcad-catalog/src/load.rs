@@ -14,9 +14,11 @@ use fieldcad_core::{ComponentSchema, ComponentTypeId};
 use crate::availability::{AvailabilityOutcome, resolve_availability};
 use crate::diagnostics::{Diagnostic, InvalidReason};
 use crate::document::{API_VERSION, CatalogEntryDocument, CatalogEnvelope, CatalogMetadata, KIND};
-use crate::entry::{CatalogEntry, CatalogFileError, CatalogLoadReport, LoadResult, TemplateMetadata};
+use crate::entry::{
+    CatalogEntry, CatalogFileError, CatalogLoadReport, LoadResult, TemplateMetadata,
+};
 use crate::ids::{CatalogScopeName, TemplateName};
-use crate::source::{DocumentOrdinal, SourceLocation, TemplateIdentity};
+use crate::source::{DocumentOrdinal, SourceLocation, TemplateIdentity, global_entry_ref};
 use crate::structure::validate_structure;
 
 /// Catalog files above this size are refused before parsing.
@@ -40,9 +42,11 @@ pub fn load_catalog_directory(
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
-            })
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
+                })
         })
         .collect();
     // Deterministic order so a report is stable across runs over the same
@@ -50,7 +54,7 @@ pub fn load_catalog_directory(
     paths.sort();
 
     for path in paths {
-        load_catalog_file(&path, component_schemas, &mut report);
+        load_catalog_file_from_root(dir, &path, component_schemas, &mut report);
     }
 
     report
@@ -60,6 +64,16 @@ pub fn load_catalog_directory(
 /// never removes its siblings; a whole-file failure never blocks the rest
 /// of the directory (the caller continues past it).
 pub fn load_catalog_file(
+    path: &Path,
+    component_schemas: &BTreeMap<ComponentTypeId, ComponentSchema>,
+    report: &mut CatalogLoadReport,
+) {
+    let root = path.parent().unwrap_or_else(|| Path::new(""));
+    load_catalog_file_from_root(root, path, component_schemas, report);
+}
+
+fn load_catalog_file_from_root(
+    catalog_root: &Path,
     path: &Path,
     component_schemas: &BTreeMap<ComponentTypeId, ComponentSchema>,
     report: &mut CatalogLoadReport,
@@ -88,7 +102,8 @@ pub fn load_catalog_file(
 
     for (index, document) in serde_norway::Deserializer::from_str(text).enumerate() {
         let ordinal = DocumentOrdinal::new(index);
-        let (entry, recoverable) = load_one_document(path, ordinal, document, component_schemas);
+        let (entry, recoverable) =
+            load_one_document(catalog_root, path, ordinal, document, component_schemas);
         report.entries.push(entry);
         if !recoverable {
             // A lexical/syntax error (as opposed to a semantic mismatch)
@@ -134,6 +149,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, InvalidReason> {
 /// to keep reading further documents from the same file's stream (`false`
 /// only for a lexical/syntax-level YAML error — see the call site).
 fn load_one_document(
+    catalog_root: &Path,
     file: &Path,
     ordinal: DocumentOrdinal,
     document: serde_norway::Deserializer<'_>,
@@ -166,6 +182,7 @@ fn load_one_document(
     if let Err(diagnostic) = check_envelope(&value) {
         let entry = CatalogEntry {
             source,
+            reference: None,
             identity: None,
             result: LoadResult::Invalid {
                 diagnostics: vec![diagnostic],
@@ -181,6 +198,7 @@ fn load_one_document(
             let message = error.into_inner().to_string();
             let entry = CatalogEntry {
                 source,
+                reference: None,
                 identity: None,
                 result: LoadResult::Invalid {
                     diagnostics: vec![Diagnostic {
@@ -198,19 +216,30 @@ fn load_one_document(
     let entry = match validate_structure(&document) {
         Err(diagnostics) => CatalogEntry {
             source,
+            reference: None,
             identity,
             result: LoadResult::Invalid { diagnostics },
         },
         Ok(spec) => {
             let metadata = TemplateMetadata::from_document(&document.metadata);
+            let reference = identity.as_ref().map(|identity| {
+                global_entry_ref(
+                    catalog_root,
+                    &source,
+                    identity,
+                    crate::template_fingerprint(identity, &metadata, &spec),
+                )
+            });
             match resolve_availability(&spec, component_schemas) {
                 AvailabilityOutcome::Available => CatalogEntry {
                     source,
+                    reference,
                     identity,
                     result: LoadResult::Available { metadata, spec },
                 },
                 AvailabilityOutcome::Unavailable(reasons) => CatalogEntry {
                     source,
+                    reference,
                     identity,
                     result: LoadResult::Unavailable {
                         metadata,
@@ -224,9 +253,14 @@ fn load_one_document(
     (entry, true)
 }
 
-fn invalid(source: SourceLocation, field_path: Option<String>, reason: InvalidReason) -> CatalogEntry {
+fn invalid(
+    source: SourceLocation,
+    field_path: Option<String>,
+    reason: InvalidReason,
+) -> CatalogEntry {
     CatalogEntry {
         source,
+        reference: None,
         identity: None,
         result: LoadResult::Invalid {
             diagnostics: vec![Diagnostic { field_path, reason }],
@@ -286,9 +320,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn registry_with_mass() -> BTreeMap<ComponentTypeId, ComponentSchema> {
-        [(inertial_mass_component_id(), inertial_mass_component_schema())]
-            .into_iter()
-            .collect()
+        [(
+            inertial_mass_component_id(),
+            inertial_mass_component_schema(),
+        )]
+        .into_iter()
+        .collect()
     }
 
     fn write_file(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
@@ -344,10 +381,16 @@ spec:
             "expected the leading valid document plus the lexically broken one, \
              and nothing read past the break"
         );
-        assert!(matches!(report.entries[0].result, LoadResult::Available { .. }));
+        assert!(matches!(
+            report.entries[0].result,
+            LoadResult::Available { .. }
+        ));
         match &report.entries[1].result {
             LoadResult::Invalid { diagnostics } => {
-                assert!(matches!(diagnostics[0].reason, InvalidReason::MalformedYaml { .. }));
+                assert!(matches!(
+                    diagnostics[0].reason,
+                    InvalidReason::MalformedYaml { .. }
+                ));
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
@@ -356,16 +399,26 @@ spec:
     #[test]
     fn a_semantically_broken_middle_document_is_isolated_from_its_siblings() {
         let dir = TempDir::new().unwrap();
-        let text = format!("{VALID_ENTRY}\n---\napiVersion: not-a-real-version\n---\n{VALID_ENTRY}");
+        let text =
+            format!("{VALID_ENTRY}\n---\napiVersion: not-a-real-version\n---\n{VALID_ENTRY}");
         write_file(&dir, "catalog.yaml", &text);
 
         let report = load_catalog_directory(dir.path(), &registry_with_mass());
 
         assert_eq!(report.entries.len(), 3);
-        assert!(matches!(report.entries[0].result, LoadResult::Available { .. }));
-        assert!(matches!(report.entries[1].result, LoadResult::Invalid { .. }));
+        assert!(matches!(
+            report.entries[0].result,
+            LoadResult::Available { .. }
+        ));
+        assert!(matches!(
+            report.entries[1].result,
+            LoadResult::Invalid { .. }
+        ));
         assert_eq!(report.entries[1].source.document_ordinal.get(), 2);
-        assert!(matches!(report.entries[2].result, LoadResult::Available { .. }));
+        assert!(matches!(
+            report.entries[2].result,
+            LoadResult::Available { .. }
+        ));
     }
 
     #[test]
@@ -383,7 +436,10 @@ spec:
             InvalidReason::FileTooLarge { .. }
         ));
         assert_eq!(report.entries.len(), 1);
-        assert!(matches!(report.entries[0].result, LoadResult::Available { .. }));
+        assert!(matches!(
+            report.entries[0].result,
+            LoadResult::Available { .. }
+        ));
     }
 
     #[test]
@@ -391,7 +447,8 @@ spec:
         let dir = TempDir::new().unwrap();
         // `spec` here is garbage that would fail a typed parse on its own —
         // proves the apiVersion check happens first.
-        let text = "apiVersion: fieldcad.catalog/v2\nkind: ObjectTemplate\nmetadata: {}\nspec: 12345\n";
+        let text =
+            "apiVersion: fieldcad.catalog/v2\nkind: ObjectTemplate\nmetadata: {}\nspec: 12345\n";
         write_file(&dir, "catalog.yaml", text);
 
         let report = load_catalog_directory(dir.path(), &registry_with_mass());
@@ -445,7 +502,10 @@ spec:
         let report = load_catalog_directory(dir.path(), &registry_with_mass());
 
         assert_eq!(report.entries.len(), 1);
-        assert!(matches!(report.entries[0].result, LoadResult::Invalid { .. }));
+        assert!(matches!(
+            report.entries[0].result,
+            LoadResult::Invalid { .. }
+        ));
         assert!(report.entries[0].identity.is_some());
     }
 }

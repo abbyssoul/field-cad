@@ -53,7 +53,10 @@ use crate::{
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
     scene_view_state,
-    ui::{self, AppAction, CameraAction, ComputeView, UiModel, ViewportGesture, ViewportTool},
+    ui::{
+        self, AppAction, CameraAction, CatalogAction, ComputeView, UiModel, ViewportGesture,
+        ViewportTool,
+    },
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -514,6 +517,18 @@ struct WindowState {
     animation_clock: Instant,
     /// Set from `WindowEvent::Occluded`; suppresses rendering entirely.
     occluded: bool,
+    catalog: fieldcad_catalog::CatalogLoadReport,
+    /// Complete global catalog directory snapshot for hot-reload polling.
+    pub catalog_file_states: fieldcad_catalog::DirectoryState,
+    /// Marks the next rendering frame on which the catalog directory should
+    /// be polled for external changes (hot reload).
+    pub next_catalog_poll: Instant,
+    /// Document-scoped catalog entries: templates created in-app, persisted
+    /// alongside the scene document.
+    pub document_entries: Vec<fieldcad_scene_document::DocumentCatalogEntry>,
+    /// Which catalog entries are hidden from the quick-add menu in this
+    /// scene — read from the document on load, written back on save.
+    pub quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
     /// Whether an embedded MCP server is running against `data_source`, and
     /// its token, if so. Disabled until the user opts in from the MCP panel.
     mcp: McpSession,
@@ -619,6 +634,8 @@ impl WindowState {
             probe_history,
             distance_history,
             mass_aggregate_history,
+            document_entries,
+            quick_add_hidden,
         ) = match open_path {
             None => {
                 let (source, warnings) = build_session(
@@ -627,7 +644,18 @@ impl WindowState {
                     true,
                 )?;
                 (
-                    source, warnings, None, None, None, None, None, None, None, None,
+                    source,
+                    warnings,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
                 )
             }
             Some(path) => {
@@ -640,6 +668,8 @@ impl WindowState {
                 let probe_history = outcome.document.probe_history.clone();
                 let distance_history = outcome.document.distance_history.clone();
                 let mass_aggregate_history = outcome.document.mass_aggregate_history.clone();
+                let document_entries = outcome.document.document_entries.clone();
+                let quick_add_hidden = outcome.document.quick_add_hidden.clone();
                 let (source, warnings) = build_session(
                     desktop_plugin_catalog(evaluator, gravity, maxwell),
                     Some(outcome.document),
@@ -656,6 +686,8 @@ impl WindowState {
                     Some(probe_history),
                     Some(distance_history),
                     Some(mass_aggregate_history),
+                    document_entries,
+                    quick_add_hidden,
                 )
             }
         };
@@ -694,7 +726,12 @@ impl WindowState {
             ui_model.object_trajectories =
                 scene_view_state::restore_object_trajectories(view.objects);
         }
+        if let Some(directory) = crate::catalog::catalog_directory() {
+            crate::catalog::seed_starter_catalog_if_missing(&directory);
+        }
         let data_source = Arc::new(Mutex::new(HeadlessServer::new(data_source)));
+        lock_model(&data_source)
+            .set_document_catalog(document_entries.clone(), quick_add_hidden.clone());
         // Replay a loaded document's paused-queue write-ahead log through the
         // ordinary command path — see `replace_session` for the same
         // sequence used after New/Open at runtime.
@@ -744,6 +781,17 @@ impl WindowState {
             None => McpSession::default(),
         };
 
+        let (catalog, catalog_file_states) = {
+            let model = lock_model(&data_source);
+            (
+                model.catalog().clone(),
+                crate::catalog::catalog_directory()
+                    .map_or_else(fieldcad_catalog::DirectoryState::default, |directory| {
+                        fieldcad_catalog::directory_state(&directory)
+                    }),
+            )
+        };
+
         Ok(Self {
             egui_state,
             renderer,
@@ -755,6 +803,10 @@ impl WindowState {
             viewport: Viewport::default(),
             data_source,
             world,
+            catalog,
+            catalog_file_states,
+            document_entries,
+            quick_add_hidden,
             compute: None,
             region_geometry_cache: BTreeMap::new(),
             cached_field_layer_geometry: None,
@@ -790,6 +842,7 @@ impl WindowState {
             step_compute_stats: StepComputeStats::default(),
             next_redraw: Instant::now(),
             animation_clock: Instant::now(),
+            next_catalog_poll: Instant::now() + Duration::from_secs(5),
             occluded: false,
             mcp,
             known_path,
@@ -928,6 +981,8 @@ impl WindowState {
             Duration::from_millis(self.ui_model.diagnostics_config.update_interval_ms as u64);
         let elapsed = self.frame_stats.begin_frame(metrics_interval);
 
+        self.poll_catalog_changes();
+
         // If an embedded MCP server died after a successful bind (a panic in
         // a tool handler, the listener erroring out), stop claiming it's
         // still `Running` with a token nothing answers to.
@@ -1041,6 +1096,8 @@ impl WindowState {
                 &mut self.ui_model,
                 ui::FrameContext {
                     compute: &compute,
+                    catalog: &self.catalog,
+                    quick_add_hidden: &self.quick_add_hidden,
                     world: &world,
                     probe_history: &self.probe_history,
                     distance_history: &self.distance_history,
@@ -1089,6 +1146,9 @@ impl WindowState {
         }
         if let Some(action) = ui_frame.app_action {
             self.apply_app_action(action);
+        }
+        if let Some(action) = ui_frame.catalog_action {
+            self.apply_catalog_action(action);
         }
         // Before the frame's own commands are dispatched: a held inspector
         // control submits an edit every frame, and the pause has to precede the
@@ -2140,9 +2200,322 @@ impl WindowState {
                     None => Ok(()),
                 }
             }
+            AppAction::ReloadCatalog => {
+                self.reload_catalog();
+                Ok(())
+            }
         };
         if let Err(error) = result {
             self.ui_model.command_error = Some(error);
+        }
+    }
+
+    fn apply_catalog_action(&mut self, action: CatalogAction) {
+        match action {
+            CatalogAction::Open(reference) => {
+                self.ui_model.catalog_visible = true;
+                self.ui_model.catalog_selected = reference;
+                self.ui_model.catalog_status = None;
+                self.ui_model.catalog_editor =
+                    self.ui_model
+                        .catalog_selected
+                        .as_ref()
+                        .and_then(|reference| {
+                            self.catalog
+                                .entries
+                                .iter()
+                                .find(|entry| entry.reference.as_ref() == Some(reference))
+                                .and_then(|entry| match &entry.result {
+                                    fieldcad_catalog::LoadResult::Available { metadata, spec }
+                                    | fieldcad_catalog::LoadResult::Unavailable {
+                                        metadata,
+                                        spec,
+                                        ..
+                                    } => Some(ui::CatalogEditorDraft::seed(
+                                        reference.clone(),
+                                        metadata,
+                                        spec,
+                                    )),
+                                    fieldcad_catalog::LoadResult::Invalid { .. } => None,
+                                })
+                        });
+            }
+            CatalogAction::SetQuickAddHidden { entry, hidden } => {
+                if hidden {
+                    if !self.quick_add_hidden.contains(&entry) {
+                        self.quick_add_hidden.push(entry);
+                    }
+                } else {
+                    self.quick_add_hidden.retain(|current| current != &entry);
+                }
+            }
+            CatalogAction::CreateGlobal { catalog, template } => {
+                let result = (|| {
+                    let directory = crate::catalog::catalog_directory().ok_or_else(|| {
+                        "catalog configuration directory is unavailable".to_owned()
+                    })?;
+                    let identity = fieldcad_catalog::TemplateIdentity {
+                        catalog: fieldcad_catalog::CatalogScopeName::new(&catalog)
+                            .map_err(|error| error.to_string())?,
+                        template: fieldcad_catalog::TemplateName::new(&template)
+                            .map_err(|error| error.to_string())?,
+                    };
+                    if self
+                        .catalog
+                        .entries
+                        .iter()
+                        .any(|entry| entry.identity.as_ref() == Some(&identity))
+                    {
+                        return Err(format!(
+                            "{} already exists; edit its existing source instead",
+                            identity
+                        ));
+                    }
+                    let path = directory.join(format!("{}.yaml", identity.template.as_str()));
+                    fieldcad_catalog::create_entry(
+                        &path,
+                        &identity,
+                        &fieldcad_catalog::TemplateMetadata {
+                            description: None,
+                            author: None,
+                            labels: BTreeMap::new(),
+                            annotations: BTreeMap::new(),
+                        },
+                        &fieldcad_catalog::TemplateSpec {
+                            object_kind: "world-object".to_owned(),
+                            shape: None,
+                            components: Vec::new(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        self.ui_model.catalog_new_template.clear();
+                        self.reload_catalog();
+                        let reference = self
+                            .catalog
+                            .entries
+                            .iter()
+                            .find(|entry| {
+                                entry.identity.as_ref().is_some_and(|identity| {
+                                    identity.catalog.as_str() == catalog.trim()
+                                        && identity.template.as_str() == template.trim()
+                                })
+                            })
+                            .and_then(|entry| entry.reference.clone());
+                        self.apply_catalog_action(CatalogAction::Open(reference));
+                    }
+                    Err(error) => self.ui_model.catalog_status = Some(error),
+                }
+            }
+            CatalogAction::CreateDocument { catalog, template } => {
+                let result = (|| {
+                    let identity = fieldcad_catalog::TemplateIdentity {
+                        catalog: fieldcad_catalog::CatalogScopeName::new(catalog)
+                            .map_err(|error| error.to_string())?,
+                        template: fieldcad_catalog::TemplateName::new(template)
+                            .map_err(|error| error.to_string())?,
+                    };
+                    if self
+                        .catalog
+                        .entries
+                        .iter()
+                        .any(|entry| entry.identity.as_ref() == Some(&identity))
+                    {
+                        return Err(format!(
+                            "{} already exists in the effective catalog",
+                            identity
+                        ));
+                    }
+                    let document = fieldcad_scene_document::DocumentCatalogEntry {
+                        entry_id: uuid::Uuid::new_v4(),
+                        identity,
+                        metadata: fieldcad_catalog::TemplateMetadata {
+                            description: None,
+                            author: None,
+                            labels: BTreeMap::new(),
+                            annotations: BTreeMap::new(),
+                        },
+                        spec: fieldcad_catalog::TemplateSpec {
+                            object_kind: "world-object".to_owned(),
+                            shape: None,
+                            components: Vec::new(),
+                        },
+                    };
+                    let reference = crate::catalog::document_entry_ref(&document);
+                    self.document_entries.push(document);
+                    Ok(reference)
+                })();
+                match result {
+                    Ok(reference) => {
+                        self.ui_model.catalog_new_template.clear();
+                        self.reload_catalog();
+                        self.apply_catalog_action(CatalogAction::Open(Some(reference)));
+                    }
+                    Err(error) => self.ui_model.catalog_status = Some(error),
+                }
+            }
+            CatalogAction::SaveEntry {
+                entry,
+                catalog,
+                template,
+                metadata,
+                spec,
+            } => {
+                let result = (|| {
+                    let identity = fieldcad_catalog::TemplateIdentity {
+                        catalog: fieldcad_catalog::CatalogScopeName::new(catalog.trim())
+                            .map_err(|error| error.to_string())?,
+                        template: fieldcad_catalog::TemplateName::new(template.trim())
+                            .map_err(|error| error.to_string())?,
+                    };
+                    if self.catalog.entries.iter().any(|candidate| {
+                        candidate.identity.as_ref() == Some(&identity)
+                            && candidate.reference.as_ref() != Some(&entry)
+                    }) {
+                        return Err(format!(
+                            "{identity} already exists in the effective catalog"
+                        ));
+                    }
+                    match &entry.origin {
+                        fieldcad_core::CatalogOrigin::Document { entry_id } => {
+                            let document = self
+                                .document_entries
+                                .iter_mut()
+                                .find(|document| document.entry_id == *entry_id)
+                                .ok_or_else(|| "document catalog entry disappeared".to_owned())?;
+                            document.identity = identity;
+                            document.metadata = metadata;
+                            document.spec = spec;
+                            Ok(crate::catalog::document_entry_ref(document))
+                        }
+                        fieldcad_core::CatalogOrigin::Global {
+                            relative_path,
+                            document_ordinal,
+                        } => {
+                            let root = crate::catalog::catalog_directory().ok_or_else(|| {
+                                "catalog configuration directory is unavailable".to_owned()
+                            })?;
+                            let path = root.join(relative_path);
+                            let expected = self
+                                .catalog_file_states
+                                .files
+                                .get(&path)
+                                .and_then(|state| state.as_ref().ok())
+                                .ok_or_else(|| {
+                                    format!(
+                                        "catalog source changed or disappeared: {}",
+                                        path.display()
+                                    )
+                                })?;
+                            let old_identity = self
+                                .catalog
+                                .entries
+                                .iter()
+                                .find(|candidate| candidate.reference.as_ref() == Some(&entry))
+                                .and_then(|candidate| candidate.identity.clone())
+                                .ok_or_else(|| "catalog entry disappeared".to_owned())?;
+                            fieldcad_catalog::save_entry_at(
+                                &fieldcad_catalog::SourceTarget {
+                                    path,
+                                    document_ordinal: fieldcad_catalog::DocumentOrdinal::new(
+                                        document_ordinal.saturating_sub(1),
+                                    ),
+                                    identity: old_identity,
+                                },
+                                &identity,
+                                &metadata,
+                                &spec,
+                                expected,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            Ok(fieldcad_core::CatalogEntryRef {
+                                catalog: identity.catalog.as_str().to_owned(),
+                                template: identity.template.as_str().to_owned(),
+                                origin: entry.origin.clone(),
+                                api_version: fieldcad_catalog::API_VERSION.to_owned(),
+                                fingerprint: String::new(),
+                            })
+                        }
+                    }
+                })();
+                match result {
+                    Ok(reference) => {
+                        self.reload_catalog();
+                        let reloaded = self
+                            .catalog
+                            .entries
+                            .iter()
+                            .find(|candidate| {
+                                candidate.reference.as_ref().is_some_and(|current| {
+                                    current.origin == reference.origin
+                                        && current.catalog == reference.catalog
+                                        && current.template == reference.template
+                                })
+                            })
+                            .and_then(|candidate| candidate.reference.clone());
+                        self.apply_catalog_action(CatalogAction::Open(reloaded));
+                    }
+                    Err(error) => self.ui_model.catalog_status = Some(error),
+                }
+            }
+            CatalogAction::DeleteEntry { entry } => {
+                let result = (|| match &entry.origin {
+                    fieldcad_core::CatalogOrigin::Document { entry_id } => {
+                        let before = self.document_entries.len();
+                        self.document_entries
+                            .retain(|document| document.entry_id != *entry_id);
+                        (self.document_entries.len() != before)
+                            .then_some(())
+                            .ok_or_else(|| "document catalog entry disappeared".to_owned())
+                    }
+                    fieldcad_core::CatalogOrigin::Global {
+                        relative_path,
+                        document_ordinal,
+                    } => {
+                        let root = crate::catalog::catalog_directory().ok_or_else(|| {
+                            "catalog configuration directory is unavailable".to_owned()
+                        })?;
+                        let path = root.join(relative_path);
+                        let expected = self
+                            .catalog_file_states
+                            .files
+                            .get(&path)
+                            .and_then(|state| state.as_ref().ok())
+                            .ok_or_else(|| {
+                                format!("catalog source changed or disappeared: {}", path.display())
+                            })?;
+                        let identity = self
+                            .catalog
+                            .entries
+                            .iter()
+                            .find(|candidate| candidate.reference.as_ref() == Some(&entry))
+                            .and_then(|candidate| candidate.identity.clone())
+                            .ok_or_else(|| "catalog entry disappeared".to_owned())?;
+                        fieldcad_catalog::remove_entry_at(
+                            &fieldcad_catalog::SourceTarget {
+                                path,
+                                document_ordinal: fieldcad_catalog::DocumentOrdinal::new(
+                                    document_ordinal.saturating_sub(1),
+                                ),
+                                identity,
+                            },
+                            expected,
+                        )
+                        .map_err(|error| error.to_string())
+                    }
+                })();
+                match result {
+                    Ok(()) => {
+                        self.ui_model.catalog_selected = None;
+                        self.ui_model.catalog_editor = None;
+                        self.reload_catalog();
+                    }
+                    Err(error) => self.ui_model.catalog_status = Some(error),
+                }
+            }
         }
     }
 
@@ -2173,10 +2546,24 @@ impl WindowState {
             probe_history,
             distance_history,
             mass_aggregate_history,
+            document_entries,
+            quick_add_hidden,
         ) = match source {
             SessionSource::New { template } => {
                 let (source, warnings) = build_session(catalog, None, template)?;
-                (source, warnings, None, None, None, None, None, None, None)
+                (
+                    source,
+                    warnings,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
             SessionSource::Load(path) => {
                 let outcome = fieldcad_scene_document::load_newest_valid(&path)
@@ -2187,6 +2574,8 @@ impl WindowState {
                 let probe_history = outcome.document.probe_history.clone();
                 let distance_history = outcome.document.distance_history.clone();
                 let mass_aggregate_history = outcome.document.mass_aggregate_history.clone();
+                let document_entries = outcome.document.document_entries.clone();
+                let quick_add_hidden = outcome.document.quick_add_hidden.clone();
                 let (source, warnings) = build_session(catalog, Some(outcome.document), false)?;
                 (
                     source,
@@ -2198,6 +2587,8 @@ impl WindowState {
                     Some(probe_history),
                     Some(distance_history),
                     Some(mass_aggregate_history),
+                    document_entries,
+                    quick_add_hidden,
                 )
             }
         };
@@ -2235,6 +2626,8 @@ impl WindowState {
         self.window
             .set_title(&window_title(self.known_path.as_deref()));
         self.last_created_at = None;
+        self.document_entries = document_entries;
+        self.quick_add_hidden = quick_add_hidden;
         if let Some(path) = &path {
             self.profile.push_recent_file(path.clone());
         }
@@ -2296,6 +2689,7 @@ impl WindowState {
         }
 
         self.refresh_world();
+        self.reload_catalog();
         // After `refresh_world()`, not before: its generation-diff check
         // (triggered above by the `u64::MAX` sentinel) unconditionally
         // resets both histories to empty, which would otherwise discard a
@@ -2318,6 +2712,39 @@ impl WindowState {
         }
         self.last_saved_revision = Some(self.world.revision());
         Ok(())
+    }
+
+    /// Re-read the user catalog directory from disk and rebuild the merged
+    /// report (global + document-scoped entries). Used by the explicit
+    /// reload action and the hot-reload poll below.
+    fn reload_catalog(&mut self) {
+        let mut server = lock_model(&self.data_source);
+        server.set_document_catalog(self.document_entries.clone(), self.quick_add_hidden.clone());
+        self.catalog = server.catalog().clone();
+        self.catalog_file_states = crate::catalog::catalog_directory()
+            .map_or_else(fieldcad_catalog::DirectoryState::default, |directory| {
+                fieldcad_catalog::directory_state(&directory)
+            });
+        self.ui_model.command_error = None;
+    }
+
+    /// Poll catalog files for external changes. Called from `redraw` at the
+    /// interval set in `next_catalog_poll`. If any file's modification time
+    /// has changed since we last loaded it, the entire catalog is reloaded.
+    fn poll_catalog_changes(&mut self) {
+        let now = Instant::now();
+        if now < self.next_catalog_poll {
+            return;
+        }
+        self.next_catalog_poll = now + Duration::from_secs(5);
+
+        let current = crate::catalog::catalog_directory()
+            .map_or_else(fieldcad_catalog::DirectoryState::default, |dir| {
+                fieldcad_catalog::directory_state(&dir)
+            });
+        if current != self.catalog_file_states {
+            self.reload_catalog();
+        }
     }
 
     /// Save the current session to `path`, falling back to Save As if no
@@ -2364,6 +2791,8 @@ impl WindowState {
                 mass_aggregate_history: probe_history_state::capture_mass_aggregate_history(
                     &self.mass_aggregate_history,
                 ),
+                document_entries: self.document_entries.clone(),
+                quick_add_hidden: self.quick_add_hidden.clone(),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(
@@ -2976,45 +3405,53 @@ fn build_session(
     ),
     String,
 > {
-    let (domain, time_step, scene_scale, integration_scheme, world, plugins, warnings, initial_sequence) =
-        match document {
-            None => {
-                let domain = Domain::new(
-                    DomainBounds::centred_cube(5.0).map_err(|error| error.to_string())?,
-                    Resolution::uniform(32).map_err(|error| error.to_string())?,
-                    BoundaryConditions::uniform(BoundaryCondition::Periodic),
-                    Precision::F32,
-                );
-                let time_step = TimeStep::from_seconds(courant_limit(&domain) * 0.8)
+    let (
+        domain,
+        time_step,
+        scene_scale,
+        integration_scheme,
+        world,
+        plugins,
+        warnings,
+        initial_sequence,
+    ) = match document {
+        None => {
+            let domain = Domain::new(
+                DomainBounds::centred_cube(5.0).map_err(|error| error.to_string())?,
+                Resolution::uniform(32).map_err(|error| error.to_string())?,
+                BoundaryConditions::uniform(BoundaryCondition::Periodic),
+                Precision::F32,
+            );
+            let time_step = TimeStep::from_seconds(courant_limit(&domain) * 0.8)
+                .map_err(|error| error.to_string())?;
+            (
+                domain,
+                time_step,
+                fieldcad_core::SceneScale::default(),
+                fieldcad_dynamics::IntegrationScheme::default(),
+                fieldcad_core::World::new(),
+                catalog,
+                Vec::new(),
+                0,
+            )
+        }
+        Some(doc) => {
+            let (plugins, warnings) =
+                fieldcad_scene_document::resolve_plugins(catalog, &doc.field_systems)
                     .map_err(|error| error.to_string())?;
-                (
-                    domain,
-                    time_step,
-                    fieldcad_core::SceneScale::default(),
-                    fieldcad_dynamics::IntegrationScheme::default(),
-                    fieldcad_core::World::new(),
-                    catalog,
-                    Vec::new(),
-                    0,
-                )
-            }
-            Some(doc) => {
-                let (plugins, warnings) =
-                    fieldcad_scene_document::resolve_plugins(catalog, &doc.field_systems)
-                        .map_err(|error| error.to_string())?;
-                let initial_sequence = doc.next_snapshot_sequence();
-                (
-                    doc.domain,
-                    doc.time_step,
-                    doc.scene_scale,
-                    doc.integration_scheme,
-                    fieldcad_core::World::from_document(doc.world),
-                    plugins,
-                    warnings,
-                    initial_sequence,
-                )
-            }
-        };
+            let initial_sequence = doc.next_snapshot_sequence();
+            (
+                doc.domain,
+                doc.time_step,
+                doc.scene_scale,
+                doc.integration_scheme,
+                fieldcad_core::World::from_document(doc.world),
+                plugins,
+                warnings,
+                initial_sequence,
+            )
+        }
+    };
     let mut config = RuntimeConfig::new(domain, time_step, fresh_session_id())
         .with_world(world)
         .with_scene_scale(scene_scale)

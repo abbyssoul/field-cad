@@ -7,9 +7,9 @@ use glam::{DQuat, DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BoxId, BoxLattice, ChannelId, ComponentSchema, ComponentTypeId, DistanceProbeId,
-    MassAggregateProbeId, ObjectId, PlaneId, PlaneLattice, ProbeId, PropertyBag, SchemaError,
-    SphereId, SphereLattice, WorldRevision,
+    BoxId, BoxLattice, CatalogEntryRef, CatalogLink, ChannelId, ComponentSchema, ComponentTypeId,
+    DistanceProbeId, MassAggregateProbeId, ObjectId, PlaneId, PlaneLattice, ProbeId, PropertyBag,
+    SchemaError, SphereId, SphereLattice, WorldRevision,
 };
 
 /// A finite, non-degenerate direction. Used for plane normals and in-plane axes.
@@ -185,6 +185,11 @@ pub struct ObjectSpec {
     /// caller would reach for — only the simulation runtime itself sets this,
     /// via [`Self::derived`].
     pub derived: bool,
+    /// Provenance for a catalog-template instantiation — see
+    /// [`WorldObject::catalog_link`]. `#[serde(default)]` so a `CreateObject`
+    /// command or scene predating this field still deserializes.
+    #[serde(default)]
+    pub catalog_link: Option<CatalogLink>,
 }
 
 impl ObjectSpec {
@@ -198,6 +203,7 @@ impl ObjectSpec {
             pinned: false,
             components: BTreeMap::new(),
             derived: false,
+            catalog_link: None,
         }
     }
 
@@ -234,6 +240,13 @@ impl ObjectSpec {
     /// Mark this object as runtime-owned — see [`WorldObject::derived`].
     pub fn derived(mut self) -> Self {
         self.derived = true;
+        self
+    }
+
+    /// Attach provenance for the catalog template this object was
+    /// instantiated from — see [`WorldObject::catalog_link`].
+    pub fn with_catalog_link(mut self, link: CatalogLink) -> Self {
+        self.catalog_link = Some(link);
         self
     }
 
@@ -280,6 +293,14 @@ pub struct WorldObject {
     ///
     /// [`attached_to`]: crate::SlicePlane::attached_to
     pub derived: bool,
+    /// Provenance for a catalog-template instantiation, if this object was
+    /// created from one — never a solver input, and never required to
+    /// reproduce this object's authored state: a saved scene remains fully
+    /// self-contained even when the originating catalog entry is absent.
+    /// `#[serde(default)]` so a scene saved before this field existed still
+    /// loads with `None`.
+    #[serde(default)]
+    pub catalog_link: Option<CatalogLink>,
 }
 
 impl WorldObject {
@@ -1484,6 +1505,19 @@ pub enum WorldCommand {
         object: ObjectId,
         pinned: bool,
     },
+    /// Preserve catalog provenance while making template-owned values local.
+    UnlinkCatalogTemplate {
+        object: ObjectId,
+    },
+    /// Replace every template-owned value through the authoritative command
+    /// path, but only if the object still tracks the expected prior revision.
+    ApplyCatalogTemplate {
+        object: ObjectId,
+        expected_entry: CatalogEntryRef,
+        shape: Option<ObjectShape>,
+        components: BTreeMap<ComponentTypeId, PropertyBag>,
+        link: CatalogLink,
+    },
     AttachComponent {
         object: ObjectId,
         component: ComponentTypeId,
@@ -1610,6 +1644,8 @@ impl WorldCommand {
             Self::SetShape { .. } => "Change shape",
             Self::SetObjectVisible { .. } => "Show or hide object",
             Self::SetObjectPinned { .. } => "Change motion authority",
+            Self::UnlinkCatalogTemplate { .. } => "Unlink object from catalog",
+            Self::ApplyCatalogTemplate { .. } => "Apply catalog template",
             Self::AttachComponent { .. } => "Edit component",
             Self::DetachComponent { .. } => "Remove component",
             Self::CreatePlane(_) => "Add slice plane",
@@ -1898,6 +1934,7 @@ fn apply_command(
                     pinned: spec.pinned,
                     components: spec.components,
                     derived: spec.derived,
+                    catalog_link: spec.catalog_link,
                 },
             );
             report.created_objects.push(id);
@@ -1963,6 +2000,13 @@ fn apply_command(
             object_mut(state, object)?.velocity = velocity;
         }
         WorldCommand::SetShape { object, shape } => {
+            if object_mut(state, object)?
+                .catalog_link
+                .as_ref()
+                .is_some_and(|link| link.mode == crate::CatalogLinkMode::Tracking)
+            {
+                return Err(WorldError::CatalogLinkedObjectReadOnly { id: object });
+            }
             if let Some(shape) = shape {
                 shape.validate()?;
             }
@@ -1974,11 +2018,59 @@ fn apply_command(
         WorldCommand::SetObjectPinned { object, pinned } => {
             object_mut(state, object)?.pinned = pinned;
         }
+        WorldCommand::UnlinkCatalogTemplate { object } => {
+            let object = object_mut(state, object)?;
+            let Some(link) = object.catalog_link.as_mut() else {
+                return Err(WorldError::CatalogLinkNotFound { id: object.id });
+            };
+            link.mode = crate::CatalogLinkMode::Unlinked;
+        }
+        WorldCommand::ApplyCatalogTemplate {
+            object,
+            expected_entry,
+            shape,
+            components,
+            link,
+        } => {
+            let existing = state
+                .objects
+                .get(&object)
+                .ok_or(WorldError::ObjectNotFound { id: object })?;
+            if existing.catalog_link.as_ref().is_none_or(|current| {
+                current.mode != crate::CatalogLinkMode::Tracking
+                    || current.entry.as_ref() != Some(&expected_entry)
+            }) {
+                return Err(WorldError::CatalogTemplateChanged { id: object });
+            }
+            if let Some(shape) = shape {
+                shape.validate()?;
+            }
+            for (component, properties) in &components {
+                state
+                    .component_schemas
+                    .get(component)
+                    .ok_or_else(|| WorldError::ComponentSchemaNotFound {
+                        id: component.clone(),
+                    })?
+                    .validate(properties)?;
+            }
+            let object = object_mut(state, object)?;
+            object.shape = shape;
+            object.components = components;
+            object.catalog_link = Some(link);
+        }
         WorldCommand::AttachComponent {
             object,
             component,
             properties,
         } => {
+            if object_mut(state, object)?
+                .catalog_link
+                .as_ref()
+                .is_some_and(|link| link.mode == crate::CatalogLinkMode::Tracking)
+            {
+                return Err(WorldError::CatalogLinkedObjectReadOnly { id: object });
+            }
             let schema = state.component_schemas.get(&component).ok_or_else(|| {
                 WorldError::ComponentSchemaNotFound {
                     id: component.clone(),
@@ -1991,6 +2083,13 @@ fn apply_command(
         }
         WorldCommand::DetachComponent { object, component } => {
             let object = object_mut(state, object)?;
+            if object
+                .catalog_link
+                .as_ref()
+                .is_some_and(|link| link.mode == crate::CatalogLinkMode::Tracking)
+            {
+                return Err(WorldError::CatalogLinkedObjectReadOnly { id: object.id });
+            }
             if object.components.remove(&component).is_none() {
                 return Err(WorldError::ComponentNotAttached { id: component });
             }
@@ -2276,6 +2375,7 @@ fn apply_command(
                     pinned: true,
                     components: BTreeMap::new(),
                     derived: true,
+                    catalog_link: None,
                 },
             );
             mass_aggregate_probes_mut(state).insert(
@@ -2462,6 +2562,14 @@ pub enum WorldError {
     DuplicateComponentSchema { id: ComponentTypeId },
     #[error("component '{id}' is not attached")]
     ComponentNotAttached { id: ComponentTypeId },
+    #[error(
+        "object {id} tracks a catalog template; unlink it before editing template-owned values"
+    )]
+    CatalogLinkedObjectReadOnly { id: ObjectId },
+    #[error("object {id} no longer has catalog provenance")]
+    CatalogLinkNotFound { id: ObjectId },
+    #[error("object {id}'s catalog link changed before the template could be applied")]
+    CatalogTemplateChanged { id: ObjectId },
     #[error(transparent)]
     Schema(#[from] SchemaError),
 }
@@ -3227,13 +3335,7 @@ mod tests {
             ))])
             .unwrap();
         let probe_id = created.created_distance_probes[0];
-        assert!(
-            world
-                .snapshot()
-                .distance_probe(probe_id)
-                .unwrap()
-                .show_line
-        );
+        assert!(world.snapshot().distance_probe(probe_id).unwrap().show_line);
 
         world
             .commit([WorldCommand::SetDistanceProbeShowLine {
@@ -3242,13 +3344,7 @@ mod tests {
             }])
             .unwrap();
 
-        assert!(
-            !world
-                .snapshot()
-                .distance_probe(probe_id)
-                .unwrap()
-                .show_line
-        );
+        assert!(!world.snapshot().distance_probe(probe_id).unwrap().show_line);
 
         let missing = DistanceProbeId::new(9999);
         assert!(
@@ -3521,10 +3617,68 @@ mod tests {
         let anchor = snapshot.object(probe.anchor).unwrap();
         assert!(anchor.derived);
         assert!(anchor.pinned);
+        assert_eq!(anchor.catalog_link, None);
         assert_eq!(
             report.first_created(),
             Some(CreatedEntity::MassAggregateProbe(probe_id))
         );
+    }
+
+    #[test]
+    fn catalog_link_round_trips_through_create_object() {
+        let mut world = World::new();
+        let link = CatalogLink {
+            entry: None,
+            mode: crate::CatalogLinkMode::Tracking,
+            source_description: "catalog.yaml (document 1)".to_owned(),
+        };
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("x").with_catalog_link(link.clone()),
+            )])
+            .unwrap();
+
+        let object = world.snapshot().object(ObjectId::new(0)).unwrap().clone();
+        assert_eq!(object.catalog_link, Some(link));
+    }
+
+    #[test]
+    fn catalog_link_survives_a_world_document_round_trip() {
+        let mut world = World::new();
+        let link = CatalogLink {
+            entry: None,
+            mode: crate::CatalogLinkMode::Tracking,
+            source_description: "catalog.yaml (document 1)".to_owned(),
+        };
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("x").with_catalog_link(link.clone()),
+            )])
+            .unwrap();
+
+        let document = world.to_document();
+        let json = serde_json::to_vec(&document).unwrap();
+        let restored: WorldDocument = serde_json::from_slice(&json).unwrap();
+        let restored = World::from_document(restored);
+
+        let object = restored
+            .snapshot()
+            .object(ObjectId::new(0))
+            .unwrap()
+            .clone();
+        assert_eq!(object.catalog_link, Some(link));
+    }
+
+    #[test]
+    fn an_object_missing_the_catalog_link_field_deserializes_as_none() {
+        // Simulates an old scene, or a `CreateObject` command from a client
+        // built before this field existed: the JSON simply has no
+        // `catalog_link` key at all.
+        let mut json = serde_json::to_value(ObjectSpec::new("x")).unwrap();
+        json.as_object_mut().unwrap().remove("catalog_link");
+        let spec: ObjectSpec = serde_json::from_value(json).unwrap();
+
+        assert_eq!(spec.catalog_link, None);
     }
 
     #[test]

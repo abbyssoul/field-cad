@@ -3401,8 +3401,14 @@ mod tests {
 
     #[test]
     fn maxwell_particle_edits_are_interventions_but_solver_motion_is_not() {
+        use fieldcad_core::quantities::{ChargeCoulombs, MassKg, coulomb, kilogram};
+        use fieldcad_core::{ObjectShape, ObjectSpec, Transform, Velocity};
+        use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
         use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
-        use fieldcad_particles::{ParticleTemplate, template_particle_spec};
+        use fieldcad_sources::{inertial_mass_component_id, inertial_mass_properties};
+
+        const ELECTRON_MASS_KG: f64 = 9.109_383_713_9e-31;
+        const ELEMENTARY_CHARGE_COULOMBS: f64 = 1.602_176_634e-19;
 
         let domain = Domain::new(
             DomainBounds::centred_cube(1.0).unwrap(),
@@ -3416,17 +3422,22 @@ mod tests {
                 .with_plugin(Box::new(ElectromagnetismPlugin::new())),
         )
         .unwrap();
+        let electron = ObjectSpec::new("Electron")
+            .with_transform(Transform::at(DVec3::ZERO).unwrap())
+            .with_velocity(Velocity::new(DVec3::X * 1.0e8, DVec3::ZERO).unwrap())
+            .with_shape(ObjectShape::point(0.01).unwrap())
+            .with_pinned(true)
+            .with_component(
+                inertial_mass_component_id(),
+                inertial_mass_properties(MassKg::new::<kilogram>(ELECTRON_MASS_KG)).unwrap(),
+            )
+            .with_component(
+                charge_component_id(),
+                charge_properties(ChargeCoulombs::new::<coulomb>(-ELEMENTARY_CHARGE_COULOMBS))
+                    .unwrap(),
+            );
         let report = runtime
-            .commit_world_commands(vec![WorldCommand::CreateObject(
-                template_particle_spec(
-                    ParticleTemplate::Catalog("Electron"),
-                    true,
-                    DVec3::ZERO,
-                    DVec3::X * 1.0e8,
-                    0.01,
-                )
-                .unwrap(),
-            )])
+            .commit_world_commands(vec![WorldCommand::CreateObject(electron)])
             .unwrap();
         let particle = report.created_objects[0];
 
@@ -3482,8 +3493,15 @@ mod tests {
     }
 
     fn proton_electron_runtime(session: u128) -> SimulationRuntime {
+        use fieldcad_core::quantities::{ChargeCoulombs, MassKg, coulomb, kilogram};
+        use fieldcad_core::{ObjectShape, ObjectSpec, Transform, Velocity};
+        use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
         use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
-        use fieldcad_particles::{ParticleTemplate, template_particle_spec};
+        use fieldcad_sources::{inertial_mass_component_id, inertial_mass_properties};
+
+        const ELECTRON_MASS_KG: f64 = 9.109_383_713_9e-31;
+        const PROTON_MASS_KG: f64 = 1.672_621_925_95e-27;
+        const ELEMENTARY_CHARGE_COULOMBS: f64 = 1.602_176_634e-19;
 
         let domain = Domain::new(
             DomainBounds::centred_cube(1.0).unwrap(),
@@ -3497,28 +3515,36 @@ mod tests {
                 .with_plugin(Box::new(ElectromagnetismPlugin::new())),
         )
         .unwrap();
+        let proton = ObjectSpec::new("Proton")
+            .with_transform(Transform::at(DVec3::new(-0.25, 0.0, 0.0)).unwrap())
+            .with_velocity(Velocity::new(DVec3::new(0.0, -1.0e5, 0.0), DVec3::ZERO).unwrap())
+            .with_shape(ObjectShape::point(0.01).unwrap())
+            .with_component(
+                inertial_mass_component_id(),
+                inertial_mass_properties(MassKg::new::<kilogram>(PROTON_MASS_KG)).unwrap(),
+            )
+            .with_component(
+                charge_component_id(),
+                charge_properties(ChargeCoulombs::new::<coulomb>(ELEMENTARY_CHARGE_COULOMBS))
+                    .unwrap(),
+            );
+        let electron = ObjectSpec::new("Electron")
+            .with_transform(Transform::at(DVec3::new(0.25, 0.0, 0.0)).unwrap())
+            .with_velocity(Velocity::new(DVec3::new(0.0, 1.0e5, 0.0), DVec3::ZERO).unwrap())
+            .with_shape(ObjectShape::point(0.01).unwrap())
+            .with_component(
+                inertial_mass_component_id(),
+                inertial_mass_properties(MassKg::new::<kilogram>(ELECTRON_MASS_KG)).unwrap(),
+            )
+            .with_component(
+                charge_component_id(),
+                charge_properties(ChargeCoulombs::new::<coulomb>(-ELEMENTARY_CHARGE_COULOMBS))
+                    .unwrap(),
+            );
         runtime
             .commit_world_commands(vec![
-                WorldCommand::CreateObject(
-                    template_particle_spec(
-                        ParticleTemplate::Catalog("Proton"),
-                        false,
-                        DVec3::new(-0.25, 0.0, 0.0),
-                        DVec3::new(0.0, -1.0e5, 0.0),
-                        0.01,
-                    )
-                    .unwrap(),
-                ),
-                WorldCommand::CreateObject(
-                    template_particle_spec(
-                        ParticleTemplate::Catalog("Electron"),
-                        false,
-                        DVec3::new(0.25, 0.0, 0.0),
-                        DVec3::new(0.0, 1.0e5, 0.0),
-                        0.01,
-                    )
-                    .unwrap(),
-                ),
+                WorldCommand::CreateObject(proton),
+                WorldCommand::CreateObject(electron),
             ])
             .unwrap();
         runtime

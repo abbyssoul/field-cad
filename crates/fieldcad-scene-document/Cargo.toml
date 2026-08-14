@@ -5,6 +5,7 @@ edition = "2024"
 description = "The fieldcad.scene/v1 document format: capture, compatibility resolution, and durable file I/O for a saved experiment"
 
 [dependencies]
+fieldcad-catalog = { workspace = true }
 fieldcad-core = { workspace = true }
 fieldcad-dynamics = { workspace = true }
 fieldcad-simulation = { workspace = true }
@@ -12,8 +13,10 @@ glam = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 fieldcad-plugin-api = { workspace = true }
 fieldcad-test-field = { workspace = true }
 tempfile = { workspace = true }
+uuid = { workspace = true }

@@ -26,6 +26,7 @@ use fieldcad_core::{
 use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_simulation::{FieldSystemStatus, PlaybackSpeed, PluginRegistration, QueueDocument};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 mod history;
 mod view;
@@ -47,12 +48,14 @@ pub const FORMAT_ID: &str = "fieldcad.scene/v1";
 /// The highest `format_version` this build can load. A document reporting a
 /// higher version is rejected outright rather than partially interpreted.
 /// Bumped 1 → 2 when `SceneDocument::view` was added, 2 → 3 when
-/// `playback_speed`/`probe_history`/`distance_history` were added, and 3 → 4
-/// when `mass_aggregate_history` was added: each field's own file still
-/// loads fine on an older-format read (all `#[serde(default)]`), but a build
-/// that only knows the prior version must refuse a newer file outright
-/// rather than silently dropping that content on the next resave.
-pub const FORMAT_VERSION: u32 = 4;
+/// `playback_speed`/`probe_history`/`distance_history` were added, 3 → 4
+/// when `mass_aggregate_history` was added, 4 → 5 when
+/// `document_entries`/`quick_add_hidden` were added, and 5 → 6 when entries
+/// and preferences became source-qualified: each field's own file
+/// still loads fine on an older-format read (all `#[serde(default)]`), but
+/// a build that only knows the prior version must refuse a newer file
+/// outright rather than silently dropping that content on the next resave.
+pub const FORMAT_VERSION: u32 = 6;
 /// File extension for a saved scene document (without the leading dot).
 pub const EXTENSION: &str = "fcscene";
 
@@ -105,6 +108,16 @@ pub struct SceneDocument {
     /// Recorded center-of-mass-probe history — see `probe_history`.
     #[serde(default)]
     pub mass_aggregate_history: MassAggregateHistoryState,
+    /// Document-scoped catalog entries: templates created in-app that
+    /// belong to this scene rather than a disk-based catalog directory.
+    #[serde(default)]
+    pub document_entries: Vec<DocumentCatalogEntry>,
+    /// Source-qualified entries hidden from the quick-add menu in this scene.
+    /// A new scene starts with an empty (all-showing) list. References must
+    /// remain source-qualified because two catalog scopes may use the same
+    /// user-authored template name.
+    #[serde(default)]
+    pub quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +129,24 @@ pub struct SceneMetadata {
     pub created_at: String,
     /// RFC 3339. Updated on every save.
     pub saved_at: String,
+}
+
+/// A catalog entry that belongs to a specific scene document — created
+/// in-app rather than loaded from a disk-based catalog directory.
+///
+/// Travels with the scene and participates in the same additive/conflict
+/// behaviour as disk-loaded entries. Resolved against the live component-
+/// schema registry on load, the same way a disk entry is re-resolved on
+/// every [`crate::load_newest_valid`] + rebuild cycle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DocumentCatalogEntry {
+    /// Opaque stable identity for references and links. Names stay editable
+    /// labels and may collide after a direct document edit.
+    #[serde(default = "Uuid::new_v4")]
+    pub entry_id: Uuid,
+    pub identity: fieldcad_catalog::TemplateIdentity,
+    pub metadata: fieldcad_catalog::TemplateMetadata,
+    pub spec: fieldcad_catalog::TemplateSpec,
 }
 
 /// One field system's composition and configuration, as declared by a
@@ -155,6 +186,8 @@ pub struct SceneDocumentInputs {
     pub probe_history: ProbeHistoryState,
     pub distance_history: DistanceHistoryState,
     pub mass_aggregate_history: MassAggregateHistoryState,
+    pub document_entries: Vec<DocumentCatalogEntry>,
+    pub quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
 }
 
 impl SceneDocument {
@@ -199,6 +232,8 @@ impl SceneDocument {
             probe_history: inputs.probe_history,
             distance_history: inputs.distance_history,
             mass_aggregate_history: inputs.mass_aggregate_history,
+            document_entries: inputs.document_entries,
+            quick_add_hidden: inputs.quick_add_hidden,
         }
     }
 

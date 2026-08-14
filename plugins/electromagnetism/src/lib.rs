@@ -8,12 +8,14 @@
 //! authored charges, and charge-conserving field/particle coupling.
 
 mod coupling;
+mod particle;
 
 pub use coupling::{
     CoupledAdvance, YeeFieldRef, continuity_residual, deposit_charge_conserving_current,
     deposit_particle_charge, deposit_source_charge, interpolate_particle_fields,
     periodic_charge_initial_state, relativistic_boris_velocity,
 };
+pub use particle::Particle;
 
 use std::sync::Arc;
 
@@ -29,7 +31,6 @@ use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_component_schema, collect_charge_sources,
     electric_field_channel_schema, magnetic_field_channel_schema,
 };
-use fieldcad_particles::particle_component_schema;
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
     PluginError, PluginMetadata, ResolvedFieldBrushStroke, SampledColumn, SolverCancellation,
@@ -173,7 +174,7 @@ pub struct MaxwellSolverSetup {
     /// tell whether the constraint actually changed.
     pub initial_sources: Vec<ChargeSource>,
     /// Generic particle state used when field/particle coupling is active.
-    pub initial_particles: Vec<fieldcad_particles::Particle>,
+    pub initial_particles: Vec<Particle>,
     pub particle_coupling: bool,
     pub world_revision: WorldRevision,
     pub initial_step: StepContext,
@@ -276,7 +277,7 @@ impl EquationSystemPlugin for ElectromagnetismPlugin {
         // shared schema, and the runtime registers one identical definition
         // once — which is what lets one object carry both without either plugin
         // depending on the other.
-        [charge_component_schema(), particle_component_schema()]
+        [charge_component_schema()]
             .into_iter()
             .chain(mass_component_schemas())
             .collect()
@@ -494,7 +495,7 @@ fn collect_sources(world: &WorldSnapshot) -> Result<Vec<ChargeSource>, PluginErr
 
 fn validate_coupled_sources(
     sources: &[ChargeSource],
-    particles: &[fieldcad_particles::Particle],
+    particles: &[Particle],
 ) -> Result<(), PluginError> {
     for source in sources {
         if matches!(

@@ -37,6 +37,7 @@ pub fn inspector(
                         super::object_inspector::object_properties(
                             ui,
                             frame.world,
+                            frame.catalog,
                             frame.compute,
                             object,
                             model.following,
