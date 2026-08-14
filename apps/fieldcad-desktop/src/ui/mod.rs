@@ -734,6 +734,7 @@ pub enum AppAction {
     ReloadCatalog,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum CatalogAction {
     Open(Option<fieldcad_core::CatalogEntryRef>),

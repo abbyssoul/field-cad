@@ -17,6 +17,7 @@ use crate::scene::TrajectoryDisplay;
 use crate::ui::compute::{ComputeView, format_engineering};
 use crate::ui::{CameraAction, CatalogAction, UiFrameOutput};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn object_properties(
     ui: &mut egui::Ui,
     world: &WorldSnapshot,

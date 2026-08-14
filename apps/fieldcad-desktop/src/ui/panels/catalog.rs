@@ -465,12 +465,11 @@ fn component_editor(
                             );
                         }
                     }
-                    if changed {
-                        if let Ok(values) = fieldcad_catalog::property_bag_to_template(schema, &bag)
-                        {
-                            for (key, value) in values {
-                                component.properties.insert(key, value);
-                            }
+                    if changed
+                        && let Ok(values) = fieldcad_catalog::property_bag_to_template(schema, &bag)
+                    {
+                        for (key, value) in values {
+                            component.properties.insert(key, value);
                         }
                     }
                 }
