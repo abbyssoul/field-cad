@@ -1,62 +1,15 @@
+# Reference catalog of notable Solar System bodies — one ObjectTemplate per body.
+# Physical data from NASA/JPL fact sheets and mission results; masses and radii
+# are mean/equatorial values as flagged per entry.
 ---
 apiVersion: fieldcad.catalog/v1
 kind: ObjectTemplate
 metadata:
-  catalog: Planets
-  name: earth
-  description: Earth
-spec:
-  objectKind: world-object
-  shape:
-    kind: sphere
-    radiusMetres: 6.378e+6
-  components:
-  - type:
-      plugin: fieldcad.mass-sources
-      name: inertial-mass
-    properties:
-      mass:
-        scalar:
-          siValue: 5.97e+24
-  - type:
-      plugin: fieldcad.mass-sources
-      name: gravitational-mass
-    properties:
-      follows-inertial:
-        boolean: true
----
-apiVersion: fieldcad.catalog/v1
-kind: ObjectTemplate
-metadata:
-  catalog: Planets
-  name: moon
-  description: Moon
-spec:
-  objectKind: world-object
-  shape:
-    kind: sphere
-    radiusMetres: 1.7375e+6
-  components:
-  - type:
-      plugin: fieldcad.mass-sources
-      name: inertial-mass
-    properties:
-      mass:
-        scalar:
-          siValue: 7.35e+22
-  - type:
-      plugin: fieldcad.mass-sources
-      name: gravitational-mass
-    properties:
-      follows-inertial:
-        boolean: true
----
-apiVersion: fieldcad.catalog/v1
-kind: ObjectTemplate
-metadata:
-  catalog: Planets
+  catalog: solar-system
   name: sol
   description: Sol
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
 spec:
   objectKind: world-object
   shape:
@@ -80,9 +33,11 @@ spec:
 apiVersion: fieldcad.catalog/v1
 kind: ObjectTemplate
 metadata:
-  catalog: Planets
+  catalog: solar-system
   name: mercury
   description: Mercury
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
 spec:
   objectKind: world-object
   shape:
@@ -106,9 +61,11 @@ spec:
 apiVersion: fieldcad.catalog/v1
 kind: ObjectTemplate
 metadata:
-  catalog: Planets
+  catalog: solar-system
   name: venus
   description: Venus
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
 spec:
   objectKind: world-object
   shape:
@@ -132,9 +89,39 @@ spec:
 apiVersion: fieldcad.catalog/v1
 kind: ObjectTemplate
 metadata:
-  catalog: Planets
+  catalog: solar-system
+  name: earth
+  description: Earth
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 6.378e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 5.97e+24
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
   name: mars
   description: Mars
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
 spec:
   objectKind: world-object
   shape:
@@ -148,6 +135,986 @@ spec:
       mass:
         scalar:
           siValue: 6.417e+23
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: jupiter
+  description: Jupiter
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 7.1492e+7
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.8982e+27
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: saturn
+  description: Saturn
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 6.0268e+7
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 5.6834e+26
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: uranus
+  description: Uranus
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.5559e+7
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 8.6810e+25
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: neptune
+  description: Neptune
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.4764e+7
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.02413e+26
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: pluto
+  description: Pluto (dwarf planet)
+  annotations:
+    source: NASA/JPL (New Horizons)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.1883e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.303e+22
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: ceres
+  description: Ceres (dwarf planet, largest main-belt asteroid)
+  annotations:
+    source: NASA/JPL Dawn mission
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 4.697e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 9.38e+20
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: eris
+  description: Eris (dwarf planet)
+  annotations:
+    source: NASA/JPL
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.163e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.6466e+22
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: haumea
+  description: Haumea (dwarf planet)
+  annotations:
+    source: NASA/JPL
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 8.16e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 4.006e+21
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: makemake
+  description: Makemake (dwarf planet)
+  annotations:
+    source: NASA/JPL
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 7.15e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 3.1e+21
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: sedna
+  description: Sedna (extreme trans-Neptunian object)
+  annotations:
+    source: JPL Small-Body Database (mass estimated)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 4.98e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.0e+21
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: moon
+  description: Moon
+  annotations:
+    source: NASA/JPL Planetary Fact Sheet
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.7375e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 7.35e+22
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: phobos
+  description: Phobos (moon of Mars)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.1267e+4
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.0659e+16
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: deimos
+  description: Deimos (moon of Mars)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 6.2e+3
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.4762e+15
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: io
+  description: Io (moon of Jupiter)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.8216e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 8.9319e+22
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: europa
+  description: Europa (moon of Jupiter)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.5608e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 4.7998e+22
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: ganymede
+  description: Ganymede (moon of Jupiter)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.6341e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.4819e+23
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: callisto
+  description: Callisto (moon of Jupiter)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.4103e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.0759e+23
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: titan
+  description: Titan (moon of Saturn)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.5747e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.3452e+23
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: enceladus
+  description: Enceladus (moon of Saturn)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.521e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.08022e+20
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: titania
+  description: Titania (moon of Uranus)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 7.884e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 3.4e+21
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: oberon
+  description: Oberon (moon of Uranus)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 7.614e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 3.014e+21
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: miranda
+  description: Miranda (moon of Uranus)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.358e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 6.6e+19
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: triton
+  description: Triton (moon of Neptune)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.3534e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 2.139e+22
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: charon
+  description: Charon (moon of Pluto)
+  annotations:
+    source: JPL Planetary Satellite Physical Parameters
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 6.06e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.586e+21
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: vesta
+  description: 4 Vesta (main-belt asteroid)
+  annotations:
+    source: NASA Dawn / JPL SSD
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.627e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 2.59e+20
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: pallas
+  description: 2 Pallas (main-belt asteroid)
+  annotations:
+    source: JPL SSD (Baer & Chesley 2008)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.56e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 2.04e+20
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: hygiea
+  description: 10 Hygiea (main-belt asteroid)
+  annotations:
+    source: JPL SSD (Vernazza et al. 2021)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.165e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 8.74e+19
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: psyche
+  description: 16 Psyche (main-belt asteroid)
+  annotations:
+    source: JPL SSD (Baer 2008)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.13e+5
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 2.29e+19
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: eros
+  description: 433 Eros (near-Earth asteroid)
+  annotations:
+    source: NASA NEAR Shoemaker (Yeomans et al. 2000)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 8.4e+3
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 6.687e+15
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: itokawa
+  description: 25143 Itokawa (near-Earth asteroid)
+  annotations:
+    source: JAXA Hayabusa (Fujiwara et al. 2006)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.635e+2
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 3.51e+10
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: mathilde
+  description: 253 Mathilde (main-belt asteroid)
+  annotations:
+    source: NASA NEAR Shoemaker (Yeomans et al. 1997)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.65e+4
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.033e+17
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: bennu
+  description: 101955 Bennu (near-Earth asteroid)
+  annotations:
+    source: NASA OSIRIS-REx / JPL PDS
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.45e+2
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 7.33e+10
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: ryugu
+  description: 162173 Ryugu (near-Earth asteroid)
+  annotations:
+    source: JAXA Hayabusa2 (Watanabe et al. 2019)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 4.48e+2
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 4.5e+11
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: didymos
+  description: 65803 Didymos (near-Earth asteroid)
+  annotations:
+    source: NASA DART / JPL SSD
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 3.9e+2
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 5.43e+11
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: solar-system
+  name: apophis
+  description: 99942 Apophis (near-Earth asteroid)
+  annotations:
+    source: Herschel thermophysical model (Mueller et al. 2014)
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.87e+2
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 5.3e+10
   - type:
       plugin: fieldcad.mass-sources
       name: gravitational-mass
