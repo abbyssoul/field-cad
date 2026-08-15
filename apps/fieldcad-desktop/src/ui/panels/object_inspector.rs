@@ -32,13 +32,13 @@ pub(super) fn object_properties(
         .catalog_link
         .as_ref()
         .is_some_and(|link| link.mode == CatalogLinkMode::Tracking);
-    if let Some(link) = &object.catalog_link {
-        super::section(
-            ui,
-            "inspector_catalog_link",
-            "Catalog template",
-            true,
-            |ui| {
+    super::section(
+        ui,
+        "inspector_catalog_link",
+        "Catalog template",
+        object.catalog_link.is_some(),
+        |ui| {
+            if let Some(link) = &object.catalog_link {
                 let mode = if tracking {
                     "tracking"
                 } else {
@@ -116,9 +116,27 @@ pub(super) fn object_properties(
                         object: object.id,
                     }]);
                 }
-            },
-        );
-    }
+            } else {
+                ui.weak("Not linked to a catalog entry.");
+            }
+            let link_label = if object.catalog_link.is_some() {
+                "Change catalog link..."
+            } else {
+                "Link to catalog..."
+            };
+            if ui
+                .button(link_label)
+                .on_hover_text(
+                    "Choose a catalog entry to attach this object to. Its declared shape/\
+                     components are set on this object; anything else you've already \
+                     attached is left untouched.",
+                )
+                .clicked()
+            {
+                output.catalog_action = Some(CatalogAction::BeginLink { object: object.id });
+            }
+        },
+    );
     if let Some(name) = name_editor(ui, ("object_name", object.id), &object.name) {
         output.edit(vec![WorldCommand::SetObjectName {
             object: object.id,

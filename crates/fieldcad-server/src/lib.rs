@@ -136,6 +136,8 @@ pub enum CatalogError {
     DirectoryUnavailable,
     #[error("catalog entry disappeared")]
     EntryNotFound,
+    #[error("object {0:?} does not exist")]
+    ObjectNotFound(fieldcad_core::ObjectId),
     #[error("{0} already exists in the effective catalog")]
     IdentityCollision(fieldcad_catalog::TemplateIdentity),
     #[error("catalog entry is invalid and cannot be edited structurally")]
@@ -307,13 +309,19 @@ impl HeadlessServer {
     /// Show or hide one catalog entry in the quick-add menu — a narrow,
     /// single-entry alternative to replacing the whole `quick_add_hidden`
     /// list via [`Self::restore_document_catalog`].
-    pub fn set_quick_add_visibility(&mut self, entry: fieldcad_core::CatalogEntryRef, hidden: bool) {
+    pub fn set_quick_add_visibility(
+        &mut self,
+        entry: fieldcad_core::CatalogEntryRef,
+        hidden: bool,
+    ) {
         if hidden {
             if !self.catalog.quick_add_hidden.contains(&entry) {
                 self.catalog.quick_add_hidden.push(entry);
             }
         } else {
-            self.catalog.quick_add_hidden.retain(|current| current != &entry);
+            self.catalog
+                .quick_add_hidden
+                .retain(|current| current != &entry);
         }
         self.reload_catalog();
     }
@@ -366,6 +374,57 @@ impl HeadlessServer {
         )
         .map_err(CatalogError::Unavailable)?;
         Ok(WorldCommand::CreateObject(object))
+    }
+
+    /// Resolve attaching or re-attaching `object` to `entry` — a
+    /// `LinkCatalogTemplate` command that merges the template's declared
+    /// shape/components onto the object's *current* placement
+    /// (transform/velocity/pinned/name unchanged), regardless of whether
+    /// `object` is currently unlinked, never linked, or tracking a
+    /// different entry. Unlike [`resolve_catalog_instantiation`]
+    /// (Self::resolve_catalog_instantiation), this never creates an
+    /// object — `object` must already exist.
+    pub fn resolve_catalog_link(
+        &self,
+        object: ObjectId,
+        entry: &CatalogEntryRef,
+    ) -> Result<WorldCommand, CatalogError> {
+        let candidate = self
+            .catalog
+            .report
+            .entries
+            .iter()
+            .find(|candidate| candidate.reference.as_ref() == Some(entry))
+            .ok_or(CatalogError::EntryNotFound)?;
+        let fieldcad_catalog::LoadResult::Available { spec, .. } = &candidate.result else {
+            return Err(CatalogError::Unavailable(Vec::new()));
+        };
+        let world = self.source.world();
+        let target = world
+            .objects()
+            .get(&object)
+            .ok_or(CatalogError::ObjectNotFound(object))?;
+        let resolved = fieldcad_catalog::instantiate_template(
+            spec,
+            entry,
+            world.component_schemas(),
+            fieldcad_catalog::InstantiationPlacement {
+                display_name: target.name.clone(),
+                transform: target.transform,
+                velocity: target.velocity,
+                pinned: target.pinned,
+                fallback_shape_radius: 0.15,
+            },
+        )
+        .map_err(CatalogError::Unavailable)?;
+        Ok(WorldCommand::LinkCatalogTemplate {
+            object,
+            shape: resolved.shape,
+            components: resolved.components,
+            link: resolved
+                .catalog_link
+                .expect("catalog instantiation stamps provenance"),
+        })
     }
 
     /// World objects tracking `entry`'s source origin — non-mutating. A

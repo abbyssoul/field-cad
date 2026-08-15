@@ -303,6 +303,10 @@ pub struct UiModel {
     pub catalog_visible: bool,
     pub catalog_filter: String,
     pub catalog_selected: Option<fieldcad_core::CatalogEntryRef>,
+    /// Set whenever `catalog_selected` changes so the catalog window scrolls
+    /// the newly selected row into view on the next frame, then clears
+    /// itself — see `CatalogAction::Open`.
+    pub catalog_scroll_to_selected: bool,
     pub catalog_new_catalog: String,
     pub catalog_new_template: String,
     /// Persistent, local edit buffer for the selected parseable catalog entry.
@@ -316,6 +320,11 @@ pub struct UiModel {
     /// confirmation, never an automatic apply. See
     /// `docs/tasks/server-authoritative-catalog.md`.
     pub catalog_propagation: Option<CatalogPropagationPrompt>,
+    /// Set while the user is picking a catalog entry to link/relink an
+    /// existing object to — the catalog window switches into a "pick a
+    /// target" mode while this is `Some`. `None` in ordinary catalog
+    /// browsing.
+    pub catalog_link_target: Option<ObjectId>,
     /// The object the camera is locked onto, if any — independent of
     /// `selection`, so following one object while inspecting another is
     /// possible. `App::apply_camera_follow` re-targets the camera to this
@@ -365,11 +374,13 @@ impl UiModel {
             catalog_visible: false,
             catalog_filter: String::new(),
             catalog_selected: None,
+            catalog_scroll_to_selected: false,
             catalog_new_catalog: "personal".to_owned(),
             catalog_new_template: String::new(),
             catalog_editor: None,
             catalog_status: None,
             catalog_propagation: None,
+            catalog_link_target: None,
             following: None,
             save_in_progress: false,
         }
@@ -570,6 +581,10 @@ pub struct CatalogEditorDraft {
     pub object_kind: String,
     pub shape: Option<fieldcad_catalog::TemplateShape>,
     pub components: Vec<fieldcad_catalog::TemplateComponentInstance>,
+    /// Transient UI toggle: the catalog-name field shows a free-text entry
+    /// box (for naming a brand-new catalog scope) instead of the picklist
+    /// of existing scope names.
+    pub new_catalog_mode: bool,
 }
 
 impl CatalogEditorDraft {
@@ -597,6 +612,7 @@ impl CatalogEditorDraft {
             object_kind: spec.object_kind.clone(),
             shape: spec.shape.clone(),
             components: spec.components.clone(),
+            new_catalog_mode: false,
         }
     }
 
@@ -789,6 +805,21 @@ pub enum CatalogAction {
     },
     /// Dismiss a pending [`CatalogPropagationPrompt`] without applying it.
     DismissPropagation,
+    /// Open the catalog window in "pick an entry to link `object` to" mode.
+    BeginLink {
+        object: ObjectId,
+    },
+    /// Attach or re-attach `object` to `entry`, merging the template's
+    /// declared shape/components onto its current placement — the
+    /// confirmed outcome of [`CatalogAction::BeginLink`]. Works whether
+    /// `object` was never linked, previously unlinked, or is currently
+    /// tracking a different entry.
+    LinkEntry {
+        object: ObjectId,
+        entry: fieldcad_core::CatalogEntryRef,
+    },
+    /// Cancel a pending [`UiModel::catalog_link_target`] without linking.
+    DismissLink,
 }
 
 #[derive(Debug)]

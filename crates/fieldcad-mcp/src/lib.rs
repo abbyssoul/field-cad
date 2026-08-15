@@ -243,6 +243,15 @@ struct CatalogObjectParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CatalogLinkParams {
+    /// Source-qualified `CatalogEntryRef` JSON returned by list_catalog_entries.
+    entry: serde_json::Value,
+    /// The existing object to attach or re-attach to `entry` — never linked,
+    /// unlinked, or currently tracking a different entry are all accepted.
+    object_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CatalogPropagationParams {
     /// Source-qualified entry reference for the current template revision.
     entry: serde_json::Value,
@@ -827,8 +836,27 @@ impl McpServer {
             Ok(value) => value,
             Err(error) => return tool_error(error),
         };
+        let command =
+            match lock(&self.model).resolve_catalog_instantiation(&entry, params.display_name) {
+                Ok(command) => command,
+                Err(error) => return tool_error(error.to_string()),
+            };
+        submit_world_commands(&self.model, vec![command]).await
+    }
+
+    #[tool(
+        description = "Attach or re-attach an existing object to a catalog entry, merging the template's declared shape/components onto the object's current placement. Works whether the object was never linked, previously unlinked, or is currently tracking a different entry (relink). Components the template doesn't declare are left untouched."
+    )]
+    async fn link_catalog_instance(
+        &self,
+        Parameters(params): Parameters<CatalogLinkParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entry = match parse_catalog_reference(params.entry) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
         let command = match lock(&self.model)
-            .resolve_catalog_instantiation(&entry, params.display_name)
+            .resolve_catalog_link(fieldcad_core::ObjectId::new(params.object_id), &entry)
         {
             Ok(command) => command,
             Err(error) => return tool_error(error.to_string()),
@@ -1707,7 +1735,10 @@ impl McpServer {
                 let revision = server.catalog_revision();
                 let entries = catalog_entry_views(server.catalog());
                 drop(server);
-                resource_text(uri, &serde_json::json!({ "revision": revision, "entries": entries }))
+                resource_text(
+                    uri,
+                    &serde_json::json!({ "revision": revision, "entries": entries }),
+                )
             }
             other => Err(ErrorData::resource_not_found(
                 format!("unknown resource: {other}"),
@@ -3112,7 +3143,10 @@ mod tests {
         assert_eq!(world.objects().len(), 1);
         let object = world.objects().values().next().unwrap();
         assert_eq!(object.name, "fancy-unicorn");
-        let link = object.catalog_link.as_ref().expect("instantiated object is linked");
+        let link = object
+            .catalog_link
+            .as_ref()
+            .expect("instantiated object is linked");
         assert_eq!(link.mode, fieldcad_core::CatalogLinkMode::Tracking);
 
         let unlinked = json_of(
@@ -3129,6 +3163,76 @@ mod tests {
         assert_eq!(
             object.catalog_link.as_ref().unwrap().mode,
             fieldcad_core::CatalogLinkMode::Unlinked
+        );
+    }
+
+    #[tokio::test]
+    async fn link_catalog_instance_merges_template_components_and_keeps_the_rest() {
+        let mcp = server_with_catalog_root(None);
+
+        // A hand-built object with a component the template below will
+        // never declare — it must survive linking.
+        json_of(
+            &mcp.commit_world(Parameters(CommitWorldParams {
+                commands: vec![
+                    serde_json::to_value(WorldCommand::CreateObject(
+                        ObjectSpec::new("hand built")
+                            .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
+                            .with_shape(ObjectShape::point(0.1).unwrap())
+                            .with_component(
+                                charge_component_id(),
+                                charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                            ),
+                    ))
+                    .unwrap(),
+                ],
+            }))
+            .await
+            .unwrap(),
+        );
+        let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
+            .expect("get_world returns a WorldSnapshot");
+        let object_id = world.objects().values().next().unwrap().id.get();
+        assert!(
+            world
+                .objects()
+                .values()
+                .next()
+                .unwrap()
+                .catalog_link
+                .is_none()
+        );
+
+        let entry = json_of(
+            &mcp.create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "document".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "fancy-unicorn".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+
+        let receipt = json_of(
+            &mcp.link_catalog_instance(Parameters(CatalogLinkParams { entry, object_id }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(receipt["disposition"], "Applied");
+
+        let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
+            .expect("get_world returns a WorldSnapshot");
+        let object = world.objects().values().next().unwrap();
+        assert_eq!(
+            object.catalog_link.as_ref().unwrap().mode,
+            fieldcad_core::CatalogLinkMode::Tracking
+        );
+        assert!(
+            object.components.contains_key(&charge_component_id()),
+            "a hand-attached component the template doesn't declare must survive linking"
         );
     }
 
@@ -3195,12 +3299,14 @@ mod tests {
         }
         json_of(
             &mcp.commit_world(Parameters(CommitWorldParams {
-                commands: vec![serde_json::to_value(WorldCommand::CreateObject(
-                    ObjectSpec::new("plain object")
-                        .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
-                        .with_shape(ObjectShape::point(0.1).unwrap()),
-                ))
-                .unwrap()],
+                commands: vec![
+                    serde_json::to_value(WorldCommand::CreateObject(
+                        ObjectSpec::new("plain object")
+                            .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
+                            .with_shape(ObjectShape::point(0.1).unwrap()),
+                    ))
+                    .unwrap(),
+                ],
             }))
             .await
             .unwrap(),
@@ -3227,11 +3333,19 @@ mod tests {
 
         let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
             .expect("get_world returns a WorldSnapshot");
-        assert_eq!(world.objects().len(), 3, "propagation must not create or remove objects");
-        let plain_survived = world.objects().values().any(|object| {
-            object.name == "plain object" && object.catalog_link.is_none()
-        });
-        assert!(plain_survived, "propagation must not touch an unlinked object");
+        assert_eq!(
+            world.objects().len(),
+            3,
+            "propagation must not create or remove objects"
+        );
+        let plain_survived = world
+            .objects()
+            .values()
+            .any(|object| object.name == "plain object" && object.catalog_link.is_none());
+        assert!(
+            plain_survived,
+            "propagation must not touch an unlinked object"
+        );
     }
 
     #[tokio::test]

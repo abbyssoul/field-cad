@@ -2225,6 +2225,7 @@ impl WindowState {
             CatalogAction::Open(reference) => {
                 self.ui_model.catalog_visible = true;
                 self.ui_model.catalog_selected = reference;
+                self.ui_model.catalog_scroll_to_selected = true;
                 self.ui_model.catalog_status = None;
                 self.ui_model.catalog_editor =
                     self.ui_model
@@ -2380,6 +2381,32 @@ impl WindowState {
                     }
                     Err(error) => self.ui_model.catalog_status = Some(error),
                 }
+            }
+            CatalogAction::BeginLink { object } => {
+                self.ui_model.catalog_visible = true;
+                self.ui_model.catalog_link_target = Some(object);
+            }
+            CatalogAction::LinkEntry { object, entry } => {
+                let mut guard = lock_model(&self.data_source);
+                let result = guard
+                    .resolve_catalog_link(object, &entry)
+                    .map_err(|error| error.to_string())
+                    .and_then(|command| {
+                        guard
+                            .submit(CommandPayload::CommitWorld(vec![command]))
+                            .map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(_) => {
+                        self.ui_model.catalog_link_target = None;
+                        self.ui_model.catalog_visible = false;
+                    }
+                    Err(error) => self.ui_model.catalog_status = Some(error),
+                }
+            }
+            CatalogAction::DismissLink => {
+                self.ui_model.catalog_link_target = None;
+                self.ui_model.catalog_visible = false;
             }
         }
     }

@@ -20,157 +20,262 @@ pub fn catalog_window(
         return;
     }
     let mut open = model.catalog_visible;
+    let linking = model.catalog_link_target.is_some();
     egui::Window::new("Catalog")
         .open(&mut open)
         .default_width(560.0)
         .default_height(440.0)
+        .min_width(480.0)
+        .min_height(240.0)
         .show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Search");
-                ui.add(
-                    egui::TextEdit::singleline(&mut model.catalog_filter)
-                        .hint_text("name, catalog, label, source"),
-                );
-                if ui.button("Reload").clicked() {
-                    output.app_action = Some(crate::ui::AppAction::ReloadCatalog);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("New global template");
-                ui.add(
-                    egui::TextEdit::singleline(&mut model.catalog_new_catalog).hint_text("catalog"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut model.catalog_new_template)
-                        .hint_text("template"),
-                );
-                let create_ready = !model.catalog_new_catalog.trim().is_empty()
-                    && !model.catalog_new_template.trim().is_empty();
-                if ui
-                    .add_enabled(create_ready, egui::Button::new("Create YAML"))
-                    .clicked()
-                {
-                    output.catalog_action = Some(CatalogAction::CreateGlobal {
-                        catalog: model.catalog_new_catalog.clone(),
-                        template: model.catalog_new_template.clone(),
-                    });
-                }
-                if ui
-                    .add_enabled(create_ready, egui::Button::new("Create document entry"))
-                    .on_disabled_hover_text("Enter both a catalog and template name first.")
-                    .clicked()
-                {
-                    output.catalog_action = Some(CatalogAction::CreateDocument {
-                        catalog: model.catalog_new_catalog.clone(),
-                        template: model.catalog_new_template.clone(),
-                    });
-                }
-            });
-            ui.separator();
-            let query = model.catalog_filter.to_ascii_lowercase();
-            ui.columns(2, |columns| {
-                let list = &mut columns[0];
-                egui::ScrollArea::vertical().show(list, |ui| {
-                    for entry in &frame.catalog.entries {
-                        let Some(reference) = entry.reference.as_ref() else {
-                            if query.is_empty() {
-                                ui.colored_label(
-                                    egui::Color32::YELLOW,
-                                    format!("{} — invalid", entry.source.file.display()),
-                                );
-                            }
-                            continue;
-                        };
-                        let matches = query.is_empty()
-                            || reference.template.to_ascii_lowercase().contains(&query)
-                            || reference.catalog.to_ascii_lowercase().contains(&query)
-                            || entry
-                                .source
-                                .file
-                                .to_string_lossy()
-                                .to_ascii_lowercase()
-                                .contains(&query);
-                        if !matches {
-                            continue;
-                        }
-                        let (state, available, detail) = match &entry.result {
-                            LoadResult::Available { metadata, .. } => (
-                                "available",
-                                true,
-                                metadata.description.clone().unwrap_or_default(),
-                            ),
-                            LoadResult::Unavailable { reasons, .. } => (
-                                "unavailable",
-                                false,
-                                reasons
-                                    .iter()
-                                    .map(ToString::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join("; "),
-                            ),
-                            LoadResult::Invalid { diagnostics } => (
-                                "invalid",
-                                false,
-                                diagnostics
-                                    .iter()
-                                    .map(ToString::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join("; "),
-                            ),
-                        };
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .selectable_label(
-                                        model.catalog_selected.as_ref() == Some(reference),
-                                        format!("{}/{}", reference.catalog, reference.template),
-                                    )
-                                    .clicked()
-                                {
-                                    output.catalog_action =
-                                        Some(CatalogAction::Open(Some(reference.clone())));
-                                }
-                                ui.weak(state);
-                                if ui.small_button("Open").clicked() {
-                                    output.catalog_action =
-                                        Some(CatalogAction::Open(Some(reference.clone())));
-                                }
-                                if ui
-                                    .add_enabled(available, egui::Button::new("Add"))
-                                    .clicked()
-                                {
-                                    output.submit(catalog_object_command(frame, reference));
-                                }
-                                let hidden = frame.quick_add_hidden.contains(reference);
-                                if ui
-                                    .selectable_label(
-                                        hidden,
-                                        if hidden { "Hidden" } else { "Quick add" },
-                                    )
-                                    .clicked()
-                                {
-                                    output.catalog_action =
-                                        Some(CatalogAction::SetQuickAddHidden {
-                                            entry: reference.clone(),
-                                            hidden: !hidden,
-                                        });
-                                }
-                            });
-                            ui.weak(format!(
-                                "{} (document #{})",
-                                entry.source.file.display(),
-                                entry.source.document_ordinal
-                            ));
-                            if !detail.is_empty() {
-                                ui.label(detail);
-                            }
+            if let Some(target) = model.catalog_link_target {
+                let name = frame
+                    .world
+                    .objects()
+                    .get(&target)
+                    .map_or_else(|| "(object)".to_owned(), |object| object.name.clone());
+                ui.label(format!(
+                    "Choose an entry to link \"{name}\" to. The catalog is read-only while linking."
+                ));
+                ui.separator();
+            }
+            ui.add_enabled_ui(!linking, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut model.catalog_filter)
+                            .hint_text("name, catalog, label, source"),
+                    );
+                    if ui.button("Reload").clicked() {
+                        output.app_action = Some(crate::ui::AppAction::ReloadCatalog);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("+ New entry")
+                        .on_hover_text(
+                            "Add a new catalog entry to this document. Rename and fill it in \
+                             on the right, then Save.",
+                        )
+                        .clicked()
+                    {
+                        let template = unique_template_name(
+                            &model.catalog_new_catalog,
+                            &frame.catalog.entries,
+                        );
+                        output.catalog_action = Some(CatalogAction::CreateDocument {
+                            catalog: model.catalog_new_catalog.clone(),
+                            template,
                         });
                     }
                 });
-                catalog_editor(&mut columns[1], model, frame, output);
+                ui.collapsing("Advanced: create global YAML file on disk", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Catalog");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut model.catalog_new_catalog)
+                                .hint_text("catalog"),
+                        );
+                        ui.label("Template");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut model.catalog_new_template)
+                                .hint_text("template"),
+                        );
+                        let create_ready = !model.catalog_new_catalog.trim().is_empty()
+                            && !model.catalog_new_template.trim().is_empty();
+                        if ui
+                            .add_enabled(create_ready, egui::Button::new("Create YAML"))
+                            .on_hover_text(
+                                "Writes a new <catalog>/<template>.yaml file under the catalog \
+                                 root, so it persists across documents (unlike \"+ New entry\", \
+                                 which is scoped to this document only).",
+                            )
+                            .clicked()
+                        {
+                            output.catalog_action = Some(CatalogAction::CreateGlobal {
+                                catalog: model.catalog_new_catalog.clone(),
+                                template: model.catalog_new_template.clone(),
+                            });
+                        }
+                    });
+                });
             });
+            ui.separator();
+            let query = model.catalog_filter.to_ascii_lowercase();
+            let bottom_bar_reserved = if linking { 40.0 } else { 0.0 };
+            let list_height = (ui.available_height() - bottom_bar_reserved).max(80.0);
+            let mut scrolled = false;
+            ui.columns(2, |columns| {
+                let list = &mut columns[0];
+                egui::ScrollArea::vertical()
+                    .max_height(list_height)
+                    .show(list, |ui| {
+                        for entry in &frame.catalog.entries {
+                            let Some(reference) = entry.reference.as_ref() else {
+                                if query.is_empty() {
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        format!("{} — invalid", entry.source.file.display()),
+                                    );
+                                }
+                                continue;
+                            };
+                            let matches = query.is_empty()
+                                || reference.template.to_ascii_lowercase().contains(&query)
+                                || reference.catalog.to_ascii_lowercase().contains(&query)
+                                || entry
+                                    .source
+                                    .file
+                                    .to_string_lossy()
+                                    .to_ascii_lowercase()
+                                    .contains(&query);
+                            if !matches {
+                                continue;
+                            }
+                            let (state, available, detail) = match &entry.result {
+                                LoadResult::Available { metadata, .. } => (
+                                    "available",
+                                    true,
+                                    metadata.description.clone().unwrap_or_default(),
+                                ),
+                                LoadResult::Unavailable { reasons, .. } => (
+                                    "unavailable",
+                                    false,
+                                    reasons
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join("; "),
+                                ),
+                                LoadResult::Invalid { diagnostics } => (
+                                    "invalid",
+                                    false,
+                                    diagnostics
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join("; "),
+                                ),
+                            };
+                            let is_selected = model.catalog_selected.as_ref() == Some(reference);
+                            let mut row_frame = egui::Frame::group(ui.style());
+                            if is_selected {
+                                row_frame = row_frame
+                                    .fill(ui.visuals().selection.bg_fill)
+                                    .stroke(ui.visuals().selection.stroke);
+                            }
+                            let row = row_frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(format!(
+                                        "{}/{}",
+                                        reference.catalog, reference.template
+                                    ));
+                                    ui.weak(state);
+                                    if !linking
+                                        && ui
+                                            .add_enabled(available, egui::Button::new("Add"))
+                                            .clicked()
+                                    {
+                                        output.submit(catalog_object_command(frame, reference));
+                                    }
+                                    let hidden = frame.quick_add_hidden.contains(reference);
+                                    if ui
+                                        .selectable_label(
+                                            hidden,
+                                            if hidden { "Hidden" } else { "Quick add" },
+                                        )
+                                        .clicked()
+                                    {
+                                        output.catalog_action =
+                                            Some(CatalogAction::SetQuickAddHidden {
+                                                entry: reference.clone(),
+                                                hidden: !hidden,
+                                            });
+                                    }
+                                });
+                                ui.weak(format!(
+                                    "{} (document #{})",
+                                    entry.source.file.display(),
+                                    entry.source.document_ordinal
+                                ));
+                                if !detail.is_empty() {
+                                    ui.label(detail);
+                                }
+                            });
+                            let row_response = ui.interact(
+                                row.response.rect,
+                                ui.id().with(format!(
+                                    "catalog_row/{}/{}",
+                                    reference.catalog, reference.template
+                                )),
+                                egui::Sense::click(),
+                            );
+                            if row_response.clicked() {
+                                output.catalog_action =
+                                    Some(CatalogAction::Open(Some(reference.clone())));
+                            }
+                            if is_selected && model.catalog_scroll_to_selected {
+                                row.response.scroll_to_me(Some(egui::Align::Center));
+                                scrolled = true;
+                            }
+                        }
+                    });
+                columns[1].add_enabled_ui(!linking, |ui| {
+                    catalog_editor(ui, model, frame, output, linking);
+                });
+            });
+            if scrolled {
+                model.catalog_scroll_to_selected = false;
+            }
+            if let Some(target) = model.catalog_link_target {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel linking").clicked() {
+                        output.catalog_action = Some(CatalogAction::DismissLink);
+                    }
+                    let selected = model.catalog_selected.clone();
+                    let selected_available = selected.as_ref().is_some_and(|reference| {
+                        frame.catalog.entries.iter().any(|entry| {
+                            entry.reference.as_ref() == Some(reference)
+                                && matches!(entry.result, LoadResult::Available { .. })
+                        })
+                    });
+                    if ui
+                        .add_enabled(selected_available, egui::Button::new("Link"))
+                        .clicked()
+                        && let Some(entry) = selected
+                    {
+                        output.catalog_action = Some(CatalogAction::LinkEntry {
+                            object: target,
+                            entry,
+                        });
+                    }
+                });
+            }
         });
     model.catalog_visible = open;
+}
+
+/// Generates a document-scoped template name guaranteed not to collide with
+/// any existing entry's identity in `catalog`, so "+ New entry" never
+/// requires the user to type anything before creating a renameable draft.
+fn unique_template_name(catalog: &str, entries: &[fieldcad_catalog::CatalogEntry]) -> String {
+    for n in 1u32.. {
+        let candidate = if n == 1 {
+            "untitled".to_owned()
+        } else {
+            format!("untitled-{n}")
+        };
+        let taken = entries.iter().any(|entry| {
+            entry.identity.as_ref().is_some_and(|identity| {
+                identity.catalog.as_str() == catalog && identity.template.as_str() == candidate
+            })
+        });
+        if !taken {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 fn catalog_editor(
@@ -178,6 +283,7 @@ fn catalog_editor(
     model: &mut UiModel,
     frame: &FrameContext<'_>,
     output: &mut UiFrameOutput,
+    linking: bool,
 ) {
     let Some(selected) = &model.catalog_selected else {
         ui.weak("Select a catalog entry to inspect or edit it.");
@@ -192,7 +298,16 @@ fn catalog_editor(
         ui.weak("The selected entry is no longer available.");
         return;
     };
-    ui.heading(format!("Edit {}/{}", selected.catalog, selected.template));
+    let read_only = linking
+        || (matches!(selected.origin, fieldcad_core::CatalogOrigin::Global { .. })
+            && std::fs::metadata(&entry.source.file)
+                .is_ok_and(|meta| meta.permissions().readonly()));
+    ui.heading(if read_only {
+        format!("{}/{}", selected.catalog, selected.template)
+    } else {
+        format!("Edit {}/{}", selected.catalog, selected.template)
+    });
+    let list_height = ui.available_height();
     match &entry.result {
         LoadResult::Available { .. } | LoadResult::Unavailable { .. } => {
             let Some(draft) = model
@@ -203,10 +318,7 @@ fn catalog_editor(
                 ui.weak("Preparing editor draft…");
                 return;
             };
-            let read_only = matches!(selected.origin, fieldcad_core::CatalogOrigin::Global { .. })
-                && std::fs::metadata(&entry.source.file)
-                    .is_ok_and(|meta| meta.permissions().readonly());
-            if read_only {
+            if read_only && !linking {
                 ui.colored_label(egui::Color32::YELLOW, "This catalog source is read-only.");
             }
             if let LoadResult::Unavailable { reasons, .. } = &entry.result {
@@ -220,12 +332,13 @@ fn catalog_editor(
             }
             egui::ScrollArea::vertical()
                 .id_salt("catalog_editor_scroll")
+                .max_height(list_height)
                 .show(ui, |ui| {
                     ui.add_enabled_ui(!read_only, |ui| {
-                        identity_editor(ui, draft);
+                        identity_editor(ui, draft, frame);
                         ui.separator();
                         ui.label("Description");
-                        ui.add(egui::TextEdit::multiline(&mut draft.description).desired_rows(3));
+                        ui.text_edit_singleline(&mut draft.description);
                         ui.label("Author");
                         ui.text_edit_singleline(&mut draft.author);
                         map_editor(ui, "Labels", &mut draft.labels);
@@ -282,10 +395,47 @@ fn catalog_editor(
     }
 }
 
-fn identity_editor(ui: &mut egui::Ui, draft: &mut crate::ui::CatalogEditorDraft) {
+fn identity_editor(
+    ui: &mut egui::Ui,
+    draft: &mut crate::ui::CatalogEditorDraft,
+    frame: &FrameContext<'_>,
+) {
     ui.horizontal(|ui| {
         ui.label("Catalog");
-        ui.text_edit_singleline(&mut draft.catalog);
+        if draft.new_catalog_mode {
+            ui.text_edit_singleline(&mut draft.catalog);
+            if ui.small_button("Choose existing").clicked() {
+                draft.new_catalog_mode = false;
+            }
+        } else {
+            let mut catalog_names: Vec<&str> = frame
+                .catalog
+                .entries
+                .iter()
+                .filter_map(|entry| entry.reference.as_ref())
+                .map(|reference| reference.catalog.as_str())
+                .collect();
+            catalog_names.sort_unstable();
+            catalog_names.dedup();
+            egui::ComboBox::from_id_salt("catalog_editor_catalog_name")
+                .selected_text(if draft.catalog.is_empty() {
+                    "(choose catalog)"
+                } else {
+                    draft.catalog.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for name in &catalog_names {
+                        if ui.selectable_label(draft.catalog == *name, *name).clicked() {
+                            draft.catalog = (*name).to_owned();
+                        }
+                    }
+                    ui.separator();
+                    if ui.selectable_label(false, "+ New catalog...").clicked() {
+                        draft.new_catalog_mode = true;
+                        draft.catalog.clear();
+                    }
+                });
+        }
     });
     ui.horizontal(|ui| {
         ui.label("Template name");
@@ -431,8 +581,14 @@ fn component_editor(
         }
     });
     let mut remove = None;
+    // Match every component box to the same width so they line up, but cap
+    // it well below the editor column's width — the column can be very wide
+    // once the window is resized, and a component box spanning all of it
+    // reads as a layout bug rather than a card.
+    let full_width = ui.available_width().min(360.0);
     for (index, component) in draft.components.iter_mut().enumerate() {
         ui.group(|ui| {
+            ui.set_min_width(full_width);
             ui.horizontal(|ui| {
                 ui.label(component.component_type.to_string());
                 if ui.small_button("Remove").clicked() {

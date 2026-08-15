@@ -1518,6 +1518,20 @@ pub enum WorldCommand {
         components: BTreeMap<ComponentTypeId, PropertyBag>,
         link: CatalogLink,
     },
+    /// Attach or re-attach a catalog link, merging the template's declared
+    /// shape/components onto the object — anything the template doesn't
+    /// declare is left as-is. Works regardless of the object's current link
+    /// state (never-linked, unlinked, or tracking a different entry): this
+    /// is both "link" and "relink". `ApplyCatalogTemplate` remains the
+    /// guarded, full-replace refresh for an object already tracking the
+    /// exact entry being reapplied (propagation's use case) — this command
+    /// is the interactive, user-driven counterpart.
+    LinkCatalogTemplate {
+        object: ObjectId,
+        shape: Option<ObjectShape>,
+        components: BTreeMap<ComponentTypeId, PropertyBag>,
+        link: CatalogLink,
+    },
     AttachComponent {
         object: ObjectId,
         component: ComponentTypeId,
@@ -1646,6 +1660,7 @@ impl WorldCommand {
             Self::SetObjectPinned { .. } => "Change motion authority",
             Self::UnlinkCatalogTemplate { .. } => "Unlink object from catalog",
             Self::ApplyCatalogTemplate { .. } => "Apply catalog template",
+            Self::LinkCatalogTemplate { .. } => "Link object to catalog",
             Self::AttachComponent { .. } => "Edit component",
             Self::DetachComponent { .. } => "Remove component",
             Self::CreatePlane(_) => "Add slice plane",
@@ -1905,6 +1920,30 @@ fn object_mut(state: &mut WorldState, id: ObjectId) -> Result<&mut WorldObject, 
         .ok_or(WorldError::ObjectNotFound { id })
 }
 
+/// Shared by `ApplyCatalogTemplate` and `LinkCatalogTemplate`: a resolved
+/// template's shape/components must be structurally valid and every
+/// component must still have a registered schema before either command
+/// mutates an object.
+fn validate_catalog_shape_and_components(
+    state: &WorldState,
+    shape: &Option<ObjectShape>,
+    components: &BTreeMap<ComponentTypeId, PropertyBag>,
+) -> Result<(), WorldError> {
+    if let Some(shape) = shape {
+        shape.validate()?;
+    }
+    for (component, properties) in components {
+        state
+            .component_schemas
+            .get(component)
+            .ok_or_else(|| WorldError::ComponentSchemaNotFound {
+                id: component.clone(),
+            })?
+            .validate(properties)?;
+    }
+    Ok(())
+}
+
 fn apply_command(
     state: &mut WorldState,
     counters: &mut Counters,
@@ -2042,21 +2081,24 @@ fn apply_command(
             }) {
                 return Err(WorldError::CatalogTemplateChanged { id: object });
             }
-            if let Some(shape) = shape {
-                shape.validate()?;
-            }
-            for (component, properties) in &components {
-                state
-                    .component_schemas
-                    .get(component)
-                    .ok_or_else(|| WorldError::ComponentSchemaNotFound {
-                        id: component.clone(),
-                    })?
-                    .validate(properties)?;
-            }
+            validate_catalog_shape_and_components(state, &shape, &components)?;
             let object = object_mut(state, object)?;
             object.shape = shape;
             object.components = components;
+            object.catalog_link = Some(link);
+        }
+        WorldCommand::LinkCatalogTemplate {
+            object,
+            shape,
+            components,
+            link,
+        } => {
+            validate_catalog_shape_and_components(state, &shape, &components)?;
+            let object = object_mut(state, object)?;
+            if let Some(shape) = shape {
+                object.shape = Some(shape);
+            }
+            object.components.extend(components);
             object.catalog_link = Some(link);
         }
         WorldCommand::AttachComponent {
@@ -4017,5 +4059,187 @@ mod tests {
             )])
             .unwrap();
         assert_eq!(report.created_spheres, vec![SphereId::new(0)]);
+    }
+
+    fn mass_component() -> ComponentSchema {
+        ComponentSchema {
+            id: ComponentTypeId::new(PluginId::new("test").unwrap(), "mass").unwrap(),
+            display_name: "Mass".to_owned(),
+            properties: vec![PropertySchema {
+                id: PropertyId::new("mass").unwrap(),
+                display_name: "Mass".to_owned(),
+                description: None,
+                kind: PropertyKind::Scalar(Dimension::MASS),
+                required: true,
+                default_value: None,
+                relevant_when: None,
+            }],
+        }
+    }
+
+    fn test_catalog_link(template: &str) -> CatalogLink {
+        CatalogLink {
+            entry: Some(crate::CatalogEntryRef {
+                catalog: "test".to_owned(),
+                template: template.to_owned(),
+                origin: crate::CatalogOrigin::Document {
+                    entry_id: uuid::Uuid::nil(),
+                },
+                api_version: "fieldcad.catalog/v1".to_owned(),
+                fingerprint: String::new(),
+            }),
+            mode: crate::CatalogLinkMode::Tracking,
+            source_description: format!("test/{template}"),
+        }
+    }
+
+    #[test]
+    fn linking_a_never_linked_object_merges_template_components_and_keeps_the_rest() {
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::RegisterComponentSchema(charge_component()),
+                WorldCommand::RegisterComponentSchema(mass_component()),
+            ])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("hand built").with_component(
+                    mass_component().id,
+                    mass_component().default_properties().unwrap(),
+                ),
+            )])
+            .unwrap();
+        let object = ObjectId::new(0);
+        assert!(world.snapshot().objects()[&object].catalog_link.is_none());
+
+        world
+            .commit([WorldCommand::LinkCatalogTemplate {
+                object,
+                shape: None,
+                components: BTreeMap::from([(
+                    charge_component().id,
+                    charge_component().default_properties().unwrap(),
+                )]),
+                link: test_catalog_link("fancy-unicorn"),
+            }])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let updated = &snapshot.objects()[&object];
+        assert!(updated.components.contains_key(&charge_component().id));
+        assert!(
+            updated.components.contains_key(&mass_component().id),
+            "a hand-attached component the template doesn't declare must survive linking"
+        );
+        assert_eq!(
+            updated.catalog_link.as_ref().unwrap().mode,
+            crate::CatalogLinkMode::Tracking
+        );
+    }
+
+    #[test]
+    fn linking_an_unlinked_object_succeeds() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::RegisterComponentSchema(charge_component())])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("was tracking").with_catalog_link(test_catalog_link("old")),
+            )])
+            .unwrap();
+        let object = ObjectId::new(0);
+        world
+            .commit([WorldCommand::UnlinkCatalogTemplate { object }])
+            .unwrap();
+        assert_eq!(
+            world.snapshot().objects()[&object]
+                .catalog_link
+                .as_ref()
+                .unwrap()
+                .mode,
+            crate::CatalogLinkMode::Unlinked
+        );
+
+        world
+            .commit([WorldCommand::LinkCatalogTemplate {
+                object,
+                shape: None,
+                components: BTreeMap::from([(
+                    charge_component().id,
+                    charge_component().default_properties().unwrap(),
+                )]),
+                link: test_catalog_link("new"),
+            }])
+            .unwrap();
+
+        let link = world.snapshot().objects()[&object]
+            .catalog_link
+            .clone()
+            .unwrap();
+        assert_eq!(link.mode, crate::CatalogLinkMode::Tracking);
+        assert_eq!(link.entry.unwrap().template, "new");
+    }
+
+    #[test]
+    fn relinking_an_already_tracking_object_switches_the_entry() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::RegisterComponentSchema(charge_component())])
+            .unwrap();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("tracking").with_catalog_link(test_catalog_link("electron")),
+            )])
+            .unwrap();
+        let object = ObjectId::new(0);
+
+        world
+            .commit([WorldCommand::LinkCatalogTemplate {
+                object,
+                shape: None,
+                components: BTreeMap::from([(
+                    charge_component().id,
+                    charge_component().default_properties().unwrap(),
+                )]),
+                link: test_catalog_link("positron"),
+            }])
+            .unwrap();
+
+        let link = world.snapshot().objects()[&object]
+            .catalog_link
+            .clone()
+            .unwrap();
+        assert_eq!(link.entry.unwrap().template, "positron");
+    }
+
+    #[test]
+    fn linking_with_no_declared_shape_leaves_the_existing_shape_unchanged() {
+        let mut world = World::new();
+        world
+            .commit([WorldCommand::RegisterComponentSchema(charge_component())])
+            .unwrap();
+        let shape = ObjectShape::point(0.2).unwrap();
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("shaped").with_shape(shape),
+            )])
+            .unwrap();
+        let object = ObjectId::new(0);
+
+        world
+            .commit([WorldCommand::LinkCatalogTemplate {
+                object,
+                shape: None,
+                components: BTreeMap::from([(
+                    charge_component().id,
+                    charge_component().default_properties().unwrap(),
+                )]),
+                link: test_catalog_link("fancy-unicorn"),
+            }])
+            .unwrap();
+
+        assert_eq!(world.snapshot().objects()[&object].shape, Some(shape));
     }
 }

@@ -153,6 +153,30 @@ pub fn template_properties_to_bag(
         }
     }
 
+    // A required property with no `relevant_when` is always required — a
+    // template that omits it (e.g. `inertial-mass` with no `mass`) is an
+    // authoring error and must stay `Unavailable`. But a required property
+    // whose sibling condition is currently unmet — e.g. `gravitational-mass`'s
+    // `mass` while `follows-inertial: true` — is presentation-inert, not
+    // absent from the model: `PropertySchema::relevant_when` promises its
+    // stored value is preserved for when the switch flips back. A template
+    // that only cares about the switch is free to omit the silenced value;
+    // fill it with the schema default here so availability tracks the same
+    // "still validated, just inert" rule the generic editor uses, rather
+    // than rejecting the template outright.
+    if errors.is_empty() {
+        for property in &schema.properties {
+            if property.required
+                && property.relevant_when.is_some()
+                && !property.is_relevant(&bag)
+                && bag.get(&property.id).is_none()
+                && let Some(default) = property.initial_value()
+            {
+                bag.insert(property.id.clone(), default);
+            }
+        }
+    }
+
     if errors.is_empty() {
         Ok(bag)
     } else {
