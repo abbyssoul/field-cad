@@ -1,0 +1,175 @@
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Particles
+  name: electron
+  description: Electron
+  annotations:
+    source: NIST CODATA 2022 / SRD 121
+spec:
+  objectKind: world-object
+  shape:
+    kind: point
+    exclusionRadiusMetres: 2.82e-15
+  components:
+  - type:
+      plugin: fieldcad.electromagnetic-sources
+      name: charge-source
+    properties:
+      charge:
+        scalar:
+          siValue: -1.602176634e-19
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 9.1093837139e-31
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Particles
+  name: positron
+  description: Positron
+  annotations:
+    source: NIST CODATA 2022 / SRD 121
+spec:
+  objectKind: world-object
+  shape:
+    kind: point
+    exclusionRadiusMetres: 2.82e-15
+  components:
+  - type:
+      plugin: fieldcad.electromagnetic-sources
+      name: charge-source
+    properties:
+      charge:
+        scalar:
+          siValue: 1.602176634e-19
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 9.1093837139e-31
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Particles
+  name: proton
+  description: Proton
+  annotations:
+    source: NIST CODATA 2022 / SRD 121
+spec:
+  objectKind: world-object
+  shape:
+    kind: point
+    exclusionRadiusMetres: 0.84e-15
+  components:
+  - type:
+      plugin: fieldcad.electromagnetic-sources
+      name: charge-source
+    properties:
+      charge:
+        scalar:
+          siValue: 1.602176634e-19
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.67262192595e-27
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Particles
+  name: anti-proton
+  description: Anti-proton
+  annotations:
+    source: NIST CODATA 2022 / SRD 121
+spec:
+  objectKind: world-object
+  shape:
+    kind: point
+    exclusionRadiusMetres: 0.84e-15
+  components:
+  - type:
+      plugin: fieldcad.electromagnetic-sources
+      name: charge-source
+    properties:
+      charge:
+        scalar:
+          siValue: -1.602176634e-19
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.67262192595e-27
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Particles
+  name: neutron
+  description: Neutron
+  annotations:
+    source: NIST CODATA 2022 / SRD 121
+spec:
+  objectKind: world-object
+  shape:
+    kind: point
+    exclusionRadiusMetres: 0.84e-15
+  components:
+  - type:
+      plugin: fieldcad.electromagnetic-sources
+      name: charge-source
+    properties:
+      charge:
+        scalar:
+          siValue: 0.0
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.67492750056e-27
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true

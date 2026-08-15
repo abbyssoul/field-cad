@@ -1,0 +1,156 @@
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Planets
+  name: earth
+  description: Earth
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 6.378e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 5.97e+24
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Planets
+  name: moon
+  description: Moon
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 1.7375e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 7.35e+22
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Planets
+  name: sol
+  description: Sol
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 6.9634e+8
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 1.989e+30
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Planets
+  name: mercury
+  description: Mercury
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 2.4397e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 3.30e+23
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Planets
+  name: venus
+  description: Venus
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 6.052e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 4.87e+24
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
+---
+apiVersion: fieldcad.catalog/v1
+kind: ObjectTemplate
+metadata:
+  catalog: Planets
+  name: mars
+  description: Mars
+spec:
+  objectKind: world-object
+  shape:
+    kind: sphere
+    radiusMetres: 3.390e+6
+  components:
+  - type:
+      plugin: fieldcad.mass-sources
+      name: inertial-mass
+    properties:
+      mass:
+        scalar:
+          siValue: 6.417e+23
+  - type:
+      plugin: fieldcad.mass-sources
+      name: gravitational-mass
+    properties:
+      follows-inertial:
+        boolean: true
