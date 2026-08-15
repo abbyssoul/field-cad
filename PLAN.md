@@ -119,24 +119,38 @@ each scientific solver has an independent reference case.
 
 ## Workspace shape
 
-Current, with planned crates marked:
+Current as of 2026-08-15, with planned crates marked. `fieldcad-particles`
+(the compiled particle catalog/provenance crate this table used to list) was
+removed by the configuration-driven catalog work — see
+`docs/tasks/user-configurable-object-catalog.md` — and replaced by
+`fieldcad-catalog` plus the generic `catalog_link` provenance field on
+`WorldObject` (`crates/fieldcad-core/src/catalog_link.rs`). Keep this table
+in sync when crates are added, renamed, or removed; it drifted stale once
+already and was mistaken for current state.
 
 ```text
 apps/
-  fieldcad-desktop/      native visualizer and composition root      [present]
-  fieldcad-compute/      later headless dedicated compute service    [planned]
+  fieldcad-desktop/                  native visualizer and composition root      [present]
+  fieldcad-compute/                  later headless dedicated compute service    [planned]
 crates/
-  fieldcad-bench/        headless compute performance harness        [present]
-  fieldcad-core/         world, domain, sampling, units, time        [present]
-  fieldcad-electromagnetic-sources/ shared charge schema/sources     [present]
-  fieldcad-mass-sources/ shared mass schema/sources                  [present]
-  fieldcad-superposition/ shared inverse-square source law kernel    [present]
-  fieldcad-particles/    catalog provenance and particle view        [present]
-  fieldcad-plugin-api/   equation-system contract and schemas        [present]
-  fieldcad-simulation/   runtime and data-source boundary            [present]
-  fieldcad-render/       wgpu renderer and visualization layers      [planned]
-  fieldcad-ui/           egui panels and input mapping               [planned]
-  fieldcad-protocol/     later transport-neutral session protocol    [planned]
+  fieldcad-bench/                    headless compute performance harness        [present]
+  fieldcad-core/                     world, domain, sampling, units, time        [present]
+  fieldcad-electromagnetic-sources/  shared charge schema/sources                [present]
+  fieldcad-sources/                  shared mass/gravitational schema/sources    [present]
+  fieldcad-superposition/            shared inverse-square source law kernel     [present]
+  fieldcad-dynamics/                 first-party velocity-dependent force        [present]
+                                      integration
+  fieldcad-catalog/                  YAML, multi-document, schema-validated      [present]
+                                      object-template catalog
+  fieldcad-plugin-api/               equation-system contract and schemas        [present]
+  fieldcad-simulation/               authoritative runtime and data-source       [present]
+                                      boundary
+  fieldcad-server/                   headless session owner: one authoritative   [present]
+                                      model shared by desktop and MCP transports
+  fieldcad-mcp/                      MCP transport over fieldcad-server          [present]
+  fieldcad-scene-document/           versioned experiment persistence            [present]
+  fieldcad-render/                   wgpu renderer and visualization layers      [planned]
+  fieldcad-ui/                       egui panels and input mapping               [planned]
 plugins/
   test-field/            analytic contract fixture                   [present]
   electrostatics/        first real equation system                  [present]
@@ -150,6 +164,14 @@ ceremony without isolation. Inside the app they are directories rather than
 single files — `scene/` divides field geometry, gizmos, picking, and authoring
 proxies; `ui/` divides the view model, panels, and the probe plot — which is the
 right amount of structure while there is still one consumer.
+
+The formerly-planned `fieldcad-protocol` (a later transport-neutral session
+protocol crate) is superseded by the `fieldcad-server`/`fieldcad-mcp` split
+that actually shipped: `fieldcad-server` owns one authoritative session —
+catalog state included, see `docs/tasks/server-authoritative-catalog.md` —
+behind a transport-neutral `FieldDataSource` boundary, and `fieldcad-mcp` is
+a thin MCP transport on top of it, embeddable in the desktop app or run
+standalone. No separate protocol crate is planned beyond that.
 
 Crate boundaries are dependency rules, not a promise of separate threads or
 dynamic libraries. We should merge any boundary that produces ceremony without
@@ -440,7 +462,7 @@ Implement a minimal gravity plugin to test that abstractions are not secretly
 electromagnetic:
 
 - mass as an independently declared object component — **done** ahead of this
-  milestone by ADR 0021: `fieldcad-mass-sources` owns the schema, and one object
+  milestone by ADR 0021: `fieldcad-sources` owns the schema, and one object
   may already carry both charge and mass;
 - gravitational potential and acceleration channels — **done**;
 - analytic point/sphere sources first — **done**; and
@@ -459,8 +481,12 @@ Exit criteria:
 
 ## Milestone 8 — runtime plugin and project format
 
-Implementation status: **contract accepted; executable host, project-document,
-and package-install implementation remain.** ADR 0023 and
+Implementation status: **contract accepted. Versioned scene/project
+persistence is implemented** (`fieldcad-scene-document`: save/load, unknown-
+plugin-data warnings rather than silent drops, catalog-link and document-
+scoped catalog round-trip) **— the runtime-loaded third-party plugin host
+(WebAssembly Component Model, signed package manifests/install) remains.**
+ADR 0023 and
 [`fieldcad.workload-package/v1`](docs/fieldcad-workload-package-v1.md) define
 the shared Field CAD/Orishu package standard. The contract intentionally reuses
 Orishu's workload lifecycle ABI and state-artifact compatibility rules.

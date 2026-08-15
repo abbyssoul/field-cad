@@ -312,6 +312,10 @@ pub struct UiModel {
     /// Catalog file/action errors belong to the Catalog window, not to the
     /// asynchronous authoritative-world command status.
     pub catalog_status: Option<String>,
+    /// Set after a catalog entry save finds tracking instances — a modal
+    /// confirmation, never an automatic apply. See
+    /// `docs/tasks/server-authoritative-catalog.md`.
+    pub catalog_propagation: Option<CatalogPropagationPrompt>,
     /// The object the camera is locked onto, if any — independent of
     /// `selection`, so following one object while inspecting another is
     /// possible. `App::apply_camera_follow` re-targets the camera to this
@@ -365,6 +369,7 @@ impl UiModel {
             catalog_new_template: String::new(),
             catalog_editor: None,
             catalog_status: None,
+            catalog_propagation: None,
             following: None,
             save_in_progress: false,
         }
@@ -734,6 +739,21 @@ pub enum AppAction {
     ReloadCatalog,
 }
 
+/// A pending, user-confirmable propagation offer: `entry`'s current
+/// template versus every world object still tracking it. Never applied
+/// automatically — see [`CatalogAction::ApplyPropagation`].
+#[derive(Debug, Clone)]
+pub struct CatalogPropagationPrompt {
+    pub entry: fieldcad_core::CatalogEntryRef,
+    /// Candidate objects with their current display name, for the
+    /// confirmation list — in the same order
+    /// `HeadlessServer::preview_catalog_propagation` returned them.
+    pub candidates: Vec<(ObjectId, String)>,
+    /// Which candidates the user has chosen to apply to. Starts with every
+    /// candidate selected ("all"); the user may narrow it before confirming.
+    pub selected: std::collections::BTreeSet<ObjectId>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum CatalogAction {
@@ -760,6 +780,15 @@ pub enum CatalogAction {
     DeleteEntry {
         entry: fieldcad_core::CatalogEntryRef,
     },
+    /// Apply `entry`'s current template to exactly `object_ids` in one
+    /// atomic authoritative transaction — the confirmed outcome of a
+    /// [`CatalogPropagationPrompt`].
+    ApplyPropagation {
+        entry: fieldcad_core::CatalogEntryRef,
+        object_ids: Vec<ObjectId>,
+    },
+    /// Dismiss a pending [`CatalogPropagationPrompt`] without applying it.
+    DismissPropagation,
 }
 
 #[derive(Debug)]
@@ -1215,6 +1244,7 @@ pub fn show(
         queue_window(&context, &frame, &mut output);
     }
     panels::catalog_window(&context, model, &frame, &mut output);
+    panels::catalog_propagation_window(&context, model, &mut output);
     settings_window(&context, model, profile);
     floating_probe_plots(&context, model, &frame);
     floating_distance_probe_plots(&context, model, &frame);

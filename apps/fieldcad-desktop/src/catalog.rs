@@ -7,10 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-use fieldcad_catalog::template_fingerprint;
-use fieldcad_core::{CatalogEntryRef, CatalogOrigin};
-use fieldcad_scene_document::DocumentCatalogEntry;
-
 pub fn catalog_directory() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "fieldcad").map(|dirs| dirs.config_dir().join("catalog"))
 }
@@ -29,17 +25,4 @@ pub fn seed_starter_catalog_if_missing(dir: &Path) {
     }
     let dest = dir.join("starter.yaml");
     let _ = std::fs::write(&dest, include_str!("starter_catalog.yaml"));
-}
-
-/// Stable reference for a scene-local entry.
-pub fn document_entry_ref(entry: &DocumentCatalogEntry) -> CatalogEntryRef {
-    CatalogEntryRef {
-        catalog: entry.identity.catalog.as_str().to_owned(),
-        template: entry.identity.template.as_str().to_owned(),
-        origin: CatalogOrigin::Document {
-            entry_id: entry.entry_id,
-        },
-        api_version: fieldcad_catalog::API_VERSION.to_owned(),
-        fingerprint: template_fingerprint(&entry.identity, &entry.metadata, &entry.spec),
-    }
 }

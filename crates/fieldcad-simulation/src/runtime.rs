@@ -446,6 +446,12 @@ impl PluginSlot {
 pub struct FieldSystemStatus {
     pub plugin: PluginMetadata,
     pub channels: Vec<ChannelSchema>,
+    /// Component type IDs this plugin declares, independent of `enabled` —
+    /// a disabled-but-composed plugin (gravity off by default, say) still
+    /// backs its component schemas for authoring, per this type's own
+    /// doc comment. A consumer wanting "is this schema orphaned" unions
+    /// this field across every `FieldSystemStatus`, not just enabled ones.
+    pub component_schemas: Vec<fieldcad_core::ComponentTypeId>,
     /// Vector channels the active numerical solver accepts direct painting for.
     /// Empty for analytical and inactive systems.
     pub mutable_vector_channels: Vec<ChannelId>,
@@ -890,6 +896,12 @@ impl SimulationRuntime {
                     .channels
                     .iter()
                     .map(|channel| channel.as_ref().clone())
+                    .collect(),
+                component_schemas: slot
+                    .plugin
+                    .component_schemas()
+                    .into_iter()
+                    .map(|schema| schema.id)
                     .collect(),
                 mutable_vector_channels: if slot.enabled {
                     slot.solver()

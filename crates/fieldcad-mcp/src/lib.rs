@@ -35,7 +35,7 @@ use fieldcad_core::{
     BoundaryCondition, BoundaryConditions, ChannelId, ChannelSnapshot, DistanceProbeId, Domain,
     DomainBounds, MassAggregateProbeId, MassAggregateSample, ObjectShape, ObjectSpec, PluginId,
     PluginProvenance, Precision, ProbeSpec, Resolution, SceneScale, SessionId,
-    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, TimeStep, Transform, Velocity, World,
+    SnapshotCompleteness, SnapshotIdentity, SolverDiagnostic, TimeStep, Transform, World,
     WorldCommand,
     quantities::{ChargeCoulombs, coulomb},
 };
@@ -536,12 +536,14 @@ const SESSION_STATUS_URI: &str = "fieldcad://session/status";
 const SESSION_SNAPSHOT_URI: &str = "fieldcad://session/snapshot";
 const SESSION_DIAGNOSTICS_URI: &str = "fieldcad://session/diagnostics";
 const SESSION_QUEUE_URI: &str = "fieldcad://session/queue";
+const SESSION_CATALOG_URI: &str = "fieldcad://session/catalog";
 
-const SESSION_RESOURCE_URIS: [&str; 4] = [
+const SESSION_RESOURCE_URIS: [&str; 5] = [
     SESSION_STATUS_URI,
     SESSION_SNAPSHOT_URI,
     SESSION_DIAGNOSTICS_URI,
     SESSION_QUEUE_URI,
+    SESSION_CATALOG_URI,
 ];
 
 fn session_resources() -> Vec<Resource> {
@@ -561,6 +563,12 @@ fn session_resources() -> Vec<Resource> {
         Resource::new(SESSION_QUEUE_URI, "session-queue").with_description(
             "Authoritative queue state: paused flag, ordered pending commands, and recent \
              terminal history (capped at 256).",
+        ),
+        Resource::new(SESSION_CATALOG_URI, "session-catalog").with_description(
+            "The effective catalog report (global plus document-scoped entries) and its \
+             revision. Bumps on every catalog create/update/delete/reload — a desktop UI and \
+             an embedded MCP client sharing this session both invalidate against this one \
+             resource, so neither can see a stale copy of the other's edit.",
         ),
     ]
 }
@@ -592,6 +600,7 @@ fn affected_resource_uris(event: &WatchEvent) -> &'static [&'static str] {
         WatchEvent::Session(SessionEvent::QueueUpdated(_) | SessionEvent::CommandTerminal(_)) => {
             &[SESSION_QUEUE_URI]
         }
+        WatchEvent::Session(SessionEvent::CatalogUpdated(_)) => &[SESSION_CATALOG_URI],
     }
 }
 
@@ -818,51 +827,13 @@ impl McpServer {
             Ok(value) => value,
             Err(error) => return tool_error(error),
         };
-        let object = {
-            let server = lock(&self.model);
-            let Some(candidate) = server
-                .catalog()
-                .entries
-                .iter()
-                .find(|candidate| candidate.reference.as_ref() == Some(&entry))
-            else {
-                return tool_error("catalog entry disappeared");
-            };
-            let fieldcad_catalog::LoadResult::Available { spec, .. } = &candidate.result else {
-                return tool_error("catalog entry is unavailable or invalid");
-            };
-            let world = server.world();
-            let name = params.display_name.unwrap_or_else(|| {
-                fieldcad_catalog::suggest_display_name(
-                    &entry.template,
-                    world.objects().values().map(|object| object.name.as_str()),
-                )
-            });
-            match fieldcad_catalog::instantiate_template(
-                spec,
-                &entry,
-                world.component_schemas(),
-                fieldcad_catalog::InstantiationPlacement {
-                    display_name: name,
-                    transform: Transform::default(),
-                    velocity: Velocity::default(),
-                    pinned: false,
-                    fallback_shape_radius: 0.15,
-                },
-            ) {
-                Ok(object) => object,
-                Err(reasons) => {
-                    return tool_error(
-                        reasons
-                            .into_iter()
-                            .map(|reason| reason.to_string())
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    );
-                }
-            }
+        let command = match lock(&self.model)
+            .resolve_catalog_instantiation(&entry, params.display_name)
+        {
+            Ok(command) => command,
+            Err(error) => return tool_error(error.to_string()),
         };
-        submit_world_commands(&self.model, vec![WorldCommand::CreateObject(object)]).await
+        submit_world_commands(&self.model, vec![command]).await
     }
 
     #[tool(
@@ -893,22 +864,9 @@ impl McpServer {
             Err(error) => return tool_error(error),
         };
         let objects = lock(&self.model)
-            .world()
-            .objects()
-            .values()
-            .filter_map(|object| {
-                object
-                    .catalog_link
-                    .as_ref()
-                    .filter(|link| {
-                        link.mode == fieldcad_core::CatalogLinkMode::Tracking
-                            && link
-                                .entry
-                                .as_ref()
-                                .is_some_and(|linked| linked.origin == entry.origin)
-                    })
-                    .map(|_| object.id.get())
-            })
+            .preview_catalog_propagation(&entry)
+            .into_iter()
+            .map(|id| id.get())
             .collect::<Vec<_>>();
         ok_json(&serde_json::json!({ "object_ids": objects, "count": objects.len() }))
     }
@@ -924,78 +882,15 @@ impl McpServer {
             Ok(value) => value,
             Err(error) => return tool_error(error),
         };
-        let commands = {
-            let server = lock(&self.model);
-            let Some(candidate) = server
-                .catalog()
-                .entries
-                .iter()
-                .find(|candidate| candidate.reference.as_ref() == Some(&entry))
-            else {
-                return tool_error("catalog entry disappeared");
-            };
-            let fieldcad_catalog::LoadResult::Available { spec, .. } = &candidate.result else {
-                return tool_error("catalog entry is unavailable or invalid");
-            };
-            let world = server.world();
-            let requested: BTreeSet<u64> = params.object_ids.into_iter().collect();
-            let mut commands = Vec::new();
-            for object in world.objects().values() {
-                let Some(link) = &object.catalog_link else {
-                    continue;
-                };
-                if link.mode != fieldcad_core::CatalogLinkMode::Tracking
-                    || !link
-                        .entry
-                        .as_ref()
-                        .is_some_and(|linked| linked.origin == entry.origin)
-                {
-                    continue;
-                }
-                if !requested.is_empty() && !requested.contains(&object.id.get()) {
-                    continue;
-                }
-                let replacement = match fieldcad_catalog::instantiate_template(
-                    spec,
-                    &entry,
-                    world.component_schemas(),
-                    fieldcad_catalog::InstantiationPlacement {
-                        display_name: object.name.clone(),
-                        transform: object.transform,
-                        velocity: object.velocity,
-                        pinned: object.pinned,
-                        fallback_shape_radius: 0.15,
-                    },
-                ) {
-                    Ok(value) => value,
-                    Err(reasons) => {
-                        return tool_error(
-                            reasons
-                                .into_iter()
-                                .map(|reason| reason.to_string())
-                                .collect::<Vec<_>>()
-                                .join("; "),
-                        );
-                    }
-                };
-                commands.push(WorldCommand::ApplyCatalogTemplate {
-                    object: object.id,
-                    expected_entry: link
-                        .entry
-                        .clone()
-                        .expect("tracking links from catalog have an entry"),
-                    shape: replacement.shape,
-                    components: replacement.components,
-                    link: replacement
-                        .catalog_link
-                        .expect("catalog instantiation stamps provenance"),
-                });
-            }
-            commands
+        let selection: Vec<fieldcad_core::ObjectId> = params
+            .object_ids
+            .into_iter()
+            .map(fieldcad_core::ObjectId::new)
+            .collect();
+        let commands = match lock(&self.model).resolve_catalog_propagation(&entry, &selection) {
+            Ok(commands) => commands,
+            Err(error) => return tool_error(error.to_string()),
         };
-        if commands.is_empty() {
-            return tool_error("no matching tracking objects");
-        }
         submit_world_commands(&self.model, commands).await
     }
 
@@ -1525,7 +1420,7 @@ impl McpServer {
             };
         let mut server = lock(&self.model);
         server.replace_source(new_source);
-        server.set_document_catalog(document_entries, quick_add_hidden);
+        server.restore_document_catalog(document_entries, quick_add_hidden);
         if queue.paused
             && let Err(error) = server.submit(CommandPayload::PauseQueue)
         {
@@ -1557,7 +1452,7 @@ impl McpServer {
             };
         let mut server = lock(&self.model);
         server.replace_source(new_source);
-        server.set_document_catalog(Vec::new(), Vec::new());
+        server.restore_document_catalog(Vec::new(), Vec::new());
         ok_json(&OpenOrCreateSceneResult {
             source: "new".to_owned(),
             warnings: warnings.iter().map(format_resolve_warning).collect(),
@@ -1806,6 +1701,13 @@ impl McpServer {
             SESSION_QUEUE_URI => {
                 let queue: QueueStatus = lock(&self.model).get_queue();
                 resource_text(uri, &queue)
+            }
+            SESSION_CATALOG_URI => {
+                let server = lock(&self.model);
+                let revision = server.catalog_revision();
+                let entries = catalog_entry_views(server.catalog());
+                drop(server);
+                resource_text(uri, &serde_json::json!({ "revision": revision, "entries": entries }))
             }
             other => Err(ErrorData::resource_not_found(
                 format!("unknown resource: {other}"),
@@ -2628,7 +2530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_resources_lists_exactly_the_four_stable_uris() {
+    async fn session_resources_lists_exactly_the_five_stable_uris() {
         let resources = session_resources();
         let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
         assert_eq!(
@@ -2638,6 +2540,7 @@ mod tests {
                 "fieldcad://session/snapshot",
                 "fieldcad://session/diagnostics",
                 "fieldcad://session/queue",
+                "fieldcad://session/catalog",
             ]
         );
     }
@@ -3069,5 +2972,290 @@ mod tests {
             world.objects().is_empty(),
             "create_scene without a template must start empty"
         );
+    }
+
+    fn server_with_catalog_root(root: Option<std::path::PathBuf>) -> McpServer {
+        let source = fieldcad_server::default_session().expect("default session builds");
+        McpServer::new(
+            Arc::new(Mutex::new(HeadlessServer::with_catalog_root(source, root))),
+            Arc::new(mcp_plugin_catalog),
+        )
+    }
+
+    fn empty_metadata() -> Value {
+        serde_json::json!({
+            "description": null,
+            "author": null,
+            "labels": {},
+            "annotations": {},
+        })
+    }
+
+    fn empty_spec() -> Value {
+        serde_json::json!({
+            "object_kind": "world-object",
+            "shape": null,
+            "components": [],
+        })
+    }
+
+    #[tokio::test]
+    async fn catalog_crud_round_trips_through_mcp_tools_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mcp = server_with_catalog_root(Some(root.path().to_path_buf()));
+
+        let created = json_of(
+            &mcp.create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "global".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "alpha".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(root.path().join("alpha.yaml").exists());
+
+        let listed = json_of(&mcp.list_catalog_entries().await.unwrap());
+        let entries = listed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["state"], "available");
+
+        let renamed = json_of(
+            &mcp.update_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "global".to_owned(),
+                entry: Some(created.clone()),
+                catalog: "test".to_owned(),
+                template: "beta".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(renamed["template"], "beta");
+
+        let deleted = json_of(
+            &mcp.delete_catalog_entry(Parameters(CatalogReferenceParams { entry: renamed }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(deleted["deleted"], true);
+        let listed_after = json_of(&mcp.list_catalog_entries().await.unwrap());
+        assert!(listed_after.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_scoped_create_is_rejected_on_collision_and_survives_reload() {
+        let mcp = server_with_catalog_root(None);
+        let created = json_of(
+            &mcp.create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "document".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "alpha".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(created["catalog"], "test");
+
+        let collision = mcp
+            .create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "document".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "alpha".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(collision.is_error, Some(true));
+
+        let reloaded = json_of(&mcp.reload_catalog().await.unwrap());
+        assert_eq!(reloaded.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn instantiate_and_unlink_catalog_entry_through_mcp() {
+        let mcp = server_with_catalog_root(None);
+        let entry = json_of(
+            &mcp.create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "document".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "fancy-unicorn".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+
+        let receipt = json_of(
+            &mcp.instantiate_catalog_entry(Parameters(CatalogInstanceParams {
+                entry: entry.clone(),
+                display_name: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(receipt["disposition"], "Applied");
+
+        let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
+            .expect("get_world returns a WorldSnapshot");
+        assert_eq!(world.objects().len(), 1);
+        let object = world.objects().values().next().unwrap();
+        assert_eq!(object.name, "fancy-unicorn");
+        let link = object.catalog_link.as_ref().expect("instantiated object is linked");
+        assert_eq!(link.mode, fieldcad_core::CatalogLinkMode::Tracking);
+
+        let unlinked = json_of(
+            &mcp.unlink_catalog_instance(Parameters(CatalogObjectParams {
+                object_id: object.id.get(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(unlinked["disposition"], "Applied");
+        let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
+            .expect("get_world returns a WorldSnapshot");
+        let object = world.objects().values().next().unwrap();
+        assert_eq!(
+            object.catalog_link.as_ref().unwrap().mode,
+            fieldcad_core::CatalogLinkMode::Unlinked
+        );
+    }
+
+    #[tokio::test]
+    async fn instantiate_catalog_entry_fails_for_a_stale_reference() {
+        let mcp = server_with_catalog_root(None);
+        let entry = json_of(
+            &mcp.create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "document".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "alpha".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+        json_of(
+            &mcp.delete_catalog_entry(Parameters(CatalogReferenceParams {
+                entry: entry.clone(),
+            }))
+            .await
+            .unwrap(),
+        );
+
+        let result = mcp
+            .instantiate_catalog_entry(Parameters(CatalogInstanceParams {
+                entry,
+                display_name: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn preview_and_apply_catalog_propagation_updates_only_matching_tracking_objects() {
+        let mcp = server_with_catalog_root(None);
+        let entry = json_of(
+            &mcp.create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "document".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "alpha".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+
+        // Two tracking instances from the same template, plus one ordinary
+        // (unlinked) object that must never be touched by propagation.
+        for _ in 0..2 {
+            json_of(
+                &mcp.instantiate_catalog_entry(Parameters(CatalogInstanceParams {
+                    entry: entry.clone(),
+                    display_name: None,
+                }))
+                .await
+                .unwrap(),
+            );
+        }
+        json_of(
+            &mcp.commit_world(Parameters(CommitWorldParams {
+                commands: vec![serde_json::to_value(WorldCommand::CreateObject(
+                    ObjectSpec::new("plain object")
+                        .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
+                        .with_shape(ObjectShape::point(0.1).unwrap()),
+                ))
+                .unwrap()],
+            }))
+            .await
+            .unwrap(),
+        );
+
+        let preview = json_of(
+            &mcp.preview_catalog_propagation(Parameters(CatalogReferenceParams {
+                entry: entry.clone(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(preview["count"], 2);
+
+        let applied = json_of(
+            &mcp.apply_catalog_propagation(Parameters(CatalogPropagationParams {
+                entry: entry.clone(),
+                object_ids: Vec::new(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(applied["disposition"], "Applied");
+
+        let world: WorldSnapshot = serde_json::from_value(json_of(&mcp.get_world().await.unwrap()))
+            .expect("get_world returns a WorldSnapshot");
+        assert_eq!(world.objects().len(), 3, "propagation must not create or remove objects");
+        let plain_survived = world.objects().values().any(|object| {
+            object.name == "plain object" && object.catalog_link.is_none()
+        });
+        assert!(plain_survived, "propagation must not touch an unlinked object");
+    }
+
+    #[tokio::test]
+    async fn apply_catalog_propagation_fails_when_nothing_matches() {
+        let mcp = server_with_catalog_root(None);
+        let entry = json_of(
+            &mcp.create_catalog_entry(Parameters(CatalogMutationParams {
+                scope: "document".to_owned(),
+                entry: None,
+                catalog: "test".to_owned(),
+                template: "alpha".to_owned(),
+                metadata: empty_metadata(),
+                spec: empty_spec(),
+            }))
+            .await
+            .unwrap(),
+        );
+        let result = mcp
+            .apply_catalog_propagation(Parameters(CatalogPropagationParams {
+                entry,
+                object_ids: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
     }
 }

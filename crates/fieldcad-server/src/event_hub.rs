@@ -38,6 +38,11 @@ pub enum SessionEvent {
     SourceStatusUpdated(DataSourceStatus),
     QueueUpdated(QueueSummary),
     CommandTerminal(CommandId),
+    /// The effective catalog (global report, document entries, or quick-add
+    /// preferences) changed. Carries the new revision so a lapsed watcher
+    /// can tell at a glance whether its cached view is stale without
+    /// re-diffing the whole report.
+    CatalogUpdated(u64),
 }
 
 /// Owned by [`crate::HeadlessServer`]. Every publication flows through
@@ -134,6 +139,12 @@ impl EventHub {
     /// the deduplicated state categories above — this is always sent.
     pub fn publish_command_event(&mut self, event: &CommandEvent) {
         self.send(SessionEvent::CommandTerminal(event.command_id()));
+    }
+
+    /// A catalog revision bump is never "the same" twice either — always
+    /// sent, same reasoning as [`Self::publish_command_event`].
+    pub fn publish_catalog_updated(&mut self, revision: u64) {
+        self.send(SessionEvent::CatalogUpdated(revision));
     }
 
     fn send(&self, event: SessionEvent) {

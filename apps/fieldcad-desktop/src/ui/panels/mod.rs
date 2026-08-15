@@ -21,7 +21,7 @@ mod world_inspector;
 
 // ── Public surface for ui/mod.rs ───────────────────────────────────────────
 
-pub use catalog::catalog_window;
+pub use catalog::{catalog_propagation_window, catalog_window};
 pub use diagnostics::diagnostics_window;
 pub use inspector::inspector;
 pub use mcp::mcp_window;

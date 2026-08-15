@@ -1,12 +1,12 @@
 //! Inspector sections for editing an object's properties: placement, shape,
 //! motion, components, and derived values.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use fieldcad_core::{
-    CatalogLinkMode, Dimension, ObjectId, ObjectShape, PropertyBag, PropertyKind, PropertySchema,
-    PropertyValue, Quantity, Transform, VectorQuantity, Velocity, WorldCommand, WorldObject,
-    WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
+    CatalogLinkMode, ComponentTypeId, Dimension, ObjectId, ObjectShape, PropertyBag, PropertyKind,
+    PropertySchema, PropertyValue, Quantity, Transform, VectorQuantity, Velocity, WorldCommand,
+    WorldObject, WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
 };
 use fieldcad_sources::{inertial_mass_component_id, mass_property_id};
 use glam::DVec3;
@@ -129,7 +129,7 @@ pub(super) fn object_properties(
         placement_editors(ui, object, tracking, output);
     });
     super::section(ui, "inspector_components", "Components", true, |ui| {
-        object_components(ui, world, object, tracking, output);
+        object_components(ui, world, compute, object, tracking, output);
     });
     if let Some(mass_kg) = inertial_mass_kg(object) {
         super::section(ui, "inspector_derived", "Derived values", true, |ui| {
@@ -430,21 +430,38 @@ pub(super) fn format_vector(vector: DVec3, unit: &str) -> String {
     )
 }
 
+/// Component type IDs backed by at least one plugin in the current session's
+/// composition — independent of `enabled`, matching `FieldSystemStatus`'s own
+/// doc comment ("Component schemas... remain available while the system is
+/// inactive"). A schema in `world.component_schemas()` but absent here has no
+/// current plugin that can declare, validate, or act on it — most commonly,
+/// data restored from a scene saved by a build with a plugin this one no
+/// longer has (see `docs/tasks/prune-orphaned-component-schemas.md`).
+fn active_component_schemas(compute: &ComputeView) -> HashSet<ComponentTypeId> {
+    compute
+        .field_systems
+        .iter()
+        .flat_map(|status| status.component_schemas.iter().cloned())
+        .collect()
+}
+
 fn object_components(
     ui: &mut egui::Ui,
     world: &WorldSnapshot,
+    compute: &ComputeView,
     object: &WorldObject,
     tracking: bool,
     output: &mut UiFrameOutput,
 ) {
     let schemas = world.component_schemas();
+    let active = active_component_schemas(compute);
     if tracking {
         ui.weak(
             "Template-owned components are read-only while this object tracks its catalog entry.",
         );
     }
     ui.add_enabled_ui(!tracking, |ui| {
-        add_component_menu(ui, world, object, output)
+        add_component_menu(ui, world, &active, object, output)
     });
 
     if object.components.is_empty() {
@@ -459,55 +476,68 @@ fn object_components(
             );
             continue;
         };
+        let orphaned = !active.contains(id);
 
         ui.add_space(4.0);
-        egui::CollapsingHeader::new(&schema.display_name)
-            .id_salt(("component", object.id, id))
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.add_enabled_ui(!tracking, |ui| {
-                    let mut edited = properties.clone();
-                    let mut changed = false;
-                    for property in &schema.properties {
-                        if !property.is_relevant(&edited) {
-                            continue;
-                        }
-                        changed |= property_editor(
-                            ui,
-                            object.id,
-                            property,
-                            &mut edited,
-                            &mut output.scene_edit_in_progress,
-                        );
+        egui::CollapsingHeader::new(if orphaned {
+            format!("(!) {}", schema.display_name)
+        } else {
+            schema.display_name.clone()
+        })
+        .id_salt(("component", object.id, id))
+        .default_open(true)
+        .show(ui, |ui| {
+            if orphaned {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 60),
+                    "No active plugin declares this component — it was restored from the \
+                         document as-is. Values are preserved but nothing computes with them.",
+                );
+            }
+            ui.add_enabled_ui(!tracking, |ui| {
+                let mut edited = properties.clone();
+                let mut changed = false;
+                for property in &schema.properties {
+                    if !property.is_relevant(&edited) {
+                        continue;
                     }
-                    if changed && schema.validate(&edited).is_ok() {
-                        output.edit(vec![WorldCommand::AttachComponent {
-                            object: object.id,
-                            component: id.clone(),
-                            properties: edited,
-                        }]);
-                    }
-                    if ui
-                        .small_button("Remove component")
-                        .on_hover_text(format!(
-                            "Detach {} from this object",
-                            schema.display_name.to_lowercase()
-                        ))
-                        .clicked()
-                    {
-                        output.edit(vec![WorldCommand::DetachComponent {
-                            object: object.id,
-                            component: id.clone(),
-                        }]);
-                    }
-                });
+                    changed |= property_editor(
+                        ui,
+                        object.id,
+                        property,
+                        &mut edited,
+                        &mut output.scene_edit_in_progress,
+                    );
+                }
+                if changed && schema.validate(&edited).is_ok() {
+                    output.edit(vec![WorldCommand::AttachComponent {
+                        object: object.id,
+                        component: id.clone(),
+                        properties: edited,
+                    }]);
+                }
+                if ui
+                    .small_button("Remove component")
+                    .on_hover_text(format!(
+                        "Detach {} from this object",
+                        schema.display_name.to_lowercase()
+                    ))
+                    .clicked()
+                {
+                    output.edit(vec![WorldCommand::DetachComponent {
+                        object: object.id,
+                        component: id.clone(),
+                    }]);
+                }
             });
+        });
     }
 }
 
 fn add_component_menu(
     ui: &mut egui::Ui,
     world: &WorldSnapshot,
+    active: &HashSet<ComponentTypeId>,
     object: &WorldObject,
     output: &mut UiFrameOutput,
 ) {
@@ -520,6 +550,17 @@ fn add_component_menu(
     ui.add_enabled_ui(!available.is_empty(), |ui| {
         ui.menu_button("+ Add", |ui| {
             for schema in available {
+                if !active.contains(&schema.id) {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(format!("{} (!)", schema.display_name)),
+                    )
+                    .on_disabled_hover_text(
+                        "No active plugin declares this component — it's data restored \
+                             from the document, not something the current build can offer.",
+                    );
+                    continue;
+                }
                 let Ok(properties) = schema.default_properties() else {
                     ui.add_enabled(false, egui::Button::new(&schema.display_name))
                         .on_disabled_hover_text(

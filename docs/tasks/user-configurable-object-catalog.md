@@ -277,7 +277,7 @@ spec:
 5. **Complete.** Build the catalog/search/editor and linked-instance inspector workflows.
    Run the desktop smoke check; manual in-app verification remains necessary
    for modal, reload, and linked-instance interaction.
-6. **In progress.** Move the effective catalog (global source report,
+6. **Mostly complete (2026-08-15).** Move the effective catalog (global source report,
    document-scoped entries, quick-add preferences, and source fingerprints)
    behind `fieldcad-server`, so desktop and MCP consume one source of truth.
    Expose list/reload/create/update/delete/instantiate/unlink through MCP,

@@ -17,7 +17,8 @@
 use std::{collections::BTreeMap, collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use fieldcad_core::{
-    Domain, FieldSnapshot, ObjectId, SceneScale, SessionId, TimeStep, TimeStepError, WorldSnapshot,
+    CatalogEntryRef, CatalogLinkMode, Domain, FieldSnapshot, ObjectId, SceneScale, SessionId,
+    TimeStep, TimeStepError, Transform, Velocity, WorldCommand, WorldSnapshot,
 };
 use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
@@ -44,6 +45,13 @@ pub struct CatalogSession {
     file_states: fieldcad_catalog::DirectoryState,
     document_entries: Vec<fieldcad_scene_document::DocumentCatalogEntry>,
     quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
+    /// Bumped every time `reload` runs. The sole change-detection signal a
+    /// client needs: cheap to compare, and never wrong in the conservative
+    /// direction (a caller that refetches on a revision bump that turned out
+    /// unchanged wastes a read; a caller that trusted a stale mirror instead
+    /// is the bug this exists to prevent). See
+    /// `docs/tasks/server-authoritative-catalog.md`.
+    revision: u64,
 }
 
 impl CatalogSession {
@@ -98,6 +106,7 @@ impl CatalogSession {
                 fieldcad_catalog::directory_state(root)
             });
         self.report = report;
+        self.revision += 1;
     }
 }
 
@@ -133,6 +142,10 @@ pub enum CatalogError {
     InvalidEntry,
     #[error("catalog source changed or disappeared: {0}")]
     SourceUnavailable(PathBuf),
+    #[error("catalog entry is unavailable or invalid: {}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    Unavailable(Vec<fieldcad_catalog::AvailabilityReason>),
+    #[error("no matching tracking objects")]
+    NoMatchingObjects,
     #[error(transparent)]
     Write(#[from] fieldcad_catalog::WriteError),
 }
@@ -244,8 +257,19 @@ impl HeadlessServer {
     }
 
     /// Re-read the configured global source and re-resolve document entries.
+    /// Every catalog mutation on this type funnels through here, so this is
+    /// the single place that bumps the catalog revision and notifies
+    /// subscribers — no mutation method needs to remember to do so itself.
     pub fn reload_catalog(&mut self) {
         self.catalog.reload(self.source.world().component_schemas());
+        self.hub.publish_catalog_updated(self.catalog.revision);
+    }
+
+    /// Monotonically increasing revision, bumped on every catalog change.
+    /// Cheap enough to poll: a client compares this before refetching the
+    /// full report rather than diffing the report itself.
+    pub fn catalog_revision(&self) -> u64 {
+        self.catalog.revision
     }
 
     /// Scene-local templates persisted with this session's scene document.
@@ -258,8 +282,19 @@ impl HeadlessServer {
         &self.catalog.quick_add_hidden
     }
 
-    /// Replace scene-local catalog state after loading a document.
-    pub fn set_document_catalog(
+    /// Replace scene-local catalog state wholesale — a new/loaded scene's
+    /// document-scoped entries and quick-add preferences, atomically with
+    /// the rest of scene lifecycle restore (see [`Self::replace_source`]).
+    ///
+    /// This is deliberately not exposed as a general-purpose sync path: an
+    /// embedded MCP client and the desktop UI share one `HeadlessServer`, so
+    /// a caller that re-pushed its own possibly-stale copy of document
+    /// entries on every reload could silently discard the other transport's
+    /// concurrent edits. Steady-state document-entry/quick-add changes go
+    /// through [`Self::create_catalog_entry`], [`Self::update_catalog_entry`],
+    /// [`Self::delete_catalog_entry`], and [`Self::set_quick_add_visibility`]
+    /// instead, each of which mutates exactly the one entry named.
+    pub fn restore_document_catalog(
         &mut self,
         entries: Vec<fieldcad_scene_document::DocumentCatalogEntry>,
         quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
@@ -267,6 +302,165 @@ impl HeadlessServer {
         self.catalog.document_entries = entries;
         self.catalog.quick_add_hidden = quick_add_hidden;
         self.reload_catalog();
+    }
+
+    /// Show or hide one catalog entry in the quick-add menu — a narrow,
+    /// single-entry alternative to replacing the whole `quick_add_hidden`
+    /// list via [`Self::restore_document_catalog`].
+    pub fn set_quick_add_visibility(&mut self, entry: fieldcad_core::CatalogEntryRef, hidden: bool) {
+        if hidden {
+            if !self.catalog.quick_add_hidden.contains(&entry) {
+                self.catalog.quick_add_hidden.push(entry);
+            }
+        } else {
+            self.catalog.quick_add_hidden.retain(|current| current != &entry);
+        }
+        self.reload_catalog();
+    }
+
+    /// Resolve one available catalog entry into a `CreateObject` command at
+    /// the origin, the way the normal authoritative `CreateObject`
+    /// transaction expects it. Placement remains an instance concern and is
+    /// never decided here — a caller (desktop viewport, MCP) that wants a
+    /// different placement submits this command then moves the result, the
+    /// same way the object inspector already handles placement for any
+    /// other object.
+    ///
+    /// Returns the command rather than submitting it: desktop callers route
+    /// it through their own edit-gesture/undo pipeline; MCP submits and
+    /// awaits it directly. This is the single implementation both share —
+    /// see `docs/tasks/server-authoritative-catalog.md`.
+    pub fn resolve_catalog_instantiation(
+        &self,
+        entry: &CatalogEntryRef,
+        display_name: Option<String>,
+    ) -> Result<WorldCommand, CatalogError> {
+        let candidate = self
+            .catalog
+            .report
+            .entries
+            .iter()
+            .find(|candidate| candidate.reference.as_ref() == Some(entry))
+            .ok_or(CatalogError::EntryNotFound)?;
+        let fieldcad_catalog::LoadResult::Available { spec, .. } = &candidate.result else {
+            return Err(CatalogError::Unavailable(Vec::new()));
+        };
+        let world = self.source.world();
+        let display_name = display_name.unwrap_or_else(|| {
+            fieldcad_catalog::suggest_display_name(
+                &entry.template,
+                world.objects().values().map(|object| object.name.as_str()),
+            )
+        });
+        let object = fieldcad_catalog::instantiate_template(
+            spec,
+            entry,
+            world.component_schemas(),
+            fieldcad_catalog::InstantiationPlacement {
+                display_name,
+                transform: Transform::default(),
+                velocity: Velocity::default(),
+                pinned: false,
+                fallback_shape_radius: 0.15,
+            },
+        )
+        .map_err(CatalogError::Unavailable)?;
+        Ok(WorldCommand::CreateObject(object))
+    }
+
+    /// World objects tracking `entry`'s source origin — non-mutating. A
+    /// caller previews before calling
+    /// [`apply_catalog_propagation`](Self::apply_catalog_propagation), which
+    /// uses the identical matching rule (link mode `Tracking` and matching
+    /// origin, independent of a possibly-renamed identity), so the count
+    /// shown here is exactly what apply will act on.
+    pub fn preview_catalog_propagation(&self, entry: &CatalogEntryRef) -> Vec<ObjectId> {
+        self.source
+            .world()
+            .objects()
+            .values()
+            .filter(|object| {
+                object.catalog_link.as_ref().is_some_and(|link| {
+                    link.mode == CatalogLinkMode::Tracking
+                        && link
+                            .entry
+                            .as_ref()
+                            .is_some_and(|linked| linked.origin == entry.origin)
+                })
+            })
+            .map(|object| object.id)
+            .collect()
+    }
+
+    /// Resolve `entry`'s current template into one `ApplyCatalogTemplate`
+    /// command per previewed tracking object, or only `selection` when
+    /// non-empty — for a caller to submit as one atomic transaction (normal
+    /// undo/history semantics apply). A catalog save or reload never calls
+    /// this itself; a caller (desktop propagation dialog, MCP
+    /// `apply_catalog_propagation`) resolves and submits explicitly after
+    /// the user confirms.
+    pub fn resolve_catalog_propagation(
+        &self,
+        entry: &CatalogEntryRef,
+        selection: &[ObjectId],
+    ) -> Result<Vec<WorldCommand>, CatalogError> {
+        let candidate = self
+            .catalog
+            .report
+            .entries
+            .iter()
+            .find(|candidate| candidate.reference.as_ref() == Some(entry))
+            .ok_or(CatalogError::EntryNotFound)?;
+        let fieldcad_catalog::LoadResult::Available { spec, .. } = &candidate.result else {
+            return Err(CatalogError::Unavailable(Vec::new()));
+        };
+        let world = self.source.world();
+        let mut commands = Vec::new();
+        for object in world.objects().values() {
+            let Some(link) = &object.catalog_link else {
+                continue;
+            };
+            if link.mode != CatalogLinkMode::Tracking
+                || !link
+                    .entry
+                    .as_ref()
+                    .is_some_and(|linked| linked.origin == entry.origin)
+            {
+                continue;
+            }
+            if !selection.is_empty() && !selection.contains(&object.id) {
+                continue;
+            }
+            let replacement = fieldcad_catalog::instantiate_template(
+                spec,
+                entry,
+                world.component_schemas(),
+                fieldcad_catalog::InstantiationPlacement {
+                    display_name: object.name.clone(),
+                    transform: object.transform,
+                    velocity: object.velocity,
+                    pinned: object.pinned,
+                    fallback_shape_radius: 0.15,
+                },
+            )
+            .map_err(CatalogError::Unavailable)?;
+            commands.push(WorldCommand::ApplyCatalogTemplate {
+                object: object.id,
+                expected_entry: link
+                    .entry
+                    .clone()
+                    .expect("tracking links from catalog have an entry"),
+                shape: replacement.shape,
+                components: replacement.components,
+                link: replacement
+                    .catalog_link
+                    .expect("catalog instantiation stamps provenance"),
+            });
+        }
+        if commands.is_empty() {
+            return Err(CatalogError::NoMatchingObjects);
+        }
+        Ok(commands)
     }
 
     /// Create a template in the requested catalog scope.

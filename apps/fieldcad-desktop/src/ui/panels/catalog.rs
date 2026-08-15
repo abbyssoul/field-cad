@@ -6,7 +6,7 @@ use fieldcad_catalog::{LoadResult, TemplateComponentInstance, TemplateShape};
 use fieldcad_core::quantities::{LengthMetres, SiScalar};
 use fieldcad_core::{Dimension, ObjectId};
 
-use crate::ui::{CatalogAction, FrameContext, UiFrameOutput, UiModel};
+use crate::ui::{CatalogAction, CatalogPropagationPrompt, FrameContext, UiFrameOutput, UiModel};
 
 use super::scene_tree::catalog_object_command;
 
@@ -564,4 +564,96 @@ fn draft_errors(draft: &crate::ui::CatalogEditorDraft, frame: &FrameContext<'_>)
         }
     }
     errors
+}
+
+/// Confirmation modal offered after a catalog entry save finds tracking
+/// instances — see `WindowState::offer_propagation`. A catalog save or
+/// reload never mutates the world by itself; this is the only path from
+/// "the template changed" to an actual object update, and it always
+/// requires this explicit confirmation.
+pub fn catalog_propagation_window(
+    root: &egui::Context,
+    model: &mut UiModel,
+    output: &mut UiFrameOutput,
+) {
+    let Some(prompt) = model.catalog_propagation.clone() else {
+        return;
+    };
+    let mut open = true;
+    egui::Window::new("Propagate catalog changes")
+        .open(&mut open)
+        .default_width(420.0)
+        .show(root, |ui| {
+            ui.label(format!(
+                "{} object(s) still track {}/{}. Choose which to update to the saved template.",
+                prompt.candidates.len(),
+                prompt.entry.catalog,
+                prompt.entry.template,
+            ));
+            ui.separator();
+            let mut selected = prompt.selected.clone();
+            ui.horizontal(|ui| {
+                if ui.button("Select all").clicked() {
+                    selected = prompt.candidates.iter().map(|(id, _)| *id).collect();
+                }
+                if ui.button("Select none").clicked() {
+                    selected.clear();
+                }
+            });
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for (id, name) in &prompt.candidates {
+                        let mut checked = selected.contains(id);
+                        if ui
+                            .checkbox(
+                                &mut checked,
+                                if name.is_empty() { "(unnamed)" } else { name },
+                            )
+                            .changed()
+                        {
+                            if checked {
+                                selected.insert(*id);
+                            } else {
+                                selected.remove(id);
+                            }
+                        }
+                    }
+                });
+            if selected != prompt.selected {
+                model.catalog_propagation = Some(CatalogPropagationPrompt {
+                    selected,
+                    ..prompt.clone()
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                let selected_count = model
+                    .catalog_propagation
+                    .as_ref()
+                    .map_or(0, |prompt| prompt.selected.len());
+                if ui
+                    .add_enabled(
+                        selected_count > 0,
+                        egui::Button::new(format!("Apply to {selected_count}")),
+                    )
+                    .clicked()
+                {
+                    let prompt = model
+                        .catalog_propagation
+                        .clone()
+                        .expect("prompt still open");
+                    output.catalog_action = Some(CatalogAction::ApplyPropagation {
+                        entry: prompt.entry,
+                        object_ids: prompt.selected.into_iter().collect(),
+                    });
+                }
+                if ui.button("Not now").clicked() {
+                    output.catalog_action = Some(CatalogAction::DismissPropagation);
+                }
+            });
+        });
+    if !open {
+        output.catalog_action = Some(CatalogAction::DismissPropagation);
+    }
 }

@@ -1,5 +1,44 @@
 # Task: server-authoritative catalog session
 
+## Status (2026-08-15)
+
+**Core ownership closed.** `HeadlessServer` now holds a `revision: u64` on
+`CatalogSession`, bumped and broadcast (`SessionEvent::CatalogUpdated`, MCP
+resource `fieldcad://session/catalog`) on every catalog change.
+`set_document_catalog` is renamed `restore_document_catalog` and used only
+for scene lifecycle restore (startup, `replace_session`, MCP
+`open_scene`/`create_scene`); steady-state edits go through
+`create_catalog_entry`/`update_catalog_entry`/`delete_catalog_entry`/
+`set_quick_add_visibility`. The desktop's `WindowState` document
+entries/quick-add/catalog fields are now read-only caches refreshed from the
+server (`sync_catalog_cache`/`reload_catalog`) and never pushed back — the
+"desktop reload overwrites concurrent MCP edits" defect is closed. Desktop
+catalog CRUD (`apply_catalog_action`) now calls the server's CRUD methods
+instead of writing YAML directly via `fieldcad_catalog::write`.
+Instantiate/preview/apply propagation logic is unified in
+`HeadlessServer::resolve_catalog_instantiation`/
+`preview_catalog_propagation`/`resolve_catalog_propagation` (resolve-only;
+callers submit through their own pipeline — MCP via `submit_and_wait`,
+desktop's propagation dialog via `HeadlessServer::submit` directly), and MCP
+delegates to them thinly. `fieldcad-mcp` gained CRUD/instantiate/unlink/
+preview/apply test coverage (previously none). A desktop propagation
+confirmation dialog (`ui/panels/catalog.rs::catalog_propagation_window`)
+appears after a catalog entry save when tracking instances exist, with a
+per-object selected/all choice and an explicit Apply.
+
+**Deliberately deferred, not done:**
+- The confirmation dialog triggers on **save**, not on **reload**. Reload
+  can change many entries at once with no cheap way to say which changed;
+  offering propagation there needs a report diff, not just a revision bump.
+- `apps/fieldcad-desktop/src/ui/panels/object_inspector.rs`'s single-object
+  "Apply current template" button and `scene_tree.rs`'s quick-add
+  instantiate path still call `fieldcad_catalog::instantiate_template`
+  directly rather than the new `HeadlessServer::resolve_catalog_*` methods —
+  both submit through the UI's own edit-gesture/undo pipeline (`output.edit`),
+  which the resolve-only split was designed to accommodate, but wiring it up
+  needs the server reference threaded into inspector rendering, which it
+  doesn't currently have. Low-risk, moderate-size follow-up.
+
 ## Goal
 
 Make `fieldcad-server` the sole owner of a session's effective catalog:
