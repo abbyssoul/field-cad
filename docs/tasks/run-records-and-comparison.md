@@ -2,6 +2,12 @@
 
 ## Status: resolved (P1-6 of `docs/tasks/product-capability-gaps-audit.md`)
 
+**Verification (2026-08-16):** confirmed done by
+`docs/tasks/product-capability-gaps-verification-plan.md` item D1. One
+residual coverage note — the scene-document round-trip only exercises an
+empty `run_records` — is tracked in
+`docs/tasks/product-capability-gaps-completion.md` (item 11).
+
 **Resolution (2026-08-16):** `fieldcad_scene_document::RunRecord` (new
 `crates/fieldcad-scene-document/src/run_record.rs`) captures `run_generation`,
 `Domain`, `TimeStep`, `Vec<FieldSystemComposition>`, and a copy of
@@ -37,6 +43,10 @@ delete/compare, restore-after-`replace_source`), `crates/fieldcad-server/
 tests/headless_session.rs` (`save_run_retains_a_copy_of_recorded_probe_history`,
 proving the server-side retention actually receives real readings from a
 stepped, charge-and-probe scene through the async worker).
+
+No desktop UI was built for this — see the follow-up
+`docs/tasks/run-records-desktop-ui.md` for the UI/MCP feature-parity gap
+this leaves open.
 
 ---
 

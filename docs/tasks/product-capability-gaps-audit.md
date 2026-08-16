@@ -1,6 +1,56 @@
 # Task completion audit: CAD authoring and reproducibility capabilities
 
-## Status: P0 complete (5/5), P1 partial (2/3)
+## Status: P0 complete (5/5), P1 complete (3/3)
+
+**Update (2026-08-16, verification run):** the re-review planned in
+`docs/tasks/product-capability-gaps-verification-plan.md` was run against the
+working tree. P1-6/7/8 and the landed P0-4/P0-5 surfaces all verified, but
+the first audit's follow-up points were found **unaddressed**: configuration
+changes are still not undoable (A5), there are still no queued-path or
+MCP-level tests for `SetFieldSystemConfiguration`/`validate_world_transaction`
+(A6/A7/B5), the desktop config editor was never manually verified (C), and
+this document's P0-4/P0-5 section headers below still say "missing" (E3).
+Every outstanding item is aggregated in
+`docs/tasks/product-capability-gaps-completion.md` — treat that document as
+the authoritative completion checklist; the section bodies below describe the
+state at first audit (2026-08-15) and are superseded by the summary table and
+update notes.
+
+**Update (2026-08-16, later still):** P1-8 closed. New file format
+`fieldcad.observation-export/v1`
+(`crates/fieldcad-scene-document/src/observation_export.rs`) exports a
+caller-scoped subset of a session's retained observations — probe/channel
+series, distance-probe series, mass-aggregate-probe series, and optionally
+the current field snapshot — independent of the whole scene document.
+`fieldcad_server::{ObservationExportScope, HeadlessServer::
+export_observations}` build it from the server-side-retained histories
+P1-6 introduced; a probe/channel named in the scope with no recorded
+readings is simply absent from the result, never an error. MCP:
+`export_experiment`/`import_experiment`. Desktop: an "Export…" button on
+each of the three probe-kind inspector panels, scoped to that one probe.
+Session recording itself (originally bundled into this same task doc) was
+already split out and closed as P1-7. See
+`docs/tasks/observation-export.md`.
+
+**Update (2026-08-16, later same day):** P1-7 closed. `SessionRecording`
+(`crates/fieldcad-simulation/src/recording.rs`) now gains `Serialize`/
+`Deserialize`. Two new blocking primitives on `AsyncLocalDataSource`
+(`execute_blocking`/`poll_blocking`, `crates/fieldcad-simulation/src/
+async_source.rs`) let `HeadlessServer::replay_recording` fully settle each
+recorded event before the next, over the async transport this crate runs
+on — the async equivalent of `recording.rs`'s own synchronous replay-
+equivalence tests, reused as the model. `HeadlessServer::{start_recording,
+stop_recording, is_recording, replay_recording}` capture every
+`execute`/`advance` call while active (skipping zero-duration polls — pure
+busy-wait noise from any transport's own completion-wait loop, never a
+moment of simulated time). Recordings persist as their own
+`fieldcad.recording/v1` file (`fieldcad_scene_document::{save_recording_to_path,
+load_recording_from_path}`), distinct from a scene document. MCP:
+`start_recording`/`stop_recording`/`recording_status`/`replay_session`.
+Desktop: File-menu "Start Recording"/"Stop Recording…"/"Replay Recording…"
+plus a menu-bar "● Recording" indicator, manually smoke-tested via `cargo
+run -p fieldcad-desktop -- --smoke 60`. See
+`docs/tasks/session-recording-and-replay.md`.
 
 **Update (2026-08-16):** P1-6 closed. Named, retained run records
 (`fieldcad_scene_document::RunRecord`) capture `run_generation`,
@@ -43,8 +93,8 @@ corrected in the same change.
 | Solver-configuration editing | P0-4 | **Done** | Yes — `set_field_system_configuration` |
 | Preflight validation | P0-5 | **Done** | Yes — `validate_world_transaction` |
 | Run records and comparison | P1-6 | **Done** | Yes — `save_run`/`list_runs`/`get_run`/`delete_run`/`compare_runs` |
-| Semantic recording and replay | P1-7 | Runtime-only | No |
-| Export/share | P1-8 | Partial (save/load only) | Partial |
+| Semantic recording and replay | P1-7 | **Done** | Yes — `start_recording`/`stop_recording`/`recording_status`/`replay_session` |
+| Export/share | P1-8 | **Done** | Yes — `export_experiment`/`import_experiment` |
 
 ## P0-1 — Scene lifecycle and files: done
 

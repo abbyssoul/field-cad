@@ -1,5 +1,11 @@
 # Task: complete missing CAD authoring and reproducibility capabilities
 
+> **Completion status (2026-08-16):** verified via
+> `docs/tasks/product-capability-gaps-verification-plan.md` — P0 and P1 work
+> landed, but the run found outstanding items (configuration undo, queued/MCP
+> test coverage, manual desktop verification, doc freshness). All remaining
+> work is aggregated in `docs/tasks/product-capability-gaps-completion.md`.
+
 ## Short prompt
 
 Implement the missing user-facing Field CAD capabilities: durable scene

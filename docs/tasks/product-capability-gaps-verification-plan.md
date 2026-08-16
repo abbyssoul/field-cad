@@ -1,6 +1,18 @@
 # Task: verification plan — CAD authoring and reproducibility completion review
 
-## Status: ready to run
+## Status: run 2026-08-16 — task NOT complete
+
+Executed against the working tree at `0d1ed36` (plus the in-flight
+observation-history changes). All automated gates pass (210 tests, clippy,
+desktop check, smoke 120), and the P1 items verified, but every **[new]**
+item failed: A5 (configuration undo), A6/A7/B5 (queued-path and MCP-level
+tests), C2–C4 (manual desktop verification), and E3 (audit doc freshness)
+were never addressed by a follow-up. A8 (non-default-configuration
+round-trip) and E1 (US-55/62/63 statuses) also failed. All outstanding work
+is aggregated in `docs/tasks/product-capability-gaps-completion.md`; re-run
+this plan once that document is resolved.
+
+Original description follows.
 
 Re-review of the `docs/tasks/product-capability-gaps.md` implementation once
 the agent finishes the follow-up points found in the first audit
