@@ -800,6 +800,19 @@ pub enum AppAction {
     /// Re-read the user catalog directory from disk and rebuild the
     /// effective catalog (global + document-scoped entries).
     ReloadCatalog,
+    /// Begin recording every command this session executes and every
+    /// wall-clock poll it's given — see `HeadlessServer::start_recording`.
+    StartRecording,
+    /// End the current recording and save it to a user-chosen path (a
+    /// native file dialog, the same way `SaveSceneAs` picks one).
+    StopRecording,
+    /// Load a recording from a user-chosen path and replay it into the
+    /// current session.
+    ReplayRecording,
+    /// Export a caller-scoped subset of this session's retained
+    /// observations to a user-chosen path — see
+    /// `HeadlessServer::export_observations`.
+    ExportObservations(fieldcad_server::ObservationExportScope),
 }
 
 /// A pending, user-confirmable propagation offer: `entry`'s current
@@ -969,6 +982,11 @@ pub struct FrameContext<'a> {
     pub probe_history: &'a ProbeHistory,
     pub distance_history: &'a DistanceHistory,
     pub mass_aggregate_history: &'a MassAggregateHistory,
+    /// Whether `HeadlessServer::is_recording` is currently true — read live
+    /// each frame (cheap) rather than cached, like `catalog_revision`
+    /// elsewhere, since a stale "not recording" would let a user start a
+    /// second recording the server would then reject.
+    pub is_recording: bool,
     pub adapter_name: &'a str,
     pub frame_time_ms: f32,
     /// Oldest first, newest last — every history slice on this context
@@ -1603,6 +1621,7 @@ mod tests {
                     probe_history: &history,
                     distance_history: &distance_history,
                     mass_aggregate_history: &mass_aggregate_history,
+                    is_recording: false,
                     adapter_name: "Test adapter",
                     frame_time_ms: 16.0,
                     active_translation: None,
@@ -1683,6 +1702,7 @@ mod tests {
                     probe_history: &history,
                     distance_history: &distance_history,
                     mass_aggregate_history: &mass_aggregate_history,
+                    is_recording: false,
                     adapter_name: "Test adapter",
                     frame_time_ms: 16.0,
                     active_translation: None,

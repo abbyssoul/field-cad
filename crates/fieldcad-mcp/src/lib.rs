@@ -13,15 +13,18 @@
 //! scene lifecycle (create/open/save), particle templates, rename, subscriptions
 //! through four `fieldcad://session/{status,snapshot,diagnostics,queue}`
 //! resources with push notifications via `subscriptions/listen`, the latest
-//! snapshot, undo/redo, and named run records with comparison
+//! snapshot, undo/redo, named run records with comparison
 //! (`save_run`/`list_runs`/`get_run`/`delete_run`/`compare_runs` — see
 //! [`fieldcad_server::HeadlessServer::save_run`], which is what also makes
 //! probe/distance/mass-aggregate history a retained server-side series now,
-//! not just a client-local desktop concern). Left for later, because the
-//! underlying capability doesn't exist in the model yet or needs its own
-//! design: body trajectories as a retained series, diagnostics as a
-//! dedicated read (today folded into the snapshot), record/replay, and
-//! export.
+//! not just a client-local desktop concern), session recording/replay
+//! (`start_recording`/`stop_recording`/`recording_status`/`replay_session` —
+//! see [`fieldcad_server::HeadlessServer::replay_recording`]), and scoped
+//! observation export/import (`export_experiment`/`import_experiment` — see
+//! [`fieldcad_server::HeadlessServer::export_observations`]). Left for
+//! later, because the underlying capability doesn't exist in the model yet
+//! or needs its own design: body trajectories as a retained series, and
+//! diagnostics as a dedicated read (today folded into the snapshot).
 //!
 //! World commands too varied to give a typed MCP schema in this slice
 //! (`edit_world` and `commit_world`) are accepted as a `Vec<serde_json::Value>`
@@ -454,6 +457,93 @@ struct CompareRunsParams {
     a: String,
     /// The second run record's `id`.
     b: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RecordingPathParams {
+    /// Server-local filesystem path to a `fieldcad.recording/v1` file (not
+    /// the calling client's filesystem).
+    path: String,
+}
+
+/// One probe/channel pair to include in an observation export.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProbeChannelParam {
+    /// A probe's `id`, as reported by `list_probes`.
+    probe: u64,
+    channel: ChannelRefParam,
+}
+
+impl ProbeChannelParam {
+    fn resolve(self) -> Result<(fieldcad_core::ProbeId, ChannelId), String> {
+        let channel = self.channel.resolve()?;
+        Ok((fieldcad_core::ProbeId::new(self.probe), channel))
+    }
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct ExportExperimentParams {
+    /// Field-probe/channel series to include. A probe/channel with no
+    /// recorded readings is simply absent from the result, not an error.
+    #[serde(default)]
+    probes: Vec<ProbeChannelParam>,
+    /// Distance-probe series to include, by `id` (as reported by
+    /// `list_distance_probes`).
+    #[serde(default)]
+    distance_probes: Vec<u64>,
+    /// Mass-aggregate-probe series to include, by `id` (as reported by
+    /// `list_mass_aggregate_probes`).
+    #[serde(default)]
+    mass_aggregate_probes: Vec<u64>,
+    /// Include the current field snapshot in the export.
+    #[serde(default)]
+    include_latest_snapshot: bool,
+    /// Refuse the export and report a per-channel sample-count breakdown
+    /// instead of a giant file if an included snapshot would exceed this
+    /// many total samples. Same meaning and default as
+    /// `get_latest_snapshot`'s `max_samples`.
+    #[serde(default)]
+    max_samples: Option<usize>,
+    /// Server-local filesystem path to write the
+    /// `fieldcad.observation-export/v1` file to (not the calling client's
+    /// filesystem).
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ImportExperimentParams {
+    /// Server-local filesystem path to a `fieldcad.observation-export/v1`
+    /// file.
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayStepResult {
+    event_index: usize,
+    /// `None` for a poll event. Otherwise one of `"completed"`,
+    /// `"failed: <message>"`, or `"cancelled"`.
+    command_outcome: Option<String>,
+    /// `None` for a command event.
+    ticks_advanced: Option<u32>,
+    tick: u64,
+    time_seconds: f64,
+    world_revision: u64,
+}
+
+fn replay_step_result(step: &fieldcad_server::ReplayStep) -> ReplayStepResult {
+    let command_outcome = step.command_event.as_ref().map(|event| match event {
+        fieldcad_simulation::CommandEvent::Completed(_) => "completed".to_owned(),
+        fieldcad_simulation::CommandEvent::Failed { error, .. } => format!("failed: {error}"),
+        fieldcad_simulation::CommandEvent::Cancelled(_) => "cancelled".to_owned(),
+    });
+    ReplayStepResult {
+        event_index: step.event_index,
+        command_outcome,
+        ticks_advanced: step.poll.map(|outcome| outcome.ticks_advanced),
+        tick: step.simulation.tick(),
+        time_seconds: step.simulation.time_seconds(),
+        world_revision: step.simulation.world_revision.get(),
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1469,7 +1559,9 @@ impl McpServer {
         }
     }
 
-    #[tool(description = "Discard one retained run record. Idempotent-shaped: reports whether a record with that id was actually found and removed.")]
+    #[tool(
+        description = "Discard one retained run record. Idempotent-shaped: reports whether a record with that id was actually found and removed."
+    )]
     async fn delete_run(
         &self,
         Parameters(params): Parameters<RunIdParams>,
@@ -1499,6 +1591,156 @@ impl McpServer {
         };
         match lock(&self.model).compare_runs(a, b) {
             Ok(comparison) => ok_json(&comparison),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Begin recording every command this session executes and every wall-clock poll it's given, in order, so the session can be replayed later (see stop_recording/replay_session). Errors if a recording is already in progress."
+    )]
+    async fn start_recording(&self) -> Result<CallToolResult, ErrorData> {
+        match lock(&self.model).start_recording() {
+            Ok(()) => ok_json(&serde_json::json!({ "recording": true })),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(description = "Whether a session recording is currently in progress.")]
+    async fn recording_status(&self) -> Result<CallToolResult, ErrorData> {
+        ok_json(&serde_json::json!({ "recording": lock(&self.model).is_recording() }))
+    }
+
+    #[tool(
+        description = "End the current recording and save it as a fieldcad.recording/v1 file at the given server-local path, distinct from a fieldcad.scene/v1 document — a recording is a command/poll event log, not authored world state. Errors if no recording is in progress. The path is on the machine running this server, not the calling client's filesystem."
+    )]
+    async fn stop_recording(
+        &self,
+        Parameters(params): Parameters<RecordingPathParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let recording = match lock(&self.model).stop_recording() {
+            Ok(recording) => recording,
+            Err(error) => return tool_error(error.to_string()),
+        };
+        let event_count = recording.events().len();
+        match fieldcad_scene_document::save_recording_to_path(
+            &recording,
+            std::path::Path::new(&params.path),
+        ) {
+            Ok(()) => ok_json(&serde_json::json!({ "path": params.path, "events": event_count })),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Load a fieldcad.recording/v1 file from the given server-local path and replay it into the current session, one event at a time, each fully settled before the next is issued. Replaying does not reset or construct a session first — call create_scene/open_scene beforehand to reproduce a specific historical run from a clean slate. Returns one summary entry per recorded event."
+    )]
+    async fn replay_session(
+        &self,
+        Parameters(params): Parameters<RecordingPathParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let recording = match fieldcad_scene_document::load_recording_from_path(
+            std::path::Path::new(&params.path),
+        ) {
+            Ok(recording) => recording,
+            Err(error) => return tool_error(error.to_string()),
+        };
+        let steps = match lock(&self.model).replay_recording(&recording) {
+            Ok(steps) => steps,
+            Err(error) => return tool_error(error.to_string()),
+        };
+        ok_json(&steps.iter().map(replay_step_result).collect::<Vec<_>>())
+    }
+
+    #[tool(
+        description = "Export a caller-chosen subset of this session's retained observations — probe/channel series, distance-probe series, mass-aggregate-probe series, and optionally the current field snapshot — to a fieldcad.observation-export/v1 file at the given server-local path. Distinct from save_scene: contains only what was asked for, never the authored world or plugin configuration. A named probe/channel with no recorded readings is simply absent from the result. See import_experiment to read one back."
+    )]
+    async fn export_experiment(
+        &self,
+        Parameters(params): Parameters<ExportExperimentParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let probes = match params
+            .probes
+            .into_iter()
+            .map(ProbeChannelParam::resolve)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(probes) => probes,
+            Err(error) => return tool_error(error),
+        };
+        let scope = fieldcad_server::ObservationExportScope {
+            probes,
+            distance_probes: params
+                .distance_probes
+                .into_iter()
+                .map(fieldcad_core::DistanceProbeId::new)
+                .collect(),
+            mass_aggregate_probes: params
+                .mass_aggregate_probes
+                .into_iter()
+                .map(fieldcad_core::MassAggregateProbeId::new)
+                .collect(),
+            include_latest_snapshot: params.include_latest_snapshot,
+        };
+        let export = lock(&self.model).export_observations(&scope);
+
+        if let Some(snapshot) = &export.snapshot {
+            let total_samples: usize = snapshot
+                .channels
+                .values()
+                .map(|channel| channel.sample_count())
+                .sum();
+            let limit = params.max_samples.unwrap_or(DEFAULT_MAX_SNAPSHOT_SAMPLES);
+            if total_samples > limit {
+                let mut breakdown: Vec<(String, usize)> = snapshot
+                    .channels
+                    .iter()
+                    .map(|(id, channel)| (id.to_string(), channel.sample_count()))
+                    .collect();
+                breakdown.sort_by_key(|right| std::cmp::Reverse(right.1));
+                let listed = breakdown
+                    .iter()
+                    .map(|(id, count)| format!("{id}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return tool_error(format!(
+                    "the included snapshot has {total_samples} total samples across {} \
+                     channel(s), exceeding max_samples={limit}. Largest channels: [{listed}]. \
+                     Raise max_samples, or export without include_latest_snapshot.",
+                    snapshot.channels.len()
+                ));
+            }
+        }
+
+        let probe_count = export.probe_history.series.len();
+        let distance_count = export.distance_history.series.len();
+        let mass_aggregate_count = export.mass_aggregate_history.series.len();
+        let snapshot_included = export.snapshot.is_some();
+        match fieldcad_scene_document::save_observation_export_to_path(
+            &export,
+            std::path::Path::new(&params.path),
+        ) {
+            Ok(()) => ok_json(&serde_json::json!({
+                "path": params.path,
+                "probes": probe_count,
+                "distance_probes": distance_count,
+                "mass_aggregate_probes": mass_aggregate_count,
+                "snapshot_included": snapshot_included,
+            })),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Load a fieldcad.observation-export/v1 file from the given server-local path and return its contents for local inspection — never merged into the live session."
+    )]
+    async fn import_experiment(
+        &self,
+        Parameters(params): Parameters<ImportExperimentParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match fieldcad_scene_document::load_observation_export_from_path(std::path::Path::new(
+            &params.path,
+        )) {
+            Ok(export) => ok_json(&export),
             Err(error) => tool_error(error.to_string()),
         }
     }

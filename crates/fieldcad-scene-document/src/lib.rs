@@ -29,12 +29,23 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 mod history;
+mod observation_export;
+mod recording_file;
 mod run_record;
 mod view;
 pub use history::{
     DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, MassAggregateHistoryState,
     MassAggregateReadingRecord, MassAggregateSeriesRecord, ProbeHistoryState, ProbeReadingRecord,
     ProbeSeriesRecord,
+};
+pub use observation_export::{
+    EXPORT_EXTENSION, EXPORT_FORMAT_ID, EXPORT_FORMAT_VERSION, ExportMetadata, ObservationExport,
+    ObservationExportLoadError, ObservationExportSaveError, load_observation_export_from_path,
+    save_observation_export_to_path,
+};
+pub use recording_file::{
+    RECORDING_EXTENSION, RECORDING_FORMAT_ID, RECORDING_FORMAT_VERSION, RecordingLoadError,
+    RecordingSaveError, load_recording_from_path, save_recording_to_path,
 };
 pub use run_record::{
     ConfigurationDifference, DistanceSeriesComparison, MassAggregateSeriesComparison,

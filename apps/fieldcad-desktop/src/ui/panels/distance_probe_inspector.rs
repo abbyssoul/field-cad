@@ -44,6 +44,21 @@ pub(super) fn distance_probe_properties(
     if ui.button("Open floating plot").clicked() {
         model.open_distance_probe_plot(probe.id);
     }
+    if ui
+        .button("Export…")
+        .on_hover_text(
+            "Save this distance probe's recorded history to a standalone \
+             fieldcad.observation-export/v1 file, independent of the scene.",
+        )
+        .clicked()
+    {
+        output.app_action = Some(crate::ui::AppAction::ExportObservations(
+            fieldcad_server::ObservationExportScope {
+                distance_probes: vec![probe.id],
+                ..Default::default()
+            },
+        ));
+    }
     if ui.button("Remove distance probe").clicked() {
         output.edit(vec![WorldCommand::RemoveDistanceProbe(probe.id)]);
     }

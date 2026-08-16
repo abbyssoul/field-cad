@@ -523,6 +523,70 @@ impl AsyncLocalDataSource {
         }
     }
 
+    /// Submit `command` and block until *its own* terminal outcome is known
+    /// — [`CommandEvent::Completed`]/`Failed`/`Cancelled` — rather than the
+    /// immediate `Submitted` [`Self::execute`] itself always returns.
+    ///
+    /// Blocking is deliberate, like [`Self::capture_document`]: session
+    /// replay ([`crate::recording::SessionRecording`], driven by
+    /// `fieldcad_server::HeadlessServer::replay_recording`) must fully
+    /// settle one recorded command before issuing the next or capturing an
+    /// observation, or two replays of the same recording could race against
+    /// worker-thread timing and disagree. Any other worker event received
+    /// while waiting (an unrelated command's own completion, say) is left in
+    /// place for the ordinary [`Self::drain_command_events`] to pick up —
+    /// this never removes anyone else's event, only reads and returns a copy
+    /// of the one this call is waiting for.
+    pub fn execute_blocking(&mut self, command: Command) -> Result<CommandEvent, SourceError> {
+        if self.failure.is_some() {
+            return Err(SourceError::Disconnected);
+        }
+        let command_id = command.id;
+        let initial = self.execute(command)?;
+        if initial.disposition != CommandDisposition::Submitted {
+            return Ok(CommandEvent::Completed(initial));
+        }
+        loop {
+            if let Some(event) = self
+                .command_events
+                .iter()
+                .find(|event| event.command_id() == command_id)
+            {
+                return Ok(event.clone());
+            }
+            let event = self.events.recv().map_err(|_| SourceError::Disconnected)?;
+            self.handle_worker_event(event)?;
+        }
+    }
+
+    /// Block until a poll of `elapsed` wall-clock time is fully processed by
+    /// the worker, rather than [`Self::poll`]'s non-blocking "drain whatever
+    /// already arrived, submit a new poll if idle." Same reasoning and same
+    /// caller as [`Self::execute_blocking`]: session replay needs each
+    /// recorded poll settled before the next event.
+    pub fn poll_blocking(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
+        if self.failure.is_some() {
+            return Err(SourceError::Disconnected);
+        }
+        let mut aggregate = self.drain_worker_events()?;
+        self.accumulated_elapsed = self.accumulated_elapsed.saturating_add(elapsed);
+        self.submit_poll_if_idle()?;
+        while self.poll_in_flight {
+            let event = self.events.recv().map_err(|_| SourceError::Disconnected)?;
+            if let Some(outcome) = self.handle_worker_event(event)? {
+                aggregate.snapshot_updated |= outcome.snapshot_updated;
+                aggregate.ticks_advanced = aggregate
+                    .ticks_advanced
+                    .saturating_add(outcome.ticks_advanced);
+                aggregate.commands_applied = aggregate
+                    .commands_applied
+                    .saturating_add(outcome.commands_applied);
+                aggregate.fell_behind |= outcome.fell_behind;
+            }
+        }
+        Ok(aggregate)
+    }
+
     /// Ask the worker for `object`'s current recorded history, non-blocking
     /// — the answer arrives as a `WorkerEvent::BodyHistoryCaptured`, drained
     /// on a later `drain_worker_events`/`poll` call same as any other event,
@@ -1183,5 +1247,99 @@ mod tests {
 
         request_tx.send(WorkerRequest::Stop).unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn execute_blocking_returns_the_command_s_own_terminal_outcome() {
+        use fieldcad_core::SimulationMode;
+
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        let mut sequencer = CommandSequencer::default();
+
+        let event = source
+            .execute_blocking(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        assert!(
+            matches!(event, super::CommandEvent::Completed(_)),
+            "expected a completed command, got {event:?}"
+        );
+        assert_eq!(source.simulation_status().mode(), SimulationMode::Running);
+    }
+
+    #[test]
+    fn execute_blocking_leaves_unrelated_events_for_the_ordinary_drain() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        let mut sequencer = CommandSequencer::default();
+
+        source
+            .execute_blocking(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+        // A second command, executed non-blockingly, then waited for via
+        // `execute_blocking`'s peek-and-leave contract: its own completion
+        // must still show up through the ordinary drain afterwards, proving
+        // `execute_blocking` never removed anyone else's event.
+        let command = sequencer.issue(CommandPayload::Pause);
+        let command_id = command.id;
+        source.execute_blocking(command).unwrap();
+
+        let drained = source.drain_command_events();
+        assert!(
+            drained.iter().any(|event| event.command_id() == command_id),
+            "the command's own completion must still reach the ordinary drain: {drained:?}"
+        );
+    }
+
+    #[test]
+    fn poll_blocking_settles_before_returning() {
+        let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+        let mut sequencer = CommandSequencer::default();
+        source
+            .execute_blocking(sequencer.issue(CommandPayload::Play))
+            .unwrap();
+
+        let outcome = source.poll_blocking(Duration::from_millis(50)).unwrap();
+
+        assert!(outcome.ticks_advanced > 0, "a real elapsed poll must tick");
+        assert!(
+            !source.poll_in_flight,
+            "poll_blocking must not return while a poll is still outstanding"
+        );
+    }
+
+    #[test]
+    fn replaying_a_recording_through_the_blocking_api_is_deterministic() {
+        use crate::recording::SessionRecording;
+
+        let recording = SessionRecording::new()
+            .with_command(CommandPayload::Play)
+            .with_poll(Duration::ZERO)
+            .with_command(CommandPayload::Pause)
+            .with_command(CommandPayload::Step)
+            .with_poll(Duration::ZERO);
+
+        let replay_once = |recording: &SessionRecording| {
+            let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
+            let mut sequencer = CommandSequencer::default();
+            for event in recording.events() {
+                match event {
+                    crate::recording::RecordedEvent::Command(payload) => {
+                        source
+                            .execute_blocking(sequencer.issue(payload.clone()))
+                            .unwrap();
+                    }
+                    crate::recording::RecordedEvent::Poll(elapsed) => {
+                        source.poll_blocking(*elapsed).unwrap();
+                    }
+                }
+            }
+            source.simulation_status()
+        };
+
+        let first = replay_once(&recording);
+        let second = replay_once(&recording);
+
+        assert_eq!(first, second);
+        assert_eq!(first.tick(), 1);
     }
 }

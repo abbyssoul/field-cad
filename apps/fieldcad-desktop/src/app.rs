@@ -1107,6 +1107,7 @@ impl WindowState {
         let cpu_history = self.frame_stats.cpu_history_seconds.ordered();
         let step_compute_history = self.step_compute_stats.history.ordered();
         let world = self.world.clone();
+        let is_recording = lock_model(&self.data_source).is_recording();
 
         let full_output = self.egui_context.run_ui(raw_input, |root_ui| {
             ui_frame = ui::show(
@@ -1120,6 +1121,7 @@ impl WindowState {
                     probe_history: &self.probe_history,
                     distance_history: &self.distance_history,
                     mass_aggregate_history: &self.mass_aggregate_history,
+                    is_recording,
                     adapter_name: &self.adapter_name,
                     frame_time_ms,
                     frame_history,
@@ -2222,6 +2224,63 @@ impl WindowState {
                 self.reload_catalog();
                 Ok(())
             }
+            AppAction::StartRecording => lock_model(&self.data_source)
+                .start_recording()
+                .map_err(|error| error.to_string()),
+            AppAction::StopRecording => match rfd::FileDialog::new()
+                .add_filter(
+                    "Field CAD recording",
+                    &[fieldcad_scene_document::RECORDING_EXTENSION],
+                )
+                .set_directory(self.profile.last_directory_or_home())
+                .save_file()
+            {
+                Some(path) => {
+                    let path = ensure_extension(path, fieldcad_scene_document::RECORDING_EXTENSION);
+                    lock_model(&self.data_source)
+                        .stop_recording()
+                        .map_err(|error| error.to_string())
+                        .and_then(|recording| {
+                            fieldcad_scene_document::save_recording_to_path(&recording, &path)
+                                .map_err(|error| error.to_string())
+                        })
+                }
+                None => Ok(()),
+            },
+            AppAction::ReplayRecording => match rfd::FileDialog::new()
+                .add_filter(
+                    "Field CAD recording",
+                    &[fieldcad_scene_document::RECORDING_EXTENSION],
+                )
+                .set_directory(self.profile.last_directory_or_home())
+                .pick_file()
+            {
+                Some(path) => fieldcad_scene_document::load_recording_from_path(&path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|recording| {
+                        lock_model(&self.data_source)
+                            .replay_recording(&recording)
+                            .map(|_steps| ())
+                            .map_err(|error| error.to_string())
+                    }),
+                None => Ok(()),
+            },
+            AppAction::ExportObservations(scope) => match rfd::FileDialog::new()
+                .add_filter(
+                    "Field CAD observation export",
+                    &[fieldcad_scene_document::EXPORT_EXTENSION],
+                )
+                .set_directory(self.profile.last_directory_or_home())
+                .save_file()
+            {
+                Some(path) => {
+                    let path = ensure_extension(path, fieldcad_scene_document::EXPORT_EXTENSION);
+                    let export = lock_model(&self.data_source).export_observations(&scope);
+                    fieldcad_scene_document::save_observation_export_to_path(&export, &path)
+                        .map_err(|error| error.to_string())
+                }
+                None => Ok(()),
+            },
         };
         if let Err(error) = result {
             self.ui_model.command_error = Some(error);
@@ -3305,9 +3364,18 @@ fn demo_scene_commands() -> Result<Vec<WorldCommand>, String> {
 /// so a name typed into the Save As dialog without an extension still
 /// matches Open's own extension filter afterward.
 fn ensure_scene_extension(path: PathBuf) -> PathBuf {
-    let has_extension = path.extension().is_some_and(|extension| {
-        extension.eq_ignore_ascii_case(fieldcad_scene_document::EXTENSION)
-    });
+    ensure_extension(path, fieldcad_scene_document::EXTENSION)
+}
+
+/// Not every desktop-portal backend appends the selected filter's
+/// extension to a name typed without one (behavior varies by portal
+/// implementation) — enforced here instead of trusted from the dialog, so
+/// a saved file always matches the extension its counterpart Open/Replay
+/// dialog's own filter looks for.
+fn ensure_extension(path: PathBuf, extension: &str) -> PathBuf {
+    let has_extension = path
+        .extension()
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(extension));
     if has_extension {
         path
     } else {
@@ -3316,7 +3384,7 @@ fn ensure_scene_extension(path: PathBuf) -> PathBuf {
             .map(|name| name.to_os_string())
             .unwrap_or_default();
         name.push(".");
-        name.push(fieldcad_scene_document::EXTENSION);
+        name.push(extension);
         path.with_file_name(name)
     }
 }

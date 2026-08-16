@@ -8,19 +8,24 @@
 use std::time::Duration;
 
 use fieldcad_core::{SnapshotIdentity, WorldSnapshot};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     CommandPayload, CommandReceipt, CommandSequencer, FieldDataSource, FieldSystemStatus,
     PlaybackSpeed, PollOutcome, SimulationStatus, SourceError,
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RecordedEvent {
     Command(CommandPayload),
     Poll(Duration),
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+/// `Serialize`/`Deserialize` so a recording can be written to and read back
+/// from a file — see `fieldcad_server::HeadlessServer::{start_recording,
+/// stop_recording, replay_recording}` and
+/// `docs/tasks/session-recording-and-replay.md`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecording {
     events: Vec<RecordedEvent>,
 }

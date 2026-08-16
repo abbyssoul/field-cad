@@ -65,6 +65,30 @@ pub fn menu_bar(
                     ui.close();
                 }
                 ui.separator();
+                if frame.is_recording {
+                    if ui.button("Stop Recording…").clicked() {
+                        output.app_action = Some(AppAction::StopRecording);
+                        ui.close();
+                    }
+                } else if ui
+                    .add_enabled(file_actions_enabled, egui::Button::new("Start Recording"))
+                    .on_hover_text(
+                        "Record every command this session executes and every wall-clock \
+                         poll it's given, so it can be replayed later.",
+                    )
+                    .clicked()
+                {
+                    output.app_action = Some(AppAction::StartRecording);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(file_actions_enabled, egui::Button::new("Replay Recording…"))
+                    .clicked()
+                {
+                    output.app_action = Some(AppAction::ReplayRecording);
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Reload Catalog").clicked() {
                     output.app_action = Some(AppAction::ReloadCatalog);
                     ui.close();
@@ -169,6 +193,10 @@ pub fn menu_bar(
 
             ui.separator();
             state_badge(ui, frame.compute.workbench_state());
+            if frame.is_recording {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "● Recording")
+                    .on_hover_text("Every command and wall-clock poll is being recorded.");
+            }
             if frame.paused_for_edit {
                 ui.colored_label(egui::Color32::from_rgb(235, 190, 75), "⏸ paused for edit")
                     .on_hover_text(

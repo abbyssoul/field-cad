@@ -345,8 +345,7 @@ mod tests {
     fn a_plugin_only_present_in_one_run_is_reported_as_a_difference() {
         let a = record("run-a", 0, 1.0);
         let mut b = record("run-b", 1, 1.0);
-        b.field_systems
-            .push(field_system("extra-plugin", 1.0));
+        b.field_systems.push(field_system("extra-plugin", 1.0));
 
         let comparison = compare_run_records(&a, &b);
 

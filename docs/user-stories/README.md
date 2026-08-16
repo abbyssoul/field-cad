@@ -443,7 +443,7 @@ experiment.
 | Simulation control | `get_simulation_status`, `play`, `pause`, `step`, `set_time_step`, `set_playback_speed` |
 | Observation | `set_subscription`, `get_latest_snapshot`, `sample_field`, `get_probe_history`, `get_trajectory`, `get_diagnostics` |
 | Events | `watch_session` for snapshot/status/diagnostic/queued-command-completion events |
-| Reproducibility | `get_history`, `undo`, `redo`, `save_run`, `list_runs`, `get_run`, `delete_run`, `compare_runs`, `record_session`, `replay_session`, `export_experiment` |
+| Reproducibility | `get_history`, `undo`, `redo`, `save_run`, `list_runs`, `get_run`, `delete_run`, `compare_runs`, `start_recording`, `stop_recording`, `recording_status`, `replay_session`, `export_experiment`, `import_experiment` |
 
 The existing `CommitWorld`, field-system, transport, and snapshot abstractions
 are a useful starting point for this surface. Scene lifecycle, configuration

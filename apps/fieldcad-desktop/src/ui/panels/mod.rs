@@ -311,6 +311,7 @@ mod tests {
                             probe_history: &history,
                             distance_history: &distance_history,
                             mass_aggregate_history: &mass_aggregate_history,
+                            is_recording: false,
                             adapter_name: "Test adapter",
                             frame_time_ms: 16.0,
                             active_translation: None,

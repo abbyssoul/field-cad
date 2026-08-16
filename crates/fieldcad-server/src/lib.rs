@@ -248,6 +248,15 @@ pub struct HeadlessServer {
     /// [`fieldcad_scene_document::RunRecord`] and
     /// `docs/tasks/run-records-and-comparison.md`.
     run_records: Vec<RunRecord>,
+    /// `Some` while a session recording is in progress — see
+    /// [`Self::start_recording`]. Every command [`Self::execute`] submits
+    /// and every wall-clock elapsed [`Self::advance`] is given while this is
+    /// `Some` is appended to it, in order — the same two event kinds
+    /// [`fieldcad_simulation::recording::SessionRecording`] already models.
+    /// Replay (`Self::replay_recording`) never touches this field: replaying
+    /// a recording into a session that happens to itself be recording is not
+    /// captured back into that recording.
+    recording: Option<fieldcad_simulation::recording::SessionRecording>,
 }
 
 impl HeadlessServer {
@@ -270,6 +279,7 @@ impl HeadlessServer {
             distance_history: DistanceHistory::default(),
             mass_aggregate_history: MassAggregateHistory::default(),
             run_records: Vec::new(),
+            recording: None,
         };
         server.reload_catalog();
         server
@@ -766,6 +776,9 @@ impl HeadlessServer {
     /// for a transport that tracks its own client-issued ids rather than
     /// this server's sequencer.
     pub fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {
+        if let Some(recording) = &mut self.recording {
+            recording.record_command(command.payload.clone());
+        }
         let receipt = self.source.execute(command)?;
         self.publish();
         Ok(receipt)
@@ -796,6 +809,18 @@ impl HeadlessServer {
     /// (a run loop, a timer) — the numerical `dt` is the model's own
     /// business and never changes to compensate for a slow caller.
     pub fn advance(&mut self, elapsed: Duration) -> Result<PollOutcome, SourceError> {
+        // A zero-duration poll is a "did anything land yet" check, not a
+        // moment of simulated time worth replaying — every transport's own
+        // wait-for-completion loop (see `submit_and_wait` in this crate's
+        // and `fieldcad-mcp`'s tests/tool handlers) calls `advance(ZERO)`
+        // many times per command while waiting, which would otherwise flood
+        // a recording with noise entries that replay identically as no-ops
+        // anyway.
+        if elapsed > Duration::ZERO
+            && let Some(recording) = &mut self.recording
+        {
+            recording.record_poll(elapsed);
+        }
         let outcome = self.source.poll(elapsed)?;
         self.publish();
         Ok(outcome)
@@ -1014,6 +1039,14 @@ impl HeadlessServer {
         self.distance_history = DistanceHistory::default();
         self.mass_aggregate_history = MassAggregateHistory::default();
         self.run_records.clear();
+        // An in-progress recording captured commands against the session
+        // being replaced; appending post-replace commands to it would
+        // describe a session that never actually existed as one continuous
+        // run. Silently ending it (rather than erroring) matches this
+        // method's existing "run-scoped session state resets" precedent
+        // above — a caller that wanted the partial recording should have
+        // called `stop_recording` before replacing the session.
+        self.recording = None;
         self.reload_catalog();
         self.publish();
     }
@@ -1099,12 +1132,183 @@ impl HeadlessServer {
         let b = self.run_record(b).ok_or(RunRecordError::NotFound(b))?;
         Ok(fieldcad_scene_document::compare_run_records(a, b))
     }
+
+    /// Export a caller-scoped subset of this session's retained
+    /// observations — see [`ObservationExportScope`] and
+    /// `docs/tasks/observation-export.md`. Pure and infallible: a probe or
+    /// channel named in the scope with no recorded readings is simply
+    /// absent from the result (same discipline as
+    /// `history_capture::capture_probe_series`), and
+    /// `include_latest_snapshot` with no snapshot published yet just yields
+    /// `snapshot: None`, not an error. A caller wanting a hard guarantee
+    /// that specific data exists should check the result rather than rely
+    /// on this to fail.
+    pub fn export_observations(
+        &self,
+        scope: &ObservationExportScope,
+    ) -> fieldcad_scene_document::ObservationExport {
+        let probe_history = fieldcad_scene_document::ProbeHistoryState {
+            series: scope
+                .probes
+                .iter()
+                .filter_map(|(probe, channel)| {
+                    history_capture::capture_probe_series(&self.probe_history, *probe, channel)
+                })
+                .collect(),
+        };
+        let distance_history = fieldcad_scene_document::DistanceHistoryState {
+            series: scope
+                .distance_probes
+                .iter()
+                .filter_map(|probe| {
+                    history_capture::capture_distance_series(&self.distance_history, *probe)
+                })
+                .collect(),
+        };
+        let mass_aggregate_history = fieldcad_scene_document::MassAggregateHistoryState {
+            series: scope
+                .mass_aggregate_probes
+                .iter()
+                .filter_map(|probe| {
+                    history_capture::capture_mass_aggregate_series(
+                        &self.mass_aggregate_history,
+                        *probe,
+                    )
+                })
+                .collect(),
+        };
+        let snapshot = scope
+            .include_latest_snapshot
+            .then(|| self.latest_snapshot())
+            .flatten()
+            .map(|snapshot| (*snapshot).clone());
+        fieldcad_scene_document::ObservationExport::capture(
+            concat!("fieldcad-server/", env!("CARGO_PKG_VERSION")),
+            probe_history,
+            distance_history,
+            mass_aggregate_history,
+            snapshot,
+        )
+    }
+
+    /// Begin recording every command [`Self::execute`] submits and every
+    /// wall-clock elapsed [`Self::advance`] is given, in order — see the
+    /// `recording` field doc. Errors if a recording is already in progress;
+    /// call [`Self::stop_recording`] first.
+    pub fn start_recording(&mut self) -> Result<(), RecordingError> {
+        if self.recording.is_some() {
+            return Err(RecordingError::AlreadyRecording);
+        }
+        self.recording = Some(fieldcad_simulation::recording::SessionRecording::new());
+        Ok(())
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// End the current recording and return it — a caller persists it (see
+    /// `fieldcad_scene_document::save_to_path`'s atomic-write pattern for
+    /// the convention a recording file should follow) or replays it
+    /// immediately via [`Self::replay_recording`]. Errors if no recording is
+    /// in progress.
+    pub fn stop_recording(
+        &mut self,
+    ) -> Result<fieldcad_simulation::recording::SessionRecording, RecordingError> {
+        self.recording.take().ok_or(RecordingError::NotRecording)
+    }
+
+    /// Replay a recording into *this* session, one event at a time, each
+    /// fully settled (via [`AsyncLocalDataSource::execute_blocking`]/
+    /// `poll_blocking`) before the next is issued or an observation is
+    /// captured — see those methods' doc comments for why a blocking round
+    /// trip is required for replay to be reproducible on this async
+    /// transport. A caller wanting to reproduce a specific historical run
+    /// from a clean slate should `create_scene`/`open_scene` (or otherwise
+    /// arrange the desired starting configuration) before calling this;
+    /// replay itself never resets or constructs a session.
+    ///
+    /// Never captured back into an active recording — see the `recording`
+    /// field doc.
+    pub fn replay_recording(
+        &mut self,
+        recording: &fieldcad_simulation::recording::SessionRecording,
+    ) -> Result<Vec<ReplayStep>, SourceError> {
+        let mut observations = Vec::with_capacity(recording.events().len());
+        for (event_index, event) in recording.events().iter().enumerate() {
+            let (command_event, poll) = match event {
+                fieldcad_simulation::recording::RecordedEvent::Command(payload) => {
+                    let command = self.sequencer.issue(payload.clone());
+                    let event = self.source.execute_blocking(command)?;
+                    self.publish();
+                    (Some(event), None)
+                }
+                fieldcad_simulation::recording::RecordedEvent::Poll(elapsed) => {
+                    let outcome = self.source.poll_blocking(*elapsed)?;
+                    self.publish();
+                    (None, Some(outcome))
+                }
+            };
+            observations.push(ReplayStep {
+                event_index,
+                command_event,
+                poll,
+                simulation: self.simulation_status(),
+                field_systems: self.field_systems(),
+                world: self.world(),
+                snapshot: self.latest_snapshot().map(|snapshot| snapshot.identity),
+            });
+        }
+        Ok(observations)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecordingError {
+    #[error("a session recording is already in progress")]
+    AlreadyRecording,
+    #[error("no session recording is in progress")]
+    NotRecording,
+}
+
+/// Observable session state right after replaying one recorded event —
+/// deliberately parallel to
+/// [`fieldcad_simulation::recording::ReplayObservation`], but reporting a
+/// [`fieldcad_simulation::CommandEvent`] (a command's actual terminal
+/// outcome) rather than that type's `Option<CommandReceipt>` (an
+/// immediate, possibly still-`Submitted` receipt) — the async transport
+/// this crate replays over has no synchronous "applied" outcome to report
+/// at submission time, only a receipt to poll or block for; see
+/// `AsyncLocalDataSource::execute_blocking`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplayStep {
+    pub event_index: usize,
+    pub command_event: Option<CommandEvent>,
+    pub poll: Option<PollOutcome>,
+    pub simulation: SimulationStatus,
+    pub field_systems: Vec<FieldSystemStatus>,
+    pub world: WorldSnapshot,
+    pub snapshot: Option<fieldcad_core::SnapshotIdentity>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunRecordError {
     #[error("no retained run record with id {0}")]
     NotFound(uuid::Uuid),
+}
+
+/// A caller-chosen selection of this session's retained observations to
+/// export — see [`HeadlessServer::export_observations`]. An empty scope
+/// (the `Default`) exports nothing but the file's own metadata: a caller
+/// always names exactly what it wants, there is no "everything" shorthand,
+/// which is what keeps an export from ever accidentally emitting more than
+/// asked for.
+#[derive(Clone, Debug, Default)]
+pub struct ObservationExportScope {
+    pub probes: Vec<(fieldcad_core::ProbeId, fieldcad_core::ChannelId)>,
+    pub distance_probes: Vec<fieldcad_core::DistanceProbeId>,
+    pub mass_aggregate_probes: Vec<fieldcad_core::MassAggregateProbeId>,
+    pub include_latest_snapshot: bool,
 }
 
 impl FieldDataSource for HeadlessServer {
@@ -1298,7 +1502,10 @@ mod tests {
         let record = server.save_run("baseline".to_owned());
 
         assert_eq!(record.name, "baseline");
-        assert_eq!(record.run_generation, server.simulation_status().run_generation);
+        assert_eq!(
+            record.run_generation,
+            server.simulation_status().run_generation
+        );
         assert_eq!(record.domain, server.source.domain());
         assert!(
             record

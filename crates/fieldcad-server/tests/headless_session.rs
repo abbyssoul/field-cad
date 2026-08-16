@@ -118,5 +118,147 @@ fn save_run_retains_a_copy_of_recorded_probe_history() {
         !record.probe_history.series.is_empty(),
         "server-side history should have recorded the field probe's reading after a step"
     );
-    assert_eq!(record.run_generation, server.simulation_status().run_generation);
+    assert_eq!(
+        record.run_generation,
+        server.simulation_status().run_generation
+    );
+}
+
+#[test]
+fn a_recorded_session_replays_through_the_server_level_api() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+
+    server.start_recording().expect("recording starts");
+    submit_and_wait(&mut server, CommandPayload::CommitWorld(charge_and_probe()));
+    submit_and_wait(&mut server, CommandPayload::Step);
+    submit_and_wait(&mut server, CommandPayload::Step);
+    let recording = server.stop_recording().expect("recording stops");
+    assert_eq!(recording.events().len(), 3);
+
+    // Replay into two independent fresh sessions and require the same
+    // final observable state — the server-level equivalence property
+    // `recording.rs`'s own synchronous-source tests establish, reproduced
+    // here over the async transport this crate actually runs on.
+    let replay_into_fresh_session =
+        |recording: &fieldcad_simulation::recording::SessionRecording| {
+            let source = fieldcad_server::default_session().expect("default session builds");
+            let mut server = HeadlessServer::new(source);
+            server.replay_recording(recording).expect("replay succeeds")
+        };
+
+    let first = replay_into_fresh_session(&recording);
+    let second = replay_into_fresh_session(&recording);
+
+    assert_eq!(first.len(), 3);
+    assert_eq!(
+        first, second,
+        "replaying the same recording twice must agree"
+    );
+    let final_step = first.last().unwrap();
+    assert_eq!(final_step.simulation.tick(), 2);
+    assert!(matches!(
+        final_step.command_event,
+        Some(CommandEvent::Completed(_))
+    ));
+    assert!(
+        !final_step.world.objects().is_empty(),
+        "the replayed CommitWorld must have actually authored the charge/probe"
+    );
+}
+
+#[test]
+fn starting_a_recording_twice_is_a_structured_error() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+
+    server.start_recording().unwrap();
+    let error = server.start_recording().unwrap_err();
+
+    assert!(matches!(
+        error,
+        fieldcad_server::RecordingError::AlreadyRecording
+    ));
+}
+
+#[test]
+fn stopping_a_recording_that_never_started_is_a_structured_error() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+
+    let error = server.stop_recording().unwrap_err();
+
+    assert!(matches!(
+        error,
+        fieldcad_server::RecordingError::NotRecording
+    ));
+}
+
+fn commit_charge_and_probe(server: &mut HeadlessServer) -> fieldcad_core::ProbeId {
+    let authored = submit_and_wait(server, CommandPayload::CommitWorld(charge_and_probe()));
+    let CommandEvent::Completed(receipt) = authored else {
+        panic!("expected the authoring commit to complete: {authored:?}")
+    };
+    let probe = receipt.created.created_probes[0];
+    submit_and_wait(server, CommandPayload::Step);
+    probe
+}
+
+#[test]
+fn export_observations_includes_only_the_requested_probe_and_channel() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    let probe = commit_charge_and_probe(&mut server);
+    let channel = electric_field_channel_id();
+
+    let scope = fieldcad_server::ObservationExportScope {
+        probes: vec![(probe, channel.clone())],
+        ..Default::default()
+    };
+    let export = server.export_observations(&scope);
+
+    assert_eq!(export.probe_history.series.len(), 1);
+    assert_eq!(export.probe_history.series[0].probe, probe);
+    assert_eq!(export.probe_history.series[0].channel, channel);
+    assert!(!export.probe_history.series[0].readings.is_empty());
+    assert!(export.distance_history.series.is_empty());
+    assert!(export.mass_aggregate_history.series.is_empty());
+    assert!(export.snapshot.is_none());
+}
+
+#[test]
+fn export_observations_never_includes_an_unrequested_probe() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    commit_charge_and_probe(&mut server);
+
+    // An empty scope names nothing — there is no "everything" shorthand, so
+    // a session with real recorded readings must still export nothing when
+    // asked for nothing.
+    let export = server.export_observations(&fieldcad_server::ObservationExportScope::default());
+
+    assert!(export.probe_history.series.is_empty());
+    assert!(export.distance_history.series.is_empty());
+    assert!(export.mass_aggregate_history.series.is_empty());
+}
+
+#[test]
+fn exported_probe_history_round_trips_through_a_file_bit_for_bit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("observations.fcobservation");
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    let probe = commit_charge_and_probe(&mut server);
+    let channel = electric_field_channel_id();
+    let scope = fieldcad_server::ObservationExportScope {
+        probes: vec![(probe, channel)],
+        ..Default::default()
+    };
+    let export = server.export_observations(&scope);
+
+    fieldcad_scene_document::save_observation_export_to_path(&export, &path).unwrap();
+    let restored = fieldcad_scene_document::load_observation_export_from_path(&path).unwrap();
+
+    assert_eq!(restored.probe_history, export.probe_history);
+    assert_eq!(restored.format, fieldcad_scene_document::EXPORT_FORMAT_ID);
 }

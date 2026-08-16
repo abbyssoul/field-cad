@@ -77,6 +77,21 @@ pub(super) fn mass_aggregate_probe_properties(
     if ui.button("Focus selection  [F]").clicked() {
         output.camera_action = Some(CameraAction::FocusSelection);
     }
+    if ui
+        .button("Export…")
+        .on_hover_text(
+            "Save this center-of-mass probe's recorded history to a standalone \
+             fieldcad.observation-export/v1 file, independent of the scene.",
+        )
+        .clicked()
+    {
+        output.app_action = Some(crate::ui::AppAction::ExportObservations(
+            fieldcad_server::ObservationExportScope {
+                mass_aggregate_probes: vec![probe.id],
+                ..Default::default()
+            },
+        ));
+    }
     if ui.button("Remove center of mass").clicked() {
         output.edit(vec![WorldCommand::RemoveMassAggregateProbe(probe.id)]);
     }
