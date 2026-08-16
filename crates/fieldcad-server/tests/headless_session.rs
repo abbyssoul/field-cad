@@ -243,6 +243,50 @@ fn export_observations_never_includes_an_unrequested_probe() {
 }
 
 #[test]
+fn a_run_generation_reset_clears_server_side_observation_histories() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    let probe = commit_charge_and_probe(&mut server);
+    let channel = electric_field_channel_id();
+    let before_count = server.probe_history().readings(probe, &channel).count();
+    assert!(
+        before_count >= 2,
+        "the initial commit and the step must each have published a reading: {before_count}"
+    );
+    let generation_before = server.simulation_status().run_generation;
+
+    // A coarser domain (same extent, fewer cells) raises the Courant limit,
+    // so the session's existing time step stays valid — this only needs to
+    // trigger a numerical run reset, not actually change resolution
+    // meaningfully.
+    let coarser = fieldcad_core::Domain::centred_cube(5.0, 16).unwrap();
+    let reconfigured = submit_and_wait(&mut server, CommandPayload::ReconfigureDomain(coarser));
+    assert!(
+        matches!(reconfigured, CommandEvent::Completed(_)),
+        "reconfiguring the domain must succeed: {reconfigured:?}"
+    );
+    assert!(
+        server.simulation_status().run_generation > generation_before,
+        "a domain reconfiguration must bump run_generation"
+    );
+
+    // Reconfiguring publishes a fresh tick-0 snapshot for the new run, so
+    // the probe legitimately gets one new reading right away — but it must
+    // be the *only* one: the prior run's tick-1 reading must be gone, not
+    // sitting alongside it as if both belonged to the same series.
+    let after: Vec<_> = server.probe_history().readings(probe, &channel).collect();
+    assert_eq!(
+        after.len(),
+        1,
+        "a run-generation reset must discard every reading from the prior run: {after:?}"
+    );
+    assert_eq!(
+        after[0].tick, 0,
+        "the sole remaining reading must be the new run's own tick-0 publish, not the old tick-1 one"
+    );
+}
+
+#[test]
 fn exported_probe_history_round_trips_through_a_file_bit_for_bit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("observations.fcobservation");

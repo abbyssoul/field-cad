@@ -244,6 +244,12 @@ pub struct HeadlessServer {
     probe_history: ProbeHistory,
     distance_history: DistanceHistory,
     mass_aggregate_history: MassAggregateHistory,
+    /// The `run_generation` these three histories were last recorded
+    /// against — see [`Self::record_observations`]. A mismatch against the
+    /// session's current `run_generation` means a domain/field-system
+    /// reconfiguration happened since the last publish, and every reading
+    /// held so far belongs to a numerical run that no longer exists.
+    observed_run_generation: u64,
     /// Named, retained run records for the current scene — see
     /// [`fieldcad_scene_document::RunRecord`] and
     /// `docs/tasks/run-records-and-comparison.md`.
@@ -268,6 +274,7 @@ impl HeadlessServer {
     /// to share their normal user configuration directory without letting a
     /// transport choose arbitrary filesystem locations.
     pub fn with_catalog_root(source: AsyncLocalDataSource, root: Option<PathBuf>) -> Self {
+        let observed_run_generation = source.simulation_status().run_generation;
         let mut server = Self {
             source,
             catalog: CatalogSession::new(root),
@@ -278,6 +285,7 @@ impl HeadlessServer {
             probe_history: ProbeHistory::default(),
             distance_history: DistanceHistory::default(),
             mass_aggregate_history: MassAggregateHistory::default(),
+            observed_run_generation,
             run_records: Vec::new(),
             recording: None,
         };
@@ -858,7 +866,25 @@ impl HeadlessServer {
     /// since the last publish — see the `probe_history` field doc and
     /// `apps/fieldcad-desktop/src/app.rs`'s identical per-frame prune for
     /// the client-local case this mirrors.
+    ///
+    /// A domain/field-system reconfiguration (`reconfigure_domain`,
+    /// `set_field_system_configuration`) bumps `run_generation` and
+    /// restarts the numerical run from `t = 0` without going through
+    /// `replace_source` — `SimulationRuntime` clears its own `body_history`
+    /// at exactly those two call sites for the same reason. This is the
+    /// server-side histories' equivalent: a jump in `run_generation` since
+    /// the last publish means every reading recorded so far belongs to a
+    /// numerical run that no longer exists, so it is discarded before this
+    /// publish's own snapshot (if any) is recorded — otherwise a run reset
+    /// mid-session would silently mix two runs' readings into one series.
     fn record_observations(&mut self) {
+        let run_generation = self.simulation_status().run_generation;
+        if run_generation != self.observed_run_generation {
+            self.probe_history.clear();
+            self.distance_history.clear();
+            self.mass_aggregate_history.clear();
+            self.observed_run_generation = run_generation;
+        }
         if let Some(snapshot) = self.source.latest_snapshot() {
             self.probe_history.record(&snapshot);
             self.distance_history.record(&snapshot);
@@ -1038,6 +1064,7 @@ impl HeadlessServer {
         self.probe_history = ProbeHistory::default();
         self.distance_history = DistanceHistory::default();
         self.mass_aggregate_history = MassAggregateHistory::default();
+        self.observed_run_generation = self.source.simulation_status().run_generation;
         self.run_records.clear();
         // An in-progress recording captured commands against the session
         // being replaced; appending post-replace commands to it would

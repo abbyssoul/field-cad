@@ -1,5 +1,145 @@
 # Task: authoritative probe histories and object trajectories
 
+## Status: partially done (2026-08-16) — see "Remaining work" below
+
+**What's already in place, and where it came from:**
+
+- **Probe/distance/mass-aggregate histories are authoritative**, not
+  desktop-only. `HeadlessServer::{probe_history, distance_history,
+  mass_aggregate_history}` (`crates/fieldcad-server/src/lib.rs`) are fed
+  from every published snapshot in `record_observations` (called from
+  `publish`), pruned of deleted probes, and used by `save_run`
+  (`docs/tasks/run-records-and-comparison.md`) and `export_observations`
+  (`docs/tasks/observation-export.md`). This satisfies most of "Move bounded
+  probe-history recording to the authoritative source/session boundary."
+- **Deduplication by snapshot sequence** and **removal of deleted probes'
+  histories** both already work — inherited from
+  `fieldcad_simulation::{ProbeHistory, DistanceHistory,
+  MassAggregateHistory}`'s own `record`/`retain_probes`, unchanged by this
+  work.
+- **Run-generation reset now clears server-side histories** (fixed
+  2026-08-16): `record_observations` compares the session's current
+  `run_generation` against `observed_run_generation` and clears all three
+  histories on a mismatch, before recording the reset's own fresh publish.
+  Previously only `replace_source` (a whole new/loaded session) cleared
+  them — a mid-session `reconfigure_domain`/`set_field_system_configuration`
+  left stale readings from the discarded run sitting in the same series as
+  the new run's readings. Regression test:
+  `a_run_generation_reset_clears_server_side_observation_histories`
+  (`crates/fieldcad-server/tests/headless_session.rs`).
+- **Object trajectories are already fully authoritative** —
+  `fieldcad_simulation::BodyHistory`, owned directly by `SimulationRuntime`
+  (`crates/fieldcad-simulation/src/runtime.rs`), populated inside
+  `apply_tick`. Bounded (`DEFAULT_BODY_HISTORY = 2048`), with per-object
+  capacity override (`set_capacity`), pruned on object deletion
+  (`retain_objects`, `runtime.rs:1747`), and cleared on every run-generation
+  reset (`runtime.rs:877,1389,1676`). This appears to predate this session's
+  work entirely — the "Object trajectories" section of this task's
+  "Required model behavior" is done, just not exposed over MCP (see below).
+
+## Remaining work
+
+1. **Field-probe `history_capacity` isn't honored server-side.**
+   `ProbeSpec.history_capacity` (`crates/fieldcad-core/src/world.rs:853`) is
+   a real per-probe declared field, but `HeadlessServer.probe_history` uses
+   one uniform `ProbeHistory::default()` capacity (2048) for every probe —
+   exactly "an unrelated client-selected buffer size," which this task's
+   "Required model behavior" says not to do. `ProbeHistory` itself has no
+   per-key capacity override today (unlike `BodyHistory`, which already
+   supports one via `set_capacity`/an internal `capacities` map). Fix
+   options, in order of how closely they follow existing precedent:
+   - Add a `ProbeHistory::set_capacity(probe, channel, capacity)` mirroring
+     `BodyHistory::set_capacity` exactly, then have `HeadlessServer` read
+     each probe's `history_capacity` off the world and call it whenever a
+     probe is created/edited (watch `WorldCommand::CreateProbe` and any
+     future "set probe history capacity" command) — most faithful to the
+     task's letter, moderate-sized change to `fieldcad-simulation`.
+   - Note distance-probe and mass-aggregate-probe specs have **no** declared
+     `history_capacity` field (checked: `DistanceProbeSpec`,
+     `MassAggregateProbeSpec` in `world.rs` have none) — this gap is
+     field-probe-only.
+2. **No MCP read tools for any of this.** `get_probe_history`,
+   `get_trajectory`, and `list_recorded_observations` (all named in this
+   task's "Server and MCP interface") don't exist. Needed:
+   - `HeadlessServer::probe_history(probe, channel)`/`distance_history(probe)`/
+     `mass_aggregate_history(probe)` single-series reads — the underlying
+     `&ProbeHistory`/etc. accessors already exist
+     (`HeadlessServer::probe_history()` etc., added for `save_run`); a
+     single-series read is a thin wrapper (`history.readings(probe,
+     channel).collect()`), similar in shape to
+     `history_capture::capture_probe_series` already written for
+     `export_observations`.
+   - A **blocking** trajectory read. `HeadlessServer::request_body_history`/
+     `body_history(object)` already exist but are a fire-and-forget-request-
+     then-poll-drains-a-cache pair, designed for the desktop's per-frame
+     polling loop — wrong shape for a synchronous one-shot MCP tool call
+     (there's no event to wait on; the result just eventually appears in a
+     cache after enough `advance(ZERO)` calls). Add
+     `AsyncLocalDataSource::body_history_blocking(object) -> Vec<BodySample>`
+     following the exact `capture_document`/`execute_blocking`/
+     `poll_blocking` pattern (`crates/fieldcad-simulation/src/
+     async_source.rs`) — send the request, block on `self.events.recv()`
+     until `WorkerEvent::BodyHistoryCaptured` for that object arrives,
+     applying any other event encountered along the way exactly like those
+     three already do.
+   - MCP tools: `get_probe_history(probe, channel)`, `get_distance_history(probe)`,
+     `get_mass_aggregate_history(probe)` (three, or one tagged-enum tool —
+     match whichever shape `list_runs`/`save_run` already established feels
+     more consistent with), `get_trajectory(object)`, and
+     `list_recorded_observations` (every history type already has a
+     `tracked()` method — `ProbeHistory::tracked()`,
+     `DistanceHistory::tracked()`, `MassAggregateHistory::tracked()`,
+     `BodyHistory::tracked()` — reporting which series actually have
+     retained readings right now, without a caller having to guess IDs via
+     `get_world` first).
+   - Per this task's own requirement: "a missing series is an empty result,
+     not an error; an invalid entity/channel identifier is a structured tool
+     error" — validate the id/channel against the live world
+     (`get_world`'s own objects/probes) before returning, same as every
+     other MCP tool's id-resolution convention.
+3. **Desktop still duplicates the recording client-side.** `app.rs`'s
+   `self.probe_history`/`self.distance_history`/`self.mass_aggregate_history`
+   (fed by polling snapshots in the render loop,
+   `apps/fieldcad-desktop/src/probe_history_state.rs`) are now redundant
+   with the server-side copy `HeadlessServer` maintains — both are fed by
+   the same snapshots, just on different cadences. This task's own
+   "Relevant code" section names `app.rs`'s recorder for "remove or adapt."
+   Given the desktop is a synchronous, same-process caller of
+   `HeadlessServer`, the client-local copy could be dropped entirely in
+   favor of reading `HeadlessServer::probe_history()`/etc. directly each
+   frame — but this needs care: `FrameContext.probe_history` currently
+   passes `&ProbeHistory` by reference into every history-plotting panel,
+   and switching the source changes nothing about that shape, only where
+   the desktop code populates the field from wall-clock-cheap reads instead
+   of its own accumulation loop. Do this last, after the MCP reads above
+   land and are exercised — it's a pure simplification, not a new
+   capability, and safest done once the authoritative side has more mileage
+   on it.
+4. **Recorder lives in `HeadlessServer`, not a transport-neutral boundary**
+   (architecture constraint: "prefer a transport-neutral recorder interface
+   if placing it solely in `HeadlessServer` would diverge from
+   [local/async/loopback/remote] semantics"). A bare `LocalDataSource`/
+   `AsyncLocalDataSource` consumer without `HeadlessServer` gets no
+   authoritative probe/distance/mass-aggregate history today (though it
+   *does* get authoritative trajectories, since `BodyHistory` lives on
+   `SimulationRuntime` itself, one layer lower). In this codebase
+   `HeadlessServer` is the only real session owner every transport (desktop,
+   MCP) actually goes through, so this is likely acceptable as-is — flagging
+   it rather than prescribing a fix, since moving the recorder down to
+   `SimulationRuntime`/`LocalDataSource` would be a real architecture change,
+   not a small addition, and nothing in this codebase today needs
+   authoritative probe history from a bare `LocalDataSource`.
+
+## Suggested order
+
+(1) is the only correctness/fidelity gap with no MCP dependency — do it
+first if picked up in isolation. (2) is the bulk of the remaining task and
+should land as one pass (all three MCP tools + the blocking trajectory
+primitive together, mirroring how P1-6/P1-7/P1-8 each landed server+MCP+
+tests together). (3) depends on (2) existing and being trustworthy. (4) is a
+documented trade-off, not planned work, unless a concrete need for a bare
+transport-neutral consumer shows up.
+
 ## Goal
 
 Make time-series observations authoritative session data rather than a
