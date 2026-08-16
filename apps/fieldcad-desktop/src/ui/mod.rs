@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcad_core::{
     BoundaryConditions, BoxId, ChannelId, DistanceProbeId, Domain, DomainBounds,
-    MassAggregateProbeId, ObjectId, PlaneId, Precision, ProbeId, Resolution, SphereId,
-    WorldCommand, WorldSnapshot,
+    MassAggregateProbeId, ObjectId, PlaneId, PluginId, Precision, ProbeId, PropertyBag, Resolution,
+    SphereId, WorldCommand, WorldSnapshot,
 };
 use fieldcad_simulation::{CommandPayload, DistanceHistory, MassAggregateHistory, ProbeHistory};
 use glam::{DVec3, UVec3};
@@ -286,6 +286,11 @@ pub struct UiModel {
     /// crossing a domain change), the staged values are stale by definition
     /// and the draft is reseeded (see [`UiModel::domain_draft_for`]).
     pub domain_draft: Option<DomainDraft>,
+    /// Staged, per-plugin field-system configuration edits — same reasoning
+    /// as `domain_draft`: independent of the authoritative value until
+    /// applied, reseeded when the authoritative configuration moves out of
+    /// band (see [`UiModel::field_system_configuration_draft_for`]).
+    pub field_system_configuration_drafts: BTreeMap<PluginId, FieldSystemConfigurationDraft>,
     /// Whether the MCP panel is shown. Independent of whether the embedded
     /// server is actually running (`crate::mcp::McpSession`, read-only from
     /// here) — this only controls the panel's visibility, the way
@@ -368,6 +373,7 @@ impl UiModel {
             object_trajectories: BTreeMap::new(),
             command_error: None,
             domain_draft: None,
+            field_system_configuration_drafts: BTreeMap::new(),
             mcp_panel_open: false,
             queue_panel_open: false,
             settings_visible: false,
@@ -455,6 +461,34 @@ impl UiModel {
         self.domain_draft
             .as_mut()
             .expect("seeded immediately above when absent or stale")
+    }
+
+    /// The staged configuration edit for one plugin, kept only while the
+    /// authoritative configuration it was staged against is unchanged — same
+    /// reasoning as `domain_draft_for`.
+    pub fn field_system_configuration_draft_for(
+        &mut self,
+        plugin: &PluginId,
+        authoritative: &PropertyBag,
+    ) -> &mut PropertyBag {
+        let stale = match self.field_system_configuration_drafts.get(plugin) {
+            Some(draft) => &draft.base != authoritative,
+            None => true,
+        };
+        if stale {
+            self.field_system_configuration_drafts.insert(
+                plugin.clone(),
+                FieldSystemConfigurationDraft {
+                    values: authoritative.clone(),
+                    base: authoritative.clone(),
+                },
+            );
+        }
+        &mut self
+            .field_system_configuration_drafts
+            .get_mut(plugin)
+            .expect("seeded immediately above when absent or stale")
+            .values
     }
 
     pub fn open_probe_plot(&mut self, probe: &fieldcad_core::Probe) {
@@ -670,6 +704,19 @@ impl DomainDraft {
             self.precision,
         ))
     }
+}
+
+/// Staged edit for one field system's configuration — mirrors `DomainDraft`'s
+/// "independent until applied, reseeded when the authoritative value moves
+/// out of band" shape, but keyed per plugin rather than singleton.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldSystemConfigurationDraft {
+    pub values: PropertyBag,
+    /// The authoritative configuration this draft is staged against. Not
+    /// editable; [`UiModel::field_system_configuration_draft_for`] compares
+    /// it with the current configuration to decide whether the staged values
+    /// are still meaningful.
+    base: PropertyBag,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

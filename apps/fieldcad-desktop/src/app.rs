@@ -645,6 +645,7 @@ impl WindowState {
             mass_aggregate_history,
             document_entries,
             quick_add_hidden,
+            run_records,
         ) = match open_path {
             None => {
                 let (source, warnings) = build_session(
@@ -665,6 +666,7 @@ impl WindowState {
                     None,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 )
             }
             Some(path) => {
@@ -679,6 +681,7 @@ impl WindowState {
                 let mass_aggregate_history = outcome.document.mass_aggregate_history.clone();
                 let document_entries = outcome.document.document_entries.clone();
                 let quick_add_hidden = outcome.document.quick_add_hidden.clone();
+                let run_records = outcome.document.run_records.clone();
                 let (source, warnings) = build_session(
                     desktop_plugin_catalog(evaluator, gravity, maxwell),
                     Some(outcome.document),
@@ -697,6 +700,7 @@ impl WindowState {
                     Some(mass_aggregate_history),
                     document_entries,
                     quick_add_hidden,
+                    run_records,
                 )
             }
         };
@@ -739,7 +743,11 @@ impl WindowState {
             crate::catalog::seed_starter_catalog_if_missing(&directory);
         }
         let data_source = Arc::new(Mutex::new(HeadlessServer::new(data_source)));
-        lock_model(&data_source).restore_document_catalog(document_entries, quick_add_hidden);
+        {
+            let mut model = lock_model(&data_source);
+            model.restore_document_catalog(document_entries, quick_add_hidden);
+            model.restore_run_records(run_records);
+        }
         // Replay a loaded document's paused-queue write-ahead log through the
         // ordinary command path — see `replace_session` for the same
         // sequence used after New/Open at runtime.
@@ -2440,6 +2448,7 @@ impl WindowState {
             mass_aggregate_history,
             document_entries,
             quick_add_hidden,
+            run_records,
         ) = match source {
             SessionSource::New { template } => {
                 let (source, warnings) = build_session(catalog, None, template)?;
@@ -2455,6 +2464,7 @@ impl WindowState {
                     None,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 )
             }
             SessionSource::Load(path) => {
@@ -2468,6 +2478,7 @@ impl WindowState {
                 let mass_aggregate_history = outcome.document.mass_aggregate_history.clone();
                 let document_entries = outcome.document.document_entries.clone();
                 let quick_add_hidden = outcome.document.quick_add_hidden.clone();
+                let run_records = outcome.document.run_records.clone();
                 let (source, warnings) = build_session(catalog, Some(outcome.document), false)?;
                 (
                     source,
@@ -2481,6 +2492,7 @@ impl WindowState {
                     Some(mass_aggregate_history),
                     document_entries,
                     quick_add_hidden,
+                    run_records,
                 )
             }
         };
@@ -2489,6 +2501,7 @@ impl WindowState {
             let mut model = lock_model(&self.data_source);
             model.replace_source(new_source);
             model.restore_document_catalog(document_entries, quick_add_hidden);
+            model.restore_run_records(run_records);
             // Replay the saved paused-queue write-ahead log through the
             // ordinary command path: pause first if it was paused, then
             // resubmit each pending edit as an ordinary
@@ -2730,6 +2743,7 @@ impl WindowState {
                 ),
                 document_entries: model.document_entries().to_vec(),
                 quick_add_hidden: model.quick_add_hidden().to_vec(),
+                run_records: model.run_records().to_vec(),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(

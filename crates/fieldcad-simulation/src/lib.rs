@@ -16,7 +16,7 @@ pub mod source;
 pub use async_source::{AsyncLocalDataSource, CommandEvent};
 pub use body_history::{BodyHistory, BodySample};
 pub use fieldcad_dynamics::IntegrationScheme;
-pub use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
+pub use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke, PluginConfigurationSchema};
 pub use history::{
     DistanceHistory, DistanceReading, MassAggregateHistory, MassAggregateReading, ProbeHistory,
     ProbeReading,

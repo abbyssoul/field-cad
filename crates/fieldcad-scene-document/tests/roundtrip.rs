@@ -153,6 +153,7 @@ fn inputs(runtime: &SimulationRuntime, queue: QueueDocument) -> SceneDocumentInp
         mass_aggregate_history: fieldcad_scene_document::MassAggregateHistoryState::default(),
         document_entries: Vec::new(),
         quick_add_hidden: Vec::new(),
+        run_records: Vec::new(),
     }
 }
 

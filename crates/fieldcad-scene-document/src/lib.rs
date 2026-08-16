@@ -29,11 +29,16 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 mod history;
+mod run_record;
 mod view;
 pub use history::{
     DistanceHistoryState, DistanceReadingRecord, DistanceSeriesRecord, MassAggregateHistoryState,
     MassAggregateReadingRecord, MassAggregateSeriesRecord, ProbeHistoryState, ProbeReadingRecord,
     ProbeSeriesRecord,
+};
+pub use run_record::{
+    ConfigurationDifference, DistanceSeriesComparison, MassAggregateSeriesComparison,
+    ProbeSeriesComparison, RunComparison, RunRecord, RunRecordSummary, compare_run_records,
 };
 pub use view::{
     CameraProjection, CameraState, ChannelViewState, FieldLayerViewState, FlowLineDisplayState,
@@ -50,12 +55,13 @@ pub const FORMAT_ID: &str = "fieldcad.scene/v1";
 /// Bumped 1 → 2 when `SceneDocument::view` was added, 2 → 3 when
 /// `playback_speed`/`probe_history`/`distance_history` were added, 3 → 4
 /// when `mass_aggregate_history` was added, 4 → 5 when
-/// `document_entries`/`quick_add_hidden` were added, and 5 → 6 when entries
-/// and preferences became source-qualified: each field's own file
+/// `document_entries`/`quick_add_hidden` were added, 5 → 6 when entries
+/// and preferences became source-qualified, and 6 → 7 when `run_records`
+/// was added: each field's own file
 /// still loads fine on an older-format read (all `#[serde(default)]`), but
 /// a build that only knows the prior version must refuse a newer file
 /// outright rather than silently dropping that content on the next resave.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 /// File extension for a saved scene document (without the leading dot).
 pub const EXTENSION: &str = "fcscene";
 
@@ -118,6 +124,10 @@ pub struct SceneDocument {
     /// user-authored template name.
     #[serde(default)]
     pub quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
+    /// Named, retained run records — see [`RunRecord`]. `#[serde(default)]`
+    /// for the same reason as `view`.
+    #[serde(default)]
+    pub run_records: Vec<RunRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,7 +161,7 @@ pub struct DocumentCatalogEntry {
 
 /// One field system's composition and configuration, as declared by a
 /// document.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FieldSystemComposition {
     pub plugin: PluginId,
     pub version: PluginVersion,
@@ -188,6 +198,7 @@ pub struct SceneDocumentInputs {
     pub mass_aggregate_history: MassAggregateHistoryState,
     pub document_entries: Vec<DocumentCatalogEntry>,
     pub quick_add_hidden: Vec<fieldcad_core::CatalogEntryRef>,
+    pub run_records: Vec<RunRecord>,
 }
 
 impl SceneDocument {
@@ -234,6 +245,7 @@ impl SceneDocument {
             mass_aggregate_history: inputs.mass_aggregate_history,
             document_entries: inputs.document_entries,
             quick_add_hidden: inputs.quick_add_hidden,
+            run_records: inputs.run_records,
         }
     }
 
@@ -272,7 +284,7 @@ impl SceneDocument {
 /// date/time crate for one field: `SystemTime` plus fixed civil-calendar math
 /// is enough for a "when was this saved" label nothing parses back into a
 /// `SystemTime`.
-fn rfc3339_now() -> String {
+pub(crate) fn rfc3339_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

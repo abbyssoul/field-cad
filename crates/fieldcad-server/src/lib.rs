@@ -17,17 +17,20 @@
 use std::{collections::BTreeMap, collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use fieldcad_core::{
-    CatalogEntryRef, CatalogLinkMode, Domain, FieldSnapshot, ObjectId, SceneScale, SessionId,
-    TimeStep, TimeStepError, Transform, Velocity, WorldCommand, WorldSnapshot,
+    CatalogEntryRef, CatalogLinkMode, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId,
+    PropertyBag, SceneScale, SessionId, TimeStep, TimeStepError, Transform, Velocity, WorldCommand,
+    WorldSnapshot,
 };
 use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
+use fieldcad_scene_document::{FieldSystemComposition, RunRecord};
 use fieldcad_simulation::{
     AsyncLocalDataSource, BodySample, Command, CommandDisposition, CommandEvent, CommandId,
-    CommandPayload, CommandReceipt, CommandSequencer, DataSourceStatus, EditHistoryStatus,
-    FieldDataSource, FieldSystemStatus, IntegrationScheme, LocalDataSource, PlaybackSpeed,
-    PluginRegistration, PollOutcome, QueueStatus, QueueSummary, RuntimeConfig, RuntimeError,
-    SimulationRuntime, SimulationStatus, SourceError, Subscription,
+    CommandPayload, CommandReceipt, CommandSequencer, DataSourceStatus, DistanceHistory,
+    EditHistoryStatus, FieldDataSource, FieldSystemStatus, IntegrationScheme, LocalDataSource,
+    MassAggregateHistory, PlaybackSpeed, PluginRegistration, PollOutcome, ProbeHistory,
+    QueueStatus, QueueSummary, RuntimeConfig, RuntimeError, SimulationRuntime, SimulationStatus,
+    SourceError, Subscription,
 };
 use glam::DVec3;
 use tokio::sync::oneshot;
@@ -153,6 +156,7 @@ pub enum CatalogError {
 }
 
 mod event_hub;
+mod history_capture;
 pub use event_hub::{EventHub, EventWatcher, SessionEvent, WatchEvent};
 
 /// Builds the default session: a numerical domain and the same solver
@@ -230,6 +234,20 @@ pub struct HeadlessServer {
     /// this crate's one-canonical-drain discipline for the *inner* source
     /// even though publication now also happens here.
     events: Vec<CommandEvent>,
+    /// Session-scoped, server-side observation histories, assembled from
+    /// every snapshot this session publishes — see [`Self::publish`]. Unlike
+    /// the desktop host's own client-local `ProbeHistory` (assembled from
+    /// polled snapshots in the render loop), this is what lets an MCP client
+    /// with no client-local recording of its own still retain probe/
+    /// distance/mass-aggregate readings across a session, and is what
+    /// [`Self::save_run`] draws its observation copy from.
+    probe_history: ProbeHistory,
+    distance_history: DistanceHistory,
+    mass_aggregate_history: MassAggregateHistory,
+    /// Named, retained run records for the current scene — see
+    /// [`fieldcad_scene_document::RunRecord`] and
+    /// `docs/tasks/run-records-and-comparison.md`.
+    run_records: Vec<RunRecord>,
 }
 
 impl HeadlessServer {
@@ -248,6 +266,10 @@ impl HeadlessServer {
             waiters: HashMap::new(),
             hub: EventHub::default(),
             events: Vec::new(),
+            probe_history: ProbeHistory::default(),
+            distance_history: DistanceHistory::default(),
+            mass_aggregate_history: MassAggregateHistory::default(),
+            run_records: Vec::new(),
         };
         server.reload_catalog();
         server
@@ -802,7 +824,28 @@ impl HeadlessServer {
         // command.  Without this, an MCP 30 s timeout that drops the
         // receiver leaves the sender in the map forever (BE-8).
         self.waiters.retain(|_id, sender| !sender.is_closed());
+        self.record_observations();
         self.hub.publish_state(&self.source);
+    }
+
+    /// Fold the latest published snapshot into this session's server-side
+    /// observation histories, and drop the series of any probe deleted
+    /// since the last publish — see the `probe_history` field doc and
+    /// `apps/fieldcad-desktop/src/app.rs`'s identical per-frame prune for
+    /// the client-local case this mirrors.
+    fn record_observations(&mut self) {
+        if let Some(snapshot) = self.source.latest_snapshot() {
+            self.probe_history.record(&snapshot);
+            self.distance_history.record(&snapshot);
+            self.mass_aggregate_history.record(&snapshot);
+        }
+        let world = self.source.world();
+        self.probe_history
+            .retain_probes(|probe| world.probe(probe).is_some());
+        self.distance_history
+            .retain_probes(|probe| world.distance_probe(probe).is_some());
+        self.mass_aggregate_history
+            .retain_probes(|probe| world.mass_aggregate_probe(probe).is_some());
     }
 
     /// Completion/rejection/cancellation events for commands submitted
@@ -866,6 +909,29 @@ impl HeadlessServer {
 
     pub fn field_systems(&self) -> Vec<FieldSystemStatus> {
         self.source.field_systems()
+    }
+
+    /// Advisory, non-mutating: would this world-command transaction be
+    /// adopted if committed right now via `commit_world`/`edit_world`? Never
+    /// changes the world; the authority remains the final validator at
+    /// actual commit time. See
+    /// [`fieldcad_simulation::AsyncLocalDataSource::validate_world_commands`].
+    pub fn validate_world_commands(
+        &mut self,
+        commands: Vec<WorldCommand>,
+    ) -> Result<CommitReport, SourceError> {
+        self.source.validate_world_commands(commands)
+    }
+
+    /// Advisory, non-mutating counterpart to `validate_world_commands` for a
+    /// proposed field-system configuration.
+    pub fn validate_field_system_configuration(
+        &mut self,
+        plugin: PluginId,
+        configuration: PropertyBag,
+    ) -> Result<(), SourceError> {
+        self.source
+            .validate_field_system_configuration(plugin, configuration)
     }
 
     pub fn edit_history(&self) -> EditHistoryStatus {
@@ -939,9 +1005,106 @@ impl HeadlessServer {
         self.waiters.clear();
         self.events.clear();
         self.hub.reset();
+        // A new/loaded session is a fresh numerical run: yesterday's probe
+        // readings do not belong to it. Retained run records are untouched
+        // here — they are restored separately by the caller (see
+        // `restore_run_records`), the same split `restore_document_catalog`
+        // already uses for catalog state.
+        self.probe_history = ProbeHistory::default();
+        self.distance_history = DistanceHistory::default();
+        self.mass_aggregate_history = MassAggregateHistory::default();
+        self.run_records.clear();
         self.reload_catalog();
         self.publish();
     }
+
+    /// This session's server-side retained probe/distance/mass-aggregate
+    /// observation histories — see the `probe_history` field doc.
+    pub fn probe_history(&self) -> &ProbeHistory {
+        &self.probe_history
+    }
+
+    pub fn distance_history(&self) -> &DistanceHistory {
+        &self.distance_history
+    }
+
+    pub fn mass_aggregate_history(&self) -> &MassAggregateHistory {
+        &self.mass_aggregate_history
+    }
+
+    /// Every retained run record for the current scene, newest last.
+    pub fn run_records(&self) -> &[RunRecord] {
+        &self.run_records
+    }
+
+    pub fn run_record(&self, id: uuid::Uuid) -> Option<&RunRecord> {
+        self.run_records.iter().find(|record| record.id == id)
+    }
+
+    /// Replace this scene's whole retained run-record set — the run-record
+    /// counterpart to [`Self::restore_document_catalog`], used identically:
+    /// atomically with the rest of a new/loaded scene's restore, never as a
+    /// steady-state sync path (a concurrent transport's `save_run` in
+    /// between would otherwise be silently discarded).
+    pub fn restore_run_records(&mut self, records: Vec<RunRecord>) {
+        self.run_records = records;
+    }
+
+    /// Name the current run: snapshot its `run_generation`, the
+    /// domain/time-step and field-system configuration that produced it,
+    /// and a copy of this session's server-side observation histories, and
+    /// retain it under `name`. Returns the retained record.
+    pub fn save_run(&mut self, name: String) -> RunRecord {
+        let field_systems = self
+            .field_systems()
+            .into_iter()
+            .map(|status| FieldSystemComposition {
+                plugin: status.plugin.id,
+                version: status.plugin.version,
+                enabled: status.enabled,
+                realtime: status.realtime,
+                configuration: status.configuration,
+            })
+            .collect();
+        let record = RunRecord::capture(
+            name,
+            self.simulation_status().run_generation,
+            self.source.domain(),
+            self.time_step(),
+            field_systems,
+            history_capture::capture_probe_history(&self.probe_history),
+            history_capture::capture_distance_history(&self.distance_history),
+            history_capture::capture_mass_aggregate_history(&self.mass_aggregate_history),
+        );
+        self.run_records.push(record.clone());
+        record
+    }
+
+    /// Discard one retained run record. Returns `false` if `id` names no
+    /// retained record.
+    pub fn delete_run(&mut self, id: uuid::Uuid) -> bool {
+        let before = self.run_records.len();
+        self.run_records.retain(|record| record.id != id);
+        self.run_records.len() != before
+    }
+
+    /// Compare two retained run records — see
+    /// [`fieldcad_scene_document::compare_run_records`].
+    pub fn compare_runs(
+        &self,
+        a: uuid::Uuid,
+        b: uuid::Uuid,
+    ) -> Result<fieldcad_scene_document::RunComparison, RunRecordError> {
+        let a = self.run_record(a).ok_or(RunRecordError::NotFound(a))?;
+        let b = self.run_record(b).ok_or(RunRecordError::NotFound(b))?;
+        Ok(fieldcad_scene_document::compare_run_records(a, b))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RunRecordError {
+    #[error("no retained run record with id {0}")]
+    NotFound(uuid::Uuid),
 }
 
 impl FieldDataSource for HeadlessServer {
@@ -1125,5 +1288,82 @@ mod tests {
         assert_eq!(entry.origin, renamed.origin);
         assert_eq!(renamed.template, "beta");
         assert!(root.path().join("alpha.yaml").exists());
+    }
+
+    #[test]
+    fn save_run_captures_the_active_configuration_and_run_generation() {
+        let source = default_session().unwrap();
+        let mut server = HeadlessServer::with_catalog_root(source, None);
+
+        let record = server.save_run("baseline".to_owned());
+
+        assert_eq!(record.name, "baseline");
+        assert_eq!(record.run_generation, server.simulation_status().run_generation);
+        assert_eq!(record.domain, server.source.domain());
+        assert!(
+            record
+                .field_systems
+                .iter()
+                .any(|entry| entry.plugin.as_str() == "fieldcad.electrostatics"),
+            "captured field systems: {:?}",
+            record.field_systems
+        );
+        assert_eq!(server.run_records().len(), 1);
+        assert_eq!(server.run_record(record.id), Some(&record));
+    }
+
+    #[test]
+    fn comparing_two_runs_with_identical_configuration_reports_no_differences() {
+        let source = default_session().unwrap();
+        let mut server = HeadlessServer::with_catalog_root(source, None);
+
+        let a = server.save_run("run-a".to_owned());
+        let b = server.save_run("run-b".to_owned());
+
+        let comparison = server.compare_runs(a.id, b.id).unwrap();
+
+        assert!(!comparison.domain_changed);
+        assert!(!comparison.time_step_changed);
+        assert!(comparison.configuration_differences.is_empty());
+    }
+
+    #[test]
+    fn comparing_against_an_unknown_run_id_is_a_structured_error() {
+        let source = default_session().unwrap();
+        let mut server = HeadlessServer::with_catalog_root(source, None);
+        let a = server.save_run("run-a".to_owned());
+        let bogus = uuid::Uuid::new_v4();
+
+        let error = server.compare_runs(a.id, bogus).unwrap_err();
+
+        assert!(matches!(error, RunRecordError::NotFound(id) if id == bogus));
+    }
+
+    #[test]
+    fn deleting_a_run_record_removes_it_from_the_retained_list() {
+        let source = default_session().unwrap();
+        let mut server = HeadlessServer::with_catalog_root(source, None);
+        let record = server.save_run("baseline".to_owned());
+
+        assert!(server.delete_run(record.id));
+        assert!(server.run_record(record.id).is_none());
+        assert!(!server.delete_run(record.id), "already deleted");
+    }
+
+    #[test]
+    fn run_records_survive_replace_source_via_restore_run_records() {
+        let source = default_session().unwrap();
+        let mut server = HeadlessServer::with_catalog_root(source, None);
+        let record = server.save_run("baseline".to_owned());
+        let saved = vec![record];
+
+        server.replace_source(default_session().unwrap());
+        assert!(
+            server.run_records().is_empty(),
+            "a fresh session starts with no retained runs until restored"
+        );
+
+        server.restore_run_records(saved.clone());
+        assert_eq!(server.run_records(), saved.as_slice());
     }
 }

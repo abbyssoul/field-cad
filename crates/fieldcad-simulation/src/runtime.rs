@@ -1323,6 +1323,77 @@ impl SimulationRuntime {
         Ok(())
     }
 
+    /// Replace one plugin's configuration and restart the numerical run.
+    ///
+    /// Reset-class, like [`Self::reconfigure_domain`]: a solver bakes its
+    /// configuration into memory at construction (`SolverContext`) and never
+    /// re-reads it, so a changed value can only take effect by rebuilding
+    /// every active solver from the same instant and discarding accumulated
+    /// history, exactly as a domain change does. `run_generation` advances
+    /// so a client can tell the numerical run restarted.
+    pub fn set_field_system_configuration(
+        &mut self,
+        plugin: &PluginId,
+        configuration: PropertyBag,
+    ) -> Result<(), RuntimeError> {
+        let index = self
+            .plugins
+            .iter()
+            .position(|slot| &slot.metadata.id == plugin)
+            .ok_or_else(|| RuntimeError::UnknownPlugin(plugin.clone()))?;
+        self.plugins[index]
+            .configuration_schema
+            .validate(&configuration)?;
+        if self.plugins[index].configuration == configuration {
+            return Ok(());
+        }
+        if self.is_editing() {
+            return Err(RuntimeError::CannotReconfigurePluginWhileEditing);
+        }
+
+        let world = self.world.snapshot();
+        let initial_step = SimulationClock::new(self.clock.time_step()).snapshot().step;
+        let mut replacements: Vec<Option<Box<dyn EquationSystemSolver>>> = self
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(slot_index, slot)| {
+                if !slot.enabled {
+                    return Ok(None);
+                }
+                let candidate_configuration = if slot_index == index {
+                    &configuration
+                } else {
+                    &slot.configuration
+                };
+                let mut solver = slot.plugin.create_solver(SolverContext {
+                    configuration: candidate_configuration,
+                    domain: &self.domain,
+                    world: &world,
+                    initial_step,
+                    cancellation: self.cancellation.clone(),
+                })?;
+                solver.validate_world(&world)?;
+                solver.validate_time_step(self.clock.time_step())?;
+                solver.on_world_changed(&world)?;
+                Ok(Some(solver))
+            })
+            .collect::<Result<_, PluginError>>()?;
+        self.validate_subscription(self.subscription)?;
+
+        let time_step = self.clock.time_step();
+        self.plugins[index].configuration = configuration;
+        self.clock.reset(time_step);
+        self.run_generation = self.run_generation.saturating_add(1);
+        self.last_forces.clear();
+        self.body_history.clear();
+        for (slot, replacement) in self.plugins.iter_mut().zip(replacements.drain(..)) {
+            slot.solver = replacement;
+            slot.sampled_from = None;
+        }
+        self.publish_snapshot(SamplingPolicy::All)
+    }
+
     /// Change what is sampled. This never changes a computed value, only how
     /// densely it is observed, so it does not advance the world revision.
     pub fn set_subscription(&mut self, subscription: Subscription) -> Result<(), RuntimeError> {
@@ -1848,6 +1919,64 @@ impl SimulationRuntime {
         }
         self.publish_snapshot(SamplingPolicy::All)?;
         Ok(report)
+    }
+
+    /// Advisory, non-mutating check: would this transaction be adopted if
+    /// committed right now? Runs the exact checks `commit_world_commands`
+    /// runs before it mutates anything — a candidate world built off to the
+    /// side, then validated by every enabled solver — and discards the
+    /// candidate either way. The runtime remains the sole authority at
+    /// actual commit time; nothing here is cached or reused by a later
+    /// `commit_world_commands` call, so a caller must still handle a
+    /// same-shaped rejection there (a concurrent edit can invalidate a
+    /// transaction between preflight and commit).
+    pub fn validate_world_commands(
+        &self,
+        commands: &[WorldCommand],
+    ) -> Result<CommitReport, RuntimeError> {
+        let mut candidate = self.world.clone();
+        let report = candidate.commit(commands.to_vec())?;
+        if report.revision == self.world.revision() {
+            return Ok(report);
+        }
+        let candidate_snapshot = candidate.snapshot();
+        for slot in self.plugins.iter().filter(|slot| slot.enabled) {
+            slot.solver().validate_world(&candidate_snapshot)?;
+        }
+        Ok(report)
+    }
+
+    /// Advisory, non-mutating counterpart to
+    /// [`Self::set_field_system_configuration`]: builds and validates a
+    /// candidate solver under the proposed configuration, then discards it
+    /// without touching this plugin's live solver, `run_generation`, or the
+    /// clock.
+    pub fn validate_field_system_configuration(
+        &self,
+        plugin: &PluginId,
+        configuration: &PropertyBag,
+    ) -> Result<(), RuntimeError> {
+        let slot = self
+            .plugins
+            .iter()
+            .find(|slot| &slot.metadata.id == plugin)
+            .ok_or_else(|| RuntimeError::UnknownPlugin(plugin.clone()))?;
+        slot.configuration_schema.validate(configuration)?;
+        if !slot.enabled {
+            return Ok(());
+        }
+        let world = self.world.snapshot();
+        let initial_step = SimulationClock::new(self.clock.time_step()).snapshot().step;
+        let solver = slot.plugin.create_solver(SolverContext {
+            configuration,
+            domain: &self.domain,
+            world: &world,
+            initial_step,
+            cancellation: self.cancellation.clone(),
+        })?;
+        solver.validate_world(&world)?;
+        solver.validate_time_step(self.clock.time_step())?;
+        Ok(())
     }
 
     /// Apply one paused, solver-owned numerical field edit.
@@ -2419,6 +2548,10 @@ pub enum RuntimeError {
     )]
     CannotReconfigureDomainWhileEditing,
     #[error(
+        "cannot change field system configuration while an interactive scene edit is in progress"
+    )]
+    CannotReconfigurePluginWhileEditing,
+    #[error(
         "the current time step {current:?} is invalid for the proposed domain and no active solver reported a safe replacement"
     )]
     NoSafeTimeStepForDomain { current: TimeStep },
@@ -2458,6 +2591,7 @@ impl RuntimeError {
             Self::FieldIsReadOnly(_) => "field-read-only",
             Self::InvalidFieldBrush(_) => "invalid-field-brush",
             Self::CannotReconfigureDomainWhileEditing => "cannot-reconfigure-domain-while-editing",
+            Self::CannotReconfigurePluginWhileEditing => "cannot-reconfigure-plugin-while-editing",
             Self::NoSafeTimeStepForDomain { .. } => "no-safe-time-step-for-domain",
             Self::InvalidSamplingBudget => "invalid-sampling-budget",
             Self::InvalidSubscription(_) => "invalid-subscription",
@@ -2471,8 +2605,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use fieldcad_core::{
-        BoundaryCondition, BoundaryConditions, DomainBounds, ObjectSpec, PluginVersion, Precision,
-        Resolution, Transform, Velocity,
+        BoundaryCondition, BoundaryConditions, Dimension, DomainBounds, ObjectSpec, PluginVersion,
+        Precision, PropertyId, PropertyKind, PropertySchema, PropertyValue, Quantity, Resolution,
+        Transform, Velocity,
     };
     use fieldcad_plugin_api::{
         FieldBrushFalloff, ObjectKinematicsUpdate, SampledColumn, SolverKind, SolverStepOutcome,
@@ -3658,5 +3793,213 @@ mod tests {
         );
         assert_eq!(*runtime.domain(), domain_before);
         assert_eq!(runtime.world_snapshot().revision(), revision_before);
+    }
+
+    /// A plugin with a required scalar "gain" configuration property, so
+    /// `set_field_system_configuration`/`validate_field_system_configuration`
+    /// have something real to validate and adopt against.
+    struct GainPlugin {
+        id: PluginId,
+        gain_property: PropertyId,
+    }
+
+    impl GainPlugin {
+        fn new(id: PluginId) -> Self {
+            let gain_property = PropertyId::new("gain").unwrap();
+            Self { id, gain_property }
+        }
+
+        fn schema(&self) -> PluginConfigurationSchema {
+            PluginConfigurationSchema {
+                properties: vec![PropertySchema {
+                    id: self.gain_property.clone(),
+                    display_name: "Gain".to_owned(),
+                    description: None,
+                    kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
+                    required: true,
+                    default_value: None,
+                    relevant_when: None,
+                }],
+            }
+        }
+    }
+
+    impl EquationSystemPlugin for GainPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: self.id.clone(),
+                version: PluginVersion::new(0, 1, 0),
+                display_name: "Gain test".to_owned(),
+                description: "Exercises configuration mutation".to_owned(),
+            }
+        }
+
+        fn channels(&self) -> Vec<ChannelSchema> {
+            Vec::new()
+        }
+
+        fn configuration_schema(&self) -> PluginConfigurationSchema {
+            self.schema()
+        }
+
+        fn default_configuration(&self) -> PropertyBag {
+            [(
+                self.gain_property.clone(),
+                PropertyValue::Scalar(Quantity::new(1.0, Dimension::DIMENSIONLESS).unwrap()),
+            )]
+            .into_iter()
+            .collect()
+        }
+
+        fn create_solver(
+            &self,
+            _context: SolverContext<'_>,
+        ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
+            Ok(Box::new(NoopSolver))
+        }
+    }
+
+    struct NoopSolver;
+
+    impl EquationSystemSolver for NoopSolver {
+        fn on_world_changed(&mut self, _world: &WorldSnapshot) -> Result<(), PluginError> {
+            Ok(())
+        }
+
+        fn sample(
+            &self,
+            _channel: ChannelHandle,
+            _geometry: &SampleGeometry,
+        ) -> Result<SampledColumn, PluginError> {
+            unreachable!("GainPlugin declares no channels")
+        }
+    }
+
+    fn gain_runtime() -> (SimulationRuntime, PluginId, PropertyId) {
+        let id = PluginId::new("gain-test").unwrap();
+        let plugin = GainPlugin::new(id.clone());
+        let gain_property = plugin.gain_property.clone();
+        let config = RuntimeConfig::new(
+            Domain::centred_cube(2.0, 4).unwrap(),
+            TimeStep::from_seconds(0.25).unwrap(),
+            SessionId::from_u128(0xA1),
+        )
+        .with_plugin(Box::new(plugin));
+        (SimulationRuntime::new(config).unwrap(), id, gain_property)
+    }
+
+    #[test]
+    fn set_field_system_configuration_rejects_wrong_dimension_without_mutating() {
+        let (mut runtime, plugin, gain_property) = gain_runtime();
+        let before = runtime.field_systems();
+        let generation_before = runtime.run_generation();
+
+        let bad = [(
+            gain_property,
+            PropertyValue::Scalar(Quantity::new(2.0, Dimension::MASS).unwrap()),
+        )]
+        .into_iter()
+        .collect();
+
+        let result = runtime.set_field_system_configuration(&plugin, bad);
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Schema(SchemaError::ValueMismatch { .. }))
+        ));
+        assert_eq!(runtime.field_systems(), before);
+        assert_eq!(runtime.run_generation(), generation_before);
+    }
+
+    #[test]
+    fn set_field_system_configuration_rejects_unknown_plugin() {
+        let (mut runtime, _plugin, gain_property) = gain_runtime();
+        let unknown = PluginId::new("does-not-exist").unwrap();
+        let configuration = [(
+            gain_property,
+            PropertyValue::Scalar(Quantity::new(2.0, Dimension::DIMENSIONLESS).unwrap()),
+        )]
+        .into_iter()
+        .collect();
+
+        assert!(matches!(
+            runtime.set_field_system_configuration(&unknown, configuration),
+            Err(RuntimeError::UnknownPlugin(id)) if id == unknown
+        ));
+    }
+
+    #[test]
+    fn set_field_system_configuration_adopts_a_valid_change_and_bumps_run_generation() {
+        let (mut runtime, plugin, gain_property) = gain_runtime();
+        let generation_before = runtime.run_generation();
+
+        let configuration: PropertyBag = [(
+            gain_property.clone(),
+            PropertyValue::Scalar(Quantity::new(2.0, Dimension::DIMENSIONLESS).unwrap()),
+        )]
+        .into_iter()
+        .collect();
+
+        runtime
+            .set_field_system_configuration(&plugin, configuration.clone())
+            .unwrap();
+
+        assert_eq!(runtime.run_generation(), generation_before + 1);
+        let status = runtime
+            .field_systems()
+            .into_iter()
+            .find(|status| status.plugin.id == plugin)
+            .unwrap();
+        assert_eq!(status.configuration, configuration);
+    }
+
+    #[test]
+    fn validate_field_system_configuration_never_mutates() {
+        let (runtime, plugin, gain_property) = gain_runtime();
+        let before = runtime.field_systems();
+        let generation_before = runtime.run_generation();
+
+        let valid = [(
+            gain_property.clone(),
+            PropertyValue::Scalar(Quantity::new(2.0, Dimension::DIMENSIONLESS).unwrap()),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            runtime
+                .validate_field_system_configuration(&plugin, &valid)
+                .is_ok()
+        );
+
+        let invalid = [(
+            gain_property,
+            PropertyValue::Scalar(Quantity::new(2.0, Dimension::MASS).unwrap()),
+        )]
+        .into_iter()
+        .collect();
+        assert!(
+            runtime
+                .validate_field_system_configuration(&plugin, &invalid)
+                .is_err()
+        );
+
+        assert_eq!(runtime.field_systems(), before);
+        assert_eq!(runtime.run_generation(), generation_before);
+    }
+
+    #[test]
+    fn validate_world_commands_never_mutates_and_matches_commit_outcome() {
+        let (mut runtime, object) = motion_runtime([]);
+        let revision_before = runtime.world_snapshot().revision();
+        let commands = vec![WorldCommand::SetObjectName {
+            object,
+            name: "renamed".to_owned(),
+        }];
+
+        let preview = runtime.validate_world_commands(&commands).unwrap();
+
+        assert_eq!(runtime.world_snapshot().revision(), revision_before);
+        let applied = runtime.commit_world_commands(commands).unwrap();
+        assert_eq!(preview.revision, applied.revision);
     }
 }

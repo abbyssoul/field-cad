@@ -101,3 +101,22 @@ fn capture_document_round_trips_through_the_async_worker() {
     assert_eq!(reloaded.snapshot().objects(), live.objects());
     assert_eq!(reloaded.snapshot().probes(), live.probes());
 }
+
+#[test]
+fn save_run_retains_a_copy_of_recorded_probe_history() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+
+    let authored = submit_and_wait(&mut server, CommandPayload::CommitWorld(charge_and_probe()));
+    assert!(matches!(authored, CommandEvent::Completed(_)));
+    let stepped = submit_and_wait(&mut server, CommandPayload::Step);
+    assert!(matches!(stepped, CommandEvent::Completed(_)));
+
+    let record = server.save_run("with-history".to_owned());
+
+    assert!(
+        !record.probe_history.series.is_empty(),
+        "server-side history should have recorded the field probe's reading after a step"
+    );
+    assert_eq!(record.run_generation, server.simulation_status().run_generation);
+}

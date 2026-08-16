@@ -145,8 +145,7 @@ no such components is still a valid, non-simulated scene object.
   schema-defined property, and detach a component so that I can compose the
   physical role of an object without hidden species behaviour.
 
-- **US-17 — Create an object from a particle template** *(Required for API/MCP
-  parity)*  
+- **US-17 — Create an object from a particle template** *(Implemented)*  
   As a modeller, I want to instantiate a versioned catalogue template such as
   electron, proton, positron, or neutron so that published mass/charge values
   and their provenance are applied consistently.  
@@ -154,13 +153,11 @@ no such components is still a valid, non-simulated scene object.
   components; later edits retain the object but record that it no longer claims
   the template’s unchanged values.
 
-- **US-18 — Rename objects and all authored instruments** *(Required for API/MCP
-  parity)*  
+- **US-18 — Rename objects and all authored instruments** *(Implemented)*  
   As a modeller, I want to rename objects, planes, and probes so that I can
   keep a meaningful, automation-friendly scene inventory.  
-  Note: names exist in the model but dedicated rename commands are not yet
-  present; they should not require delete-and-recreate because IDs and
-  attachments must survive.
+  Dedicated rename commands (`SetObjectName`, `SetPlaneName`, `SetProbeName`,
+  and siblings) never delete-and-recreate, so IDs and attachments survive.
 
 ### 3. Configure the physical experiment
 
@@ -195,27 +192,29 @@ no such components is still a valid, non-simulated scene object.
   acknowledged `reconfigure_domain`/`set_domain` command, queued for the next
   tick boundary if submitted while running.
 
-- **US-24 — Configure field-system-specific settings** *(Required for API/MCP
-  parity)*
+- **US-24 — Configure field-system-specific settings** *(Implemented)*
   As a modeller, I want to change the solver configuration, initial conditions,
   and coupling parameters a selected model exposes so that I can define a
   reproducible numerical experiment.
   Acceptance: configuration schemas and constraints are discoverable, changes
   are validated before adoption, and accepted snapshots report the values that
-  produced them.
+  produced them. `set_field_system_configuration` is reset-class, like
+  `reconfigure_domain`: it rebuilds active solvers from the current authored
+  world, resets to paused `t = 0`, and advances the run generation.
 
 - **US-25 — Control recomputation during an interactive edit** *(Implemented)*
   As a modeller, I want to choose per field system whether it recomputes for
   intermediate drag/text values or only when I commit so that I can trade
   immediate feedback for responsiveness without changing the final physics.
 
-- **US-26 — Validate a proposed change before committing it** *(Implemented in
-  authority; Required for API/MCP exposure)*  
+- **US-26 — Validate a proposed change before committing it** *(Implemented)*  
   As an automation client, I want a structured validation result for a proposed
   world or experiment transaction so that I can repair invalid input before
   attempting a run.  
   The authority remains the final validator; preflight is advisory and must use
-  the same schema/domain/plugin rules.
+  the same schema/domain/plugin rules. `validate_world_transaction` covers both
+  a `commit_world`/`edit_world`-shaped world-command batch and a proposed field-
+  system configuration, without mutating anything.
 
 ### 4. Build and manage non-simulated measurement objects
 
@@ -444,10 +443,11 @@ experiment.
 | Simulation control | `get_simulation_status`, `play`, `pause`, `step`, `set_time_step`, `set_playback_speed` |
 | Observation | `set_subscription`, `get_latest_snapshot`, `sample_field`, `get_probe_history`, `get_trajectory`, `get_diagnostics` |
 | Events | `watch_session` for snapshot/status/diagnostic/queued-command-completion events |
-| Reproducibility | `get_history`, `undo`, `redo`, `record_session`, `replay_session`, `export_experiment` |
+| Reproducibility | `get_history`, `undo`, `redo`, `save_run`, `list_runs`, `get_run`, `delete_run`, `compare_runs`, `record_session`, `replay_session`, `export_experiment` |
 
 The existing `CommitWorld`, field-system, transport, and snapshot abstractions
-are a useful starting point for this surface. The missing work is chiefly a
-transport-neutral serialization contract, capability/schema discovery, durable
-scene lifecycle, configuration mutation, and structured asynchronous events —
-not a second model for remote clients.
+are a useful starting point for this surface. Scene lifecycle, configuration
+mutation, and preflight validation are implemented; the remaining missing work
+is chiefly a transport-neutral serialization contract, capability/schema
+discovery, and structured asynchronous events — not a second model for remote
+clients.

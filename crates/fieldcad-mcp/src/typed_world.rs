@@ -275,6 +275,77 @@ fn convert_property_value(
     }
 }
 
+/// Convert a plugin configuration payload against its declared
+/// [`fieldcad_simulation::PluginConfigurationSchema`] — the same per-property
+/// conversion `convert_properties` runs for component properties, keyed
+/// directly off the plugin's own property list rather than a registered
+/// component schema.
+pub fn convert_configuration(
+    plugin: &PluginId,
+    schema: &fieldcad_simulation::PluginConfigurationSchema,
+    properties: BTreeMap<String, PropertyValueParam>,
+) -> Result<PropertyBag, String> {
+    let mut bag = PropertyBag::default();
+    for (name, value) in properties {
+        let property_id = PropertyId::new(name.clone())
+            .map_err(|error| format!("plugin '{plugin}' configuration '{name}': {error}"))?;
+        let property = schema
+            .properties
+            .iter()
+            .find(|candidate| candidate.id == property_id)
+            .ok_or_else(|| {
+                format!(
+                    "plugin '{plugin}' has no configuration property '{property_id}'; valid properties: [{}]",
+                    schema
+                        .properties
+                        .iter()
+                        .map(|candidate| candidate.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        let kind_name = value.kind_name();
+        let converted = match (&property.kind, value) {
+            (PropertyKind::Scalar(dimension), PropertyValueParam::Scalar { si_value }) => {
+                Quantity::new(si_value, *dimension)
+                    .map(PropertyValue::Scalar)
+                    .map_err(|error| {
+                        format!("plugin '{plugin}' configuration '{property_id}': {error}")
+                    })
+            }
+            (PropertyKind::Vector(dimension), PropertyValueParam::Vector { x, y, z }) => {
+                VectorQuantity::new(DVec3::new(x, y, z), *dimension)
+                    .map(PropertyValue::Vector)
+                    .map_err(|error| {
+                        format!("plugin '{plugin}' configuration '{property_id}': {error}")
+                    })
+            }
+            (PropertyKind::Boolean, PropertyValueParam::Boolean { value }) => {
+                Ok(PropertyValue::Boolean(value))
+            }
+            (PropertyKind::Text, PropertyValueParam::Text { value }) => {
+                Ok(PropertyValue::Text(value))
+            }
+            (PropertyKind::Choice(options), PropertyValueParam::Choice { value }) => {
+                if options.contains(&value) {
+                    Ok(PropertyValue::Choice(value))
+                } else {
+                    Err(format!(
+                        "plugin '{plugin}' configuration '{property_id}': '{value}' is not one of [{}]",
+                        options.join(", ")
+                    ))
+                }
+            }
+            (kind, _) => Err(format!(
+                "plugin '{plugin}' configuration '{property_id}': expected {}, got {kind_name}",
+                describe_property_kind(kind)
+            )),
+        }?;
+        bag.insert(property_id, converted);
+    }
+    Ok(bag)
+}
+
 fn convert_properties(
     schemas: &BTreeMap<ComponentTypeId, ComponentSchema>,
     component: &ComponentTypeId,

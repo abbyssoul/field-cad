@@ -203,7 +203,13 @@ mod tests {
             ..Default::default()
         };
         let full_output = context.run_ui(input, |ui| {
-            field_system_controls(ui, &compute, &mut UiFrameOutput::default());
+            field_system_controls(
+                ui,
+                &mut UiModel::new(),
+                &compute,
+                false,
+                &mut UiFrameOutput::default(),
+            );
         });
         let mut text = String::new();
         for clipped in &full_output.shapes {

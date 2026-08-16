@@ -1,7 +1,7 @@
 //! Inspector sections for the Simulation (world) node: domain, fields,
 //! field systems, transport sampling, and compute status.
 
-use fieldcad_core::{BoundaryCondition, Dimension, Precision, PropertyValue};
+use fieldcad_core::{BoundaryCondition, Dimension, ObjectId, Precision};
 use fieldcad_simulation::{CommandPayload, IntegrationScheme};
 
 use super::coordinate_editor;
@@ -32,7 +32,7 @@ pub(super) fn world_properties(
         field_controls(ui, compute, output);
     });
     super::section(ui, "inspector_field_systems", "Field systems", true, |ui| {
-        field_system_controls(ui, compute, output);
+        field_system_controls(ui, model, compute, edit_in_progress, output);
     });
     super::section(
         ui,
@@ -345,7 +345,9 @@ fn taken_field(
 
 pub(super) fn field_system_controls(
     ui: &mut egui::Ui,
+    model: &mut UiModel,
     compute: &ComputeView,
+    edit_in_progress: bool,
     output: &mut UiFrameOutput,
 ) {
     ui.add(
@@ -419,26 +421,70 @@ pub(super) fn field_system_controls(
                     if !system.configuration_schema.properties.is_empty() {
                         ui.add_space(3.0);
                         ui.strong("Settings");
-                        for property in &system.configuration_schema.properties {
-                            let value = system
-                                .configuration
-                                .get(&property.id)
-                                .map(format_configuration_value)
-                                .unwrap_or_else(|| "not set".to_owned());
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "{}: {value}",
-                                        property.display_name
-                                    ))
-                                    .small(),
-                                )
-                                .wrap(),
-                            );
-                        }
+                        configuration_editor(ui, model, compute, system, edit_in_progress, output);
                     }
                 });
         });
+    }
+}
+
+/// Staged, per-plugin configuration form: reset-class, exactly like the
+/// domain editor above, so it stages edits independently of the
+/// authoritative value and only submits `SetFieldSystemConfiguration` on an
+/// explicit "Apply" click, never per keystroke/drag.
+fn configuration_editor(
+    ui: &mut egui::Ui,
+    model: &mut UiModel,
+    compute: &ComputeView,
+    system: &fieldcad_simulation::FieldSystemStatus,
+    edit_in_progress: bool,
+    output: &mut UiFrameOutput,
+) {
+    let plugin = system.plugin.id.clone();
+    let draft = model.field_system_configuration_draft_for(&plugin, &system.configuration);
+
+    // No held-edit concept of its own, same reasoning as `domain_coordinate`:
+    // the draft is staged and applied only by the button below.
+    let mut editing = false;
+    for property in &system.configuration_schema.properties {
+        if !property.is_relevant(draft) {
+            continue;
+        }
+        super::object_inspector::property_editor(
+            ui,
+            ObjectId::new(0),
+            property,
+            draft,
+            &mut editing,
+        );
+    }
+
+    let valid = system.configuration_schema.validate(draft).is_ok();
+    if !valid {
+        ui.colored_label(
+            egui::Color32::from_rgb(240, 105, 95),
+            "Invalid configuration.",
+        );
+    }
+    let dirty = *draft != system.configuration;
+    let candidate = draft.clone();
+    let response = ui
+        .add_enabled(
+            compute.accepts_commands() && dirty && valid && !edit_in_progress,
+            egui::Button::new("Apply configuration"),
+        )
+        .on_hover_text(
+            "Reset-class, like reconfiguring the domain: rebuilds every active solver from \
+             the current authored world and resumes from t = 0.",
+        );
+    if response.clicked() {
+        output.submit(CommandPayload::SetFieldSystemConfiguration {
+            plugin,
+            configuration: candidate,
+        });
+    }
+    if edit_in_progress {
+        ui.small("Finish the scene edit in progress before applying a configuration change.");
     }
 }
 
@@ -469,40 +515,6 @@ pub(super) fn realtime_control(
             });
         }
     });
-}
-
-fn format_configuration_value(value: &PropertyValue) -> String {
-    match value {
-        PropertyValue::Scalar(value) => format!(
-            "{} {}",
-            format_configuration_number(value.si_value()),
-            value.dimension()
-        ),
-        PropertyValue::Vector(value) => {
-            let vector = value.si_value();
-            format!(
-                "({}, {}, {}) {}",
-                format_configuration_number(vector.x),
-                format_configuration_number(vector.y),
-                format_configuration_number(vector.z),
-                value.dimension()
-            )
-        }
-        PropertyValue::Boolean(value) => value.to_string(),
-        PropertyValue::Text(value) | PropertyValue::Choice(value) => value.clone(),
-    }
-}
-
-fn format_configuration_number(value: f64) -> String {
-    if value != 0.0 && !(1.0e-3..1.0e6).contains(&value.abs()) {
-        format!("{value:.6e}")
-    } else {
-        let formatted = format!("{value:.6}");
-        formatted
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_owned()
-    }
 }
 
 pub(super) fn transport_sampling(

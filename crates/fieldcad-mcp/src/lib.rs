@@ -9,14 +9,19 @@
 //!
 //! Scope of this first slice (mapped from the "Suggested MCP surface" table in
 //! `docs/user-stories/README.md`): simulation control, world inventory and
-//! mutation, experiment (field system) configuration, subscriptions through
-//! four `fieldcad://session/{status,snapshot,diagnostics,queue}` resources with
-//! push notifications via `subscriptions/listen`, the latest snapshot, and
-//! undo/redo. Left for later, because the underlying capability doesn't exist
-//! in the model yet or needs its own design: scene lifecycle (create/open/save),
-//! particle templates, rename, probe history and trajectories as retained
-//! server-side series, diagnostics as a dedicated read (today folded into the
-//! snapshot), run comparison, record/replay, and export.
+//! mutation, experiment (field system) configuration and preflight validation,
+//! scene lifecycle (create/open/save), particle templates, rename, subscriptions
+//! through four `fieldcad://session/{status,snapshot,diagnostics,queue}`
+//! resources with push notifications via `subscriptions/listen`, the latest
+//! snapshot, undo/redo, and named run records with comparison
+//! (`save_run`/`list_runs`/`get_run`/`delete_run`/`compare_runs` — see
+//! [`fieldcad_server::HeadlessServer::save_run`], which is what also makes
+//! probe/distance/mass-aggregate history a retained server-side series now,
+//! not just a client-local desktop concern). Left for later, because the
+//! underlying capability doesn't exist in the model yet or needs its own
+//! design: body trajectories as a retained series, diagnostics as a
+//! dedicated read (today folded into the snapshot), record/replay, and
+//! export.
 //!
 //! World commands too varied to give a typed MCP schema in this slice
 //! (`edit_world` and `commit_world`) are accepted as a `Vec<serde_json::Value>`
@@ -207,6 +212,22 @@ async fn submit_world_commands(
         Ok(receipt) => ok_json(&receipt),
         Err(error) => tool_error(error.to_string()),
     }
+}
+
+/// One proposed transaction to check before actually submitting it — either
+/// a `edit_world`-shaped batch of world commands, or a proposed field-system
+/// configuration.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ValidateWorldTransactionParams {
+    WorldCommands {
+        commands: Vec<crate::typed_world::WorldEditParam>,
+    },
+    FieldSystemConfiguration {
+        /// The plugin identifier, as reported by `list_field_systems`.
+        plugin: String,
+        configuration: BTreeMap<String, crate::typed_world::PropertyValueParam>,
+    },
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -403,6 +424,36 @@ struct SetFieldSystemRealtimeParams {
     /// recomputation until the edit commits. This changes responsiveness, not
     /// the result of the committed scene.
     realtime: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetFieldSystemConfigurationParams {
+    /// The plugin identifier, as reported by `list_field_systems`.
+    plugin: String,
+    /// Replaces the plugin's entire declared configuration — not a partial
+    /// patch. Discover valid properties and current values from
+    /// `list_field_systems`' `configuration_schema`/`configuration`.
+    configuration: BTreeMap<String, crate::typed_world::PropertyValueParam>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SaveRunParams {
+    /// User-chosen label for the retained run. Not required to be unique.
+    name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RunIdParams {
+    /// A run record's `id`, as reported by `save_run` or `list_runs`.
+    id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CompareRunsParams {
+    /// The first run record's `id`.
+    a: String,
+    /// The second run record's `id`.
+    b: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1115,6 +1166,72 @@ impl McpServer {
         submit_world_commands(&self.model, commands).await
     }
 
+    #[tool(
+        description = "Advisory, non-mutating check: would a proposed world-command batch (edit_world-shaped) or field-system configuration be adopted if submitted right now? Never changes the world. The authority remains the final validator at actual commit time — a same-shaped rejection can still occur there if state changes between preflight and commit."
+    )]
+    async fn validate_world_transaction(
+        &self,
+        Parameters(params): Parameters<ValidateWorldTransactionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match params {
+            ValidateWorldTransactionParams::WorldCommands { commands } => {
+                let world = lock(&self.model).world();
+                let schemas = world.component_schemas();
+                let commands: Vec<WorldCommand> = match commands
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, command)| {
+                        into_world_command(schemas, command)
+                            .map_err(|error| format!("invalid command at index {index}: {error}"))
+                    })
+                    .collect()
+                {
+                    Ok(commands) => commands,
+                    Err(error) => return tool_error(error),
+                };
+                drop(world);
+                match lock(&self.model).validate_world_commands(commands) {
+                    Ok(report) => ok_json(&report),
+                    Err(error) => tool_error(error.to_string()),
+                }
+            }
+            ValidateWorldTransactionParams::FieldSystemConfiguration {
+                plugin,
+                configuration,
+            } => {
+                let plugin = match PluginId::new(plugin) {
+                    Ok(plugin) => plugin,
+                    Err(error) => return tool_error(error.to_string()),
+                };
+                let schema = {
+                    let server = lock(&self.model);
+                    server
+                        .field_systems()
+                        .into_iter()
+                        .find(|status| status.plugin.id == plugin)
+                        .map(|status| status.configuration_schema)
+                };
+                let Some(schema) = schema else {
+                    return tool_error(format!(
+                        "plugin '{plugin}' is not registered in this scene"
+                    ));
+                };
+                let configuration = match crate::typed_world::convert_configuration(
+                    &plugin,
+                    &schema,
+                    configuration,
+                ) {
+                    Ok(configuration) => configuration,
+                    Err(error) => return tool_error(error),
+                };
+                match lock(&self.model).validate_field_system_configuration(plugin, configuration) {
+                    Ok(()) => ok_json(&serde_json::json!({ "valid": true })),
+                    Err(error) => tool_error(error.to_string()),
+                }
+            }
+        }
+    }
+
     #[tool(description = "Start the run: fixed simulation ticks advance until paused.")]
     async fn play(&self) -> Result<CallToolResult, ErrorData> {
         match submit_and_wait(&self.model, CommandPayload::Play).await {
@@ -1271,6 +1388,122 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Replace one field system's configuration and restart the numerical run. This is reset-class, like reconfigure_domain: the scene resumes from its initial boundary under the new configuration rather than continuing from the current tick. Validated against the plugin's configuration_schema (see list_field_systems) before adoption."
+    )]
+    async fn set_field_system_configuration(
+        &self,
+        Parameters(params): Parameters<SetFieldSystemConfigurationParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let plugin = match PluginId::new(params.plugin) {
+            Ok(plugin) => plugin,
+            Err(error) => return tool_error(error.to_string()),
+        };
+        let schema = {
+            let server = lock(&self.model);
+            server
+                .field_systems()
+                .into_iter()
+                .find(|status| status.plugin.id == plugin)
+                .map(|status| status.configuration_schema)
+        };
+        let Some(schema) = schema else {
+            return tool_error(format!("plugin '{plugin}' is not registered in this scene"));
+        };
+        let configuration =
+            match crate::typed_world::convert_configuration(&plugin, &schema, params.configuration)
+            {
+                Ok(configuration) => configuration,
+                Err(error) => return tool_error(error),
+            };
+        match submit_and_wait(
+            &self.model,
+            CommandPayload::SetFieldSystemConfiguration {
+                plugin,
+                configuration,
+            },
+        )
+        .await
+        {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Name and retain the current numerical run: its run_generation, domain/time-step and field-system configuration, and a copy of this session's server-side probe/distance/mass-aggregate observation histories. Retained runs persist with the scene document (save_scene/open_scene) and can be listed and compared later — see list_runs and compare_runs."
+    )]
+    async fn save_run(
+        &self,
+        Parameters(params): Parameters<SaveRunParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let record = lock(&self.model).save_run(params.name);
+        ok_json(&record.summary())
+    }
+
+    #[tool(
+        description = "List every run record retained for the current scene, newest last. Each entry is a summary (id, name, created_at, run_generation) — call get_run for one record's full configuration and observation histories."
+    )]
+    async fn list_runs(&self) -> Result<CallToolResult, ErrorData> {
+        let summaries: Vec<_> = lock(&self.model)
+            .run_records()
+            .iter()
+            .map(fieldcad_scene_document::RunRecord::summary)
+            .collect();
+        ok_json(&summaries)
+    }
+
+    #[tool(
+        description = "Fetch one retained run record's full configuration (domain, time step, field-system composition) and its copy of the observation histories recorded when it was named."
+    )]
+    async fn get_run(
+        &self,
+        Parameters(params): Parameters<RunIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let id = match uuid::Uuid::parse_str(&params.id) {
+            Ok(id) => id,
+            Err(error) => return tool_error(format!("invalid run id: {error}")),
+        };
+        match lock(&self.model).run_record(id) {
+            Some(record) => ok_json(record),
+            None => tool_error(format!("no retained run record with id {id}")),
+        }
+    }
+
+    #[tool(description = "Discard one retained run record. Idempotent-shaped: reports whether a record with that id was actually found and removed.")]
+    async fn delete_run(
+        &self,
+        Parameters(params): Parameters<RunIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let id = match uuid::Uuid::parse_str(&params.id) {
+            Ok(id) => id,
+            Err(error) => return tool_error(format!("invalid run id: {error}")),
+        };
+        let deleted = lock(&self.model).delete_run(id);
+        ok_json(&serde_json::json!({ "deleted": deleted }))
+    }
+
+    #[tool(
+        description = "Compare two retained run records: which field-system configuration differs between them (domain, time step, per-plugin enabled/realtime/configuration), and every probe/distance/mass-aggregate series either run recorded, placed side by side by matching probe/channel."
+    )]
+    async fn compare_runs(
+        &self,
+        Parameters(params): Parameters<CompareRunsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let a = match uuid::Uuid::parse_str(&params.a) {
+            Ok(id) => id,
+            Err(error) => return tool_error(format!("invalid run id 'a': {error}")),
+        };
+        let b = match uuid::Uuid::parse_str(&params.b) {
+            Ok(id) => id,
+            Err(error) => return tool_error(format!("invalid run id 'b': {error}")),
+        };
+        match lock(&self.model).compare_runs(a, b) {
+            Ok(comparison) => ok_json(&comparison),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
         description = "Begin a streamed interactive scene edit. Use only when sending intermediate mutations (for example a drag); ordinary agents should submit one final atomic commit_world transaction instead."
     )]
     async fn begin_interactive_edit(&self) -> Result<CallToolResult, ErrorData> {
@@ -1412,6 +1645,7 @@ impl McpServer {
                 ),
                 document_entries: server.document_entries().to_vec(),
                 quick_add_hidden: server.quick_add_hidden().to_vec(),
+                run_records: server.run_records().to_vec(),
             }
         };
         let document = fieldcad_scene_document::SceneDocument::capture(
@@ -1440,6 +1674,7 @@ impl McpServer {
         let queue = outcome.document.queue.clone();
         let document_entries = outcome.document.document_entries.clone();
         let quick_add_hidden = outcome.document.quick_add_hidden.clone();
+        let run_records = outcome.document.run_records.clone();
         let source_label = format!("{:?}", outcome.source);
         let (new_source, warnings) =
             match build_session((self.plugin_catalog)(), Some(outcome.document)) {
@@ -1449,6 +1684,7 @@ impl McpServer {
         let mut server = lock(&self.model);
         server.replace_source(new_source);
         server.restore_document_catalog(document_entries, quick_add_hidden);
+        server.restore_run_records(run_records);
         if queue.paused
             && let Err(error) = server.submit(CommandPayload::PauseQueue)
         {

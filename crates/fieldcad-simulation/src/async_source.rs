@@ -16,7 +16,10 @@ use std::{
     time::Duration,
 };
 
-use fieldcad_core::{CommitReport, Domain, FieldSnapshot, ObjectId, SceneScale, WorldSnapshot};
+use fieldcad_core::{
+    CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, PropertyBag, SceneScale, WorldCommand,
+    WorldSnapshot,
+};
 use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_plugin_api::SolverCancellation;
 use glam::DVec3;
@@ -67,6 +70,18 @@ enum WorkerRequest {
     /// event; the next `BodyHistory`/`Poll` a caller happens to make will
     /// simply reflect it.
     SetBodyHistoryCapacity(ObjectId, usize),
+    /// Advisory, non-mutating check — see
+    /// [`AsyncLocalDataSource::validate_world_commands`]. Sent on the
+    /// ordinary `requests` channel: a preflight answer that jumped a
+    /// backlog of real mutations would describe a world that may no longer
+    /// exist by the time the caller acts on it.
+    ValidateWorldCommands(Vec<WorldCommand>),
+    /// Advisory, non-mutating check — see
+    /// [`AsyncLocalDataSource::validate_field_system_configuration`].
+    ValidateFieldSystemConfiguration {
+        plugin: PluginId,
+        configuration: PropertyBag,
+    },
     Stop,
 }
 
@@ -110,6 +125,10 @@ enum WorkerEvent {
         object: ObjectId,
         samples: Vec<BodySample>,
     },
+    /// Answer to [`WorkerRequest::ValidateWorldCommands`].
+    WorldCommandsValidated(Result<CommitReport, SourceError>),
+    /// Answer to [`WorkerRequest::ValidateFieldSystemConfiguration`].
+    FieldSystemConfigurationValidated(Result<(), SourceError>),
 }
 
 #[derive(Debug)]
@@ -405,6 +424,16 @@ impl AsyncLocalDataSource {
                 // anything else through here.
                 Ok(None)
             }
+            WorkerEvent::WorldCommandsValidated(_) => {
+                // Only meaningful to `validate_world_commands`'s own
+                // blocking wait, same reasoning as `DocumentCaptured`.
+                Ok(None)
+            }
+            WorkerEvent::FieldSystemConfigurationValidated(_) => {
+                // Only meaningful to `validate_field_system_configuration`'s
+                // own blocking wait, same reasoning as `DocumentCaptured`.
+                Ok(None)
+            }
             WorkerEvent::BodyHistoryCaptured { object, samples } => {
                 self.body_history_in_flight.remove(&object);
                 self.body_history_cache.insert(object, samples);
@@ -434,6 +463,59 @@ impl AsyncLocalDataSource {
         loop {
             match self.events.recv().map_err(|_| SourceError::Disconnected)? {
                 WorkerEvent::DocumentCaptured { world, queue } => return Ok((world, queue)),
+                other => {
+                    self.handle_worker_event(other)?;
+                }
+            }
+        }
+    }
+
+    /// Advisory, non-mutating: would this transaction be adopted if
+    /// committed right now? Blocking, like [`Self::capture_document`] — a
+    /// caller wants a definitive answer, not a value to poll for. See
+    /// [`crate::runtime::SimulationRuntime::validate_world_commands`]: the
+    /// runtime remains the sole authority at actual commit time, so a
+    /// same-shaped rejection can still occur at `execute` if state changed
+    /// between preflight and commit.
+    pub fn validate_world_commands(
+        &mut self,
+        commands: Vec<WorldCommand>,
+    ) -> Result<CommitReport, SourceError> {
+        if self.failure.is_some() {
+            return Err(SourceError::Disconnected);
+        }
+        self.requests
+            .send(WorkerRequest::ValidateWorldCommands(commands))
+            .map_err(|_| SourceError::Disconnected)?;
+        loop {
+            match self.events.recv().map_err(|_| SourceError::Disconnected)? {
+                WorkerEvent::WorldCommandsValidated(result) => return result,
+                other => {
+                    self.handle_worker_event(other)?;
+                }
+            }
+        }
+    }
+
+    /// Advisory, non-mutating counterpart to `validate_world_commands` for
+    /// one field system's proposed configuration.
+    pub fn validate_field_system_configuration(
+        &mut self,
+        plugin: PluginId,
+        configuration: PropertyBag,
+    ) -> Result<(), SourceError> {
+        if self.failure.is_some() {
+            return Err(SourceError::Disconnected);
+        }
+        self.requests
+            .send(WorkerRequest::ValidateFieldSystemConfiguration {
+                plugin,
+                configuration,
+            })
+            .map_err(|_| SourceError::Disconnected)?;
+        loop {
+            match self.events.recv().map_err(|_| SourceError::Disconnected)? {
+                WorkerEvent::FieldSystemConfigurationValidated(result) => return result,
                 other => {
                     self.handle_worker_event(other)?;
                 }
@@ -774,6 +856,33 @@ fn worker_loop(
                 source
                     .runtime_mut()
                     .set_body_history_capacity(object, capacity);
+            }
+            Ok(WorkerRequest::ValidateWorldCommands(commands)) => {
+                let result = source
+                    .runtime()
+                    .validate_world_commands(&commands)
+                    .map_err(SourceError::from);
+                if events
+                    .send(WorkerEvent::WorldCommandsValidated(result))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(WorkerRequest::ValidateFieldSystemConfiguration {
+                plugin,
+                configuration,
+            }) => {
+                let result = source
+                    .runtime()
+                    .validate_field_system_configuration(&plugin, &configuration)
+                    .map_err(SourceError::from);
+                if events
+                    .send(WorkerEvent::FieldSystemConfigurationValidated(result))
+                    .is_err()
+                {
+                    break;
+                }
             }
             Ok(WorkerRequest::Stop) => break,
             Err(RecvTimeoutError::Timeout) => continue,

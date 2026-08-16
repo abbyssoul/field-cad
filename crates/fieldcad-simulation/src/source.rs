@@ -13,8 +13,8 @@ use std::{
 };
 
 use fieldcad_core::{
-    ChannelId, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, SceneScale, SimulationMode,
-    TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
+    ChannelId, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, PropertyBag, SceneScale,
+    SimulationMode, TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
 };
 use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_plugin_api::FieldBrushStroke;
@@ -117,6 +117,16 @@ pub enum CommandPayload {
         plugin: PluginId,
         realtime: bool,
     },
+    /// Replace one equation system's declared configuration.
+    ///
+    /// Reset-class, like `ReconfigureDomain`: a solver bakes its
+    /// configuration into memory at construction and never re-reads it, so
+    /// adopting a new value restarts the numerical run. Queued at the next
+    /// tick boundary while running, exactly like `ReconfigureDomain`.
+    SetFieldSystemConfiguration {
+        plugin: PluginId,
+        configuration: PropertyBag,
+    },
     /// Choose which equation system computes one field, or none.
     ///
     /// A scene has one electric field however many models of it are composed
@@ -176,6 +186,7 @@ impl CommandPayload {
             Self::SetSceneScale(_) => CommandKind::SetSceneScale,
             Self::SetFieldSystemEnabled { .. } => CommandKind::SetFieldSystemEnabled,
             Self::SetFieldSystemRealtime { .. } => CommandKind::SetFieldSystemRealtime,
+            Self::SetFieldSystemConfiguration { .. } => CommandKind::SetFieldSystemConfiguration,
             Self::SetFieldModel { .. } => CommandKind::SetFieldModel,
             Self::SetInteractiveEdit(_) => CommandKind::SetInteractiveEdit,
             Self::ApplyFieldBrushStroke(_) => CommandKind::ApplyFieldBrushStroke,
@@ -212,6 +223,7 @@ pub enum CommandKind {
     SetSceneScale,
     SetFieldSystemEnabled,
     SetFieldSystemRealtime,
+    SetFieldSystemConfiguration,
     SetFieldModel,
     SetInteractiveEdit,
     ApplyFieldBrushStroke,
@@ -239,6 +251,7 @@ impl CommandKind {
             Self::SetSceneScale => "Set scene scale",
             Self::SetFieldSystemEnabled => "Set field system enabled",
             Self::SetFieldSystemRealtime => "Set field system realtime",
+            Self::SetFieldSystemConfiguration => "Set field system configuration",
             Self::SetFieldModel => "Set field model",
             Self::SetInteractiveEdit => "Set interactive edit",
             Self::ApplyFieldBrushStroke => "Field brush stroke",
@@ -277,6 +290,10 @@ pub enum CommandLifecycle {
 enum PendingPayload {
     World(Vec<WorldCommand>),
     Domain(Domain),
+    Configuration {
+        plugin: PluginId,
+        configuration: PropertyBag,
+    },
 }
 
 /// One command's identity, order, and lifecycle — replaces a payload-only
@@ -364,8 +381,9 @@ pub struct QueueStatus {
 pub struct QueueDocument {
     pub paused: bool,
     /// Oldest first, matching `pending_mutations`' order. Always
-    /// [`CommandPayload::CommitWorld`] or [`CommandPayload::ReconfigureDomain`]
-    /// — the only two variants a queued [`PendingPayload`] ever holds.
+    /// [`CommandPayload::CommitWorld`], [`CommandPayload::ReconfigureDomain`],
+    /// or [`CommandPayload::SetFieldSystemConfiguration`] — the only
+    /// variants a queued [`PendingPayload`] ever holds.
     pub pending: Vec<CommandPayload>,
 }
 
@@ -779,6 +797,13 @@ impl SessionCore {
                         PendingPayload::Domain(domain) => {
                             CommandPayload::ReconfigureDomain(*domain)
                         }
+                        PendingPayload::Configuration {
+                            plugin,
+                            configuration,
+                        } => CommandPayload::SetFieldSystemConfiguration {
+                            plugin: plugin.clone(),
+                            configuration: configuration.clone(),
+                        },
                     })
                 })
                 .collect(),
@@ -888,6 +913,31 @@ impl SessionCore {
             }
             CommandPayload::SetFieldSystemRealtime { plugin, realtime } => {
                 self.runtime.set_field_system_realtime(&plugin, realtime)?;
+            }
+            CommandPayload::SetFieldSystemConfiguration {
+                plugin,
+                configuration,
+            } => {
+                if self.should_queue_mutation() {
+                    let record = CommandRecord::queued(
+                        id,
+                        kind,
+                        self.next_sequence(),
+                        PendingPayload::Configuration {
+                            plugin,
+                            configuration,
+                        },
+                    );
+                    self.pending_mutations.push_back(record);
+                    return Ok(self.receipt(
+                        id,
+                        CommandDisposition::Queued,
+                        CommitReport::empty(self.runtime.status().world_revision),
+                    ));
+                }
+                self.runtime
+                    .set_field_system_configuration(&plugin, configuration)?;
+                self.pacer.reset();
             }
             CommandPayload::SetFieldModel { channel, provider } => {
                 self.runtime.set_field_model(&channel, provider.as_ref())?;
@@ -1159,6 +1209,18 @@ impl SessionCore {
             PendingPayload::World(commands) => self.runtime.commit_world_commands(commands),
             PendingPayload::Domain(domain) => {
                 let outcome = self.runtime.reconfigure_domain(domain);
+                if outcome.is_ok() {
+                    self.pacer.reset();
+                }
+                outcome.map(|()| CommitReport::empty(self.runtime.status().world_revision))
+            }
+            PendingPayload::Configuration {
+                plugin,
+                configuration,
+            } => {
+                let outcome = self
+                    .runtime
+                    .set_field_system_configuration(&plugin, configuration);
                 if outcome.is_ok() {
                     self.pacer.reset();
                 }
