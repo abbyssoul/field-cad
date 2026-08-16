@@ -21,8 +21,8 @@ use fieldcad_core::{
 };
 use fieldcad_dynamics::{self as dynamics, DynamicsError, IntegrationScheme};
 use fieldcad_expressions::{
-    EvaluationPlan, ExpressionCommand, ExpressionDocument, ExpressionError, PropertyBindingSchema,
-    PropertyTarget, ValueProvider,
+    EvaluationPlan, ExpressionCommand, ExpressionDiagnostic, ExpressionDocument, ExpressionError,
+    ExpressionState, PropertyBindingSchema, PropertyTarget, ValueProvider,
 };
 use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, FieldBrushStroke,
@@ -493,12 +493,58 @@ pub struct FieldSystemStatus {
     pub realtime: bool,
 }
 
+/// One authored transaction spanning ordinary world mutations and expression edits.
+///
+/// World commands are provisionally applied first so expression bindings may
+/// validate against the resulting schemas and probe set. Neither half is
+/// adopted unless the complete effective world passes every validator.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SceneEdit {
+    /// Ordinary authoritative world mutations.
+    #[serde(default)]
+    pub world_commands: Vec<WorldCommand>,
+    /// Authored constant and property-binding mutations.
+    #[serde(default)]
+    pub expression_commands: Vec<ExpressionCommand>,
+}
+
+impl SceneEdit {
+    /// Construct a world-only compatibility transaction.
+    pub fn world(commands: Vec<WorldCommand>) -> Self {
+        Self {
+            world_commands: commands,
+            expression_commands: Vec::new(),
+        }
+    }
+
+    /// Construct an expression-only compatibility transaction.
+    pub fn expressions(commands: Vec<ExpressionCommand>) -> Self {
+        Self {
+            world_commands: Vec::new(),
+            expression_commands: commands,
+        }
+    }
+
+    fn label(&self) -> String {
+        match (
+            self.world_commands.is_empty(),
+            self.expression_commands.is_empty(),
+        ) {
+            (false, true) => WorldCommand::batch_label(&self.world_commands),
+            (true, false) => "Edit expression".to_owned(),
+            _ => "Edit scene".to_owned(),
+        }
+    }
+}
+
 /// Owns solver memory for one session and publishes immutable field snapshots.
 pub struct SimulationRuntime {
     world: World,
     expression_document: ExpressionDocument,
     expression_plan: EvaluationPlan,
     expression_values: BTreeMap<PropertyTarget, fieldcad_expressions::ExpressionValue>,
+    expression_diagnostics: Vec<ExpressionDiagnostic>,
+    expression_resolved_world_revision: WorldRevision,
     clock: SimulationClock,
     domain: Domain,
     /// How many metres one render/camera unit represents. Purely a
@@ -714,7 +760,7 @@ fn compile_expression_plan(
 
 fn resolved_property_commands(
     world: &WorldSnapshot,
-    values: &BTreeMap<PropertyTarget, fieldcad_expressions::ExpressionValue>,
+    values: impl IntoIterator<Item = (PropertyTarget, fieldcad_expressions::ExpressionValue)>,
 ) -> Result<Vec<WorldCommand>, ExpressionError> {
     let mut bags: BTreeMap<(ObjectId, ComponentTypeId), PropertyBag> = BTreeMap::new();
     for (target, value) in values {
@@ -848,8 +894,13 @@ impl SimulationRuntime {
             let snapshot = world.snapshot();
             expression_plan.evaluate(&WorldDistanceProvider(snapshot))?
         };
-        let expression_commands =
-            resolved_property_commands(&world.snapshot(), &expression_values.properties)?;
+        let expression_commands = resolved_property_commands(
+            &world.snapshot(),
+            expression_values
+                .properties
+                .iter()
+                .map(|(target, value)| (target.clone(), *value)),
+        )?;
         if !expression_commands.is_empty() {
             world.commit(expression_commands)?;
         }
@@ -937,11 +988,14 @@ impl SimulationRuntime {
         // tests do this).
         world.adopt_legacy_center_of_mass();
 
+        let expression_resolved_world_revision = world.revision();
         let mut runtime = Self {
             world,
             expression_document: expressions,
             expression_plan,
             expression_values: expression_values.properties,
+            expression_diagnostics: Vec::new(),
+            expression_resolved_world_revision,
             clock,
             domain,
             scene_scale,
@@ -1003,6 +1057,19 @@ impl SimulationRuntime {
         &self,
     ) -> BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue> {
         self.expression_plan.constant_values().collect()
+    }
+
+    /// Accepted graph definitions, direct dependencies, values, and current live fault.
+    pub fn expression_state(&self) -> ExpressionState {
+        ExpressionState {
+            document: self.expression_document.clone(),
+            graph_hash: self.expression_plan.content_hash().to_owned(),
+            resolved_world_revision: Some(self.expression_resolved_world_revision),
+            nodes: self
+                .expression_plan
+                .node_states(&self.expression_diagnostics),
+            diagnostics: self.expression_diagnostics.clone(),
+        }
     }
 
     pub fn clock_snapshot(&self) -> ClockSnapshot {
@@ -1191,6 +1258,8 @@ impl SimulationRuntime {
         self.expression_document = entry.expression_document.clone();
         self.expression_plan = expression_plan;
         self.expression_values = expression_values;
+        self.expression_diagnostics.clear();
+        self.expression_resolved_world_revision = self.world.revision();
         if let Some(numerical) = entry.numerical {
             self.reconfigure_domain_inner(numerical.domain, Some(numerical.time_step))?;
         }
@@ -1758,8 +1827,16 @@ impl SimulationRuntime {
             .any(|slot| slot.enabled && slot.solver().kind().advances_with_time())
     }
 
-    pub fn play(&mut self) {
+    pub fn play(&mut self) -> Result<(), RuntimeError> {
+        if let Err(error) = self.refresh_expression_values() {
+            self.clock.pause();
+            return Err(error);
+        }
+        if self.world.revision() != self.latest.identity.world_revision {
+            self.publish_snapshot(SamplingPolicy::All)?;
+        }
         self.clock.play();
+        Ok(())
     }
 
     pub fn pause(&mut self) {
@@ -2104,21 +2181,7 @@ impl SimulationRuntime {
         &mut self,
         commands: Vec<WorldCommand>,
     ) -> Result<CommitReport, RuntimeError> {
-        // Captured before the attempt and kept only if it succeeded: a rejected
-        // edit changed nothing, so offering to undo it would step the user back
-        // past an edit they did make.
-        let before = self.world.checkpoint();
-        let before_document = self.expression_document.clone();
-        let label = WorldCommand::batch_label(&commands);
-        let coalesce = self.is_editing();
-
-        let report = self.adopt_world_commands(commands)?;
-        if report.revision != before.captured_at() {
-            self.history
-                .record(before, before_document, label, coalesce);
-        }
-        self.publish_snapshot(SamplingPolicy::All)?;
-        Ok(report)
+        self.commit_scene_edit(SceneEdit::world(commands))
     }
 
     /// Atomically edit authored constants/property formulas and adopt every
@@ -2127,25 +2190,89 @@ impl SimulationRuntime {
         &mut self,
         commands: Vec<ExpressionCommand>,
     ) -> Result<CommitReport, RuntimeError> {
-        let before_document = self.expression_document.clone();
-        let document = self.expression_document.apply(commands)?;
-        let snapshot = self.world.snapshot();
-        let mut plan = compile_expression_plan(&document, &snapshot)?;
-        let evaluated = plan.evaluate(&WorldDistanceProvider(snapshot.clone()))?;
-        let world_commands = resolved_property_commands(&snapshot, &evaluated.properties)?;
+        self.commit_scene_edit(SceneEdit::expressions(commands))
+    }
 
+    /// Apply one authored transaction spanning the world and expression graph.
+    pub fn commit_scene_edit(&mut self, edit: SceneEdit) -> Result<CommitReport, RuntimeError> {
         let before = self.world.checkpoint();
-        let mut candidate = self.world.clone();
-        let report = candidate.commit(world_commands)?;
-        let candidate_snapshot = candidate.snapshot();
+        let before_document = self.expression_document.clone();
+        let label = edit.label();
+        let coalesce = self.is_editing();
+        let report = self.adopt_scene_edit(edit)?;
+        if report.revision != before.captured_at() || self.expression_document != before_document {
+            self.history
+                .record(before, before_document, label, coalesce);
+        }
+        self.publish_snapshot(SamplingPolicy::All)?;
+        Ok(report)
+    }
+
+    fn adopt_scene_edit(&mut self, edit: SceneEdit) -> Result<CommitReport, RuntimeError> {
+        let authored_world_commands = edit.world_commands;
+        let mut provisional = self.world.clone();
+        let mut report = provisional.commit(authored_world_commands.clone())?;
+        let provisional_snapshot = provisional.snapshot();
+
+        let mut base_document = self.expression_document.clone();
+        base_document.bindings.retain(|binding| {
+            property_binding_schema(&provisional_snapshot, &binding.target).is_some()
+        });
+        let document = base_document.apply(edit.expression_commands)?;
+
+        // A literal change to a still-bound property is ambiguous. Clearing
+        // that binding in this same scene edit makes the literal authoritative.
+        let before_snapshot = self.world.snapshot();
+        for binding in &document.bindings {
+            let before = before_snapshot
+                .object(binding.target.object)
+                .and_then(|object| object.components.get(&binding.target.component))
+                .and_then(|properties| properties.scalar(&binding.target.property));
+            let after = provisional_snapshot
+                .object(binding.target.object)
+                .and_then(|object| object.components.get(&binding.target.component))
+                .and_then(|properties| properties.scalar(&binding.target.property));
+            if before.is_some() && after.is_some() && before != after {
+                return Err(ExpressionError {
+                    kind: fieldcad_expressions::ExpressionErrorKind::ConflictingWriter,
+                    message: format!(
+                        "property {} is written by both a literal edit and a retained expression",
+                        binding.target
+                    ),
+                    span: None,
+                    dependents: vec![binding.target.to_string()],
+                }
+                .into());
+            }
+        }
+
+        let mut plan = compile_expression_plan(&document, &provisional_snapshot)?;
+        let evaluated = plan.evaluate(&WorldDistanceProvider(provisional_snapshot.clone()))?;
+        let resolved = resolved_property_commands(
+            &provisional_snapshot,
+            evaluated
+                .properties
+                .iter()
+                .map(|(target, value)| (target.clone(), *value)),
+        )?;
+        if !resolved.is_empty() {
+            let mut atomic_commands = authored_world_commands;
+            atomic_commands.extend(resolved);
+            provisional = self.world.clone();
+            report = provisional.commit(atomic_commands)?;
+        }
+
+        let candidate_snapshot = provisional.snapshot();
         for slot in self.plugins.iter().filter(|slot| slot.enabled) {
             slot.solver().validate_world(&candidate_snapshot)?;
         }
 
-        self.world = candidate;
+        self.world = provisional;
         self.expression_document = document;
         self.expression_plan = plan;
         self.expression_values = evaluated.properties;
+        self.expression_diagnostics.clear();
+        self.expression_resolved_world_revision = candidate_snapshot.revision();
         let editing = self.is_editing();
         for slot in self
             .plugins
@@ -2154,38 +2281,61 @@ impl SimulationRuntime {
         {
             slot.solver_mut().on_world_changed(&candidate_snapshot)?;
         }
-        // A formula-only edit whose numeric result is unchanged is still
-        // authored intent and must be distinguishable and undoable.
-        self.history.record(
-            before,
-            before_document,
-            "Edit expression".to_owned(),
-            self.is_editing(),
-        );
-        self.publish_snapshot(SamplingPolicy::All)?;
         Ok(report)
     }
 
     fn refresh_expression_values(&mut self) -> Result<bool, RuntimeError> {
         let snapshot = self.world.snapshot();
-        self.expression_plan.evaluate_properties_into(
-            &WorldDistanceProvider(snapshot.clone()),
-            &mut self.expression_values,
+        if let Err(diagnostic) = self
+            .expression_plan
+            .evaluate_candidate(&WorldDistanceProvider(snapshot.clone()))
+        {
+            self.expression_diagnostics = vec![diagnostic.as_ref().clone()];
+            return Err(diagnostic.error.into());
+        }
+        let commands = resolved_property_commands(
+            &snapshot,
+            self.expression_plan
+                .candidate_properties()
+                .map(|(target, value)| (target.clone(), value)),
         )?;
-        let commands = resolved_property_commands(&snapshot, &self.expression_values)?;
         if commands.is_empty() {
+            self.expression_plan.adopt_candidate();
+            for (target, value) in self.expression_plan.property_values() {
+                *self
+                    .expression_values
+                    .get_mut(target)
+                    .expect("accepted graph preallocates property values") = value;
+            }
+            self.expression_diagnostics.clear();
+            self.expression_resolved_world_revision = snapshot.revision();
             return Ok(false);
         }
         // The authored graph has not changed here. Adopt only its resolved
         // values so a live binding never recompiles or rebuilds the graph on
         // the tick path.
         let mut candidate = self.world.clone();
-        candidate.commit(commands)?;
+        if let Err(error) = candidate.commit(commands) {
+            self.expression_plan.discard_candidate();
+            return Err(error.into());
+        }
         let candidate_snapshot = candidate.snapshot();
         for slot in self.plugins.iter().filter(|slot| slot.enabled) {
-            slot.solver().validate_world(&candidate_snapshot)?;
+            if let Err(error) = slot.solver().validate_world(&candidate_snapshot) {
+                self.expression_plan.discard_candidate();
+                return Err(error.into());
+            }
         }
         self.world = candidate;
+        self.expression_plan.adopt_candidate();
+        for (target, value) in self.expression_plan.property_values() {
+            *self
+                .expression_values
+                .get_mut(target)
+                .expect("accepted graph preallocates property values") = value;
+        }
+        self.expression_diagnostics.clear();
+        self.expression_resolved_world_revision = candidate_snapshot.revision();
         let editing = self.is_editing();
         let expression_values = &self.expression_values;
         for slot in self.plugins.iter_mut().filter(|slot| {
@@ -2409,8 +2559,13 @@ impl SimulationRuntime {
             compile_expression_plan(&expression_document, &candidate_before_expressions)?;
         let evaluated = expression_plan
             .evaluate(&WorldDistanceProvider(candidate_before_expressions.clone()))?;
-        let resolved =
-            resolved_property_commands(&candidate_before_expressions, &evaluated.properties)?;
+        let resolved = resolved_property_commands(
+            &candidate_before_expressions,
+            evaluated
+                .properties
+                .iter()
+                .map(|(target, value)| (target.clone(), *value)),
+        )?;
         if !resolved.is_empty() {
             // Rebuild from the committed base so authored and derived property
             // updates land at one world revision, not two observable commits.
@@ -2434,6 +2589,8 @@ impl SimulationRuntime {
         self.expression_document = expression_document;
         self.expression_plan = expression_plan;
         self.expression_values = evaluated.properties;
+        self.expression_diagnostics.clear();
+        self.expression_resolved_world_revision = candidate_snapshot.revision();
         for slot in self
             .plugins
             .iter_mut()
@@ -4460,5 +4617,154 @@ mod tests {
         assert!(runtime.expression_document().bindings.is_empty());
         runtime.undo().unwrap();
         assert_eq!(runtime.expression_document().bindings.len(), 1);
+    }
+
+    #[test]
+    fn mixed_scene_edit_is_one_revision_and_one_undo_step() {
+        let (mut runtime, object, probe, target) = expression_runtime("distance.0 / 2");
+        let before_revision = runtime.world_snapshot().revision();
+        let other = runtime
+            .world_snapshot()
+            .distance_probe(probe)
+            .unwrap()
+            .object_b;
+        runtime
+            .commit_scene_edit(SceneEdit {
+                world_commands: vec![WorldCommand::SetTransform {
+                    object: other,
+                    transform: Transform::at(DVec3::new(20.0, 0.0, 0.0)).unwrap(),
+                }],
+                expression_commands: vec![ExpressionCommand::SetPropertyExpression(
+                    fieldcad_expressions::PropertyBinding {
+                        target: target.clone(),
+                        source: "distance.0 / 4".into(),
+                    },
+                )],
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.world_snapshot().revision().get(),
+            before_revision.get() + 1
+        );
+        assert_eq!(
+            runtime.world_snapshot().object(object).unwrap().components[&target.component]
+                .scalar(&target.property),
+            Some(5.0)
+        );
+        runtime.undo().unwrap();
+        assert_eq!(
+            runtime.expression_document().bindings[0].source.as_str(),
+            "distance.0 / 2"
+        );
+        assert_eq!(
+            runtime
+                .world_snapshot()
+                .resolve_distance(runtime.world_snapshot().distance_probe(probe).unwrap())
+                .unwrap(),
+            10.0
+        );
+    }
+
+    #[test]
+    fn one_scene_edit_can_clear_a_binding_and_remove_its_probe() {
+        let (mut runtime, _, probe, target) = expression_runtime("distance.0 / 2");
+        runtime
+            .commit_scene_edit(SceneEdit {
+                world_commands: vec![WorldCommand::RemoveDistanceProbe(probe)],
+                expression_commands: vec![ExpressionCommand::ClearPropertyExpression(target)],
+            })
+            .unwrap();
+        assert!(runtime.expression_document().bindings.is_empty());
+        assert!(runtime.world_snapshot().distance_probe(probe).is_none());
+    }
+
+    #[test]
+    fn invalid_expression_rolls_back_the_world_half_of_a_scene_edit() {
+        let (mut runtime, object, _, target) = expression_runtime("2 m");
+        let before_revision = runtime.world_snapshot().revision();
+        let error = runtime
+            .commit_scene_edit(SceneEdit {
+                world_commands: vec![WorldCommand::SetObjectName {
+                    object,
+                    name: "must roll back".to_owned(),
+                }],
+                expression_commands: vec![ExpressionCommand::SetPropertyExpression(
+                    fieldcad_expressions::PropertyBinding {
+                        target,
+                        source: "1 kg".into(),
+                    },
+                )],
+            })
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::Expression(_)));
+        assert_eq!(runtime.world_snapshot().revision(), before_revision);
+        assert_eq!(runtime.world_snapshot().object(object).unwrap().name, "a");
+        assert_eq!(
+            runtime.expression_document().bindings[0].source.as_str(),
+            "2 m"
+        );
+    }
+
+    #[test]
+    fn play_validates_before_changing_mode_and_retains_live_fault_state() {
+        let (mut runtime, _, probe, target) = expression_runtime("1 m^2 / distance.0");
+        let other = runtime
+            .world_snapshot()
+            .distance_probe(probe)
+            .unwrap()
+            .object_b;
+        // Test-only corruption models an observation becoming invalid outside
+        // the authored command boundary; Play must still defend its boundary.
+        runtime
+            .world
+            .commit([WorldCommand::SetTransform {
+                object: other,
+                transform: Transform::at(DVec3::ZERO).unwrap(),
+            }])
+            .unwrap();
+        let clock = runtime.clock_snapshot();
+        let snapshot = Arc::clone(&runtime.latest);
+        let last_value = runtime.expression_values[&target];
+
+        let error = runtime.play().unwrap_err();
+
+        assert!(matches!(error, RuntimeError::Expression(_)));
+        assert_eq!(runtime.clock_snapshot(), clock);
+        assert!(Arc::ptr_eq(&runtime.latest, &snapshot));
+        assert_eq!(runtime.expression_values[&target], last_value);
+        let state = runtime.expression_state();
+        assert_eq!(state.diagnostics.len(), 1);
+        assert_eq!(
+            state.diagnostics[0].subject,
+            fieldcad_expressions::ExpressionSubject::Property(target)
+        );
+    }
+
+    #[test]
+    fn step_samples_live_distance_before_advancing_and_skips_unchanged_adoption() {
+        let (mut runtime, object, probe, target) = expression_runtime("distance.0 / 2");
+        let unchanged_revision = runtime.world_snapshot().revision();
+        runtime.step_once().unwrap();
+        assert_eq!(runtime.world_snapshot().revision(), unchanged_revision);
+
+        let other = runtime
+            .world_snapshot()
+            .distance_probe(probe)
+            .unwrap()
+            .object_b;
+        runtime
+            .world
+            .commit([WorldCommand::SetTransform {
+                object: other,
+                transform: Transform::at(DVec3::new(14.0, 0.0, 0.0)).unwrap(),
+            }])
+            .unwrap();
+        runtime.step_once().unwrap();
+        assert_eq!(runtime.clock_snapshot().tick(), 2);
+        assert_eq!(
+            runtime.world_snapshot().object(object).unwrap().components[&target.component]
+                .scalar(&target.property),
+            Some(7.0)
+        );
     }
 }

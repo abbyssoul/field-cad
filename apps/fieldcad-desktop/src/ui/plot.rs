@@ -195,7 +195,7 @@ pub(super) fn distance_history_plot(
             .map(|reading| reading.distance as f32)
             .collect();
         ui.label(format!("Distance · {:.4} m", values.last().unwrap()));
-        history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75));
+        history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75), "m");
     }
     if series.rate_of_change {
         let rates = distance_rate_of_change(&readings);
@@ -203,7 +203,7 @@ pub(super) fn distance_history_plot(
             ui.weak("Not enough samples yet for a rate of change");
         } else {
             ui.label(format!("Rate of change · {:.4} m/s", rates.last().unwrap()));
-            history_plot(ui, &rates, egui::Color32::from_rgb(100, 155, 245));
+            history_plot(ui, &rates, egui::Color32::from_rgb(100, 155, 245), "m/s");
         }
     }
 }
@@ -305,7 +305,7 @@ pub(super) fn mass_aggregate_history_plot(
             "Distance from origin · {:.4} m",
             values.last().unwrap()
         ));
-        history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75));
+        history_plot(ui, &values, egui::Color32::from_rgb(245, 205, 75), "m");
     }
     if series.velocity {
         let values: Vec<f32> = readings
@@ -313,7 +313,7 @@ pub(super) fn mass_aggregate_history_plot(
             .map(|reading| reading.velocity.length() as f32)
             .collect();
         ui.label(format!("Speed · {:.4} m/s", values.last().unwrap()));
-        history_plot(ui, &values, egui::Color32::from_rgb(100, 155, 245));
+        history_plot(ui, &values, egui::Color32::from_rgb(100, 155, 245), "m/s");
     }
     if series.momentum {
         let values: Vec<f32> = readings
@@ -324,7 +324,12 @@ pub(super) fn mass_aggregate_history_plot(
             "Momentum magnitude · {:.4} kg·m/s",
             values.last().unwrap()
         ));
-        history_plot(ui, &values, egui::Color32::from_rgb(120, 220, 150));
+        history_plot(
+            ui,
+            &values,
+            egui::Color32::from_rgb(120, 220, 150),
+            "kg·m/s",
+        );
     }
     if series.angular_momentum {
         let values: Vec<f32> = readings
@@ -335,7 +340,12 @@ pub(super) fn mass_aggregate_history_plot(
             "Angular momentum magnitude · {:.4} kg·m²/s",
             values.last().unwrap()
         ));
-        history_plot(ui, &values, egui::Color32::from_rgb(235, 160, 60));
+        history_plot(
+            ui,
+            &values,
+            egui::Color32::from_rgb(235, 160, 60),
+            "kg·m²/s",
+        );
     }
     if series.kinetic_energy {
         let values: Vec<f32> = readings
@@ -343,7 +353,7 @@ pub(super) fn mass_aggregate_history_plot(
             .map(|reading| reading.total_kinetic_energy_j as f32)
             .collect();
         ui.label(format!("Kinetic energy · {:.4} J", values.last().unwrap()));
-        history_plot(ui, &values, egui::Color32::from_rgb(220, 130, 220));
+        history_plot(ui, &values, egui::Color32::from_rgb(220, 130, 220), "J");
     }
 }
 
@@ -545,10 +555,12 @@ fn plot_frame(ui: &mut egui::Ui, height: f32) -> (egui::Rect, egui::Rect, egui::
 }
 
 /// A single-trace time series, oldest sample first. Used by the diagnostics
-/// panel for frame time, memory, and CPU — anything that is one number
-/// sampled repeatedly, as opposed to a probe's multi-component field
-/// reading.
-pub(super) fn history_plot(ui: &mut egui::Ui, values: &[f32], color: egui::Color32) {
+/// panel for frame time, memory, and CPU, and by probe plots for distance,
+/// velocity, momentum, and similar recorded quantities — anything that is
+/// one number sampled repeatedly, as opposed to a probe's multi-component
+/// field reading. `unit` labels the min/max/avg readout (e.g. `"ms"`,
+/// `"MiB"`, `"m/s"`); pass `""` for an already-dimensionless series.
+pub(super) fn history_plot(ui: &mut egui::Ui, values: &[f32], color: egui::Color32, unit: &str) {
     if values.len() < 2 {
         ui.weak("Not enough samples yet");
         return;
@@ -560,6 +572,7 @@ pub(super) fn history_plot(ui: &mut egui::Ui, values: &[f32], color: egui::Color
             (lo.min(value), hi.max(value))
         });
     let (display_min, display_max) = (y_min, y_max);
+    let display_avg = values.iter().copied().sum::<f32>() / values.len() as f32;
     if y_min == y_max {
         let padding = y_min.abs().max(1.0) * 0.05;
         y_min -= padding;
@@ -603,14 +616,21 @@ pub(super) fn history_plot(ui: &mut egui::Ui, values: &[f32], color: egui::Color
     painter.text(
         rect.left_top() + egui::vec2(4.0, 3.0),
         egui::Align2::LEFT_TOP,
-        format!("max {display_max:.3e}"),
+        format!("max {display_max:.2} {unit}"),
         egui::FontId::monospace(9.0),
         egui::Color32::GRAY,
     );
     painter.text(
         rect.right_top() + egui::vec2(-4.0, 3.0),
         egui::Align2::RIGHT_TOP,
-        format!("min {display_min:.3e}"),
+        format!("min {display_min:.2} {unit}"),
+        egui::FontId::monospace(9.0),
+        egui::Color32::GRAY,
+    );
+    painter.text(
+        rect.center_top() + egui::vec2(0.0, 3.0),
+        egui::Align2::CENTER_TOP,
+        format!("avg {display_avg:.2} {unit}"),
         egui::FontId::monospace(9.0),
         egui::Color32::GRAY,
     );

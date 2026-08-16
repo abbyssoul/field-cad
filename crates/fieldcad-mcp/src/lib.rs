@@ -255,6 +255,16 @@ struct CommitExpressionsParams {
     commands: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct EditSceneParams {
+    /// Typed world edits applied before expression compilation.
+    #[serde(default)]
+    world_commands: Vec<crate::typed_world::WorldEditParam>,
+    /// Native `ExpressionCommand` JSON objects applied in the same transaction.
+    #[serde(default)]
+    expression_commands: Vec<serde_json::Value>,
+}
+
 /// A catalog reference and template payload are ordinary JSON because catalog
 /// schemas are intentionally extensible independently of this transport.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1202,6 +1212,13 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Read the accepted expression graph with direct dependencies, last valid values, node health, and current live-evaluation diagnostics."
+    )]
+    async fn get_expression_state(&self) -> Result<CallToolResult, ErrorData> {
+        ok_json(&lock(&self.model).expression_state())
+    }
+
+    #[tool(
         description = "Authoritative run state: mode, tick, simulation time, time step, and world revision."
     )]
     async fn get_simulation_status(&self) -> Result<CallToolResult, ErrorData> {
@@ -1411,6 +1428,57 @@ impl McpServer {
             Err(error) => return tool_error(error),
         };
         match submit_and_wait(&self.model, CommandPayload::CommitExpressions(commands)).await {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Atomically apply typed world edits and expression edits as one queued scene transaction. Both halves are rolled back if expression compilation, evaluation, world validation, or solver validation fails."
+    )]
+    async fn edit_scene(
+        &self,
+        Parameters(params): Parameters<EditSceneParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let world = lock(&self.model).world();
+        let schemas = world.component_schemas();
+        let world_commands: Vec<WorldCommand> = match params
+            .world_commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| {
+                into_world_command(schemas, command)
+                    .map_err(|error| format!("invalid world command at index {index}: {error}"))
+            })
+            .collect()
+        {
+            Ok(commands) => commands,
+            Err(error) => return tool_error(error),
+        };
+        drop(world);
+        let expression_commands = match params
+            .expression_commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| {
+                serde_json::from_value(command).map_err(|error| {
+                    format!("invalid expression command at index {index}: {error}")
+                })
+            })
+            .collect()
+        {
+            Ok(commands) => commands,
+            Err(error) => return tool_error(error),
+        };
+        match submit_and_wait(
+            &self.model,
+            CommandPayload::CommitSceneEdit(fieldcad_simulation::SceneEdit {
+                world_commands,
+                expression_commands,
+            }),
+        )
+        .await
+        {
             Ok(receipt) => ok_json(&receipt),
             Err(error) => tool_error(error.to_string()),
         }
@@ -3060,6 +3128,36 @@ mod tests {
 
         let history = json_of(&server.get_edit_history().await.unwrap());
         assert_eq!(history["undo"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn unified_expression_edit_and_dependency_state_share_the_mcp_authority() {
+        let server = server();
+        let command = fieldcad_expressions::ExpressionCommand::AddConstant(
+            fieldcad_expressions::ConstantDefinition {
+                id: fieldcad_expressions::ConstantId::new(42),
+                scope: fieldcad_expressions::ConstantScope::Document,
+                name: "answer".to_owned(),
+                source: "42".into(),
+                revision: None,
+                provenance: None,
+            },
+        );
+        let receipt = json_of(
+            &server
+                .edit_scene(Parameters(EditSceneParams {
+                    world_commands: Vec::new(),
+                    expression_commands: vec![serde_json::to_value(command).unwrap()],
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(receipt["disposition"], "Applied");
+
+        let state = json_of(&server.get_expression_state().await.unwrap());
+        assert_eq!(state["document"]["constants"][0]["name"], "answer");
+        assert_eq!(state["nodes"][0]["status"], "Resolved");
+        assert_eq!(state["diagnostics"], serde_json::json!([]));
     }
 
     #[tokio::test]

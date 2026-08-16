@@ -528,7 +528,9 @@ fn object_components(
                             id,
                             property,
                             &mut edited,
+                            world,
                             &compute.expressions,
+                            &compute.expression_state,
                             user_constants,
                             output,
                         )
@@ -657,7 +659,9 @@ fn expression_property_editor(
     component: &ComponentTypeId,
     schema: &PropertySchema,
     values: &mut PropertyBag,
+    world: &WorldSnapshot,
     expressions: &fieldcad_expressions::ExpressionDocument,
+    expression_state: &fieldcad_expressions::ExpressionState,
     user_constants: &fieldcad_expressions::UserConstantLibrary,
     output: &mut UiFrameOutput,
 ) -> bool {
@@ -699,6 +703,7 @@ fn expression_property_editor(
     }
 
     let mut literal_changed = false;
+    let mut commit_requested = false;
     ui.horizontal(|ui| {
         let label = ui.label(&schema.display_name);
         if let Some(description) = &schema.description {
@@ -711,20 +716,8 @@ fn expression_property_editor(
                     .desired_width(150.0),
             );
             output.scene_edit_in_progress |= response.has_focus();
-            let committed =
+            commit_requested =
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if committed && !draft.source.trim().is_empty() {
-                output.submit(fieldcad_simulation::CommandPayload::CommitExpressions(
-                    vec![
-                        fieldcad_expressions::ExpressionCommand::SetPropertyExpression(
-                            fieldcad_expressions::PropertyBinding {
-                                target: target.clone(),
-                                source: draft.source.as_str().into(),
-                            },
-                        ),
-                    ],
-                ));
-            }
             super::expression_editor::insert_constant_menu(
                 ui,
                 &mut draft.source,
@@ -771,36 +764,57 @@ fn expression_property_editor(
 
     if draft.active {
         ui.indent(editor_id.with("details"), |ui| {
-            ui.weak(format!(
-                "Resolved: {}",
-                fieldcad_core::format_si_value(magnitude, dimension).unwrap_or_else(|| format!(
-                    "{} {}",
-                    format_engineering(magnitude),
-                    dimension.unit_symbol()
-                ))
-            ));
-            let preview = fieldcad_expressions::EvaluationPlan::compile(
-                &fieldcad_expressions::ExpressionDocument {
-                    constants: expressions.constants.clone(),
-                    bindings: vec![fieldcad_expressions::PropertyBinding {
+            let candidate = expressions.apply([
+                fieldcad_expressions::ExpressionCommand::SetPropertyExpression(
+                    fieldcad_expressions::PropertyBinding {
                         target: target.clone(),
                         source: draft.source.as_str().into(),
-                    }],
-                },
-                |candidate| {
-                    (candidate == &target).then_some(fieldcad_expressions::PropertyBindingSchema {
-                        dimension,
-                        live_binding: schema.live_binding,
-                    })
-                },
-            );
+                    },
+                ),
+            ]);
+            let preview = candidate
+                .and_then(|document| super::expression_editor::preview_document(&document, world));
             match preview {
-                Ok(_) => {
-                    ui.weak("Dimension valid; press Enter to submit authoritatively.");
+                Ok(result) => {
+                    if let Some(value) = result.properties.get(&target) {
+                        ui.weak(format!(
+                            "Resolved: {}",
+                            fieldcad_core::format_si_value(value.si_value(), dimension)
+                                .unwrap_or_else(|| format!(
+                                    "{} {}",
+                                    format_engineering(value.si_value()),
+                                    dimension.unit_symbol()
+                                ))
+                        ));
+                    }
+                    if commit_requested || ui.button("Apply").clicked() {
+                        output.submit(fieldcad_simulation::CommandPayload::CommitExpressions(
+                            vec![
+                                fieldcad_expressions::ExpressionCommand::SetPropertyExpression(
+                                    fieldcad_expressions::PropertyBinding {
+                                        target: target.clone(),
+                                        source: draft.source.as_str().into(),
+                                    },
+                                ),
+                            ],
+                        ));
+                    }
                 }
                 Err(error) => {
                     ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
+                    if let Some(span) = error.span {
+                        ui.weak(format!("Source bytes {}..{}", span.start, span.end));
+                    }
                 }
+            }
+            if let Some(node) = expression_state.nodes.iter().find(|node| {
+                node.subject == fieldcad_expressions::ExpressionSubject::Property(target.clone())
+            }) && node.status != fieldcad_expressions::ExpressionNodeStatus::Resolved
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 100, 90),
+                    format!("Authoritative dependency status: {:?}", node.status),
+                );
             }
         });
     }

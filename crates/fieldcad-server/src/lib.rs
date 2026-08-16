@@ -1499,6 +1499,10 @@ impl FieldDataSource for HeadlessServer {
         self.source.resolved_constants()
     }
 
+    fn expression_state(&self) -> fieldcad_expressions::ExpressionState {
+        self.source.expression_state()
+    }
+
     // Not the trait default: a source that actually holds body forces must
     // say so, or an inspector reading this through `&dyn FieldDataSource`
     // (as the desktop UI does) sees an empty map forever.

@@ -17,8 +17,9 @@
 
 use fieldcad_core::quantities::{MassKg, kilogram};
 use fieldcad_core::{
-    ObjectShape, ObjectSpec, PlaneId, PlaneLattice, ProbeId, ProbePosition, SampleGeometry,
-    SessionId, StepContext, TimeStep, Transform, World, WorldCommand,
+    ComponentTypeId, Dimension, ObjectId, ObjectShape, ObjectSpec, PlaneId, PlaneLattice, PluginId,
+    ProbeId, ProbePosition, PropertyId, SampleGeometry, SessionId, StepContext, TimeStep,
+    Transform, World, WorldCommand,
 };
 use fieldcad_electromagnetism::{
     ELECTRIC_FIELD_HANDLE as MAXWELL_ELECTRIC_HANDLE, ElectromagnetismPlugin, courant_limit,
@@ -27,7 +28,7 @@ use fieldcad_electromagnetism::{
 use fieldcad_electrostatics::{ELECTRIC_FIELD_HANDLE, ElectrostaticsPlugin};
 use fieldcad_expressions::{
     ConstantDefinition, ConstantId, ConstantScope, EvaluationPlan, ExpressionDocument,
-    PropertyTarget, ValueProvider,
+    PropertyBinding, PropertyBindingSchema, PropertyTarget, ValueProvider,
 };
 use fieldcad_gravity::GRAVITATIONAL_ACCELERATION_HANDLE;
 use fieldcad_plugin_api::{
@@ -57,6 +58,8 @@ pub enum Parameter {
     Samples,
     /// Compiled expression graph nodes.
     ExpressionNodes,
+    /// Live property bindings and their referenced distance observations.
+    LiveBindings,
 }
 
 impl Parameter {
@@ -66,6 +69,7 @@ impl Parameter {
             Self::Charges => "charges",
             Self::Samples => "samples",
             Self::ExpressionNodes => "expression nodes",
+            Self::LiveBindings => "live bindings",
         }
     }
 
@@ -75,6 +79,7 @@ impl Parameter {
             Self::Charges => scene.charges as f64,
             Self::Samples => scene.samples_per_channel() as f64,
             Self::ExpressionNodes => scene.expression_nodes as f64,
+            Self::LiveBindings => scene.live_bindings as f64,
         }
     }
 }
@@ -522,6 +527,22 @@ impl ValueProvider for NoDistances {
     }
 }
 
+struct BenchmarkDistances;
+
+impl ValueProvider for BenchmarkDistances {
+    fn distance(&self, probe: fieldcad_core::DistanceProbeId) -> Option<f64> {
+        Some(probe.get() as f64 + 1.0)
+    }
+}
+
+fn expression_target(index: usize) -> PropertyTarget {
+    PropertyTarget {
+        object: ObjectId::new(index as u64),
+        component: ComponentTypeId::new(PluginId::new("bench").unwrap(), "body").unwrap(),
+        property: PropertyId::new("length").unwrap(),
+    }
+}
+
 fn expression_plan(nodes: usize) -> EvaluationPlan {
     let constants = (0..nodes)
         .map(|index| ConstantDefinition {
@@ -540,25 +561,62 @@ fn expression_plan(nodes: usize) -> EvaluationPlan {
     EvaluationPlan::compile(
         &ExpressionDocument {
             constants,
-            bindings: Vec::new(),
+            bindings: vec![PropertyBinding {
+                target: expression_target(0),
+                source: format!("doc.v{}", nodes - 1).into(),
+            }],
         },
-        |_| None,
+        |_| {
+            Some(PropertyBindingSchema {
+                dimension: Dimension::LENGTH,
+                live_binding: true,
+            })
+        },
     )
     .expect("benchmark graph is acyclic and dimensionally valid")
+}
+
+fn live_expression_plan(bindings: usize) -> EvaluationPlan {
+    EvaluationPlan::compile(
+        &ExpressionDocument {
+            constants: Vec::new(),
+            bindings: (0..bindings)
+                .map(|index| PropertyBinding {
+                    target: expression_target(index),
+                    source: format!("distance.{index} / 2").into(),
+                })
+                .collect(),
+        },
+        |_| {
+            Some(PropertyBindingSchema {
+                dimension: Dimension::LENGTH,
+                live_binding: true,
+            })
+        },
+    )
+    .expect("benchmark live bindings are dimensionally valid")
+}
+
+fn expression_live_bindings(scene: &Scene, config: &MeasureConfig) -> Timing {
+    measure(
+        config,
+        || live_expression_plan(scene.live_bindings),
+        |plan, _| {
+            plan.evaluate_candidate(&BenchmarkDistances)
+                .expect("benchmark graph evaluates");
+            plan.adopt_candidate();
+        },
+    )
 }
 
 fn expression_evaluate(scene: &Scene, config: &MeasureConfig) -> Timing {
     measure(
         config,
-        || {
-            (
-                expression_plan(scene.expression_nodes),
-                std::collections::BTreeMap::<PropertyTarget, _>::new(),
-            )
-        },
-        |(plan, output), _| {
-            plan.evaluate_properties_into(&NoDistances, output)
-                .expect("benchmark graph evaluates")
+        || expression_plan(scene.expression_nodes),
+        |plan, _| {
+            plan.evaluate_candidate(&NoDistances)
+                .expect("benchmark graph evaluates");
+            plan.adopt_candidate();
         },
     )
 }
@@ -629,6 +687,25 @@ fn expression_sweep(base: Scene, quick: bool) -> Vec<Scene> {
                 .with_expression_nodes(nodes)
                 .with_name(format!("expression-{nodes}"))
                 .with_summary(format!("acyclic derived-constant chain with {nodes} nodes"))
+        })
+        .collect()
+}
+
+fn live_binding_sweep(base: Scene, quick: bool) -> Vec<Scene> {
+    let sizes: &[usize] = if quick {
+        &[16, 64, 256]
+    } else {
+        &[16, 32, 64, 128, 256, 512]
+    };
+    sizes
+        .iter()
+        .map(|&bindings| {
+            base.clone()
+                .with_live_bindings(bindings)
+                .with_name(format!("live-bindings-{bindings}"))
+                .with_summary(format!(
+                    "{bindings} live scalar bindings reading stable distance ids"
+                ))
         })
         .collect()
 }
@@ -856,8 +933,18 @@ pub fn benchmarks(quick: bool) -> Vec<Benchmark> {
             why: "runs before ticks for live bindings; graph construction and parsing are excluded",
             parameter: Parameter::ExpressionNodes,
             declared: Complexity::Linear,
-            scenes: expression_sweep(default.with_name("expression-evaluate"), quick),
+            scenes: expression_sweep(default.clone().with_name("expression-evaluate"), quick),
             runner: expression_evaluate,
+        },
+        Benchmark {
+            id: "expressions/evaluate-live-bindings",
+            group: "expressions",
+            what: "evaluate live scalar bindings from stable distance references",
+            why: "measures the pre-tick dependency/provider path with compiled nodes and reused buffers",
+            parameter: Parameter::LiveBindings,
+            declared: Complexity::Linear,
+            scenes: live_binding_sweep(default.with_name("expression-live"), quick),
+            runner: expression_live_bindings,
         },
     ]
 }

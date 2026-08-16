@@ -48,6 +48,12 @@ pub fn diagnostics_window(
                 ui.horizontal(|ui| {
                     ui.strong("Frame");
                     ui.monospace(format!("{:.2} ms", frame.frame_time_ms));
+                    if let Some(fps) = fps_over_last_second(frame.frame_history) {
+                        ui.label(format!("{fps:.0} FPS")).on_hover_text(
+                            "Rendered frames per second, averaged over the most recent \
+                             second of history — not the simulation's own clock.",
+                        );
+                    }
                     if !frame.frame_history.is_empty() && frame.frame_min_ms.is_finite() {
                         ui.label(format!(
                             "(min {:.1} / max {:.1})",
@@ -55,7 +61,13 @@ pub fn diagnostics_window(
                         ));
                     }
                 });
-                metric_history_dropdown(ui, "frame_plot", frame.frame_history, FRAME_TRACE_COLOR);
+                metric_history_dropdown(
+                    ui,
+                    "frame_plot",
+                    frame.frame_history,
+                    FRAME_TRACE_COLOR,
+                    "ms",
+                );
             }
 
             if config.show_memory {
@@ -68,7 +80,7 @@ pub fn diagnostics_window(
                         ui.monospace("—");
                     }
                 });
-                metric_history_dropdown(ui, "mem_plot", frame.mem_history, MEM_TRACE_COLOR);
+                metric_history_dropdown(ui, "mem_plot", frame.mem_history, MEM_TRACE_COLOR, "MiB");
             }
 
             if config.show_cpu {
@@ -81,7 +93,7 @@ pub fn diagnostics_window(
                         ui.monospace("—");
                     }
                 });
-                metric_history_dropdown(ui, "cpu_plot", frame.cpu_history, CPU_TRACE_COLOR);
+                metric_history_dropdown(ui, "cpu_plot", frame.cpu_history, CPU_TRACE_COLOR, "s");
             }
 
             if config.show_solver_step {
@@ -121,6 +133,7 @@ pub fn diagnostics_window(
                     "step_plot",
                     frame.step_compute_history,
                     STEP_TRACE_COLOR,
+                    "ms",
                 );
             }
 
@@ -135,7 +148,15 @@ pub fn diagnostics_window(
                         ui.monospace(frame.adapter_name);
                         ui.end_row();
                         ui.label("Objects");
-                        ui.monospace(frame.world.objects().len().to_string());
+                        ui.monospace(
+                            frame
+                                .world
+                                .objects()
+                                .values()
+                                .filter(|object| !object.derived)
+                                .count()
+                                .to_string(),
+                        );
                         ui.end_row();
                         ui.label("Samples");
                         ui.monospace(format_count(frame.compute.total_samples));
@@ -162,7 +183,13 @@ pub fn diagnostics_window(
         });
 }
 
-fn metric_history_dropdown(ui: &mut egui::Ui, id: &str, history: &[f32], color: egui::Color32) {
+fn metric_history_dropdown(
+    ui: &mut egui::Ui,
+    id: &str,
+    history: &[f32],
+    color: egui::Color32,
+    unit: &str,
+) {
     if history.len() < 2 {
         return;
     }
@@ -170,8 +197,26 @@ fn metric_history_dropdown(ui: &mut egui::Ui, id: &str, history: &[f32], color: 
         .id_salt(id)
         .default_open(false)
         .show(ui, |ui| {
-            history_plot(ui, history, color);
+            history_plot(ui, history, color, unit);
         });
+}
+
+/// Rendered frames per second, averaged over the most recent second of
+/// `history` (each entry is one render's wall-clock duration in
+/// milliseconds, oldest first). Falls back to whatever history is
+/// available when there isn't yet a full second of it, so the reading
+/// isn't `None` for the first second after the window opens.
+fn fps_over_last_second(history: &[f32]) -> Option<f32> {
+    let mut elapsed_ms = 0.0_f32;
+    let mut count = 0_u32;
+    for &frame_ms in history.iter().rev() {
+        elapsed_ms += frame_ms;
+        count += 1;
+        if elapsed_ms >= 1_000.0 {
+            break;
+        }
+    }
+    (elapsed_ms > 0.0).then(|| count as f32 * 1_000.0 / elapsed_ms)
 }
 
 fn format_count(n: usize) -> String {
@@ -189,5 +234,42 @@ fn format_count(n: usize) -> String {
         result
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fps_over_last_second_averages_a_steady_frame_rate() {
+        // 60 fps ~= 16.667 ms/frame; 60 of them span exactly one second.
+        let history = vec![1_000.0 / 60.0; 60];
+        let fps = fps_over_last_second(&history).unwrap();
+        assert!((fps - 60.0).abs() < 0.5, "expected ~60 FPS, got {fps}");
+    }
+
+    #[test]
+    fn fps_over_last_second_uses_only_the_most_recent_second() {
+        // A long run of slow frames followed by one second of fast ones:
+        // the slow prefix must not drag the reading down.
+        let mut history = vec![100.0; 20]; // 10 fps, oldest
+        history.extend(vec![10.0; 100]); // 100 fps, most recent
+        let fps = fps_over_last_second(&history).unwrap();
+        assert!((fps - 100.0).abs() < 1.0, "expected ~100 FPS, got {fps}");
+    }
+
+    #[test]
+    fn fps_over_last_second_is_none_for_empty_history() {
+        assert_eq!(fps_over_last_second(&[]), None);
+    }
+
+    #[test]
+    fn fps_over_last_second_falls_back_to_partial_history() {
+        // Fewer than a second's worth of frames: still report something
+        // rather than waiting for a full second of history to exist.
+        let history = vec![50.0; 3]; // 150 ms total, 3 frames
+        let fps = fps_over_last_second(&history).unwrap();
+        assert!((fps - 20.0).abs() < 0.1, "expected ~20 FPS, got {fps}");
     }
 }

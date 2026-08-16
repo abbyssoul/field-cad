@@ -19,11 +19,15 @@ live there. A solver-independent crate compiles that authored graph into a
 transient deterministic plan. The authoritative world continues to contain only
 ordinary finite SI-valued `PropertyValue`s.
 
-Every authored expression edit is compiled and evaluated against a candidate.
-Its resolved component bags then cross the existing solver validation boundary,
-and the world plus authored graph are adopted together only if every check
-succeeds. Removing a target removes its binding in that transaction; removing a
-referenced constant or distance probe is rejected with its dependents.
+Every authored scene edit is one envelope containing ordinary world commands
+and expression commands. World commands are applied provisionally, the edited
+graph is compiled and evaluated against that candidate, and its resolved
+component bags cross the existing solver validation boundary. The world plus
+authored graph are adopted together only if every check succeeds. The older
+world-only and expression-only commands remain compatibility projections of
+this envelope. Removing a target removes its binding in that transaction;
+removing a referenced constant or distance probe is rejected with its
+dependents unless those references are cleared in the same envelope.
 
 A schema must explicitly opt into live binding. Immediately before `Step` and
 each running tick, the compiled graph reads distance probes from the current
@@ -42,7 +46,13 @@ so numerically equal worlds with different formulas remain distinguishable.
 - Documents retain reproducible formulas while older documents load with an
   empty expression section.
 - Live evaluation is linear in graph nodes, dependency edges, and referenced
-  distances; implementations must reuse compiled nodes and tick scratch storage.
+  distances. Compiled dependency lookup and evaluation use preallocated active
+  and candidate buffers and perform no steady-state allocation after
+  initialization. Publishing a new immutable world revision or snapshot when a
+  resolved value changes is outside this allocation guarantee.
+- Dependency health and current live faults are transient authoritative source
+  state. Rejected edits remain command diagnostics; they do not replace the
+  accepted graph's health.
 - A live feedback cycle is invalid rather than an algebraic system to solve.
 - Renaming is presentation work around stable identities; persisted source is
   rewritten, while compiled references are rebuilt.

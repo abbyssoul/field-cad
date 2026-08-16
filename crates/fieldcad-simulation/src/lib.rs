@@ -26,8 +26,8 @@ pub use observation_recorder::ObservationRecorder;
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
 pub use runtime::{
     DEFAULT_UNDO_DEPTH, EditHistoryStatus, FieldSystemStatus, PluginRegistration, RuntimeConfig,
-    RuntimeError, SamplingBudget, SimulationRuntime, SimulationStatus, Subscription, TickDemand,
-    TickPacer,
+    RuntimeError, SamplingBudget, SceneEdit, SimulationRuntime, SimulationStatus, Subscription,
+    TickDemand, TickPacer,
 };
 pub use source::{
     Command, CommandDisposition, CommandId, CommandKind, CommandLifecycle, CommandPayload,
@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(runtime.clock_snapshot().tick(), 1);
         assert_eq!(runtime.clock_snapshot().time_seconds(), 0.1);
 
-        runtime.play();
+        runtime.play().unwrap();
         assert!(runtime.advance_running().unwrap());
         runtime.pause();
         assert!(!runtime.advance_running().unwrap());
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn stepping_while_running_is_refused() {
         let mut runtime = runtime();
-        runtime.play();
+        runtime.play().unwrap();
 
         assert!(matches!(
             runtime.step_once(),
@@ -2257,6 +2257,19 @@ mod tests {
             .with_command(CommandPayload::CommitWorld(vec![
                 WorldCommand::CreateObject(ObjectSpec::new("recorded object")),
             ]))
+            .with_command(CommandPayload::CommitSceneEdit(SceneEdit {
+                world_commands: Vec::new(),
+                expression_commands: vec![fieldcad_expressions::ExpressionCommand::AddConstant(
+                    fieldcad_expressions::ConstantDefinition {
+                        id: fieldcad_expressions::ConstantId::new(99),
+                        scope: fieldcad_expressions::ConstantScope::Document,
+                        name: "recorded".to_owned(),
+                        source: "2 m".into(),
+                        revision: None,
+                        provenance: None,
+                    },
+                )],
+            }))
             .with_poll(Duration::from_millis(1))
             .with_poll(Duration::from_millis(250))
             .with_command(CommandPayload::Pause)
@@ -3332,5 +3345,32 @@ mod tests {
 
         source.execute(command(CommandPayload::Pause)).unwrap();
         assert_eq!(source.simulation_status().mode(), SimulationMode::Paused);
+    }
+
+    #[test]
+    fn unified_scene_edits_queue_and_persist_as_one_payload() {
+        let mut source = LocalDataSource::new(runtime());
+        source.execute(command(CommandPayload::PauseQueue)).unwrap();
+        let receipt = source
+            .execute(command(CommandPayload::CommitSceneEdit(SceneEdit {
+                world_commands: vec![WorldCommand::CreateObject(ObjectSpec::new("atomic"))],
+                expression_commands: Vec::new(),
+            })))
+            .unwrap();
+        assert_eq!(receipt.disposition, CommandDisposition::Queued);
+        assert!(matches!(
+            source.queue_document().pending.as_slice(),
+            [CommandPayload::CommitSceneEdit(_)]
+        ));
+
+        source
+            .execute(command(CommandPayload::ResumeQueue))
+            .unwrap();
+        source.poll(Duration::ZERO).unwrap();
+        assert_eq!(source.world().objects().len(), 1);
+        assert_eq!(
+            source.get_queue().history.last().unwrap().state,
+            CommandLifecycle::Applied
+        );
     }
 }

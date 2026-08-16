@@ -24,7 +24,9 @@ use fieldcad_scene_document::{
     PlaneViewState, ResolveError, SceneDocument, SceneDocumentInputs, SceneViewState,
     resolve_plugins, save_to_path,
 };
-use fieldcad_simulation::{PluginRegistration, QueueDocument, RuntimeConfig, SimulationRuntime};
+use fieldcad_simulation::{
+    CommandPayload, PluginRegistration, QueueDocument, RuntimeConfig, SceneEdit, SimulationRuntime,
+};
 use fieldcad_test_field::TestFieldPlugin;
 use glam::DVec3;
 
@@ -861,4 +863,35 @@ fn authored_expressions_round_trip_and_legacy_documents_default_empty() {
         .document;
     assert!(loaded.expressions.constants.is_empty());
     assert!(loaded.expressions.bindings.is_empty());
+}
+
+#[test]
+fn unified_and_legacy_queued_scene_edits_round_trip() {
+    let runtime = build_runtime(World::new());
+    let queue = QueueDocument {
+        paused: true,
+        pending: vec![
+            CommandPayload::CommitSceneEdit(SceneEdit {
+                world_commands: vec![WorldCommand::CreateObject(ObjectSpec::new("unified"))],
+                expression_commands: Vec::new(),
+            }),
+            CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(ObjectSpec::new(
+                "legacy",
+            ))]),
+        ],
+    };
+    let document = SceneDocument::capture(inputs(&runtime, queue), "test", None);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queued-scene-edit.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let loaded = fieldcad_scene_document::load_newest_valid(&path)
+        .unwrap()
+        .document;
+    assert!(matches!(
+        loaded.queue.pending.as_slice(),
+        [
+            CommandPayload::CommitSceneEdit(_),
+            CommandPayload::CommitWorld(_)
+        ]
+    ));
 }

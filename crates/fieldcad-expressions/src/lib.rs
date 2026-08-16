@@ -100,6 +100,8 @@ pub enum ExpressionErrorKind {
     LiveBindingNotSupported,
     /// A referenced definition or probe cannot be removed.
     ReferencedDefinition,
+    /// A literal world edit and retained formula attempted to write one property.
+    ConflictingWriter,
 }
 
 /// User-facing expression diagnostic with a stable source location.
@@ -248,6 +250,75 @@ pub struct PropertyBinding {
     pub target: PropertyTarget,
     /// Retained authored formula.
     pub source: ExpressionSource,
+}
+
+/// Stable owner of one compiled expression node.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExpressionSubject {
+    /// A document or embedded user constant.
+    Constant(ConstantId),
+    /// A scalar property binding.
+    Property(PropertyTarget),
+}
+
+/// Stable direct dependency read by a compiled expression.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExpressionDependency {
+    /// Another constant in the authored graph.
+    Constant(ConstantId),
+    /// A live authoritative distance observation.
+    Distance(DistanceProbeId),
+}
+
+/// Health of one node in the currently accepted expression graph.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpressionNodeStatus {
+    /// The node resolved successfully against the named world revision.
+    Resolved,
+    /// Evaluation failed in this node.
+    Faulted,
+    /// The node could not be evaluated because an upstream node faulted.
+    Blocked {
+        /// Upstream node responsible for the blockage.
+        by: ExpressionSubject,
+    },
+}
+
+/// Published dependency and value state for one expression node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExpressionNodeState {
+    /// Stable node owner.
+    pub subject: ExpressionSubject,
+    /// Stable, deterministically ordered direct dependencies.
+    pub dependencies: Vec<ExpressionDependency>,
+    /// Last successfully resolved finite value.
+    pub last_valid_value: Option<ExpressionValue>,
+    /// Current dependency/evaluation health.
+    pub status: ExpressionNodeStatus,
+}
+
+/// One current expression-graph diagnostic tied to its authored owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpressionDiagnostic {
+    /// Constant or property whose evaluation failed.
+    pub subject: ExpressionSubject,
+    /// Stable diagnostic payload, including the source byte span.
+    pub error: ExpressionError,
+}
+
+/// Transport-neutral inspection state for the accepted authored graph.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExpressionState {
+    /// Accepted persisted definitions and bindings.
+    pub document: ExpressionDocument,
+    /// Content hash of the accepted graph.
+    pub graph_hash: String,
+    /// World revision against which `last_valid_value` was resolved.
+    pub resolved_world_revision: Option<fieldcad_core::WorldRevision>,
+    /// Dependency/value state in deterministic evaluation order.
+    pub nodes: Vec<ExpressionNodeState>,
+    /// Current live-evaluation diagnostics. Rejected edits are command errors.
+    pub diagnostics: Vec<ExpressionDiagnostic>,
 }
 
 /// Persisted authored expression state. Compiled nodes are never serialized.
@@ -675,6 +746,23 @@ impl Expr {
             _ => false,
         }
     }
+
+    fn collect_dependencies(&self, dependencies: &mut BTreeSet<ExpressionDependency>) {
+        match self {
+            Self::Symbol { reference, .. } => {
+                dependencies.insert(match reference {
+                    SymbolRef::Constant(id) => ExpressionDependency::Constant(*id),
+                    SymbolRef::Distance(id) => ExpressionDependency::Distance(*id),
+                });
+            }
+            Self::Unary { expression, .. } => expression.collect_dependencies(dependencies),
+            Self::Binary { left, right, .. } => {
+                left.collect_dependencies(dependencies);
+                right.collect_dependencies(dependencies);
+            }
+            Self::Literal { .. } => {}
+        }
+    }
 }
 
 /// Parsed and dimension-checked transient expression.
@@ -696,6 +784,12 @@ impl CompiledExpression {
     /// Whether this expression reads a live distance probe.
     pub fn is_live(&self) -> bool {
         self.root.contains_distance()
+    }
+
+    fn dependencies(&self) -> Vec<ExpressionDependency> {
+        let mut dependencies = BTreeSet::new();
+        self.root.collect_dependencies(&mut dependencies);
+        dependencies.into_iter().collect()
     }
 
     fn evaluate(
@@ -786,12 +880,14 @@ fn evaluate_expr(
 struct CompiledConstant {
     id: ConstantId,
     expression: CompiledExpression,
+    dependencies: Vec<ExpressionDependency>,
 }
 
 #[derive(Clone, Debug)]
 struct CompiledBinding {
     target: PropertyTarget,
     expression: CompiledExpression,
+    dependencies: Vec<ExpressionDependency>,
 }
 
 /// Deterministically topologically sorted, allocation-reusing expression graph.
@@ -800,6 +896,10 @@ pub struct EvaluationPlan {
     constants: Vec<CompiledConstant>,
     bindings: Vec<CompiledBinding>,
     values: BTreeMap<ConstantId, ExpressionValue>,
+    candidate_values: BTreeMap<ConstantId, ExpressionValue>,
+    properties: BTreeMap<PropertyTarget, ExpressionValue>,
+    candidate_properties: BTreeMap<PropertyTarget, ExpressionValue>,
+    candidate_ready: bool,
     hash: String,
 }
 
@@ -839,13 +939,25 @@ impl EvaluationPlan {
                 &mut stack,
             )?;
         }
-        let constants: Vec<CompiledConstant> = order
-            .into_iter()
-            .map(|id| CompiledConstant {
+        let mut constants = Vec::with_capacity(order.len());
+        let mut constant_liveness = BTreeMap::new();
+        for id in order {
+            let expression = compiled.remove(&id).expect("topological id was compiled");
+            let dependencies = expression.dependencies();
+            let live = expression.is_live()
+                || dependencies.iter().any(|dependency| match dependency {
+                    ExpressionDependency::Constant(id) => {
+                        constant_liveness.get(id).copied().unwrap_or(false)
+                    }
+                    ExpressionDependency::Distance(_) => true,
+                });
+            constant_liveness.insert(id, live);
+            constants.push(CompiledConstant {
                 id,
-                expression: compiled.remove(&id).expect("topological id was compiled"),
-            })
-            .collect();
+                expression,
+                dependencies,
+            });
+        }
 
         let dimensions: BTreeMap<_, _> = constants
             .iter()
@@ -883,7 +995,15 @@ impl EvaluationPlan {
                     ),
                 ));
             }
-            if expression.is_live() && !schema.live_binding {
+            let dependencies = expression.dependencies();
+            let live = expression.is_live()
+                || dependencies.iter().any(|dependency| match dependency {
+                    ExpressionDependency::Constant(id) => {
+                        constant_liveness.get(id).copied().unwrap_or(false)
+                    }
+                    ExpressionDependency::Distance(_) => true,
+                });
+            if live && !schema.live_binding {
                 return Err(ExpressionError::graph(
                     ExpressionErrorKind::LiveBindingNotSupported,
                     format!("property {} does not support live bindings", binding.target),
@@ -892,13 +1012,58 @@ impl EvaluationPlan {
             bindings.push(CompiledBinding {
                 target: binding.target.clone(),
                 expression,
+                dependencies,
             });
         }
         bindings.sort_by(|left, right| left.target.cmp(&right.target));
+        let values = constants
+            .iter()
+            .map(|constant| {
+                (
+                    constant.id,
+                    ExpressionValue::new(0.0, constant.expression.dimension())
+                        .expect("zero is finite"),
+                )
+            })
+            .collect();
+        let candidate_values = constants
+            .iter()
+            .map(|constant| {
+                (
+                    constant.id,
+                    ExpressionValue::new(0.0, constant.expression.dimension())
+                        .expect("zero is finite"),
+                )
+            })
+            .collect();
+        let properties = bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.target.clone(),
+                    ExpressionValue::new(0.0, binding.expression.dimension())
+                        .expect("zero is finite"),
+                )
+            })
+            .collect();
+        let candidate_properties = bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.target.clone(),
+                    ExpressionValue::new(0.0, binding.expression.dimension())
+                        .expect("zero is finite"),
+                )
+            })
+            .collect();
         Ok(Self {
             constants,
             bindings,
-            values: BTreeMap::new(),
+            values,
+            candidate_values,
+            properties,
+            candidate_properties,
+            candidate_ready: false,
             hash: document.content_hash(),
         })
     }
@@ -918,25 +1083,167 @@ impl EvaluationPlan {
         self.values.iter().map(|(id, value)| (*id, *value))
     }
 
+    /// Most recently adopted property values in stable target order.
+    pub fn property_values(&self) -> impl Iterator<Item = (&PropertyTarget, ExpressionValue)> + '_ {
+        self.properties
+            .iter()
+            .map(|(target, value)| (target, *value))
+    }
+
+    /// Evaluate into preallocated candidate buffers without changing last-valid values.
+    pub fn evaluate_candidate(
+        &mut self,
+        provider: &dyn ValueProvider,
+    ) -> Result<(), Box<ExpressionDiagnostic>> {
+        self.candidate_ready = false;
+        for constant in &self.constants {
+            let value = constant
+                .expression
+                .evaluate(&self.candidate_values, provider)
+                .map_err(|error| {
+                    Box::new(ExpressionDiagnostic {
+                        subject: ExpressionSubject::Constant(constant.id),
+                        error,
+                    })
+                })?;
+            *self
+                .candidate_values
+                .get_mut(&constant.id)
+                .expect("compiled constants preallocate candidate values") = value;
+        }
+        for binding in &self.bindings {
+            let value = binding
+                .expression
+                .evaluate(&self.candidate_values, provider)
+                .map_err(|error| {
+                    Box::new(ExpressionDiagnostic {
+                        subject: ExpressionSubject::Property(binding.target.clone()),
+                        error,
+                    })
+                })?;
+            *self
+                .candidate_properties
+                .get_mut(&binding.target)
+                .expect("compiled bindings preallocate candidate values") = value;
+        }
+        self.candidate_ready = true;
+        Ok(())
+    }
+
+    /// Candidate property outputs produced by the last successful candidate evaluation.
+    pub fn candidate_properties(
+        &self,
+    ) -> impl Iterator<Item = (&PropertyTarget, ExpressionValue)> + '_ {
+        self.candidate_properties
+            .iter()
+            .map(|(target, value)| (target, *value))
+    }
+
+    /// Make the successfully evaluated candidate the graph's last-valid state.
+    pub fn adopt_candidate(&mut self) {
+        assert!(
+            self.candidate_ready,
+            "candidate evaluation must succeed first"
+        );
+        std::mem::swap(&mut self.values, &mut self.candidate_values);
+        std::mem::swap(&mut self.properties, &mut self.candidate_properties);
+        self.candidate_ready = false;
+    }
+
+    /// Discard any prepared candidate without changing last-valid values.
+    pub fn discard_candidate(&mut self) {
+        self.candidate_ready = false;
+    }
+
+    /// Build transport state for the current last-valid values and live fault.
+    pub fn node_states(&self, diagnostics: &[ExpressionDiagnostic]) -> Vec<ExpressionNodeState> {
+        let faulted: BTreeSet<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.subject.clone())
+            .collect();
+        let mut blocked_by: BTreeMap<ExpressionSubject, ExpressionSubject> = BTreeMap::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for constant in &self.constants {
+                let subject = ExpressionSubject::Constant(constant.id);
+                if faulted.contains(&subject) || blocked_by.contains_key(&subject) {
+                    continue;
+                }
+                for dependency in &constant.dependencies {
+                    let ExpressionDependency::Constant(id) = dependency else {
+                        continue;
+                    };
+                    let upstream = ExpressionSubject::Constant(*id);
+                    if faulted.contains(&upstream) || blocked_by.contains_key(&upstream) {
+                        blocked_by.insert(subject.clone(), upstream);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            for binding in &self.bindings {
+                let subject = ExpressionSubject::Property(binding.target.clone());
+                if faulted.contains(&subject) || blocked_by.contains_key(&subject) {
+                    continue;
+                }
+                for dependency in &binding.dependencies {
+                    let ExpressionDependency::Constant(id) = dependency else {
+                        continue;
+                    };
+                    let upstream = ExpressionSubject::Constant(*id);
+                    if faulted.contains(&upstream) || blocked_by.contains_key(&upstream) {
+                        blocked_by.insert(subject.clone(), upstream);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let status = |subject: &ExpressionSubject| {
+            if faulted.contains(subject) {
+                ExpressionNodeStatus::Faulted
+            } else if let Some(by) = blocked_by.get(subject) {
+                ExpressionNodeStatus::Blocked { by: by.clone() }
+            } else {
+                ExpressionNodeStatus::Resolved
+            }
+        };
+        self.constants
+            .iter()
+            .map(|constant| {
+                let subject = ExpressionSubject::Constant(constant.id);
+                ExpressionNodeState {
+                    status: status(&subject),
+                    subject,
+                    dependencies: constant.dependencies.clone(),
+                    last_valid_value: self.values.get(&constant.id).copied(),
+                }
+            })
+            .chain(self.bindings.iter().map(|binding| {
+                let subject = ExpressionSubject::Property(binding.target.clone());
+                ExpressionNodeState {
+                    status: status(&subject),
+                    subject,
+                    dependencies: binding.dependencies.clone(),
+                    last_valid_value: self.properties.get(&binding.target).copied(),
+                }
+            }))
+            .collect()
+    }
+
     /// Evaluate in O(nodes + edges + referenced distances), reusing internal constant storage.
     pub fn evaluate(
         &mut self,
         provider: &dyn ValueProvider,
     ) -> Result<EvaluationResult, ExpressionError> {
-        for constant in &self.constants {
-            let value = constant.expression.evaluate(&self.values, provider)?;
-            self.values.insert(constant.id, value);
-        }
-        let mut properties = BTreeMap::new();
-        for binding in &self.bindings {
-            properties.insert(
-                binding.target.clone(),
-                binding.expression.evaluate(&self.values, provider)?,
-            );
-        }
+        self.evaluate_candidate(provider)
+            .map_err(|diagnostic| diagnostic.error)?;
+        self.adopt_candidate();
         Ok(EvaluationResult {
             constants: self.values.clone(),
-            properties,
+            properties: self.properties.clone(),
         })
     }
 
@@ -949,16 +1256,14 @@ impl EvaluationPlan {
         provider: &dyn ValueProvider,
         properties: &mut BTreeMap<PropertyTarget, ExpressionValue>,
     ) -> Result<(), ExpressionError> {
-        for constant in &self.constants {
-            let value = constant.expression.evaluate(&self.values, provider)?;
-            self.values.insert(constant.id, value);
-        }
-        for binding in &self.bindings {
-            let value = binding.expression.evaluate(&self.values, provider)?;
-            if let Some(existing) = properties.get_mut(&binding.target) {
-                *existing = value;
+        self.evaluate_candidate(provider)
+            .map_err(|diagnostic| diagnostic.error)?;
+        self.adopt_candidate();
+        for (target, value) in &self.properties {
+            if let Some(existing) = properties.get_mut(target) {
+                *existing = *value;
             } else {
-                properties.insert(binding.target.clone(), value);
+                properties.insert(target.clone(), *value);
             }
         }
         Ok(())
@@ -1548,6 +1853,13 @@ impl Parser<'_> {
             })?;
             (SymbolRef::Constant(*id), dimension)
         } else if let Some(raw) = name.strip_prefix("distance.") {
+            if self.environment.current_scope == Some(ConstantScope::User) {
+                return Err(ExpressionError::at(
+                    ExpressionErrorKind::ScopeViolation,
+                    "user constants cannot reference document observations",
+                    span,
+                ));
+            }
             let id = raw.parse::<u64>().map_err(|_| {
                 ExpressionError::at(
                     ExpressionErrorKind::UnknownSymbol,
@@ -2015,5 +2327,113 @@ mod tests {
                 .iter()
                 .all(|item| item.provenance.as_deref() == Some("user-constants.json"))
         );
+    }
+
+    #[test]
+    fn transitive_distance_dependencies_require_live_targets() {
+        let document = ExpressionDocument {
+            constants: vec![ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::Document,
+                name: "gap".into(),
+                source: "distance.7".into(),
+                revision: None,
+                provenance: None,
+            }],
+            bindings: vec![PropertyBinding {
+                target: target(),
+                source: "doc.gap / 2".into(),
+            }],
+        };
+        let error = EvaluationPlan::compile(&document, |_| {
+            Some(PropertyBindingSchema {
+                dimension: Dimension::LENGTH,
+                live_binding: false,
+            })
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, ExpressionErrorKind::LiveBindingNotSupported);
+    }
+
+    #[test]
+    fn user_constants_cannot_read_distance_observations() {
+        let document = ExpressionDocument {
+            constants: vec![ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::User,
+                name: "gap".into(),
+                source: "distance.7".into(),
+                revision: None,
+                provenance: None,
+            }],
+            bindings: vec![],
+        };
+        assert_eq!(
+            EvaluationPlan::compile(&document, |_| None)
+                .unwrap_err()
+                .kind,
+            ExpressionErrorKind::ScopeViolation
+        );
+    }
+
+    #[test]
+    fn failed_candidate_keeps_last_valid_values_and_marks_dependents_blocked() {
+        let document = ExpressionDocument {
+            constants: vec![
+                ConstantDefinition {
+                    id: ConstantId::new(1),
+                    scope: ConstantScope::Document,
+                    name: "gap".into(),
+                    source: "distance.7".into(),
+                    revision: None,
+                    provenance: None,
+                },
+                ConstantDefinition {
+                    id: ConstantId::new(2),
+                    scope: ConstantScope::Document,
+                    name: "half".into(),
+                    source: "doc.gap / 2".into(),
+                    revision: None,
+                    provenance: None,
+                },
+            ],
+            bindings: vec![PropertyBinding {
+                target: target(),
+                source: "doc.half".into(),
+            }],
+        };
+        let mut plan = EvaluationPlan::compile(&document, |_| {
+            Some(PropertyBindingSchema {
+                dimension: Dimension::LENGTH,
+                live_binding: true,
+            })
+        })
+        .unwrap();
+        plan.evaluate_candidate(&Distances([(DistanceProbeId::new(7), 10.0)].into()))
+            .unwrap();
+        plan.adopt_candidate();
+        let before = plan
+            .property_values()
+            .map(|(target, value)| (target.clone(), value))
+            .collect::<Vec<_>>();
+        let diagnostic = plan
+            .evaluate_candidate(&Distances(BTreeMap::new()))
+            .unwrap_err();
+        assert_eq!(
+            plan.property_values()
+                .map(|(target, value)| (target.clone(), value))
+                .collect::<Vec<_>>(),
+            before
+        );
+        let states = plan.node_states(&[diagnostic.as_ref().clone()]);
+        assert_eq!(states[0].status, ExpressionNodeStatus::Faulted);
+        assert!(matches!(
+            states[1].status,
+            ExpressionNodeStatus::Blocked { .. }
+        ));
+        assert!(matches!(
+            states[2].status,
+            ExpressionNodeStatus::Blocked { .. }
+        ));
     }
 }

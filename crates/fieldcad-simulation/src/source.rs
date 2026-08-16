@@ -17,7 +17,7 @@ use fieldcad_core::{
     SimulationMode, TimeStep, WorldCommand, WorldRevision, WorldSnapshot,
 };
 use fieldcad_dynamics::IntegrationScheme;
-use fieldcad_expressions::{ExpressionCommand, ExpressionDocument};
+use fieldcad_expressions::{ExpressionCommand, ExpressionDocument, ExpressionState};
 use fieldcad_plugin_api::FieldBrushStroke;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::async_source::CommandEvent;
 use crate::body_history::BodySample;
 use crate::runtime::{
-    EditHistoryStatus, FieldSystemStatus, RuntimeError, SimulationRuntime, SimulationStatus,
-    Subscription, TickPacer,
+    EditHistoryStatus, FieldSystemStatus, RuntimeError, SceneEdit, SimulationRuntime,
+    SimulationStatus, Subscription, TickPacer,
 };
 
 /// Retained terminal command records per session, per
@@ -151,6 +151,8 @@ pub enum CommandPayload {
     /// Edit authored constants/property formulas through the same authoritative
     /// queue and validation boundary as world edits.
     CommitExpressions(Vec<ExpressionCommand>),
+    /// Atomically edit ordinary world state and authored expressions.
+    CommitSceneEdit(SceneEdit),
     /// Step the scene back to how it stood before the most recent authored edit,
     /// or forward again.
     ///
@@ -196,6 +198,7 @@ impl CommandPayload {
             Self::ApplyFieldBrushStroke(_) => CommandKind::ApplyFieldBrushStroke,
             Self::CommitWorld(_) => CommandKind::CommitWorld,
             Self::CommitExpressions(_) => CommandKind::CommitExpressions,
+            Self::CommitSceneEdit(_) => CommandKind::CommitSceneEdit,
             Self::Undo => CommandKind::Undo,
             Self::Redo => CommandKind::Redo,
             Self::PauseQueue => CommandKind::PauseQueue,
@@ -234,6 +237,7 @@ pub enum CommandKind {
     ApplyFieldBrushStroke,
     CommitWorld,
     CommitExpressions,
+    CommitSceneEdit,
     Undo,
     Redo,
     PauseQueue,
@@ -263,6 +267,7 @@ impl CommandKind {
             Self::ApplyFieldBrushStroke => "Field brush stroke",
             Self::CommitWorld => "Commit world",
             Self::CommitExpressions => "Commit expressions",
+            Self::CommitSceneEdit => "Edit scene",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
             Self::PauseQueue => "Pause queue",
@@ -295,8 +300,7 @@ pub enum CommandLifecycle {
 /// `CommitWorld` payload can be arbitrarily large.
 #[derive(Clone, Debug, PartialEq)]
 enum PendingPayload {
-    World(Vec<WorldCommand>),
-    Expressions(Vec<ExpressionCommand>),
+    Scene(SceneEdit),
     Domain(Domain),
     Configuration {
         plugin: PluginId,
@@ -571,6 +575,10 @@ pub trait FieldDataSource: Send {
     ) -> BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue> {
         BTreeMap::new()
     }
+    /// Accepted expression graph, dependency health, values, and current live fault.
+    fn expression_state(&self) -> ExpressionState {
+        ExpressionState::default()
+    }
 
     /// The dynamics system's summed force on every body it advanced, as of the
     /// most recent tick — for an inspector's read-only display. A body with no
@@ -809,11 +817,8 @@ impl SessionCore {
                 .iter()
                 .filter_map(|record| {
                     record.payload.as_ref().map(|payload| match payload {
-                        PendingPayload::World(commands) => {
-                            CommandPayload::CommitWorld(commands.clone())
-                        }
-                        PendingPayload::Expressions(commands) => {
-                            CommandPayload::CommitExpressions(commands.clone())
+                        PendingPayload::Scene(edit) => {
+                            CommandPayload::CommitSceneEdit(edit.clone())
                         }
                         PendingPayload::Domain(domain) => {
                             CommandPayload::ReconfigureDomain(*domain)
@@ -876,7 +881,7 @@ impl SessionCore {
         let mut created = None;
         match command.payload {
             CommandPayload::Play => {
-                self.runtime.play();
+                self.runtime.play()?;
                 self.pacer.reset();
             }
             CommandPayload::Pause => {
@@ -975,7 +980,7 @@ impl SessionCore {
                         id,
                         kind,
                         self.next_sequence(),
-                        PendingPayload::World(commands),
+                        PendingPayload::Scene(SceneEdit::world(commands)),
                     );
                     self.pending_mutations.push_back(record);
                     return Ok(self.receipt(
@@ -992,7 +997,7 @@ impl SessionCore {
                         id,
                         kind,
                         self.next_sequence(),
-                        PendingPayload::Expressions(commands),
+                        PendingPayload::Scene(SceneEdit::expressions(commands)),
                     );
                     self.pending_mutations.push_back(record);
                     return Ok(self.receipt(
@@ -1002,6 +1007,23 @@ impl SessionCore {
                     ));
                 }
                 created = Some(self.runtime.commit_expression_commands(commands)?);
+            }
+            CommandPayload::CommitSceneEdit(edit) => {
+                if self.should_queue_mutation() {
+                    let record = CommandRecord::queued(
+                        id,
+                        kind,
+                        self.next_sequence(),
+                        PendingPayload::Scene(edit),
+                    );
+                    self.pending_mutations.push_back(record);
+                    return Ok(self.receipt(
+                        id,
+                        CommandDisposition::Queued,
+                        CommitReport::empty(self.runtime.status().world_revision),
+                    ));
+                }
+                created = Some(self.runtime.commit_scene_edit(edit)?);
             }
             CommandPayload::Undo => {
                 // An edit still waiting for a tick boundary has not been
@@ -1244,10 +1266,7 @@ impl SessionCore {
             .take()
             .expect("a queued record always carries its payload");
         let result: Result<CommitReport, RuntimeError> = match payload {
-            PendingPayload::World(commands) => self.runtime.commit_world_commands(commands),
-            PendingPayload::Expressions(commands) => {
-                self.runtime.commit_expression_commands(commands)
-            }
+            PendingPayload::Scene(edit) => self.runtime.commit_scene_edit(edit),
             PendingPayload::Domain(domain) => {
                 let outcome = self.runtime.reconfigure_domain(domain);
                 if outcome.is_ok() {
@@ -1409,6 +1428,10 @@ impl FieldDataSource for LocalDataSource {
         &self,
     ) -> BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue> {
         self.core.runtime.resolved_constants()
+    }
+
+    fn expression_state(&self) -> ExpressionState {
+        self.core.runtime.expression_state()
     }
 
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
@@ -1618,6 +1641,20 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn world(&self) -> WorldSnapshot {
         self.believed_world.clone()
+    }
+
+    fn expressions(&self) -> ExpressionDocument {
+        self.core.runtime.expression_document().clone()
+    }
+
+    fn resolved_constants(
+        &self,
+    ) -> BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue> {
+        self.core.runtime.resolved_constants()
+    }
+
+    fn expression_state(&self) -> ExpressionState {
+        self.core.runtime.expression_state()
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {

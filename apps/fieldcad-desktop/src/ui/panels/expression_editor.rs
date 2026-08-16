@@ -8,6 +8,7 @@
 //! the widgets here render UI and hand back a finished draft rather than
 //! deciding how to commit it.
 
+use fieldcad_core::{PropertyKind, WorldSnapshot};
 use fieldcad_expressions::{
     ConstantDefinition, ConstantId, ConstantScope, EvaluationPlan, ExpressionCommand,
     ExpressionDocument, UserConstantLibrary,
@@ -18,18 +19,50 @@ use super::NoDistanceProvider;
 use crate::ui::compute::ComputeView;
 use crate::ui::{UiFrameOutput, UiModel};
 
+pub(super) struct WorldDistanceProvider<'a>(pub &'a WorldSnapshot);
+
+impl fieldcad_expressions::ValueProvider for WorldDistanceProvider<'_> {
+    fn distance(&self, probe: fieldcad_core::DistanceProbeId) -> Option<f64> {
+        self.0
+            .distance_probe(probe)
+            .and_then(|probe| self.0.resolve_distance(probe).ok())
+    }
+}
+
+pub(super) fn preview_document(
+    document: &ExpressionDocument,
+    world: &WorldSnapshot,
+) -> Result<fieldcad_expressions::EvaluationResult, fieldcad_expressions::ExpressionError> {
+    let mut plan = EvaluationPlan::compile(document, |target| {
+        let object = world.object(target.object)?;
+        object.components.get(&target.component)?;
+        let schema = world.component_schemas().get(&target.component)?;
+        let property = schema
+            .properties
+            .iter()
+            .find(|property| property.id == target.property)?;
+        let PropertyKind::Scalar(dimension) = property.kind else {
+            return None;
+        };
+        Some(fieldcad_expressions::PropertyBindingSchema {
+            dimension,
+            live_binding: property.live_binding,
+        })
+    })?;
+    plan.evaluate(&WorldDistanceProvider(world))
+}
+
 /// A brand-new, uncommitted constant has no authoritative resolved value
 /// yet at any call site, so its preview always compiles and evaluates
 /// locally against the supplied constants plus the drafted candidate.
-fn preview_line(
-    ui: &mut egui::Ui,
+fn preview_constant(
     scope: ConstantScope,
     name: &str,
     source: &str,
     existing_constants: &[ConstantDefinition],
-) {
+) -> Option<Result<fieldcad_expressions::ExpressionValue, fieldcad_expressions::ExpressionError>> {
     if name.trim().is_empty() || source.trim().is_empty() {
-        return;
+        return None;
     }
     let candidate_id = ConstantId::new(u64::MAX);
     let mut constants = existing_constants.to_vec();
@@ -41,31 +74,21 @@ fn preview_line(
         revision: None,
         provenance: None,
     });
-    match EvaluationPlan::compile(
-        &ExpressionDocument {
-            constants,
-            bindings: Vec::new(),
+    Some(
+        match EvaluationPlan::compile(
+            &ExpressionDocument {
+                constants,
+                bindings: Vec::new(),
+            },
+            |_| None,
+        ) {
+            Ok(mut plan) => match plan.evaluate(&NoDistanceProvider) {
+                Ok(result) => Ok(result.constants[&candidate_id]),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
         },
-        |_| None,
-    ) {
-        Ok(mut plan) => match plan.evaluate(&NoDistanceProvider) {
-            Ok(result) => {
-                if let Some(value) = result.constants.get(&candidate_id) {
-                    ui.small(format!(
-                        "= {} {}",
-                        value.si_value(),
-                        value.dimension().unit_symbol()
-                    ));
-                }
-            }
-            Err(error) => {
-                ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
-            }
-        },
-        Err(error) => {
-            ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
-        }
-    }
+    )
 }
 
 /// A staged, uncommitted name+source pair for a new constant.
@@ -121,6 +144,7 @@ pub(super) fn add_constant_control(
     let mut draft = ui
         .data_mut(|data| data.get_temp::<ConstantDraft>(draft_id))
         .unwrap_or_default();
+    let preview = preview_constant(scope, &draft.name, &draft.source, existing_constants);
 
     let mut result = None;
     ui.horizontal(|ui| {
@@ -137,7 +161,7 @@ pub(super) fn add_constant_control(
                 .desired_width(120.0),
         );
         extra_source_ui(ui, &mut draft.source);
-        let can_submit = !draft.name.trim().is_empty() && !draft.source.trim().is_empty();
+        let can_submit = preview.as_ref().is_some_and(Result::is_ok);
         if ui
             .add_enabled(can_submit, egui::Button::new("Add"))
             .clicked()
@@ -148,7 +172,22 @@ pub(super) fn add_constant_control(
             open = false;
         }
     });
-    preview_line(ui, scope, &draft.name, &draft.source, existing_constants);
+    match preview {
+        Some(Ok(value)) => {
+            ui.small(format!(
+                "= {} {}",
+                value.si_value(),
+                value.dimension().unit_symbol()
+            ));
+        }
+        Some(Err(error)) => {
+            ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
+            if let Some(span) = error.span {
+                ui.weak(format!("Source bytes {}..{}", span.start, span.end));
+            }
+        }
+        None => {}
+    }
 
     if result.is_some() {
         open = false;
@@ -217,6 +256,7 @@ struct VariableDraft {
 /// The "Variables" inspector panel: document and embedded user constants.
 pub(super) fn variables_editor(
     ui: &mut egui::Ui,
+    world: &WorldSnapshot,
     compute: &ComputeView,
     user_constants: &UserConstantLibrary,
     output: &mut UiFrameOutput,
@@ -234,6 +274,29 @@ pub(super) fn variables_editor(
                 })
         });
         ui.group(|ui| {
+            let mut commands = Vec::new();
+            if draft.name != constant.name {
+                commands.push(ExpressionCommand::RenameConstant {
+                    constant: constant.id,
+                    name: draft.name.clone(),
+                });
+            }
+            if draft.source != constant.source.as_str() {
+                commands.push(ExpressionCommand::SetConstantSource {
+                    constant: constant.id,
+                    source: draft.source.as_str().into(),
+                });
+            }
+            let preview = if commands.is_empty() {
+                None
+            } else {
+                Some(
+                    compute
+                        .expressions
+                        .apply(commands.clone())
+                        .and_then(|document| preview_document(&document, world)),
+                )
+            };
             ui.horizontal(|ui| {
                 ui.label(match constant.scope {
                     ConstantScope::Document => "doc.",
@@ -257,25 +320,15 @@ pub(super) fn variables_editor(
                     output,
                 );
                 output.scene_edit_in_progress |= name.has_focus() || source.has_focus();
-                let submit = (name.lost_focus() || source.lost_focus())
+                let enter = (name.lost_focus() || source.lost_focus())
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                if submit {
-                    let mut commands = Vec::new();
-                    if draft.name != constant.name {
-                        commands.push(ExpressionCommand::RenameConstant {
-                            constant: constant.id,
-                            name: draft.name.clone(),
-                        });
-                    }
-                    if draft.source != constant.source.as_str() {
-                        commands.push(ExpressionCommand::SetConstantSource {
-                            constant: constant.id,
-                            source: draft.source.as_str().into(),
-                        });
-                    }
-                    if !commands.is_empty() {
-                        output.submit(CommandPayload::CommitExpressions(commands));
-                    }
+                let valid = preview.as_ref().is_some_and(Result::is_ok);
+                if (enter || ui.add_enabled(valid, egui::Button::new("Apply")).clicked()) && valid {
+                    output.submit(CommandPayload::CommitExpressions(commands.clone()));
+                }
+                if !commands.is_empty() && ui.small_button("Reset").clicked() {
+                    draft.name = constant.name.clone();
+                    draft.source = constant.source.as_str().to_owned();
                 }
                 if constant.scope == ConstantScope::Document && ui.small_button("Delete").clicked()
                 {
@@ -284,12 +337,57 @@ pub(super) fn variables_editor(
                     ]));
                 }
             });
+            if let Some(Err(error)) = &preview {
+                ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
+                if let Some(span) = error.span {
+                    ui.weak(format!("Source bytes {}..{}", span.start, span.end));
+                }
+            }
             if let Some(value) = compute.resolved_constants.get(&constant.id) {
                 ui.small(format!(
                     "= {} {}",
                     value.si_value(),
                     value.dimension().unit_symbol()
                 ));
+            }
+            if let Some(state) = compute.expression_state.nodes.iter().find(|node| {
+                node.subject == fieldcad_expressions::ExpressionSubject::Constant(constant.id)
+            }) {
+                if !state.dependencies.is_empty() {
+                    let dependencies = state
+                        .dependencies
+                        .iter()
+                        .map(|dependency| match dependency {
+                            fieldcad_expressions::ExpressionDependency::Constant(id) => compute
+                                .expressions
+                                .constants
+                                .iter()
+                                .find(|candidate| candidate.id == *id)
+                                .map(|candidate| {
+                                    format!(
+                                        "{}.{}",
+                                        match candidate.scope {
+                                            ConstantScope::Document => "doc",
+                                            ConstantScope::User => "user",
+                                        },
+                                        candidate.name
+                                    )
+                                })
+                                .unwrap_or_else(|| format!("constant {}", id.get())),
+                            fieldcad_expressions::ExpressionDependency::Distance(id) => {
+                                format!("distance.{}", id.get())
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ui.weak(format!("Depends on: {dependencies}"));
+                }
+                if state.status != fieldcad_expressions::ExpressionNodeStatus::Resolved {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 100, 90),
+                        format!("Dependency status: {:?}", state.status),
+                    );
+                }
             }
             if let Some(provenance) = &constant.provenance {
                 ui.weak(format!("Embedded from {provenance}"));
@@ -372,13 +470,14 @@ pub(super) fn user_constants_editor(ui: &mut egui::Ui, model: &mut UiModel) {
             }
         });
     }
-    if let Err(error) = EvaluationPlan::compile(
+    let library_validation = EvaluationPlan::compile(
         &ExpressionDocument {
             constants: model.user_constants.constants.clone(),
             bindings: Vec::new(),
         },
         |_| None,
-    ) {
+    );
+    if let Err(error) = &library_validation {
         ui.colored_label(
             egui::Color32::from_rgb(220, 100, 90),
             format!("Library diagnostic: {error}"),
@@ -419,10 +518,12 @@ pub(super) fn user_constants_editor(ui: &mut egui::Ui, model: &mut UiModel) {
         save_library = true;
     }
 
-    if save_library {
+    if save_library && library_validation.is_ok() {
         match crate::user_constants::save(&model.user_constants) {
             Ok(()) => model.user_constants_status = None,
             Err(error) => model.user_constants_status = Some(error.to_string()),
         }
+    } else if save_library {
+        model.user_constants_status = Some("Invalid library draft was not saved".to_owned());
     }
 }

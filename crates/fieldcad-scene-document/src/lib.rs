@@ -68,11 +68,12 @@ pub const FORMAT_ID: &str = "fieldcad.scene/v1";
 /// when `mass_aggregate_history` was added, 4 → 5 when
 /// `document_entries`/`quick_add_hidden` were added, 5 → 6 when entries
 /// and preferences became source-qualified, 6 → 7 when `run_records` was
-/// added, and 7 → 8 when authored expressions and constants were added. Each field's own file
+/// added, 7 → 8 when authored expressions and constants were added, and 8 → 9
+/// when queued world/expression edits gained one atomic scene envelope. Each field's own file
 /// still loads fine on an older-format read (all `#[serde(default)]`), but
 /// a build that only knows the prior version must refuse a newer file
 /// outright rather than silently dropping that content on the next resave.
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 /// File extension for a saved scene document (without the leading dot).
 pub const EXTENSION: &str = "fcscene";
 

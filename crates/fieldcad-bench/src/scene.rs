@@ -53,6 +53,8 @@ pub struct Scene {
     pub precision: Precision,
     /// Nodes in an expression-graph benchmark; zero for solver scenes.
     pub expression_nodes: usize,
+    /// Live property bindings in an expression benchmark; zero for solver scenes.
+    pub live_bindings: usize,
 }
 
 impl Scene {
@@ -76,6 +78,7 @@ impl Scene {
             maxwell: MaxwellMode::StaticCharges,
             precision: Precision::F64,
             expression_nodes: 0,
+            live_bindings: 0,
         }
     }
 
@@ -101,6 +104,11 @@ impl Scene {
 
     pub fn with_expression_nodes(mut self, expression_nodes: usize) -> Self {
         self.expression_nodes = expression_nodes;
+        self
+    }
+
+    pub fn with_live_bindings(mut self, live_bindings: usize) -> Self {
+        self.live_bindings = live_bindings;
         self
     }
 
@@ -273,12 +281,13 @@ impl Scene {
     /// A compact one-line size description for the report.
     pub fn size_label(&self) -> String {
         format!(
-            "{c}³={cells} cells, {q} charge(s), {s} sample(s)/channel, {e} expression node(s)",
+            "{c}³={cells} cells, {q} charge(s), {s} sample(s)/channel, {e} expression node(s), {l} live binding(s)",
             c = self.cells_per_axis,
             cells = self.cells(),
             q = self.charges,
             s = self.samples_per_channel(),
-            e = self.expression_nodes
+            e = self.expression_nodes,
+            l = self.live_bindings,
         )
     }
 }

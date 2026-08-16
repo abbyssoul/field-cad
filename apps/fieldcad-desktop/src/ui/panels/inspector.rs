@@ -32,6 +32,7 @@ pub fn inspector(
                         ui.separator();
                         super::expression_editor::variables_editor(
                             ui,
+                            frame.world,
                             frame.compute,
                             &model.user_constants,
                             output,

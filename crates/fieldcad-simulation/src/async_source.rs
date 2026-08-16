@@ -118,7 +118,11 @@ enum WorkerEvent {
         /// completion reported once it actually applies, not before.
         terminal: Vec<CommandEvent>,
     },
-    PollFailed(SourceError),
+    PollFailed {
+        error: SourceError,
+        /// State after the failed poll, including a retained expression fault.
+        state: Option<Box<SourceState>>,
+    },
     /// Answer to [`WorkerRequest::CaptureDocument`] — carries no `state`,
     /// since a save-only read changes nothing about the running session.
     DocumentCaptured {
@@ -151,6 +155,7 @@ struct SourceState {
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
     expressions: fieldcad_expressions::ExpressionDocument,
+    expression_state: fieldcad_expressions::ExpressionState,
     resolved_constants:
         BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
     snapshot: Option<Arc<FieldSnapshot>>,
@@ -172,6 +177,7 @@ impl SourceState {
             edit_history: source.edit_history(),
             world: source.world(),
             expressions: source.expressions(),
+            expression_state: source.expression_state(),
             resolved_constants: source.resolved_constants(),
             snapshot: source.latest_snapshot(),
             forces: source.runtime().body_forces(),
@@ -208,6 +214,7 @@ pub struct AsyncLocalDataSource {
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
     expressions: fieldcad_expressions::ExpressionDocument,
+    expression_state: fieldcad_expressions::ExpressionState,
     resolved_constants:
         BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
     forces: BTreeMap<ObjectId, DVec3>,
@@ -296,6 +303,7 @@ impl AsyncLocalDataSource {
             edit_history: initial.edit_history,
             world: initial.world,
             expressions: initial.expressions,
+            expression_state: initial.expression_state,
             resolved_constants: initial.resolved_constants,
             forces: initial.forces,
             step_compute_ms: initial.step_compute_ms,
@@ -325,6 +333,7 @@ impl AsyncLocalDataSource {
         self.edit_history = state.edit_history;
         self.world = state.world;
         self.expressions = state.expressions;
+        self.expression_state = state.expression_state;
         self.resolved_constants = state.resolved_constants;
         self.forces = state.forces;
         self.step_compute_ms = state.step_compute_ms;
@@ -440,8 +449,11 @@ impl AsyncLocalDataSource {
                     ..outcome
                 }))
             }
-            WorkerEvent::PollFailed(error) => {
+            WorkerEvent::PollFailed { error, state } => {
                 self.poll_in_flight = false;
+                if let Some(state) = state {
+                    let _ = self.adopt(*state)?;
+                }
                 self.failure = Some(error.to_string());
                 // Don't return early (BE-9): earlier events in this batch
                 // already called adopt() and their aggregate is valid.
@@ -859,6 +871,10 @@ impl FieldDataSource for AsyncLocalDataSource {
         self.resolved_constants.clone()
     }
 
+    fn expression_state(&self) -> fieldcad_expressions::ExpressionState {
+        self.expression_state.clone()
+    }
+
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         self.forces.clone()
     }
@@ -1024,7 +1040,10 @@ fn worker_loop(
                         state: SourceState::capture(&source),
                         terminal: source.drain_command_events(),
                     },
-                    Err(error) => WorkerEvent::PollFailed(error),
+                    Err(error) => WorkerEvent::PollFailed {
+                        error,
+                        state: Some(Box::new(SourceState::capture(&source))),
+                    },
                 };
                 if events.send(event).is_err() {
                     break;
@@ -1284,10 +1303,13 @@ mod tests {
         // a transient poll failure arriving *after* real worker events.
         source
             .test_events_tx
-            .send(WorkerEvent::PollFailed(SourceError::Solver {
-                code: "test-error".to_owned(),
-                message: "simulated transient failure".to_owned(),
-            }))
+            .send(WorkerEvent::PollFailed {
+                error: SourceError::Solver {
+                    code: "test-error".to_owned(),
+                    message: "simulated transient failure".to_owned(),
+                },
+                state: None,
+            })
             .unwrap();
 
         // drain_worker_events must NOT propagate the PollFailed as Err —

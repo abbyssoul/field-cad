@@ -64,6 +64,8 @@ pub struct ComputeView {
     /// Most recently resolved constant values for the Variables inspector.
     pub resolved_constants:
         BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
+    /// Dependency health and current live-evaluation faults for the accepted graph.
+    pub expression_state: fieldcad_expressions::ExpressionState,
     /// Channels a generic vector layer can draw, in published order.
     pub vector_channels: Vec<ChannelId>,
     /// Active vector fields that their owning numerical solver permits painting.
@@ -172,6 +174,16 @@ impl ComputeView {
             _ => source.get_queue(),
         };
 
+        let expression_state = source.expression_state();
+        let mut diagnostics = diagnostics;
+        diagnostics.extend(
+            expression_state
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("[Expression] {}", diagnostic.error)),
+        );
+        let has_errors = has_errors || !expression_state.diagnostics.is_empty();
+
         Self {
             description: source.description().to_owned(),
             status: source.status(),
@@ -199,6 +211,7 @@ impl ComputeView {
             edit_history: source.edit_history(),
             expressions: source.expressions(),
             resolved_constants: source.resolved_constants(),
+            expression_state,
             vector_channels,
             mutable_vector_channels,
             subscription: source.subscription(),
