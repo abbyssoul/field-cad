@@ -176,7 +176,13 @@ fn domain_cells(ui: &mut egui::Ui, axis: &str, value: &mut u32) {
         egui::DragValue::new(value)
             .speed(1.0)
             .prefix(format!("{axis}: "))
-            .range(0..=u32::MAX),
+            .range(0..=u32::MAX)
+            .custom_parser(|text| {
+                text.trim()
+                    .parse()
+                    .ok()
+                    .or_else(|| super::evaluate_dimensionless_expression(text))
+            }),
     );
 }
 
@@ -593,7 +599,15 @@ fn density_field(
         let response = ui
             .add_enabled(
                 enabled,
-                egui::DragValue::new(&mut count).speed(1.0).range(range),
+                egui::DragValue::new(&mut count)
+                    .speed(1.0)
+                    .range(range)
+                    .custom_parser(|text| {
+                        text.trim()
+                            .parse()
+                            .ok()
+                            .or_else(|| super::evaluate_dimensionless_expression(text))
+                    }),
             )
             .on_hover_text(hover);
         if response.changed() {

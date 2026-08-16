@@ -332,6 +332,9 @@ physical sources or alter a solver result.
   As a researcher, I want to name, retain, and compare snapshots, probe series,
   and diagnostics from multiple runs/configurations so that I can attribute a
   difference to a stated model or parameter change.
+  > Status stale: implemented 2026-08-16 (`save_run`/`list_runs`/`get_run`/
+  > `delete_run`/`compare_runs`, P1-6); update tracked in
+  > `docs/tasks/product-capability-gaps-completion.md` (item 9).
 
 ### 7. History, recording, reproducibility, and exchange
 
@@ -355,6 +358,9 @@ physical sources or alter a solver result.
   As a researcher, I want to record semantic commands and elapsed intervals,
   then replay them against a fresh session so that I can reproduce a result
   independently of rendered frames and UI timing.
+  > Status stale: server/MCP/desktop exposure implemented 2026-08-16 (P1-7);
+  > update tracked in `docs/tasks/product-capability-gaps-completion.md`
+  > (item 9).
 
 - **US-63 — Save, export, import, and share an experiment** *(Partially
   implemented)*  
@@ -367,9 +373,12 @@ physical sources or alter a solver result.
   configuration, field-system composition, and provenance, including any
   edits still paused in the command queue — is implemented via the desktop
   File menu and MCP's `save_scene`/`open_scene`/`create_scene` tools (see
-  US-01/US-02). Named views, recordings, and selected-observation
-  export/import remain out of scope; see `docs/tasks/product-capability-gaps.md`
-  items 6-8.
+   US-01/US-02). Named views, recordings, and selected-observation
+   export/import remain out of scope; see `docs/tasks/product-capability-gaps.md`
+   items 6-8.
+   > Status stale: recordings (P1-7) and selected-observation export/import
+   > (P1-8) were implemented 2026-08-16; update tracked in
+   > `docs/tasks/product-capability-gaps-completion.md` (item 9).
 
 ### 8. Navigate and present the scene
 

@@ -73,6 +73,7 @@ fn mass_property_schema() -> PropertySchema {
         description: None,
         kind: PropertyKind::Scalar(Dimension::MASS),
         required: true,
+        live_binding: false,
         relevant_when: None,
         default_value: Some(PropertyValue::Scalar(
             Quantity::new(DEFAULT_MASS_KILOGRAMS, Dimension::MASS)
@@ -114,6 +115,7 @@ pub fn gravitational_mass_component_schema() -> ComponentSchema {
                 ),
                 kind: PropertyKind::Boolean,
                 required: true,
+                live_binding: false,
                 default_value: Some(PropertyValue::Boolean(true)),
                 relevant_when: None,
             },

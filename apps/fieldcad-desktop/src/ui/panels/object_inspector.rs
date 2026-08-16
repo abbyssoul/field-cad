@@ -26,6 +26,7 @@ pub(super) fn object_properties(
     object: &WorldObject,
     following: Option<ObjectId>,
     object_trajectories: &mut BTreeMap<ObjectId, TrajectoryDisplay>,
+    user_constants: &fieldcad_expressions::UserConstantLibrary,
     output: &mut UiFrameOutput,
 ) {
     let tracking = object
@@ -147,7 +148,7 @@ pub(super) fn object_properties(
         placement_editors(ui, object, tracking, output);
     });
     super::section(ui, "inspector_components", "Components", true, |ui| {
-        object_components(ui, world, compute, object, tracking, output);
+        object_components(ui, world, compute, object, tracking, user_constants, output);
     });
     if let Some(mass_kg) = inertial_mass_kg(object) {
         super::section(ui, "inspector_derived", "Derived values", true, |ui| {
@@ -219,10 +220,6 @@ fn placement_editors(
             });
             ui.end_row();
 
-            ui.label("Extent");
-            ui.add_enabled_ui(!tracking, |ui| shape_editor(ui, object, output));
-            ui.end_row();
-
             let mut velocity = object.velocity.linear;
             let mut velocity_changed = false;
             ui.label("Velocity");
@@ -244,6 +241,10 @@ fn placement_editors(
                     velocity,
                 }]);
             }
+
+            ui.label("Extent");
+            ui.add_enabled_ui(!tracking, |ui| shape_editor(ui, object, output));
+            ui.end_row();
 
             ui.label("Motion");
             motion_editor(ui, object, output);
@@ -469,6 +470,7 @@ fn object_components(
     compute: &ComputeView,
     object: &WorldObject,
     tracking: bool,
+    user_constants: &fieldcad_expressions::UserConstantLibrary,
     output: &mut UiFrameOutput,
 ) {
     let schemas = world.component_schemas();
@@ -519,13 +521,26 @@ fn object_components(
                     if !property.is_relevant(&edited) {
                         continue;
                     }
-                    changed |= property_editor(
-                        ui,
-                        object.id,
-                        property,
-                        &mut edited,
-                        &mut output.scene_edit_in_progress,
-                    );
+                    changed |= if matches!(property.kind, PropertyKind::Scalar(_)) {
+                        expression_property_editor(
+                            ui,
+                            object.id,
+                            id,
+                            property,
+                            &mut edited,
+                            &compute.expressions,
+                            user_constants,
+                            output,
+                        )
+                    } else {
+                        property_editor(
+                            ui,
+                            object.id,
+                            property,
+                            &mut edited,
+                            &mut output.scene_edit_in_progress,
+                        )
+                    };
                 }
                 if changed && schema.validate(&edited).is_ok() {
                     output.edit(vec![WorldCommand::AttachComponent {
@@ -627,6 +642,179 @@ pub(super) fn property_editor(
         changed = property_widget(ui, object, schema, values, editing);
     });
     changed
+}
+
+#[derive(Clone, Debug)]
+struct ExpressionDraft {
+    active: bool,
+    source: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expression_property_editor(
+    ui: &mut egui::Ui,
+    object: ObjectId,
+    component: &ComponentTypeId,
+    schema: &PropertySchema,
+    values: &mut PropertyBag,
+    expressions: &fieldcad_expressions::ExpressionDocument,
+    user_constants: &fieldcad_expressions::UserConstantLibrary,
+    output: &mut UiFrameOutput,
+) -> bool {
+    let PropertyKind::Scalar(dimension) = schema.kind else {
+        return false;
+    };
+    let target = fieldcad_expressions::PropertyTarget {
+        object,
+        component: component.clone(),
+        property: schema.id.clone(),
+    };
+    let binding = expressions
+        .bindings
+        .iter()
+        .find(|binding| binding.target == target);
+    let magnitude = values
+        .get(&schema.id)
+        .and_then(|value| match value {
+            PropertyValue::Scalar(quantity) => Some(quantity.si_value()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let editor_id = ui.make_persistent_id(("property-expression", &target));
+    let mut draft = ui.data_mut(|data| {
+        data.get_temp::<ExpressionDraft>(editor_id)
+            .unwrap_or_else(|| ExpressionDraft {
+                active: binding.is_some(),
+                source: binding.map_or_else(
+                    || literal_expression_source(magnitude, dimension),
+                    |binding| binding.source.as_str().to_owned(),
+                ),
+            })
+    });
+    if let Some(binding) = binding
+        && !draft.active
+    {
+        draft.active = true;
+        draft.source = binding.source.as_str().to_owned();
+    }
+
+    let mut literal_changed = false;
+    ui.horizontal(|ui| {
+        let label = ui.label(&schema.display_name);
+        if let Some(description) = &schema.description {
+            let _ = label.on_hover_text(description);
+        }
+        if draft.active {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut draft.source)
+                    .id(editor_id.with("source"))
+                    .desired_width(150.0),
+            );
+            output.scene_edit_in_progress |= response.has_focus();
+            let committed =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if committed && !draft.source.trim().is_empty() {
+                output.submit(fieldcad_simulation::CommandPayload::CommitExpressions(
+                    vec![
+                        fieldcad_expressions::ExpressionCommand::SetPropertyExpression(
+                            fieldcad_expressions::PropertyBinding {
+                                target: target.clone(),
+                                source: draft.source.as_str().into(),
+                            },
+                        ),
+                    ],
+                ));
+            }
+            super::expression_editor::insert_constant_menu(
+                ui,
+                &mut draft.source,
+                expressions,
+                user_constants,
+                output,
+            );
+            if ui
+                .small_button("Freeze")
+                .on_hover_text("Replace the formula with its current resolved literal value")
+                .clicked()
+            {
+                output.submit(fieldcad_simulation::CommandPayload::CommitExpressions(
+                    vec![
+                        fieldcad_expressions::ExpressionCommand::ClearPropertyExpression(
+                            target.clone(),
+                        ),
+                    ],
+                ));
+                draft.active = false;
+                draft.source = literal_expression_source(magnitude, dimension);
+            }
+        } else {
+            let mut edited = magnitude;
+            literal_changed = scalar_editor(
+                ui,
+                &mut edited,
+                dimension,
+                &mut output.scene_edit_in_progress,
+            );
+            if literal_changed && let Ok(quantity) = Quantity::new(edited, dimension) {
+                values.insert(schema.id.clone(), PropertyValue::Scalar(quantity));
+            }
+            if ui
+                .small_button("fx")
+                .on_hover_text("Author a dimension-checked expression")
+                .clicked()
+            {
+                draft.active = true;
+                draft.source = literal_expression_source(magnitude, dimension);
+            }
+        }
+    });
+
+    if draft.active {
+        ui.indent(editor_id.with("details"), |ui| {
+            ui.weak(format!(
+                "Resolved: {}",
+                fieldcad_core::format_si_value(magnitude, dimension).unwrap_or_else(|| format!(
+                    "{} {}",
+                    format_engineering(magnitude),
+                    dimension.unit_symbol()
+                ))
+            ));
+            let preview = fieldcad_expressions::EvaluationPlan::compile(
+                &fieldcad_expressions::ExpressionDocument {
+                    constants: expressions.constants.clone(),
+                    bindings: vec![fieldcad_expressions::PropertyBinding {
+                        target: target.clone(),
+                        source: draft.source.as_str().into(),
+                    }],
+                },
+                |candidate| {
+                    (candidate == &target).then_some(fieldcad_expressions::PropertyBindingSchema {
+                        dimension,
+                        live_binding: schema.live_binding,
+                    })
+                },
+            );
+            match preview {
+                Ok(_) => {
+                    ui.weak("Dimension valid; press Enter to submit authoritatively.");
+                }
+                Err(error) => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
+                }
+            }
+        });
+    }
+    ui.data_mut(|data| data.insert_temp(editor_id, draft));
+    literal_changed
+}
+
+fn literal_expression_source(value: f64, dimension: Dimension) -> String {
+    let unit = dimension.unit_symbol();
+    if unit.is_empty() {
+        format_engineering(value)
+    } else {
+        format!("{} {unit}", format_engineering(value))
+    }
 }
 
 fn property_widget(

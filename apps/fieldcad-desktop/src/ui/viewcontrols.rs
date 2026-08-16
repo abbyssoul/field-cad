@@ -288,6 +288,12 @@ fn scene_scale_controls(ui: &mut egui::Ui, compute: &ComputeView, output: &mut U
                     .custom_parser(|text| {
                         fieldcad_core::parse_si_value(text, fieldcad_core::Dimension::LENGTH)
                             .or_else(|| text.trim().parse().ok())
+                            .or_else(|| {
+                                super::panels::evaluate_literal_expression(
+                                    text,
+                                    fieldcad_core::Dimension::LENGTH,
+                                )
+                            })
                     })
                     .update_while_editing(false),
             )

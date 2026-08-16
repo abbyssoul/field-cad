@@ -34,6 +34,9 @@ pub struct RunRecord {
     /// RFC 3339, set once when the run is named.
     pub created_at: String,
     pub run_generation: u64,
+    /// Authored expression graph that produced the recorded numeric world.
+    #[serde(default)]
+    pub expression_graph_hash: Option<String>,
     pub domain: Domain,
     pub time_step: TimeStep,
     pub field_systems: Vec<FieldSystemComposition>,
@@ -48,6 +51,7 @@ impl RunRecord {
     pub fn capture(
         name: String,
         run_generation: u64,
+        expression_graph_hash: Option<String>,
         domain: Domain,
         time_step: TimeStep,
         field_systems: Vec<FieldSystemComposition>,
@@ -60,6 +64,7 @@ impl RunRecord {
             name,
             created_at: rfc3339_now(),
             run_generation,
+            expression_graph_hash,
             domain,
             time_step,
             field_systems,
@@ -140,6 +145,7 @@ pub struct RunComparison {
     pub b: RunRecordSummary,
     pub domain_changed: bool,
     pub time_step_changed: bool,
+    pub expression_graph_changed: bool,
     pub configuration_differences: Vec<ConfigurationDifference>,
     pub probe_series: Vec<ProbeSeriesComparison>,
     pub distance_series: Vec<DistanceSeriesComparison>,
@@ -244,6 +250,7 @@ pub fn compare_run_records(a: &RunRecord, b: &RunRecord) -> RunComparison {
         b: b.summary(),
         domain_changed: a.domain != b.domain,
         time_step_changed: a.time_step != b.time_step,
+        expression_graph_changed: a.expression_graph_hash != b.expression_graph_hash,
         configuration_differences,
         probe_series,
         distance_series,
@@ -309,6 +316,7 @@ mod tests {
         RunRecord::capture(
             name.to_owned(),
             generation,
+            None,
             Domain::centred_cube(2.0, 4).unwrap(),
             TimeStep::from_seconds(0.1).unwrap(),
             vec![field_system("gain-test", gain)],

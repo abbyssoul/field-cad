@@ -51,6 +51,8 @@ pub struct Scene {
     pub domain_stride: Option<u32>,
     pub maxwell: MaxwellMode,
     pub precision: Precision,
+    /// Nodes in an expression-graph benchmark; zero for solver scenes.
+    pub expression_nodes: usize,
 }
 
 impl Scene {
@@ -73,6 +75,7 @@ impl Scene {
             domain_stride: Some(8),
             maxwell: MaxwellMode::StaticCharges,
             precision: Precision::F64,
+            expression_nodes: 0,
         }
     }
 
@@ -93,6 +96,11 @@ impl Scene {
 
     pub fn with_charges(mut self, charges: usize) -> Self {
         self.charges = charges;
+        self
+    }
+
+    pub fn with_expression_nodes(mut self, expression_nodes: usize) -> Self {
+        self.expression_nodes = expression_nodes;
         self
     }
 
@@ -265,11 +273,12 @@ impl Scene {
     /// A compact one-line size description for the report.
     pub fn size_label(&self) -> String {
         format!(
-            "{c}³={cells} cells, {q} charge(s), {s} sample(s)/channel",
+            "{c}³={cells} cells, {q} charge(s), {s} sample(s)/channel, {e} expression node(s)",
             c = self.cells_per_axis,
             cells = self.cells(),
             q = self.charges,
-            s = self.samples_per_channel()
+            s = self.samples_per_channel(),
+            e = self.expression_nodes
         )
     }
 }

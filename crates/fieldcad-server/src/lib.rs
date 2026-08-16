@@ -1150,6 +1150,7 @@ impl HeadlessServer {
         let record = RunRecord::capture(
             name,
             self.simulation_status().run_generation,
+            Some(self.source.expressions().content_hash()),
             self.source.domain(),
             self.time_step(),
             field_systems,
@@ -1486,6 +1487,16 @@ impl FieldDataSource for HeadlessServer {
 
     fn world(&self) -> WorldSnapshot {
         self.source.world()
+    }
+
+    fn expressions(&self) -> fieldcad_expressions::ExpressionDocument {
+        self.source.expressions()
+    }
+
+    fn resolved_constants(
+        &self,
+    ) -> BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue> {
+        self.source.resolved_constants()
     }
 
     // Not the trait default: a source that actually holds body forces must

@@ -150,6 +150,9 @@ struct SourceState {
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
+    expressions: fieldcad_expressions::ExpressionDocument,
+    resolved_constants:
+        BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
     snapshot: Option<Arc<FieldSnapshot>>,
     forces: BTreeMap<ObjectId, DVec3>,
     step_compute_ms: f32,
@@ -168,6 +171,8 @@ impl SourceState {
             field_systems: source.field_systems(),
             edit_history: source.edit_history(),
             world: source.world(),
+            expressions: source.expressions(),
+            resolved_constants: source.resolved_constants(),
             snapshot: source.latest_snapshot(),
             forces: source.runtime().body_forces(),
             step_compute_ms: source.runtime().last_tick_compute_ms(),
@@ -202,6 +207,9 @@ pub struct AsyncLocalDataSource {
     field_systems: Vec<FieldSystemStatus>,
     edit_history: EditHistoryStatus,
     world: WorldSnapshot,
+    expressions: fieldcad_expressions::ExpressionDocument,
+    resolved_constants:
+        BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
     forces: BTreeMap<ObjectId, DVec3>,
     step_compute_ms: f32,
     mailbox: SnapshotMailbox,
@@ -287,6 +295,8 @@ impl AsyncLocalDataSource {
             field_systems: initial.field_systems,
             edit_history: initial.edit_history,
             world: initial.world,
+            expressions: initial.expressions,
+            resolved_constants: initial.resolved_constants,
             forces: initial.forces,
             step_compute_ms: initial.step_compute_ms,
             mailbox,
@@ -314,6 +324,8 @@ impl AsyncLocalDataSource {
         self.field_systems = state.field_systems;
         self.edit_history = state.edit_history;
         self.world = state.world;
+        self.expressions = state.expressions;
+        self.resolved_constants = state.resolved_constants;
         self.forces = state.forces;
         self.step_compute_ms = state.step_compute_ms;
         match state.snapshot {
@@ -835,6 +847,16 @@ impl FieldDataSource for AsyncLocalDataSource {
 
     fn world(&self) -> WorldSnapshot {
         self.world.clone()
+    }
+
+    fn expressions(&self) -> fieldcad_expressions::ExpressionDocument {
+        self.expressions.clone()
+    }
+
+    fn resolved_constants(
+        &self,
+    ) -> BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue> {
+        self.resolved_constants.clone()
     }
 
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {

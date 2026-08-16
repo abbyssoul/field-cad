@@ -37,3 +37,4 @@ Status values: `accepted`, `superseded by NNNN`, `revisited NNNN`.
 | [0023](0023-an-interactive-edit-suspends-the-run.md) | An interactive edit suspends the run and may defer a system | accepted |
 | [0024](0024-undo-restores-a-captured-scene.md) | Undo restores a captured scene, forwards | accepted |
 | [0025](0025-a-field-is-shared-a-model-is-chosen.md) | A field is shared; the model that computes it is chosen | accepted |
+| [0026](0026-authored-expressions-evaluate-before-ticks.md) | Authored expressions evaluate outside the world, before ticks | accepted |

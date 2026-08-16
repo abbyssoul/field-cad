@@ -67,12 +67,12 @@ pub const FORMAT_ID: &str = "fieldcad.scene/v1";
 /// `playback_speed`/`probe_history`/`distance_history` were added, 3 → 4
 /// when `mass_aggregate_history` was added, 4 → 5 when
 /// `document_entries`/`quick_add_hidden` were added, 5 → 6 when entries
-/// and preferences became source-qualified, and 6 → 7 when `run_records`
-/// was added: each field's own file
+/// and preferences became source-qualified, 6 → 7 when `run_records` was
+/// added, and 7 → 8 when authored expressions and constants were added. Each field's own file
 /// still loads fine on an older-format read (all `#[serde(default)]`), but
 /// a build that only knows the prior version must refuse a newer file
 /// outright rather than silently dropping that content on the next resave.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 /// File extension for a saved scene document (without the leading dot).
 pub const EXTENSION: &str = "fcscene";
 
@@ -104,6 +104,10 @@ pub struct SceneDocument {
     pub field_systems: Vec<FieldSystemComposition>,
     /// Opaque to this crate — see [`fieldcad_core::WorldDocument`].
     pub world: WorldDocument,
+    /// Authored constants and property formulas. Resolved finite SI values
+    /// remain in `world`; transient compiled graphs are rebuilt after load.
+    #[serde(default)]
+    pub expressions: fieldcad_expressions::ExpressionDocument,
     /// The paused-queue write-ahead log: world/domain edits accepted but not
     /// yet applied at save time. A user who paused the command queue mid-edit
     /// and saved must not lose that work.
@@ -202,6 +206,7 @@ pub struct SceneDocumentInputs {
     pub integration_scheme: IntegrationScheme,
     pub field_systems: Vec<FieldSystemStatus>,
     pub world: WorldDocument,
+    pub expressions: fieldcad_expressions::ExpressionDocument,
     pub queue: QueueDocument,
     pub view: SceneViewState,
     pub probe_history: ProbeHistoryState,
@@ -249,6 +254,7 @@ impl SceneDocument {
                 })
                 .collect(),
             world: inputs.world,
+            expressions: inputs.expressions,
             queue: inputs.queue,
             view: inputs.view,
             probe_history: inputs.probe_history,

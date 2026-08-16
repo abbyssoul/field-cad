@@ -59,6 +59,11 @@ pub struct ComputeView {
     pub fields: Vec<FieldRow>,
     /// What undo and redo are currently offering, as the source reports it.
     pub edit_history: EditHistoryStatus,
+    /// Authoritative retained formulas and constants for inspectors/editors.
+    pub expressions: fieldcad_expressions::ExpressionDocument,
+    /// Most recently resolved constant values for the Variables inspector.
+    pub resolved_constants:
+        BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
     /// Channels a generic vector layer can draw, in published order.
     pub vector_channels: Vec<ChannelId>,
     /// Active vector fields that their owning numerical solver permits painting.
@@ -192,6 +197,8 @@ impl ComputeView {
             fields,
             field_systems,
             edit_history: source.edit_history(),
+            expressions: source.expressions(),
+            resolved_constants: source.resolved_constants(),
             vector_channels,
             mutable_vector_channels,
             subscription: source.subscription(),

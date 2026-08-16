@@ -27,11 +27,21 @@ pub fn inspector(
                             frame.edit_in_progress,
                             output,
                         );
+                    } else if model.variables_selected {
+                        ui.heading("Variables");
+                        ui.separator();
+                        super::expression_editor::variables_editor(
+                            ui,
+                            frame.compute,
+                            &model.user_constants,
+                            output,
+                        );
                     } else if let Some(object) = model
                         .selection
                         .and_then(|id| frame.world.object(id))
                         .filter(|object| !object.derived)
                     {
+                        let user_constants = model.user_constants.clone();
                         ui.heading("Object");
                         ui.separator();
                         super::object_inspector::object_properties(
@@ -42,6 +52,7 @@ pub fn inspector(
                             object,
                             model.following,
                             &mut model.object_trajectories,
+                            &user_constants,
                             output,
                         );
                     } else if let Some(plane) = model

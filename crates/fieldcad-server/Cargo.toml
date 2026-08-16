@@ -12,6 +12,7 @@ path = "src/main.rs"
 directories = { workspace = true }
 fieldcad-catalog = { workspace = true }
 fieldcad-core = { workspace = true }
+fieldcad-expressions = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-electromagnetism = { workspace = true }
 fieldcad-electrostatics = { workspace = true }

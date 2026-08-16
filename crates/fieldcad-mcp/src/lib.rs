@@ -249,6 +249,12 @@ struct CommitWorldParams {
     commands: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CommitExpressionsParams {
+    /// Native `ExpressionCommand` JSON objects, applied as one transaction.
+    commands: Vec<serde_json::Value>,
+}
+
 /// A catalog reference and template payload are ordinary JSON because catalog
 /// schemas are intentionally extensible independently of this transport.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1189,6 +1195,13 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Read authored constants and scalar-property bindings, including retained formula source and stable targets."
+    )]
+    async fn get_expressions(&self) -> Result<CallToolResult, ErrorData> {
+        ok_json(&lock(&self.model).expressions())
+    }
+
+    #[tool(
         description = "Authoritative run state: mode, tick, simulation time, time step, and world revision."
     )]
     async fn get_simulation_status(&self) -> Result<CallToolResult, ErrorData> {
@@ -1374,6 +1387,33 @@ impl McpServer {
             Err(error) => return tool_error(error),
         };
         submit_world_commands(&self.model, commands).await
+    }
+
+    #[tool(
+        description = "Apply one authoritative, queued transaction of ExpressionCommand JSON: add/update/rename/remove constants, set/clear property expressions, or import explicit embedded user constants. Compilation, dimensional checks, evaluation, world-schema validation, and solver validation all occur before adoption."
+    )]
+    async fn commit_expressions(
+        &self,
+        Parameters(params): Parameters<CommitExpressionsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let commands: Vec<fieldcad_expressions::ExpressionCommand> = match params
+            .commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| {
+                serde_json::from_value(command).map_err(|error| {
+                    format!("invalid expression command at index {index}: {error}")
+                })
+            })
+            .collect()
+        {
+            Ok(commands) => commands,
+            Err(error) => return tool_error(error),
+        };
+        match submit_and_wait(&self.model, CommandPayload::CommitExpressions(commands)).await {
+            Ok(receipt) => ok_json(&receipt),
+            Err(error) => tool_error(error.to_string()),
+        }
     }
 
     #[tool(
@@ -2093,6 +2133,7 @@ impl McpServer {
                 integration_scheme: server.integration_scheme(),
                 field_systems: server.field_systems(),
                 world,
+                expressions: server.expressions(),
                 queue,
                 view: fieldcad_scene_document::SceneViewState::default(),
                 probe_history,
@@ -2290,7 +2331,7 @@ fn build_session(
     ),
     String,
 > {
-    let (domain, time_step, scene_scale, integration_scheme, world, plugins, warnings) =
+    let (domain, time_step, scene_scale, integration_scheme, world, expressions, plugins, warnings) =
         match document {
             None => {
                 let domain = Domain::centred_cube(5.0, 32).map_err(|error| error.to_string())?;
@@ -2302,6 +2343,7 @@ fn build_session(
                     SceneScale::default(),
                     fieldcad_dynamics::IntegrationScheme::default(),
                     World::new(),
+                    fieldcad_expressions::ExpressionDocument::default(),
                     catalog,
                     Vec::new(),
                 )
@@ -2316,6 +2358,7 @@ fn build_session(
                     doc.scene_scale,
                     doc.integration_scheme,
                     World::from_document(doc.world),
+                    doc.expressions,
                     plugins,
                     warnings,
                 )
@@ -2323,6 +2366,7 @@ fn build_session(
         };
     let mut config = RuntimeConfig::new(domain, time_step, fresh_session_id())
         .with_world(world)
+        .with_expressions(expressions)
         .with_scene_scale(scene_scale)
         .with_integration_scheme(integration_scheme);
     for plugin in plugins {

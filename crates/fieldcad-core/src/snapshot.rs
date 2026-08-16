@@ -132,6 +132,10 @@ impl ChannelSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FieldSnapshot {
     pub identity: SnapshotIdentity,
+    /// Hash of authored constants/bindings that produced this numeric world.
+    /// Empty for snapshots created by pre-expression producers.
+    #[serde(default)]
+    pub expression_graph_hash: Option<String>,
     pub completeness: SnapshotCompleteness,
     /// The numerical region and configuration this result was computed over.
     pub domain: Domain,

@@ -73,6 +73,11 @@ pub struct PropertySchema {
     pub description: Option<String>,
     pub kind: PropertyKind,
     pub required: bool,
+    /// Whether this scalar property may be resolved from a live observation
+    /// before each simulation tick. Static expressions remain valid for every
+    /// scalar property.
+    #[serde(default)]
+    pub live_binding: bool,
     /// When set, this property only takes effect while the named sibling holds
     /// the given value.
     ///
@@ -371,6 +376,7 @@ mod tests {
             description: None,
             kind: PropertyKind::Scalar(Dimension::CHARGE),
             required: true,
+            live_binding: false,
             default_value: None,
             relevant_when: None,
         }
@@ -385,6 +391,7 @@ mod tests {
             description: None,
             kind: PropertyKind::Scalar(Dimension::MASS),
             required: true,
+            live_binding: false,
             relevant_when: Some(PropertyCondition {
                 property: switch.clone(),
                 equals: PropertyValue::Boolean(false),

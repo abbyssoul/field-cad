@@ -46,6 +46,13 @@ fn simulation_section(ui: &mut egui::Ui, model: &mut UiModel, frame: &FrameConte
             }
         })
         .body(|ui| {
+            if ui
+                .selectable_label(model.variables_selected, "Variables")
+                .on_hover_text("Document and reusable user constants referenced by expressions")
+                .clicked()
+            {
+                model.select_variables();
+            }
             if frame.compute.field_systems.is_empty() {
                 ui.weak("No field systems available.");
             }

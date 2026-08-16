@@ -82,6 +82,7 @@ impl EquationSystemPlugin for TestFieldPlugin {
                 description: None,
                 kind: PropertyKind::Scalar(Dimension::DIMENSIONLESS),
                 required: true,
+                live_binding: false,
                 default_value: None,
                 relevant_when: None,
             }],

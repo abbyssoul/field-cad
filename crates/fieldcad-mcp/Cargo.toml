@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { workspace = true }
 fieldcad-core = { workspace = true }
+fieldcad-expressions = { workspace = true }
 fieldcad-catalog = { workspace = true }
 fieldcad-dynamics = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }

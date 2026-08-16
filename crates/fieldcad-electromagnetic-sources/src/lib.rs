@@ -103,6 +103,7 @@ pub fn charge_component_schema() -> ComponentSchema {
             description: None,
             kind: PropertyKind::Scalar(Dimension::CHARGE),
             required: true,
+            live_binding: false,
             default_value: None,
             relevant_when: None,
         }],

@@ -720,6 +720,7 @@ mod tests {
                 tick: 0,
                 time_seconds: 0.0,
             },
+            expression_graph_hash: None,
             completeness: SnapshotCompleteness::Complete,
             domain: Domain::centred_cube(4.0, 4).unwrap(),
             plugins: Arc::from([]),

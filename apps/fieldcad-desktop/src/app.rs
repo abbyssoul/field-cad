@@ -489,7 +489,12 @@ struct WindowState {
     /// reuse-if-unchanged fields), and cloning these histories is not free.
     /// The `Option<u64>` is the snapshot sequence the clone was last
     /// refreshed against — `None` means never refreshed.
-    probe_history_cache: (Option<u64>, ProbeHistory, DistanceHistory, MassAggregateHistory),
+    probe_history_cache: (
+        Option<u64>,
+        ProbeHistory,
+        DistanceHistory,
+        MassAggregateHistory,
+    ),
     active_transform: Option<ActiveTransformDrag>,
     active_field_brush: Option<ActiveFieldBrushDrag>,
     /// Set from the last UI frame: an inspector control is being held.
@@ -2771,6 +2776,7 @@ impl WindowState {
                 integration_scheme: model.integration_scheme(),
                 field_systems: model.field_systems(),
                 world,
+                expressions: model.expressions(),
                 queue,
                 view: scene_view_state::capture(
                     &self.camera,
@@ -3412,6 +3418,7 @@ fn build_session(
         scene_scale,
         integration_scheme,
         world,
+        expressions,
         plugins,
         warnings,
         initial_sequence,
@@ -3431,6 +3438,7 @@ fn build_session(
                 fieldcad_core::SceneScale::default(),
                 fieldcad_dynamics::IntegrationScheme::default(),
                 fieldcad_core::World::new(),
+                fieldcad_expressions::ExpressionDocument::default(),
                 catalog,
                 Vec::new(),
                 0,
@@ -3447,6 +3455,7 @@ fn build_session(
                 doc.scene_scale,
                 doc.integration_scheme,
                 fieldcad_core::World::from_document(doc.world),
+                doc.expressions,
                 plugins,
                 warnings,
                 initial_sequence,
@@ -3455,6 +3464,7 @@ fn build_session(
     };
     let mut config = RuntimeConfig::new(domain, time_step, fresh_session_id())
         .with_world(world)
+        .with_expressions(expressions)
         .with_scene_scale(scene_scale)
         .with_integration_scheme(integration_scheme)
         // A loaded document's own recorded histories (if any) must not
@@ -3958,6 +3968,7 @@ mod tests {
                     tick: 0,
                     time_seconds: 0.0,
                 },
+                expression_graph_hash: None,
                 completeness: SnapshotCompleteness::Complete,
                 domain: Domain::centred_cube(4.0, 4).unwrap(),
                 plugins: Arc::from([]),

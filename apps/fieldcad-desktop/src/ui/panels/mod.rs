@@ -7,6 +7,7 @@
 mod catalog;
 mod diagnostics;
 mod distance_probe_inspector;
+mod expression_editor;
 mod inspector;
 mod mass_aggregate_probe_inspector;
 mod mcp;
@@ -61,7 +62,9 @@ pub(super) fn coordinate_editor(
         drag = drag
             .custom_formatter(move |val, _| fieldcad_core::format_si_value(val, dimension).unwrap())
             .custom_parser(move |text| {
-                fieldcad_core::parse_si_value(text, dimension).or_else(|| text.trim().parse().ok())
+                fieldcad_core::parse_si_value(text, dimension)
+                    .or_else(|| text.trim().parse().ok())
+                    .or_else(|| evaluate_literal_expression(text, dimension))
             });
     } else {
         // Compound dimension — just show the unit symbol as a suffix.
@@ -71,11 +74,118 @@ pub(super) fn coordinate_editor(
         } else {
             format!(" {symbol}")
         };
-        drag = drag.suffix(suffix);
+        drag = drag.suffix(suffix).custom_parser(move |text| {
+            text.trim()
+                .parse()
+                .ok()
+                .or_else(|| evaluate_literal_expression(text, dimension))
+        });
     }
 
     let response = ui.add(drag);
     note_held_edit(&response, editing)
+}
+
+/// One-shot dimension-checked calculator for plain numeric-entry fields
+/// (position, velocity, extent, domain bounds, …): parses `text` as an
+/// authored arithmetic/unit-literal expression and returns its SI
+/// magnitude if it evaluates to exactly `dimension`. Unlike
+/// `expression_editor`'s component-property bindings, the result is not
+/// persisted as a formula — only the literal number is kept, and there is
+/// no `doc.`/`user.` constant reference support, matching the "type 3/2 mm
+/// and it evaluates" convenience these fields need rather than the full
+/// authoritative expression-binding UX.
+pub(super) fn evaluate_literal_expression(
+    text: &str,
+    dimension: fieldcad_core::Dimension,
+) -> Option<f64> {
+    evaluate_expression_text(text, dimension)
+        .or_else(|| evaluate_trailing_unit_expression(text, dimension))
+}
+
+/// Compile and evaluate `text` as a single self-contained expression,
+/// accepting it only if it resolves to exactly `dimension`.
+fn evaluate_expression_text(text: &str, dimension: fieldcad_core::Dimension) -> Option<f64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let candidate_id = fieldcad_expressions::ConstantId::new(0);
+    let document = fieldcad_expressions::ExpressionDocument {
+        constants: vec![fieldcad_expressions::ConstantDefinition {
+            id: candidate_id,
+            scope: fieldcad_expressions::ConstantScope::Document,
+            name: "value".to_owned(),
+            source: text.into(),
+            revision: None,
+            provenance: None,
+        }],
+        bindings: Vec::new(),
+    };
+    let mut plan = fieldcad_expressions::EvaluationPlan::compile(&document, |_| None).ok()?;
+    let result = plan.evaluate(&NoDistanceProvider).ok()?;
+    let value = result.constants.get(&candidate_id)?;
+    (value.dimension() == dimension).then_some(value.si_value())
+}
+
+/// Natural shorthand where a single trailing unit scales the whole authored
+/// expression, e.g. `"120 + 15 Mm"` meaning `"(120 + 15) Mm"`.
+///
+/// `fieldcad-expressions` binds a unit identifier at multiplicative
+/// precedence, so it multiplies only the term immediately to its left —
+/// correct and necessary for genuinely mixed-dimension sums like
+/// `"5 km + 200 m"`, but it rejects `"120 + 15 Mm"` outright, since `120`
+/// alone is dimensionless and can't add to a length. This fallback only
+/// runs after that strict evaluation has already failed, so it never
+/// changes the result of an expression that was valid on its own terms —
+/// it splits off exactly one trailing run of alphabetic characters,
+/// evaluates it alone as the unit (e.g. `"Mm"` → its SI conversion factor),
+/// evaluates everything before it as a plain dimensionless number, and
+/// multiplies the two. Compound trailing units (e.g. `"m/s"`) aren't
+/// split off, since only a contiguous alphabetic run is treated as the
+/// unit.
+fn evaluate_trailing_unit_expression(
+    text: &str,
+    dimension: fieldcad_core::Dimension,
+) -> Option<f64> {
+    let trimmed = text.trim();
+    let mut split_at = trimmed.len();
+    for (index, character) in trimmed.char_indices().rev() {
+        if character.is_alphabetic() {
+            split_at = index;
+        } else {
+            break;
+        }
+    }
+    if split_at == 0 || split_at == trimmed.len() {
+        return None;
+    }
+    let (head, unit_token) = trimmed.split_at(split_at);
+    let head = head.trim_end();
+    if head.is_empty() {
+        return None;
+    }
+    let per_unit = evaluate_expression_text(unit_token, dimension)?;
+    let factor = evaluate_expression_text(head, fieldcad_core::Dimension::DIMENSIONLESS)?;
+    Some(factor * per_unit)
+}
+
+/// Shorthand for [`evaluate_literal_expression`] with a bare, unit-less
+/// count/ratio field (arrow density, cell counts, scale factors, …), where
+/// a plain typed number already carries [`fieldcad_core::Dimension::DIMENSIONLESS`].
+pub(super) fn evaluate_dimensionless_expression(text: &str) -> Option<f64> {
+    evaluate_literal_expression(text, fieldcad_core::Dimension::DIMENSIONLESS)
+}
+
+/// A `ValueProvider` for local one-shot/dry-run expression evaluation
+/// outside the authoritative runtime: no distance probes exist to resolve,
+/// so every reference misses.
+pub(super) struct NoDistanceProvider;
+
+impl fieldcad_expressions::ValueProvider for NoDistanceProvider {
+    fn distance(&self, _probe: fieldcad_core::DistanceProbeId) -> Option<f64> {
+        None
+    }
 }
 
 pub(super) fn name_editor(
@@ -153,6 +263,65 @@ mod tests {
     use super::scene_tree::new_object_command;
     use super::shape_inspector::{plane_field_layers, plane_properties};
     use super::world_inspector::{field_system_controls, realtime_control, transport_sampling};
+
+    #[test]
+    fn coordinate_editor_arithmetic_expressions_evaluate_to_si_value() {
+        assert_eq!(
+            evaluate_literal_expression("3/2 mm", Dimension::LENGTH),
+            Some(1.5e-3)
+        );
+        assert_eq!(
+            evaluate_literal_expression("6400 / 2 * 1e3 km", Dimension::LENGTH),
+            Some(3_200_000_000.0)
+        );
+        // Wrong dimension.
+        assert_eq!(evaluate_literal_expression("1 kg", Dimension::LENGTH), None);
+        // Malformed.
+        assert_eq!(evaluate_literal_expression("1 /", Dimension::LENGTH), None);
+        // A bare number, with no unit suffix, is dimensionless and evaluates
+        // through the unit-less count/ratio shorthand used by arrow density,
+        // cell counts, and similar fields.
+        assert_eq!(evaluate_dimensionless_expression("3/2"), Some(1.5));
+        assert_eq!(evaluate_dimensionless_expression("1 mm"), None);
+        // Blank stays a miss, deferring to the caller's other parse fallbacks.
+        assert_eq!(evaluate_literal_expression("  ", Dimension::LENGTH), None);
+    }
+
+    #[test]
+    fn coordinate_editor_expressions_apply_a_trailing_unit_to_the_whole_expression() {
+        // `fieldcad-expressions` binds a unit at multiplicative precedence,
+        // so a unit not directly adjacent to the whole expression (past a
+        // `+`/`-` outside parentheses) fails to compile as one self-
+        // contained expression and needs `evaluate_trailing_unit_expression`'s
+        // fallback. Every case below is checked against the same +-*/()
+        // arithmetic evaluated in plain f64, in every order, whether or not
+        // it happens to need the fallback — the two must always agree.
+        let cases: &[(&str, f64)] = &[
+            ("30/2 Mm", 30.0 / 2.0),                 // direct: unit adjacent to term
+            ("120+15 Mm", 120.0 + 15.0),             // fallback: + before unit
+            ("120+30/2 Mm", 120.0 + 30.0 / 2.0),     // fallback: + then /
+            ("120-15 Mm", 120.0 - 15.0),             // fallback: - before unit
+            ("120-30/2 Mm", 120.0 - 30.0 / 2.0),     // fallback: - then /
+            ("120*2-15 Mm", 120.0 * 2.0 - 15.0),     // fallback: * before -
+            ("120-15*2 Mm", 120.0 - 15.0 * 2.0),     // fallback: - before *, * binds tighter
+            ("1+2+3 Mm", 1.0 + 2.0 + 3.0),           // fallback: left-associative + chain
+            ("(120+15)/3 Mm", (120.0 + 15.0) / 3.0), // direct: parens make the sum atomic
+            ("(120-15)*2 Mm", (120.0 - 15.0) * 2.0), // direct: parens, then *
+            ("120/(2+3) Mm", 120.0 / (2.0 + 3.0)),   // direct: parens on the right of /
+            ("(120-15)/(3+2) Mm", (120.0 - 15.0) / (3.0 + 2.0)), // direct: parens on both sides
+        ];
+        for (source, expected) in cases {
+            let actual = evaluate_literal_expression(source, Dimension::LENGTH);
+            let expected_si = expected * 1.0e6; // Mm -> m
+            match actual {
+                Some(actual) => assert!(
+                    (actual - expected_si).abs() < 1.0e-6,
+                    "{source}: expected {expected_si}, got {actual}"
+                ),
+                None => panic!("{source}: expected {expected_si}, got None"),
+            }
+        }
+    }
 
     #[test]
     fn an_idle_name_editor_does_not_cache_the_authoritative_name() {

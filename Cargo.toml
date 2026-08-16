@@ -6,6 +6,7 @@ members = [
     "crates/fieldcad-catalog",
     "crates/fieldcad-core",
     "crates/fieldcad-dynamics",
+    "crates/fieldcad-expressions",
     "crates/fieldcad-electromagnetic-sources",
     "crates/fieldcad-sources",
     "crates/fieldcad-mcp",
@@ -50,6 +51,7 @@ glam = "0.33"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 naga = { version = "29", features = ["wgsl-in"] }
+open = "5"
 pollster = "1.0"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 rmcp = "3.1.0"
@@ -80,6 +82,7 @@ fieldcad-bench = { path = "crates/fieldcad-bench" }
 fieldcad-catalog = { path = "crates/fieldcad-catalog" }
 fieldcad-core = { path = "crates/fieldcad-core" }
 fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
+fieldcad-expressions = { path = "crates/fieldcad-expressions" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
 fieldcad-sources = { path = "crates/fieldcad-sources" }
 fieldcad-mcp = { path = "crates/fieldcad-mcp" }

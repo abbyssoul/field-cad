@@ -208,6 +208,7 @@ mod tests {
                 tick: sequence,
                 time_seconds: sequence as f64,
             },
+            expression_graph_hash: None,
             completeness: SnapshotCompleteness::Complete,
             domain: Domain::centred_cube(1.0, 2).unwrap(),
             plugins: Arc::from([]),

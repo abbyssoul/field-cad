@@ -25,6 +25,10 @@ use fieldcad_electromagnetism::{
     prescribed_plane_wave_configuration,
 };
 use fieldcad_electrostatics::{ELECTRIC_FIELD_HANDLE, ElectrostaticsPlugin};
+use fieldcad_expressions::{
+    ConstantDefinition, ConstantId, ConstantScope, EvaluationPlan, ExpressionDocument,
+    PropertyTarget, ValueProvider,
+};
 use fieldcad_gravity::GRAVITATIONAL_ACCELERATION_HANDLE;
 use fieldcad_plugin_api::{
     DynamicBody, EquationSystemPlugin, EquationSystemSolver, SolverCancellation, SolverContext,
@@ -51,6 +55,8 @@ pub enum Parameter {
     Charges,
     /// Samples one channel is asked for in one publication.
     Samples,
+    /// Compiled expression graph nodes.
+    ExpressionNodes,
 }
 
 impl Parameter {
@@ -59,6 +65,7 @@ impl Parameter {
             Self::Cells => "cells",
             Self::Charges => "charges",
             Self::Samples => "samples",
+            Self::ExpressionNodes => "expression nodes",
         }
     }
 
@@ -67,6 +74,7 @@ impl Parameter {
             Self::Cells => scene.cells() as f64,
             Self::Charges => scene.charges as f64,
             Self::Samples => scene.samples_per_channel() as f64,
+            Self::ExpressionNodes => scene.expression_nodes as f64,
         }
     }
 }
@@ -506,6 +514,55 @@ fn runtime_commit_probe_edit(scene: &Scene, config: &MeasureConfig) -> Timing {
     )
 }
 
+struct NoDistances;
+
+impl ValueProvider for NoDistances {
+    fn distance(&self, _probe: fieldcad_core::DistanceProbeId) -> Option<f64> {
+        None
+    }
+}
+
+fn expression_plan(nodes: usize) -> EvaluationPlan {
+    let constants = (0..nodes)
+        .map(|index| ConstantDefinition {
+            id: ConstantId::new(index as u64),
+            scope: ConstantScope::Document,
+            name: format!("v{index}"),
+            source: if index == 0 {
+                "1 m".into()
+            } else {
+                format!("doc.v{} + 1 m", index - 1).as_str().into()
+            },
+            revision: None,
+            provenance: None,
+        })
+        .collect();
+    EvaluationPlan::compile(
+        &ExpressionDocument {
+            constants,
+            bindings: Vec::new(),
+        },
+        |_| None,
+    )
+    .expect("benchmark graph is acyclic and dimensionally valid")
+}
+
+fn expression_evaluate(scene: &Scene, config: &MeasureConfig) -> Timing {
+    measure(
+        config,
+        || {
+            (
+                expression_plan(scene.expression_nodes),
+                std::collections::BTreeMap::<PropertyTarget, _>::new(),
+            )
+        },
+        |(plan, output), _| {
+            plan.evaluate_properties_into(&NoDistances, output)
+                .expect("benchmark graph evaluates")
+        },
+    )
+}
+
 // --- sweeps ----------------------------------------------------------------
 
 /// Lattice sizes. Spans a 64x range in cells, which is enough separation for a
@@ -555,6 +612,23 @@ fn sample_sweep(base: Scene, quick: bool) -> Vec<Scene> {
                 .with_domain_stride(None)
                 .with_plane_samples_per_axis(density)
                 .with_name(format!("{}-{density}sq", base.name))
+        })
+        .collect()
+}
+
+fn expression_sweep(base: Scene, quick: bool) -> Vec<Scene> {
+    let sizes: &[usize] = if quick {
+        &[16, 64, 256]
+    } else {
+        &[16, 32, 64, 128, 256, 512]
+    };
+    sizes
+        .iter()
+        .map(|&nodes| {
+            base.clone()
+                .with_expression_nodes(nodes)
+                .with_name(format!("expression-{nodes}"))
+                .with_summary(format!("acyclic derived-constant chain with {nodes} nodes"))
         })
         .collect()
 }
@@ -772,8 +846,18 @@ pub fn benchmarks(quick: bool) -> Vec<Benchmark> {
                   a per-map Arc'd WorldState should keep this flat",
             parameter: Parameter::Charges,
             declared: Complexity::Constant,
-            scenes: charge_sweep(default.with_name("probe-edit-by-objects"), quick),
+            scenes: charge_sweep(default.clone().with_name("probe-edit-by-objects"), quick),
             runner: runtime_commit_probe_edit,
+        },
+        Benchmark {
+            id: "expressions/evaluate-graph",
+            group: "expressions",
+            what: "evaluate one compiled acyclic constant graph into reusable storage",
+            why: "runs before ticks for live bindings; graph construction and parsing are excluded",
+            parameter: Parameter::ExpressionNodes,
+            declared: Complexity::Linear,
+            scenes: expression_sweep(default.with_name("expression-evaluate"), quick),
+            runner: expression_evaluate,
         },
     ]
 }

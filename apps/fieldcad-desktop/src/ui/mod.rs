@@ -234,6 +234,13 @@ pub struct UiModel {
     /// the scene itself, so they are reached by selecting a node in the scene
     /// list like anything else rather than by deselecting everything.
     pub world_selected: bool,
+    /// Whether the document/user constant library is the inspector's
+    /// subject. Not part of [`SceneSelection`], same reasoning as
+    /// `distance_probe_selection`: constants have no viewport gizmo or pick
+    /// target — only a scene-tree row nested under Simulation and their own
+    /// inspector panel, independent of `world_selected` so opening it does
+    /// not visually select the Simulation node.
+    pub variables_selected: bool,
     pub selection: Option<ObjectId>,
     pub plane_selection: Option<PlaneId>,
     pub box_selection: Option<BoxId>,
@@ -305,6 +312,10 @@ pub struct UiModel {
     /// Whether the app-settings panel is shown. Defaults closed, matching
     /// `mcp_panel_open`/`queue_panel_open`: there's nothing urgent to show.
     pub settings_visible: bool,
+    /// Desktop-local reusable constants, explicitly embedded when imported.
+    pub user_constants: fieldcad_expressions::UserConstantLibrary,
+    /// Load/save diagnostic shown in Settings.
+    pub user_constants_status: Option<String>,
     pub catalog_visible: bool,
     pub catalog_filter: String,
     pub catalog_selected: Option<fieldcad_core::CatalogEntryRef>,
@@ -345,6 +356,13 @@ pub struct UiModel {
 
 impl UiModel {
     pub fn new() -> Self {
+        let (user_constants, user_constants_status) = match crate::user_constants::load() {
+            Ok(library) => (library, None),
+            Err(error) => (
+                fieldcad_expressions::UserConstantLibrary::default(),
+                Some(error.to_string()),
+            ),
+        };
         Self {
             view: ViewOptions::default(),
             viewport_tool: ViewportTool::default(),
@@ -357,6 +375,7 @@ impl UiModel {
             // the scene's domain and field systems before anything is selected
             // rather than showing an empty panel.
             world_selected: true,
+            variables_selected: false,
             selection: None,
             plane_selection: None,
             box_selection: None,
@@ -377,6 +396,8 @@ impl UiModel {
             mcp_panel_open: false,
             queue_panel_open: false,
             settings_visible: false,
+            user_constants,
+            user_constants_status,
             catalog_visible: false,
             catalog_filter: String::new(),
             catalog_selected: None,
@@ -396,6 +417,13 @@ impl UiModel {
     pub fn select_world(&mut self) {
         self.set_scene_selection(None);
         self.world_selected = true;
+    }
+
+    /// Make the document/user constant library the inspector's subject,
+    /// independent of the Simulation node — see `variables_selected`.
+    pub fn select_variables(&mut self) {
+        self.set_scene_selection(None);
+        self.variables_selected = true;
     }
 
     /// Whether any flow-line layer is both visible and animated — the one
@@ -588,6 +616,7 @@ impl UiModel {
         // Selecting anything in the scene — including nothing — takes the
         // inspector off the world node, so the two can never both look selected.
         self.world_selected = false;
+        self.variables_selected = false;
         match selection {
             Some(SceneSelection::Object(id)) => self.selection = Some(id),
             Some(SceneSelection::Plane(id)) => self.plane_selection = Some(id),
@@ -1097,7 +1126,13 @@ fn vector_display_controls(
             ui.add(
                 egui::DragValue::new(&mut display.density)
                     .speed(0.25)
-                    .range(0..=256),
+                    .range(0..=256)
+                    .custom_parser(|text| {
+                        text.trim()
+                            .parse()
+                            .ok()
+                            .or_else(|| panels::evaluate_dimensionless_expression(text))
+                    }),
             )
             .on_hover_text(
                 "Arrows along the longest axis, interpolated from the published samples.\n\
@@ -1110,7 +1145,13 @@ fn vector_display_controls(
                 egui::DragValue::new(&mut display.scale)
                     .speed(0.01)
                     .range(0.05..=20.0)
-                    .custom_formatter(|scale, _| format!("{scale:.2}×")),
+                    .custom_formatter(|scale, _| format!("{scale:.2}×"))
+                    .custom_parser(|text| {
+                        text.trim()
+                            .parse()
+                            .ok()
+                            .or_else(|| panels::evaluate_dimensionless_expression(text))
+                    }),
             )
             .on_hover_text(
                 "Multiplies the arrow length. Arrows are sized to their spacing by default; \
@@ -1138,7 +1179,13 @@ fn flow_line_display_controls(
             ui.add(
                 egui::DragValue::new(&mut display.density)
                     .speed(0.25)
-                    .range(0..=64),
+                    .range(0..=64)
+                    .custom_parser(|text| {
+                        text.trim()
+                            .parse()
+                            .ok()
+                            .or_else(|| panels::evaluate_dimensionless_expression(text))
+                    }),
             )
             .on_hover_text(
                 "Streamline seeds along the longest axis. Kept lower than arrow density by \
@@ -1151,7 +1198,13 @@ fn flow_line_display_controls(
                 egui::DragValue::new(&mut display.thickness_px)
                     .speed(0.05)
                     .range(0.5..=24.0)
-                    .suffix(" px"),
+                    .suffix(" px")
+                    .custom_parser(|text| {
+                        text.trim()
+                            .parse()
+                            .ok()
+                            .or_else(|| panels::evaluate_dimensionless_expression(text))
+                    }),
             )
             .on_hover_text("Ribbon width, in screen pixels, independent of zoom.");
         });
@@ -1163,7 +1216,13 @@ fn flow_line_display_controls(
                 egui::DragValue::new(&mut display.speed)
                     .speed(0.02)
                     .range(0.0..=10.0)
-                    .suffix(" /s"),
+                    .suffix(" /s")
+                    .custom_parser(|text| {
+                        text.trim()
+                            .parse()
+                            .ok()
+                            .or_else(|| panels::evaluate_dimensionless_expression(text))
+                    }),
             )
             .on_hover_text("Animation speed.");
         });

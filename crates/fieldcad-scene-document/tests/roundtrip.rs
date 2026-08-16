@@ -146,6 +146,7 @@ fn inputs(runtime: &SimulationRuntime, queue: QueueDocument) -> SceneDocumentInp
         integration_scheme: runtime.integration_scheme(),
         field_systems: runtime.field_systems(),
         world: runtime.world_document(),
+        expressions: fieldcad_expressions::ExpressionDocument::default(),
         queue,
         view: SceneViewState::default(),
         probe_history: fieldcad_scene_document::ProbeHistoryState::default(),
@@ -825,4 +826,39 @@ fn objects_with_catalog_links_survive_round_trip() {
         CatalogLoadReport::default().resolve_link(link.entry.as_ref().unwrap()),
         LinkResolution::Unavailable
     ));
+}
+
+#[test]
+fn authored_expressions_round_trip_and_legacy_documents_default_empty() {
+    let runtime = build_runtime(World::new());
+    let mut capture = inputs(&runtime, QueueDocument::default());
+    capture
+        .expressions
+        .constants
+        .push(fieldcad_expressions::ConstantDefinition {
+            id: fieldcad_expressions::ConstantId::new(7),
+            scope: fieldcad_expressions::ConstantScope::Document,
+            name: "radius".to_owned(),
+            source: "6400 km".into(),
+            revision: None,
+            provenance: None,
+        });
+    let document = SceneDocument::capture(capture, "test", None);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("expressions.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let loaded = fieldcad_scene_document::load_newest_valid(&path)
+        .unwrap()
+        .document;
+    assert_eq!(loaded.expressions, document.expressions);
+
+    let mut legacy = serde_json::to_value(document).unwrap();
+    legacy["format_version"] = serde_json::json!(7);
+    legacy.as_object_mut().unwrap().remove("expressions");
+    std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    let loaded = fieldcad_scene_document::load_newest_valid(&path)
+        .unwrap()
+        .document;
+    assert!(loaded.expressions.constants.is_empty());
+    assert!(loaded.expressions.bindings.is_empty());
 }
