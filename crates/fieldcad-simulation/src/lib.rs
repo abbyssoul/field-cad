@@ -9,6 +9,7 @@
 pub mod async_source;
 pub mod body_history;
 pub mod history;
+pub mod observation_recorder;
 pub mod recording;
 pub mod runtime;
 pub mod source;
@@ -21,6 +22,7 @@ pub use history::{
     DistanceHistory, DistanceReading, MassAggregateHistory, MassAggregateReading, ProbeHistory,
     ProbeReading,
 };
+pub use observation_recorder::ObservationRecorder;
 pub use recording::{RecordedEvent, ReplayObservation, SessionRecording};
 pub use runtime::{
     DEFAULT_UNDO_DEPTH, EditHistoryStatus, FieldSystemStatus, PluginRegistration, RuntimeConfig,

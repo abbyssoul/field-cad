@@ -6,7 +6,7 @@
 //! boundary, not a second implementation of simulation semantics.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,8 +17,8 @@ use std::{
 };
 
 use fieldcad_core::{
-    CommitReport, Domain, FieldSnapshot, ObjectId, PluginId, PropertyBag, SceneScale, WorldCommand,
-    WorldSnapshot,
+    ChannelId, CommitReport, DistanceProbeId, Domain, FieldSnapshot, MassAggregateProbeId,
+    ObjectId, PluginId, ProbeId, PropertyBag, SceneScale, WorldCommand, WorldSnapshot,
 };
 use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_plugin_api::SolverCancellation;
@@ -26,9 +26,11 @@ use glam::DVec3;
 
 use crate::{
     BodySample, Command, CommandDisposition, CommandId, CommandKind, CommandPayload,
-    CommandReceipt, CommandRecord, DataSourceStatus, EditHistoryStatus, FieldDataSource,
-    FieldSystemStatus, LocalDataSource, PlaybackSpeed, PollOutcome, QueueDocument, QueueStatus,
-    QueueSummary, SimulationStatus, SnapshotMailbox, SourceError, Subscription,
+    CommandReceipt, CommandRecord, DataSourceStatus, DistanceHistory, DistanceReading,
+    EditHistoryStatus, FieldDataSource, FieldSystemStatus, LocalDataSource, MassAggregateHistory,
+    MassAggregateReading, ObservationRecorder, PlaybackSpeed, PollOutcome, ProbeHistory,
+    ProbeReading, QueueDocument, QueueStatus, QueueSummary, SimulationStatus, SnapshotMailbox,
+    SourceError, Subscription,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +72,9 @@ enum WorkerRequest {
     /// event; the next `BodyHistory`/`Poll` a caller happens to make will
     /// simply reflect it.
     SetBodyHistoryCapacity(ObjectId, usize),
+    /// A blocking inventory read — see
+    /// [`AsyncLocalDataSource::tracked_body_history_objects_blocking`].
+    TrackedBodyHistoryObjects,
     /// Advisory, non-mutating check — see
     /// [`AsyncLocalDataSource::validate_world_commands`]. Sent on the
     /// ordinary `requests` channel: a preflight answer that jumped a
@@ -125,6 +130,8 @@ enum WorkerEvent {
         object: ObjectId,
         samples: Vec<BodySample>,
     },
+    /// Answer to [`WorkerRequest::TrackedBodyHistoryObjects`].
+    TrackedBodyHistoryObjects(Vec<ObjectId>),
     /// Answer to [`WorkerRequest::ValidateWorldCommands`].
     WorldCommandsValidated(Result<CommitReport, SourceError>),
     /// Answer to [`WorkerRequest::ValidateFieldSystemConfiguration`].
@@ -221,6 +228,12 @@ pub struct AsyncLocalDataSource {
     submission_counter: u64,
     command_events: Vec<CommandEvent>,
     failure: Option<String>,
+    /// Transport-neutral, authoritative probe/distance/mass-aggregate
+    /// observation history — see [`crate::observation_recorder::ObservationRecorder`].
+    /// Updated in [`Self::adopt`], the one place a fresh snapshot becomes
+    /// newly visible, so it stays in sync regardless of which caller
+    /// (`HeadlessServer`, or this type used directly) drives `execute`/`poll`.
+    observations: ObservationRecorder,
     #[cfg(test)]
     test_events_tx: mpsc::Sender<WorkerEvent>,
 }
@@ -230,7 +243,9 @@ impl AsyncLocalDataSource {
         let initial = SourceState::capture(&source);
         let cancellation = source.cancellation();
         let mut mailbox = SnapshotMailbox::default();
+        let mut observations = ObservationRecorder::new();
         if let Some(snapshot) = &initial.snapshot {
+            observations.observe(snapshot, &initial.world, initial.simulation.run_generation);
             let _ = mailbox.offer(Arc::clone(snapshot));
         }
         let (request_sender, request_receiver) = mpsc::channel();
@@ -282,6 +297,7 @@ impl AsyncLocalDataSource {
             accumulated_elapsed: Duration::ZERO,
             command_events: Vec::new(),
             failure: None,
+            observations,
             #[cfg(test)]
             test_events_tx,
         }
@@ -301,7 +317,11 @@ impl AsyncLocalDataSource {
         self.forces = state.forces;
         self.step_compute_ms = state.step_compute_ms;
         match state.snapshot {
-            Some(snapshot) => Ok(self.mailbox.offer(snapshot)?),
+            Some(snapshot) => {
+                self.observations
+                    .observe(&snapshot, &self.world, self.simulation.run_generation);
+                Ok(self.mailbox.offer(snapshot)?)
+            }
             None => Ok(false),
         }
     }
@@ -437,6 +457,12 @@ impl AsyncLocalDataSource {
             WorkerEvent::BodyHistoryCaptured { object, samples } => {
                 self.body_history_in_flight.remove(&object);
                 self.body_history_cache.insert(object, samples);
+                Ok(None)
+            }
+            WorkerEvent::TrackedBodyHistoryObjects(_) => {
+                // Only meaningful to
+                // `tracked_body_history_objects_blocking`'s own blocking
+                // wait, same reasoning as `DocumentCaptured`.
                 Ok(None)
             }
         }
@@ -585,6 +611,90 @@ impl AsyncLocalDataSource {
             }
         }
         Ok(aggregate)
+    }
+
+    /// Block until `object`'s current recorded kinematics history is
+    /// fetched, rather than [`Self::request_body_history`]'s fire-and-
+    /// forget-then-poll-a-cache pair — that shape suits the desktop's
+    /// per-frame polling loop but gives a synchronous one-shot caller (an
+    /// MCP tool) no way to block until *this* call's own answer has
+    /// arrived. Same blocking-round-trip discipline as
+    /// [`Self::capture_document`]/[`Self::execute_blocking`]: any other
+    /// worker event received while waiting is applied exactly as
+    /// `drain_worker_events` would have.
+    pub fn body_history_blocking(
+        &mut self,
+        object: ObjectId,
+    ) -> Result<Vec<BodySample>, SourceError> {
+        if self.failure.is_some() {
+            return Err(SourceError::Disconnected);
+        }
+        self.requests
+            .send(WorkerRequest::BodyHistory(object))
+            .map_err(|_| SourceError::Disconnected)?;
+        loop {
+            match self.events.recv().map_err(|_| SourceError::Disconnected)? {
+                WorkerEvent::BodyHistoryCaptured {
+                    object: answered,
+                    samples,
+                } if answered == object => return Ok(samples),
+                other => {
+                    self.handle_worker_event(other)?;
+                }
+            }
+        }
+    }
+
+    /// Blocking inventory read: every object with at least one recorded
+    /// kinematics sample — see [`crate::runtime::SimulationRuntime::body_history_tracked_objects`].
+    /// For a caller (an MCP `list_recorded_observations`-style tool)
+    /// discovering which objects have a trajectory worth fetching, without
+    /// guessing object ids.
+    pub fn tracked_body_history_objects_blocking(&mut self) -> Result<Vec<ObjectId>, SourceError> {
+        if self.failure.is_some() {
+            return Err(SourceError::Disconnected);
+        }
+        self.requests
+            .send(WorkerRequest::TrackedBodyHistoryObjects)
+            .map_err(|_| SourceError::Disconnected)?;
+        loop {
+            match self.events.recv().map_err(|_| SourceError::Disconnected)? {
+                WorkerEvent::TrackedBodyHistoryObjects(objects) => return Ok(objects),
+                other => {
+                    self.handle_worker_event(other)?;
+                }
+            }
+        }
+    }
+
+    /// This session's authoritative probe/distance/mass-aggregate
+    /// observation history — see [`ObservationRecorder`].
+    pub fn probe_history(&self) -> &ProbeHistory {
+        self.observations.probe_history()
+    }
+
+    pub fn distance_history(&self) -> &DistanceHistory {
+        self.observations.distance_history()
+    }
+
+    pub fn mass_aggregate_history(&self) -> &MassAggregateHistory {
+        self.observations.mass_aggregate_history()
+    }
+
+    /// Rebuild the observation history from a scene document's saved state
+    /// — see [`ObservationRecorder::restore`].
+    pub fn restore_observation_history(
+        &mut self,
+        probe_series: Vec<(ProbeId, ChannelId, VecDeque<ProbeReading>)>,
+        distance_series: Vec<(DistanceProbeId, VecDeque<DistanceReading>)>,
+        mass_aggregate_series: Vec<(MassAggregateProbeId, VecDeque<MassAggregateReading>)>,
+    ) {
+        self.observations.restore(
+            &self.world,
+            probe_series,
+            distance_series,
+            mass_aggregate_series,
+        );
     }
 
     /// Ask the worker for `object`'s current recorded history, non-blocking
@@ -920,6 +1030,14 @@ fn worker_loop(
                 source
                     .runtime_mut()
                     .set_body_history_capacity(object, capacity);
+            }
+            Ok(WorkerRequest::TrackedBodyHistoryObjects) => {
+                let event = WorkerEvent::TrackedBodyHistoryObjects(
+                    source.runtime().body_history_tracked_objects(),
+                );
+                if events.send(event).is_err() {
+                    break;
+                }
             }
             Ok(WorkerRequest::ValidateWorldCommands(commands)) => {
                 let result = source

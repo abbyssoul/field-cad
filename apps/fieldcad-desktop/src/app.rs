@@ -48,7 +48,6 @@ use crate::{
     electromagnetism_gpu::GpuMaxwellBackend,
     gpu_inverse_square::GpuInverseSquareEvaluator,
     mcp::{self, McpAction, McpSession},
-    probe_history_state,
     profile::UserProfile,
     renderer::{GuiPaint, RenderStatus, SceneFrame, ViewportRenderer},
     scene::{self, TransformHandle},
@@ -480,13 +479,17 @@ struct WindowState {
     /// animated flow line's shader-only scroll, most commonly) costs a
     /// refcount bump instead of a fresh multi-region copy.
     cached_field_layer_geometry: Option<Arc<scene::FieldGeometry>>,
-    probe_history: ProbeHistory,
-    distance_history: DistanceHistory,
-    mass_aggregate_history: MassAggregateHistory,
-    /// The numerical run generation whose recorder data is currently held.
-    /// A domain reset creates a fresh t=0 run and must not join its samples to
-    /// the previous lattice's history.
-    run_generation: u64,
+    /// A clone of the server's authoritative probe/distance/mass-aggregate
+    /// observation history (`HeadlessServer::{probe_history,
+    /// distance_history, mass_aggregate_history}`), refreshed only when
+    /// `compute.snapshot_sequence` has advanced since the last clone — see
+    /// [`Self::refresh_probe_history_cache`]. A redraw can run at up to the
+    /// display's refresh rate while the source itself changes far less
+    /// often (same reasoning `ComputeView::build` documents for its own
+    /// reuse-if-unchanged fields), and cloning these histories is not free.
+    /// The `Option<u64>` is the snapshot sequence the clone was last
+    /// refreshed against — `None` means never refreshed.
+    probe_history_cache: (Option<u64>, ProbeHistory, DistanceHistory, MassAggregateHistory),
     active_transform: Option<ActiveTransformDrag>,
     active_field_brush: Option<ActiveFieldBrushDrag>,
     /// Set from the last UI frame: an inspector control is being held.
@@ -706,7 +709,6 @@ impl WindowState {
         };
         let world = data_source.world();
         let world_revision = world.revision();
-        let run_generation = data_source.simulation_status().run_generation;
         if let Some(path) = &known_path {
             profile.push_recent_file(path.clone());
         }
@@ -747,6 +749,15 @@ impl WindowState {
             let mut model = lock_model(&data_source);
             model.restore_document_catalog(document_entries, quick_add_hidden);
             model.restore_run_records(run_records);
+            if let (Some(probe_history), Some(distance_history), Some(mass_aggregate_history)) =
+                (probe_history, distance_history, mass_aggregate_history)
+            {
+                model.restore_observation_history(
+                    probe_history,
+                    distance_history,
+                    mass_aggregate_history,
+                );
+            }
         }
         // Replay a loaded document's paused-queue write-ahead log through the
         // ordinary command path — see `replace_session` for the same
@@ -828,28 +839,12 @@ impl WindowState {
             compute: None,
             region_geometry_cache: BTreeMap::new(),
             cached_field_layer_geometry: None,
-            probe_history: probe_history.map_or_else(ProbeHistory::default, |state| {
-                probe_history_state::restore_probe_history(
-                    state,
-                    fieldcad_core::DEFAULT_PROBE_HISTORY,
-                )
-            }),
-            distance_history: distance_history.map_or_else(DistanceHistory::default, |state| {
-                probe_history_state::restore_distance_history(
-                    state,
-                    fieldcad_core::DEFAULT_PROBE_HISTORY,
-                )
-            }),
-            mass_aggregate_history: mass_aggregate_history.map_or_else(
-                MassAggregateHistory::default,
-                |state| {
-                    probe_history_state::restore_mass_aggregate_history(
-                        state,
-                        fieldcad_core::DEFAULT_PROBE_HISTORY,
-                    )
-                },
+            probe_history_cache: (
+                None,
+                ProbeHistory::default(),
+                DistanceHistory::default(),
+                MassAggregateHistory::default(),
             ),
-            run_generation,
             active_transform: None,
             active_field_brush: None,
             inspector_editing: false,
@@ -1070,6 +1065,7 @@ impl WindowState {
         let compute = ComputeView::build(&*self.model(), &self.world, self.compute.as_ref());
         self.step_compute_stats
             .observe(compute.tick, compute.step_compute_ms);
+        self.refresh_probe_history_cache(compute.snapshot_sequence);
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let pixels_per_point_before_frame = self.egui_context.pixels_per_point().max(0.01);
         let transform_preview = self
@@ -1118,9 +1114,9 @@ impl WindowState {
                     catalog: &self.catalog,
                     quick_add_hidden: &self.quick_add_hidden,
                     world: &world,
-                    probe_history: &self.probe_history,
-                    distance_history: &self.distance_history,
-                    mass_aggregate_history: &self.mass_aggregate_history,
+                    probe_history: &self.probe_history_cache.1,
+                    distance_history: &self.probe_history_cache.2,
+                    mass_aggregate_history: &self.probe_history_cache.3,
                     is_recording,
                     adapter_name: &self.adapter_name,
                     frame_time_ms,
@@ -1394,19 +1390,6 @@ impl WindowState {
     /// Pick up the current world and record any new probe samples.
     fn refresh_world(&mut self) {
         let model = lock_model(&self.data_source);
-        let generation = model.simulation_status().run_generation;
-        if generation != self.run_generation {
-            self.probe_history = ProbeHistory::new(self.probe_history.capacity());
-            self.distance_history = DistanceHistory::new(self.distance_history.capacity());
-            self.mass_aggregate_history =
-                MassAggregateHistory::new(self.mass_aggregate_history.capacity());
-            self.run_generation = generation;
-        }
-        if let Some(snapshot) = model.latest_snapshot() {
-            self.probe_history.record(&snapshot);
-            self.distance_history.record(&snapshot);
-            self.mass_aggregate_history.record(&snapshot);
-        }
         self.world = model.world();
         drop(model);
 
@@ -1481,14 +1464,6 @@ impl WindowState {
         self.ui_model
             .object_trajectories
             .retain(|id, _| self.world.object(*id).is_some());
-        // Each series is bounded, but the set of them is not: probe IDs are
-        // never reused, so deleted probes would accumulate for the session.
-        self.probe_history
-            .retain_probes(|probe| self.world.probe(probe).is_some());
-        self.distance_history
-            .retain_probes(|probe| self.world.distance_probe(probe).is_some());
-        self.mass_aggregate_history
-            .retain_probes(|probe| self.world.mass_aggregate_probe(probe).is_some());
         self.ui_model
             .distance_probe_plots
             .retain(|probe| self.world.distance_probe(*probe).is_some());
@@ -1501,6 +1476,26 @@ impl WindowState {
         }) {
             self.active_transform = None;
         }
+    }
+
+    /// Refresh `probe_history_cache` from the server's authoritative
+    /// observation history, but only when `snapshot_sequence` has advanced
+    /// since the last refresh — see the field's own doc comment for why
+    /// this isn't unconditional every frame.
+    fn refresh_probe_history_cache(&mut self, snapshot_sequence: Option<u64>) {
+        let Some(sequence) = snapshot_sequence else {
+            return;
+        };
+        if self.probe_history_cache.0 == Some(sequence) {
+            return;
+        }
+        let model = lock_model(&self.data_source);
+        self.probe_history_cache = (
+            Some(sequence),
+            model.probe_history().clone(),
+            model.distance_history().clone(),
+            model.mass_aggregate_history().clone(),
+        );
     }
 
     fn apply_camera_action(&mut self, action: Option<CameraAction>) {
@@ -2561,6 +2556,15 @@ impl WindowState {
             model.replace_source(new_source);
             model.restore_document_catalog(document_entries, quick_add_hidden);
             model.restore_run_records(run_records);
+            if let (Some(probe_history), Some(distance_history), Some(mass_aggregate_history)) =
+                (probe_history, distance_history, mass_aggregate_history)
+            {
+                model.restore_observation_history(
+                    probe_history,
+                    distance_history,
+                    mass_aggregate_history,
+                );
+            }
             // Replay the saved paused-queue write-ahead log through the
             // ordinary command path: pause first if it was paused, then
             // resubmit each pending edit as an ordinary
@@ -2597,12 +2601,12 @@ impl WindowState {
 
         // Everything below assumes ID/generation continuity with the
         // previous session and must not survive a session replace. A fresh
-        // session's `run_generation` always starts at 0, which the *old*
-        // session's may also still be — forcing a sentinel here makes
-        // `refresh_world`'s generation-diff check reset the histories
-        // unconditionally rather than relying on that coincidence not
-        // occurring.
-        self.run_generation = u64::MAX;
+        // session's snapshot sequence always starts at 0, which the *old*
+        // session's cached sequence may also still be — clearing the cache
+        // marker forces `refresh_probe_history_cache` to refresh
+        // unconditionally on the next frame rather than relying on that
+        // coincidence not occurring.
+        self.probe_history_cache.0 = None;
         self.region_geometry_cache.clear();
         self.active_transform = None;
         self.active_field_brush = None;
@@ -2653,26 +2657,6 @@ impl WindowState {
 
         self.refresh_world();
         self.reload_catalog();
-        // After `refresh_world()`, not before: its generation-diff check
-        // (triggered above by the `u64::MAX` sentinel) unconditionally
-        // resets both histories to empty, which would otherwise discard a
-        // restore landing here first.
-        if let Some(state) = probe_history {
-            self.probe_history =
-                probe_history_state::restore_probe_history(state, self.probe_history.capacity());
-        }
-        if let Some(state) = distance_history {
-            self.distance_history = probe_history_state::restore_distance_history(
-                state,
-                self.distance_history.capacity(),
-            );
-        }
-        if let Some(state) = mass_aggregate_history {
-            self.mass_aggregate_history = probe_history_state::restore_mass_aggregate_history(
-                state,
-                self.mass_aggregate_history.capacity(),
-            );
-        }
         self.last_saved_revision = Some(self.world.revision());
         Ok(())
     }
@@ -2777,6 +2761,8 @@ impl WindowState {
             let (world, queue) = model
                 .capture_document()
                 .map_err(|error| error.to_string())?;
+            let (probe_history, distance_history, mass_aggregate_history) =
+                model.capture_observation_history();
             fieldcad_scene_document::SceneDocumentInputs {
                 domain: model.domain(),
                 time_step: model.time_step(),
@@ -2793,13 +2779,9 @@ impl WindowState {
                     &self.ui_model.field_layers,
                     &self.ui_model.object_trajectories,
                 ),
-                probe_history: probe_history_state::capture_probe_history(&self.probe_history),
-                distance_history: probe_history_state::capture_distance_history(
-                    &self.distance_history,
-                ),
-                mass_aggregate_history: probe_history_state::capture_mass_aggregate_history(
-                    &self.mass_aggregate_history,
-                ),
+                probe_history,
+                distance_history,
+                mass_aggregate_history,
                 document_entries: model.document_entries().to_vec(),
                 quick_add_hidden: model.quick_add_hidden().to_vec(),
                 run_records: model.run_records().to_vec(),

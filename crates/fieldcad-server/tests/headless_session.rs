@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 
 use fieldcad_core::{
     ObjectShape, ObjectSpec, ProbeSpec, Transform, WorldCommand,
-    quantities::{ChargeCoulombs, coulomb},
+    quantities::{ChargeCoulombs, MassKg, coulomb, kilogram},
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electrostatics::electric_field_channel_id;
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{CommandEvent, CommandPayload};
+use fieldcad_sources::{inertial_mass_component_id, inertial_mass_properties};
 use glam::DVec3;
 
 /// [`HeadlessServer`] wraps a non-blocking source (ADR 0011): a submission
@@ -305,4 +306,222 @@ fn exported_probe_history_round_trips_through_a_file_bit_for_bit() {
 
     assert_eq!(restored.probe_history, export.probe_history);
     assert_eq!(restored.format, fieldcad_scene_document::EXPORT_FORMAT_ID);
+}
+
+#[test]
+fn server_side_probe_history_honors_each_probes_own_declared_capacity() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    let channel = electric_field_channel_id();
+
+    let commands = vec![
+        WorldCommand::CreateObject(
+            ObjectSpec::new("Point charge")
+                .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                .with_shape(ObjectShape::point(0.1).unwrap())
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                ),
+        ),
+        WorldCommand::CreateProbe(
+            ProbeSpec::at("Small", DVec3::new(1.0, 0.0, 0.0), vec![channel.clone()])
+                .with_history_capacity(2),
+        ),
+        WorldCommand::CreateProbe(ProbeSpec::at(
+            "Large",
+            DVec3::new(2.0, 0.0, 0.0),
+            vec![channel.clone()],
+        )),
+    ];
+    let authored = submit_and_wait(&mut server, CommandPayload::CommitWorld(commands));
+    let CommandEvent::Completed(receipt) = authored else {
+        panic!("expected the authoring commit to complete: {authored:?}")
+    };
+    let [small, large] = receipt.created.created_probes[..] else {
+        panic!(
+            "expected exactly two created probes: {:?}",
+            receipt.created.created_probes
+        );
+    };
+
+    for _ in 0..5 {
+        submit_and_wait(&mut server, CommandPayload::Step);
+    }
+
+    assert_eq!(
+        server.probe_history().len(small, &channel),
+        2,
+        "the probe's own declared history_capacity=2 must bound its series, \
+         independent of the session's default capacity"
+    );
+    assert!(
+        server.probe_history().len(large, &channel) > 2,
+        "a probe with no declared override must still use the session default, \
+         unaffected by the other probe's narrower capacity"
+    );
+}
+
+/// A pinned charge source and a free (unpinned) charged, massive body a
+/// tick's dynamics integration actually pushes — the same fixture
+/// `field_data_source_delegation.rs::body_forces_reach_the_trait_object_not_just_the_inherent_method`
+/// uses to get a real, moving dynamic body. Unlike that test, this doesn't
+/// register the mass component schema first: `default_session` already has
+/// it registered (registering it again is rejected as a duplicate).
+fn commit_charge_source_and_free_body(server: &mut HeadlessServer) -> fieldcad_core::ObjectId {
+    let commands = vec![
+        WorldCommand::CreateObject(
+            ObjectSpec::new("source")
+                .with_pinned(true)
+                .with_shape(ObjectShape::point(0.05).unwrap())
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-6)).unwrap(),
+                ),
+        ),
+        WorldCommand::CreateObject(
+            ObjectSpec::new("free")
+                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                .with_shape(ObjectShape::point(0.05).unwrap())
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                )
+                .with_component(
+                    inertial_mass_component_id(),
+                    inertial_mass_properties(MassKg::new::<kilogram>(1.0e-6)).unwrap(),
+                ),
+        ),
+    ];
+    let authored = submit_and_wait(server, CommandPayload::CommitWorld(commands));
+    let CommandEvent::Completed(receipt) = authored else {
+        panic!("expected the authoring commit to complete: {authored:?}")
+    };
+    receipt.created.created_objects[1]
+}
+
+#[test]
+fn trajectory_returns_the_free_bodys_recorded_kinematics() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    let free = commit_charge_source_and_free_body(&mut server);
+
+    for _ in 0..3 {
+        submit_and_wait(&mut server, CommandPayload::Step);
+    }
+
+    let samples = server.trajectory(free).expect("trajectory read succeeds");
+    assert_eq!(samples.len(), 3, "one sample per tick");
+    assert!(
+        samples.iter().any(|sample| sample.force.x > 0.0),
+        "the free body must have recorded a real repulsive force: {samples:?}"
+    );
+}
+
+#[test]
+fn trajectory_for_an_object_with_no_recorded_ticks_is_empty_not_an_error() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+
+    let samples = server
+        .trajectory(fieldcad_core::ObjectId::new(0xdead_beef))
+        .expect("an unknown object id is an empty result, not an error");
+
+    assert!(samples.is_empty());
+}
+
+#[test]
+fn recorded_observations_lists_exactly_what_was_actually_recorded() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    let probe = commit_charge_and_probe(&mut server);
+    let free = commit_charge_source_and_free_body(&mut server);
+    submit_and_wait(&mut server, CommandPayload::Step);
+
+    let inventory = server
+        .recorded_observations()
+        .expect("inventory read succeeds");
+
+    let channel = electric_field_channel_id();
+    assert!(
+        inventory.probes.contains(&(probe, channel)),
+        "the recorded probe/channel must be listed: {:?}",
+        inventory.probes
+    );
+    assert!(inventory.distance_probes.is_empty());
+    assert!(inventory.mass_aggregate_probes.is_empty());
+    assert!(
+        inventory.objects.contains(&free),
+        "the free body's trajectory must be listed: {:?}",
+        inventory.objects
+    );
+}
+
+#[test]
+fn observation_history_survives_replace_source_via_restore_observation_history() {
+    let source = fieldcad_server::default_session().expect("default session builds");
+    let mut server = HeadlessServer::new(source);
+    let probe = commit_charge_and_probe(&mut server);
+    let channel = electric_field_channel_id();
+
+    let (probe_history, distance_history, mass_aggregate_history) =
+        server.capture_observation_history();
+    assert!(
+        !probe_history.series.is_empty(),
+        "there must be something real to restore"
+    );
+    let (world_document, _queue) = server.capture_document().unwrap();
+
+    // Rebuild a fresh session from the same world (as loading the scene
+    // document that was saved alongside this history would), replace the
+    // session, then restore the captured history into it — mirroring
+    // `open_scene`/`replace_session`'s call sequence exactly.
+    let world = fieldcad_core::World::from_document(world_document);
+    let domain = fieldcad_core::Domain::centred_cube(5.0, 32).unwrap();
+    let time_step = fieldcad_core::TimeStep::from_seconds(
+        fieldcad_electromagnetism::courant_limit(&domain) * 0.8,
+    )
+    .unwrap();
+    let config = fieldcad_simulation::RuntimeConfig::new(
+        domain,
+        time_step,
+        fieldcad_core::SessionId::from_u128(2),
+    )
+    .with_world(world);
+    let config = fieldcad_server::server_plugin_catalog()
+        .into_iter()
+        .fold(config, |config, registration| {
+            config.with_plugin_registration(registration)
+        });
+    let runtime = fieldcad_simulation::SimulationRuntime::new(config).unwrap();
+    let new_source = fieldcad_simulation::AsyncLocalDataSource::new(
+        fieldcad_simulation::LocalDataSource::new(runtime),
+    );
+
+    // A freshly replaced session may already have recorded its own tick-0
+    // publish for `probe` (the new world already contains it) — `restore`
+    // must still wholesale-replace that with the captured history, not
+    // merge with it.
+    server.replace_source(new_source);
+
+    server.restore_observation_history(
+        probe_history.clone(),
+        distance_history,
+        mass_aggregate_history,
+    );
+
+    let restored = server
+        .probe_history_series(probe, &channel)
+        .expect("the restored series must be readable after replace_source");
+    assert_eq!(
+        restored.readings.len(),
+        probe_history.series[0].readings.len()
+    );
+
+    // Also readable through export, the other read path this task added.
+    let export = server.export_observations(&fieldcad_server::ObservationExportScope {
+        probes: vec![(probe, channel)],
+        ..Default::default()
+    });
+    assert_eq!(export.probe_history, probe_history);
 }

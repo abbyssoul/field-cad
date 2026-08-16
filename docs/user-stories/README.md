@@ -441,7 +441,7 @@ experiment.
 | World mutation | `commit_world(expected_revision, commands)`, `validate_world_transaction` |
 | Experiment configuration | `list_field_systems`, `set_field_system_enabled`, `set_field_model`, `set_field_system_configuration`, `reconfigure_domain` |
 | Simulation control | `get_simulation_status`, `play`, `pause`, `step`, `set_time_step`, `set_playback_speed` |
-| Observation | `set_subscription`, `get_latest_snapshot`, `sample_field`, `get_probe_history`, `get_trajectory`, `get_diagnostics` |
+| Observation | `set_subscription`, `get_latest_snapshot`, `sample_field`, `get_probe_history`, `get_distance_history`, `get_mass_aggregate_history`, `get_trajectory`, `list_recorded_observations`, `get_diagnostics` |
 | Events | `watch_session` for snapshot/status/diagnostic/queued-command-completion events |
 | Reproducibility | `get_history`, `undo`, `redo`, `save_run`, `list_runs`, `get_run`, `delete_run`, `compare_runs`, `start_recording`, `stop_recording`, `recording_status`, `replay_session`, `export_experiment`, `import_experiment` |
 

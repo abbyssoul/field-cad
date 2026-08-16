@@ -141,3 +141,54 @@ fn mass_aggregate_reading_record(
         member_count: reading.member_count,
     }
 }
+
+// --- Restore direction: `*ReadingRecord` (saved, from a scene document) ->
+// `fieldcad_simulation::*Reading` (live). Counterpart to the capture
+// functions above, for `HeadlessServer::restore_observation_history` — see
+// that method for why only the per-reading conversion lives here rather
+// than a whole rebuilt `ProbeHistory`/etc: capacity-aware series insertion
+// happens in `ObservationRecorder::restore`, which needs raw readings, not
+// an already-built (and therefore potentially already-truncated) history.
+
+pub(crate) fn probe_reading_from_record(
+    record: ProbeReadingRecord,
+) -> fieldcad_simulation::ProbeReading {
+    fieldcad_simulation::ProbeReading {
+        tick: record.tick,
+        time_seconds: record.time_seconds,
+        world_revision: record.world_revision,
+        snapshot_sequence: record.snapshot_sequence,
+        value: record.value,
+        validity: record.validity,
+    }
+}
+
+pub(crate) fn distance_reading_from_record(
+    record: DistanceReadingRecord,
+) -> fieldcad_simulation::DistanceReading {
+    fieldcad_simulation::DistanceReading {
+        tick: record.tick,
+        time_seconds: record.time_seconds,
+        world_revision: record.world_revision,
+        snapshot_sequence: record.snapshot_sequence,
+        distance: record.distance,
+    }
+}
+
+pub(crate) fn mass_aggregate_reading_from_record(
+    record: MassAggregateReadingRecord,
+) -> fieldcad_simulation::MassAggregateReading {
+    fieldcad_simulation::MassAggregateReading {
+        tick: record.tick,
+        time_seconds: record.time_seconds,
+        world_revision: record.world_revision,
+        snapshot_sequence: record.snapshot_sequence,
+        center_of_mass: record.center_of_mass,
+        velocity: record.velocity,
+        total_momentum: record.total_momentum,
+        angular_momentum: record.angular_momentum,
+        total_kinetic_energy_j: record.total_kinetic_energy_j,
+        total_mass_kg: record.total_mass_kg,
+        member_count: record.member_count,
+    }
+}

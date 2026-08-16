@@ -234,22 +234,6 @@ pub struct HeadlessServer {
     /// this crate's one-canonical-drain discipline for the *inner* source
     /// even though publication now also happens here.
     events: Vec<CommandEvent>,
-    /// Session-scoped, server-side observation histories, assembled from
-    /// every snapshot this session publishes — see [`Self::publish`]. Unlike
-    /// the desktop host's own client-local `ProbeHistory` (assembled from
-    /// polled snapshots in the render loop), this is what lets an MCP client
-    /// with no client-local recording of its own still retain probe/
-    /// distance/mass-aggregate readings across a session, and is what
-    /// [`Self::save_run`] draws its observation copy from.
-    probe_history: ProbeHistory,
-    distance_history: DistanceHistory,
-    mass_aggregate_history: MassAggregateHistory,
-    /// The `run_generation` these three histories were last recorded
-    /// against — see [`Self::record_observations`]. A mismatch against the
-    /// session's current `run_generation` means a domain/field-system
-    /// reconfiguration happened since the last publish, and every reading
-    /// held so far belongs to a numerical run that no longer exists.
-    observed_run_generation: u64,
     /// Named, retained run records for the current scene — see
     /// [`fieldcad_scene_document::RunRecord`] and
     /// `docs/tasks/run-records-and-comparison.md`.
@@ -274,7 +258,6 @@ impl HeadlessServer {
     /// to share their normal user configuration directory without letting a
     /// transport choose arbitrary filesystem locations.
     pub fn with_catalog_root(source: AsyncLocalDataSource, root: Option<PathBuf>) -> Self {
-        let observed_run_generation = source.simulation_status().run_generation;
         let mut server = Self {
             source,
             catalog: CatalogSession::new(root),
@@ -282,10 +265,6 @@ impl HeadlessServer {
             waiters: HashMap::new(),
             hub: EventHub::default(),
             events: Vec::new(),
-            probe_history: ProbeHistory::default(),
-            distance_history: DistanceHistory::default(),
-            mass_aggregate_history: MassAggregateHistory::default(),
-            observed_run_generation,
             run_records: Vec::new(),
             recording: None,
         };
@@ -857,46 +836,7 @@ impl HeadlessServer {
         // command.  Without this, an MCP 30 s timeout that drops the
         // receiver leaves the sender in the map forever (BE-8).
         self.waiters.retain(|_id, sender| !sender.is_closed());
-        self.record_observations();
         self.hub.publish_state(&self.source);
-    }
-
-    /// Fold the latest published snapshot into this session's server-side
-    /// observation histories, and drop the series of any probe deleted
-    /// since the last publish — see the `probe_history` field doc and
-    /// `apps/fieldcad-desktop/src/app.rs`'s identical per-frame prune for
-    /// the client-local case this mirrors.
-    ///
-    /// A domain/field-system reconfiguration (`reconfigure_domain`,
-    /// `set_field_system_configuration`) bumps `run_generation` and
-    /// restarts the numerical run from `t = 0` without going through
-    /// `replace_source` — `SimulationRuntime` clears its own `body_history`
-    /// at exactly those two call sites for the same reason. This is the
-    /// server-side histories' equivalent: a jump in `run_generation` since
-    /// the last publish means every reading recorded so far belongs to a
-    /// numerical run that no longer exists, so it is discarded before this
-    /// publish's own snapshot (if any) is recorded — otherwise a run reset
-    /// mid-session would silently mix two runs' readings into one series.
-    fn record_observations(&mut self) {
-        let run_generation = self.simulation_status().run_generation;
-        if run_generation != self.observed_run_generation {
-            self.probe_history.clear();
-            self.distance_history.clear();
-            self.mass_aggregate_history.clear();
-            self.observed_run_generation = run_generation;
-        }
-        if let Some(snapshot) = self.source.latest_snapshot() {
-            self.probe_history.record(&snapshot);
-            self.distance_history.record(&snapshot);
-            self.mass_aggregate_history.record(&snapshot);
-        }
-        let world = self.source.world();
-        self.probe_history
-            .retain_probes(|probe| world.probe(probe).is_some());
-        self.distance_history
-            .retain_probes(|probe| world.distance_probe(probe).is_some());
-        self.mass_aggregate_history
-            .retain_probes(|probe| world.mass_aggregate_probe(probe).is_some());
     }
 
     /// Completion/rejection/cancellation events for commands submitted
@@ -1057,14 +997,13 @@ impl HeadlessServer {
         self.events.clear();
         self.hub.reset();
         // A new/loaded session is a fresh numerical run: yesterday's probe
-        // readings do not belong to it. Retained run records are untouched
-        // here — they are restored separately by the caller (see
-        // `restore_run_records`), the same split `restore_document_catalog`
-        // already uses for catalog state.
-        self.probe_history = ProbeHistory::default();
-        self.distance_history = DistanceHistory::default();
-        self.mass_aggregate_history = MassAggregateHistory::default();
-        self.observed_run_generation = self.source.simulation_status().run_generation;
+        // readings do not belong to it. The new `self.source` already
+        // starts with an empty observation history of its own (see
+        // `fieldcad_simulation::ObservationRecorder`), so there is nothing
+        // to reset here. Retained run records are untouched here too —
+        // they are restored separately by the caller (see
+        // `restore_run_records`/`restore_observation_history`), the same
+        // split `restore_document_catalog` already uses for catalog state.
         self.run_records.clear();
         // An in-progress recording captured commands against the session
         // being replaced; appending post-replace commands to it would
@@ -1079,17 +1018,99 @@ impl HeadlessServer {
     }
 
     /// This session's server-side retained probe/distance/mass-aggregate
-    /// observation histories — see the `probe_history` field doc.
+    /// observation histories. Transport-neutral: owned by `self.source`
+    /// (`fieldcad_simulation::ObservationRecorder`, updated at every
+    /// snapshot adoption), not by this type — see
+    /// `docs/tasks/authoritative-observation-history.md`.
     pub fn probe_history(&self) -> &ProbeHistory {
-        &self.probe_history
+        self.source.probe_history()
     }
 
     pub fn distance_history(&self) -> &DistanceHistory {
-        &self.distance_history
+        self.source.distance_history()
     }
 
     pub fn mass_aggregate_history(&self) -> &MassAggregateHistory {
-        &self.mass_aggregate_history
+        self.source.mass_aggregate_history()
+    }
+
+    /// Rebuild the observation history from a scene document's saved state
+    /// — see [`Self::capture_observation_history`] for the inverse, and
+    /// `AsyncLocalDataSource::restore_observation_history` for where the
+    /// actual work happens. Call right after [`Self::replace_source`]
+    /// (or, at startup, right after construction), the same way
+    /// `restore_run_records`/`restore_document_catalog` are already used.
+    pub fn restore_observation_history(
+        &mut self,
+        probe_history: fieldcad_scene_document::ProbeHistoryState,
+        distance_history: fieldcad_scene_document::DistanceHistoryState,
+        mass_aggregate_history: fieldcad_scene_document::MassAggregateHistoryState,
+    ) {
+        let probe_series = probe_history
+            .series
+            .into_iter()
+            .map(|series| {
+                (
+                    series.probe,
+                    series.channel,
+                    series
+                        .readings
+                        .into_iter()
+                        .map(history_capture::probe_reading_from_record)
+                        .collect(),
+                )
+            })
+            .collect();
+        let distance_series = distance_history
+            .series
+            .into_iter()
+            .map(|series| {
+                (
+                    series.probe,
+                    series
+                        .readings
+                        .into_iter()
+                        .map(history_capture::distance_reading_from_record)
+                        .collect(),
+                )
+            })
+            .collect();
+        let mass_aggregate_series = mass_aggregate_history
+            .series
+            .into_iter()
+            .map(|series| {
+                (
+                    series.probe,
+                    series
+                        .readings
+                        .into_iter()
+                        .map(history_capture::mass_aggregate_reading_from_record)
+                        .collect(),
+                )
+            })
+            .collect();
+        self.source.restore_observation_history(
+            probe_series,
+            distance_series,
+            mass_aggregate_series,
+        );
+    }
+
+    /// Capture the current observation history in the shape a scene
+    /// document persists — see [`Self::restore_observation_history`] for
+    /// the inverse. The one API both desktop's and MCP's `save_scene` call.
+    pub fn capture_observation_history(
+        &self,
+    ) -> (
+        fieldcad_scene_document::ProbeHistoryState,
+        fieldcad_scene_document::DistanceHistoryState,
+        fieldcad_scene_document::MassAggregateHistoryState,
+    ) {
+        (
+            history_capture::capture_probe_history(self.source.probe_history()),
+            history_capture::capture_distance_history(self.source.distance_history()),
+            history_capture::capture_mass_aggregate_history(self.source.mass_aggregate_history()),
+        )
     }
 
     /// Every retained run record for the current scene, newest last.
@@ -1132,9 +1153,9 @@ impl HeadlessServer {
             self.source.domain(),
             self.time_step(),
             field_systems,
-            history_capture::capture_probe_history(&self.probe_history),
-            history_capture::capture_distance_history(&self.distance_history),
-            history_capture::capture_mass_aggregate_history(&self.mass_aggregate_history),
+            history_capture::capture_probe_history(self.source.probe_history()),
+            history_capture::capture_distance_history(self.source.distance_history()),
+            history_capture::capture_mass_aggregate_history(self.source.mass_aggregate_history()),
         );
         self.run_records.push(record.clone());
         record
@@ -1179,7 +1200,11 @@ impl HeadlessServer {
                 .probes
                 .iter()
                 .filter_map(|(probe, channel)| {
-                    history_capture::capture_probe_series(&self.probe_history, *probe, channel)
+                    history_capture::capture_probe_series(
+                        self.source.probe_history(),
+                        *probe,
+                        channel,
+                    )
                 })
                 .collect(),
         };
@@ -1188,7 +1213,7 @@ impl HeadlessServer {
                 .distance_probes
                 .iter()
                 .filter_map(|probe| {
-                    history_capture::capture_distance_series(&self.distance_history, *probe)
+                    history_capture::capture_distance_series(self.source.distance_history(), *probe)
                 })
                 .collect(),
         };
@@ -1198,7 +1223,7 @@ impl HeadlessServer {
                 .iter()
                 .filter_map(|probe| {
                     history_capture::capture_mass_aggregate_series(
-                        &self.mass_aggregate_history,
+                        self.source.mass_aggregate_history(),
                         *probe,
                     )
                 })
@@ -1216,6 +1241,64 @@ impl HeadlessServer {
             mass_aggregate_history,
             snapshot,
         )
+    }
+
+    /// One probe/channel's recorded series, or `None` if that probe/channel
+    /// has never recorded a reading — see
+    /// `docs/tasks/authoritative-observation-history.md`.
+    pub fn probe_history_series(
+        &self,
+        probe: fieldcad_core::ProbeId,
+        channel: &fieldcad_core::ChannelId,
+    ) -> Option<fieldcad_scene_document::ProbeSeriesRecord> {
+        history_capture::capture_probe_series(self.source.probe_history(), probe, channel)
+    }
+
+    /// See [`Self::probe_history_series`].
+    pub fn distance_history_series(
+        &self,
+        probe: fieldcad_core::DistanceProbeId,
+    ) -> Option<fieldcad_scene_document::DistanceSeriesRecord> {
+        history_capture::capture_distance_series(self.source.distance_history(), probe)
+    }
+
+    /// See [`Self::probe_history_series`].
+    pub fn mass_aggregate_history_series(
+        &self,
+        probe: fieldcad_core::MassAggregateProbeId,
+    ) -> Option<fieldcad_scene_document::MassAggregateSeriesRecord> {
+        history_capture::capture_mass_aggregate_series(self.source.mass_aggregate_history(), probe)
+    }
+
+    /// `object`'s recorded kinematics trajectory — see
+    /// `AsyncLocalDataSource::body_history_blocking`. Blocking, unlike
+    /// [`Self::probe_history_series`] and its siblings: trajectories live
+    /// on the compute worker's `SimulationRuntime`, not a plain field this
+    /// type owns directly, so answering requires a round trip.
+    pub fn trajectory(
+        &mut self,
+        object: fieldcad_core::ObjectId,
+    ) -> Result<Vec<BodySample>, SourceError> {
+        self.source.body_history_blocking(object)
+    }
+
+    /// Every probe/channel, distance-probe, mass-aggregate-probe, and
+    /// object with at least one retained observation right now — for a
+    /// caller (an MCP `list_recorded_observations` tool) discovering what
+    /// exists without guessing ids/channels via `get_world` first.
+    pub fn recorded_observations(&mut self) -> Result<RecordedObservationsInventory, SourceError> {
+        let objects = self.source.tracked_body_history_objects_blocking()?;
+        Ok(RecordedObservationsInventory {
+            probes: self
+                .source
+                .probe_history()
+                .tracked()
+                .map(|(probe, channel)| (probe, channel.clone()))
+                .collect(),
+            distance_probes: self.source.distance_history().tracked().collect(),
+            mass_aggregate_probes: self.source.mass_aggregate_history().tracked().collect(),
+            objects,
+        })
     }
 
     /// Begin recording every command [`Self::execute`] submits and every
@@ -1316,6 +1399,16 @@ pub struct ReplayStep {
     pub field_systems: Vec<FieldSystemStatus>,
     pub world: WorldSnapshot,
     pub snapshot: Option<fieldcad_core::SnapshotIdentity>,
+}
+
+/// Every retained observation series/trajectory right now — see
+/// [`HeadlessServer::recorded_observations`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedObservationsInventory {
+    pub probes: Vec<(fieldcad_core::ProbeId, fieldcad_core::ChannelId)>,
+    pub distance_probes: Vec<fieldcad_core::DistanceProbeId>,
+    pub mass_aggregate_probes: Vec<fieldcad_core::MassAggregateProbeId>,
+    pub objects: Vec<fieldcad_core::ObjectId>,
 }
 
 #[derive(Debug, thiserror::Error)]

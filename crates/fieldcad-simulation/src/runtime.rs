@@ -1552,6 +1552,14 @@ impl SimulationRuntime {
         self.body_history.readings(object)
     }
 
+    /// Objects with at least one recorded kinematics sample — see
+    /// [`BodyHistory::tracked`]. For a caller (an MCP inventory read)
+    /// discovering which objects have a trajectory worth fetching, without
+    /// guessing object ids.
+    pub fn body_history_tracked_objects(&self) -> Vec<ObjectId> {
+        self.body_history.tracked().collect()
+    }
+
     /// Override how many samples `object`'s history keeps, independent of
     /// every other body's — see [`BodyHistory::set_capacity`]. A trajectory
     /// display asking for a longer trail than the default depth affords

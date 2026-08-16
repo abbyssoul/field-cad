@@ -27,6 +27,14 @@ pub struct ProbeReading {
 #[derive(Clone, Debug)]
 pub struct ProbeHistory {
     capacity: usize,
+    /// Explicit per-`(ProbeId, ChannelId)` overrides — see
+    /// [`Self::set_capacity`]. Absent means [`Self::capacity`]. Mirrors
+    /// [`crate::BodyHistory`]'s own `capacities` map: most probes never get
+    /// an override and stay at the uniform default, but a probe with its
+    /// own declared `history_capacity` (`fieldcad_core::ProbeSpec`) can
+    /// retain a different depth than the rest without paying that cost on
+    /// every other probe.
+    capacities: BTreeMap<(ProbeId, ChannelId), usize>,
     series: BTreeMap<(ProbeId, ChannelId), VecDeque<ProbeReading>>,
 }
 
@@ -34,12 +42,38 @@ impl ProbeHistory {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
+            capacities: BTreeMap::new(),
             series: BTreeMap::new(),
         }
     }
 
     pub const fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// The capacity `(probe, channel)` currently records against — its own
+    /// override if one was ever set via [`Self::set_capacity`], otherwise
+    /// [`Self::capacity`].
+    fn capacity_for(&self, probe: ProbeId, channel: &ChannelId) -> usize {
+        self.capacities
+            .get(&(probe, channel.clone()))
+            .copied()
+            .unwrap_or(self.capacity)
+    }
+
+    /// Override how many samples `(probe, channel)` keeps, independent of
+    /// every other probe/channel's — see `fieldcad_core::ProbeSpec::history_capacity`.
+    /// Takes effect immediately: samples already past the new capacity are
+    /// dropped right away rather than left to age out on the next
+    /// `record`, mirroring [`crate::BodyHistory::set_capacity`] exactly.
+    pub fn set_capacity(&mut self, probe: ProbeId, channel: &ChannelId, capacity: usize) {
+        let capacity = capacity.max(1);
+        self.capacities.insert((probe, channel.clone()), capacity);
+        if let Some(series) = self.series.get_mut(&(probe, channel.clone())) {
+            while series.len() > capacity {
+                series.pop_front();
+            }
+        }
     }
 
     /// Record every probe sample in a snapshot.
@@ -59,6 +93,7 @@ impl ProbeHistory {
                         continue;
                     };
                     let key = (*probe, channel_id.clone());
+                    let capacity = self.capacity_for(*probe, channel_id);
                     let series = self.series.entry(key).or_default();
                     if series
                         .back()
@@ -66,7 +101,7 @@ impl ProbeHistory {
                     {
                         continue;
                     }
-                    if series.len() == self.capacity {
+                    if series.len() == capacity {
                         series.pop_front();
                     }
                     series.push_back(ProbeReading {
@@ -109,13 +144,15 @@ impl ProbeHistory {
         self.series.clear();
     }
 
-    /// Drop the series of probes that no longer exist.
+    /// Drop the series (and any capacity override) of probes that no longer
+    /// exist.
     ///
     /// Each series is bounded, but the set of series is not: probe identifiers
     /// are minted monotonically and never reused, so a session that repeatedly
     /// adds and removes probes would otherwise retain every one of them.
     pub fn retain_probes(&mut self, live: impl Fn(ProbeId) -> bool) {
         self.series.retain(|(probe, _), _| live(*probe));
+        self.capacities.retain(|(probe, _), _| live(*probe));
     }
 
     /// Probe/channel pairs that have at least one reading.
@@ -136,15 +173,20 @@ impl ProbeHistory {
     }
 
     /// Replace a whole series directly, dropping the oldest readings past
-    /// `capacity` — the counterpart to [`Self::entries`] for restoring a
-    /// history saved with a possibly different capacity than this one's.
+    /// `capacity` (or this probe/channel's own override, if
+    /// [`Self::set_capacity`] was called for it first — see
+    /// [`ObservationRecorder::restore`](crate::observation_recorder::ObservationRecorder::restore),
+    /// which syncs per-probe capacities before calling this) — the
+    /// counterpart to [`Self::entries`] for restoring a history saved with
+    /// a possibly different capacity than this one's.
     pub fn insert_series(
         &mut self,
         probe: ProbeId,
         channel: ChannelId,
         mut readings: VecDeque<ProbeReading>,
     ) {
-        while readings.len() > self.capacity {
+        let capacity = self.capacity_for(probe, &channel);
+        while readings.len() > capacity {
             readings.pop_front();
         }
         self.series.insert((probe, channel), readings);
@@ -499,6 +541,75 @@ mod tests {
         assert_eq!(history.len(kept, &channel_id()), 1);
         assert_eq!(history.len(removed, &channel_id()), 0);
         assert_eq!(history.tracked().count(), 1);
+    }
+
+    /// A raised per-`(probe, channel)` capacity lets that one series keep
+    /// deeper history — e.g. to honor a probe's own declared
+    /// `history_capacity` — without changing what any other probe/channel
+    /// records against. Mirrors `BodyHistory`'s equivalent test.
+    #[test]
+    fn a_raised_capacity_applies_to_only_the_one_probe_channel_it_was_set_for() {
+        let watched = ProbeId::new(0);
+        let ordinary = ProbeId::new(1);
+        let mut history = ProbeHistory::new(2);
+        history.set_capacity(watched, &channel_id(), 5);
+
+        for sequence in 0..5 {
+            let mut snapshot = snapshot_with(&[watched, ordinary]);
+            snapshot.identity.sequence = sequence;
+            history.record(&snapshot);
+        }
+
+        assert_eq!(
+            history.len(watched, &channel_id()),
+            5,
+            "the raised probe/channel keeps every sample"
+        );
+        assert_eq!(
+            history.len(ordinary, &channel_id()),
+            2,
+            "a probe/channel with no override still uses the default capacity"
+        );
+    }
+
+    /// Lowering a capacity below what's already recorded frees the excess
+    /// immediately, rather than waiting for enough future `record` calls to
+    /// age it out.
+    #[test]
+    fn lowering_a_probes_capacity_trims_existing_samples_immediately() {
+        let probe = ProbeId::new(0);
+        let mut history = ProbeHistory::new(10);
+        for sequence in 0..10 {
+            let mut snapshot = snapshot_with(&[probe]);
+            snapshot.identity.sequence = sequence;
+            history.record(&snapshot);
+        }
+        assert_eq!(history.len(probe, &channel_id()), 10);
+
+        history.set_capacity(probe, &channel_id(), 3);
+
+        assert_eq!(history.len(probe, &channel_id()), 3);
+    }
+
+    /// `retain_probes` must forget a deleted probe/channel's capacity
+    /// override too — otherwise it would linger forever alongside the
+    /// series it used to size, even though probe identifiers are never
+    /// reused.
+    #[test]
+    fn deleted_probes_do_not_retain_their_capacity_override_forever() {
+        let removed = ProbeId::new(0);
+        let mut history = ProbeHistory::new(2);
+        history.set_capacity(removed, &channel_id(), 100);
+        history.record(&snapshot_with(&[removed]));
+
+        history.retain_probes(|_| false);
+
+        for sequence in 0..5 {
+            let mut snapshot = snapshot_with(&[removed]);
+            snapshot.identity.sequence = sequence;
+            history.record(&snapshot);
+        }
+        assert_eq!(history.len(removed, &channel_id()), 2);
     }
 
     fn snapshot_with_distances(

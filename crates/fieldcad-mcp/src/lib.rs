@@ -21,10 +21,16 @@
 //! (`start_recording`/`stop_recording`/`recording_status`/`replay_session` —
 //! see [`fieldcad_server::HeadlessServer::replay_recording`]), and scoped
 //! observation export/import (`export_experiment`/`import_experiment` — see
-//! [`fieldcad_server::HeadlessServer::export_observations`]). Left for
-//! later, because the underlying capability doesn't exist in the model yet
-//! or needs its own design: body trajectories as a retained series, and
-//! diagnostics as a dedicated read (today folded into the snapshot).
+//! [`fieldcad_server::HeadlessServer::export_observations`]), and direct
+//! reads of every retained observation series
+//! (`get_probe_history`/`get_distance_history`/`get_mass_aggregate_history`/
+//! `get_trajectory`/`list_recorded_observations` — see
+//! `docs/tasks/authoritative-observation-history.md`; body trajectories
+//! were already authoritative, owned by `SimulationRuntime`'s
+//! `BodyHistory`, before this crate exposed them). Left for later, because
+//! the underlying capability doesn't exist in the model yet or needs its
+//! own design: diagnostics as a dedicated read (today folded into the
+//! snapshot).
 //!
 //! World commands too varied to give a typed MCP schema in this slice
 //! (`edit_world` and `commit_world`) are accepted as a `Vec<serde_json::Value>`
@@ -515,6 +521,120 @@ struct ImportExperimentParams {
     /// Server-local filesystem path to a `fieldcad.observation-export/v1`
     /// file.
     path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProbeHistoryParams {
+    /// A field probe's `id`, as reported by `get_world`.
+    probe: u64,
+    channel: ChannelRefParam,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DistanceProbeIdParams {
+    /// A distance probe's `id`, as reported by `get_world`.
+    probe: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MassAggregateProbeIdParams {
+    /// A mass-aggregate probe's `id`, as reported by `get_world`.
+    probe: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ObjectIdParams {
+    /// An object's `id`, as reported by `get_world`.
+    object: u64,
+}
+
+/// A plain, JSON-serializable mirror of `fieldcad_simulation::BodySample` —
+/// that type itself carries no `Serialize` (it's an internal solver/runtime
+/// value, not a persisted or transport-crossing one elsewhere), and `glam`
+/// has no `serde` feature enabled in this crate, so `position`/`velocity`/
+/// `force` are flattened to plain `x`/`y`/`z` rather than pulling that
+/// dependency in for one tool's result shape.
+#[derive(Debug, Serialize)]
+struct TrajectorySampleResult {
+    tick: u64,
+    time_seconds: f64,
+    world_revision: u64,
+    position: Vec3Result,
+    velocity: Vec3Result,
+    force: Vec3Result,
+}
+
+#[derive(Debug, Serialize)]
+struct Vec3Result {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+impl From<glam::DVec3> for Vec3Result {
+    fn from(vector: glam::DVec3) -> Self {
+        Self {
+            x: vector.x,
+            y: vector.y,
+            z: vector.z,
+        }
+    }
+}
+
+impl From<fieldcad_simulation::BodySample> for TrajectorySampleResult {
+    fn from(sample: fieldcad_simulation::BodySample) -> Self {
+        Self {
+            tick: sample.tick,
+            time_seconds: sample.time_seconds,
+            world_revision: sample.world_revision.get(),
+            position: sample.position.into(),
+            velocity: sample.velocity.into(),
+            force: sample.force.into(),
+        }
+    }
+}
+
+/// A plain, JSON-serializable mirror of `fieldcad_server::RecordedObservationsInventory`
+/// — that type carries no `Serialize` since `fieldcad-server` does not
+/// depend on `serde`.
+#[derive(Debug, Serialize)]
+struct RecordedObservationsInventoryResult {
+    probes: Vec<ProbeChannelResult>,
+    distance_probes: Vec<u64>,
+    mass_aggregate_probes: Vec<u64>,
+    objects: Vec<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeChannelResult {
+    probe: u64,
+    channel: ChannelId,
+}
+
+impl From<fieldcad_server::RecordedObservationsInventory> for RecordedObservationsInventoryResult {
+    fn from(inventory: fieldcad_server::RecordedObservationsInventory) -> Self {
+        Self {
+            probes: inventory
+                .probes
+                .into_iter()
+                .map(|(probe, channel)| ProbeChannelResult {
+                    probe: probe.get(),
+                    channel,
+                })
+                .collect(),
+            distance_probes: inventory
+                .distance_probes
+                .into_iter()
+                .map(|id| id.get())
+                .collect(),
+            mass_aggregate_probes: inventory
+                .mass_aggregate_probes
+                .into_iter()
+                .map(|id| id.get())
+                .collect(),
+            objects: inventory.objects.into_iter().map(|id| id.get()).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1746,6 +1866,100 @@ impl McpServer {
     }
 
     #[tool(
+        description = "One field probe's recorded history for one channel it records. A valid probe with no recorded readings yet returns an empty series, not an error; an unknown probe id is a structured error."
+    )]
+    async fn get_probe_history(
+        &self,
+        Parameters(params): Parameters<ProbeHistoryParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let probe = fieldcad_core::ProbeId::new(params.probe);
+        let channel = match params.channel.resolve() {
+            Ok(channel) => channel,
+            Err(error) => return tool_error(error),
+        };
+        {
+            let server = lock(&self.model);
+            if server.world().probe(probe).is_none() {
+                return tool_error(format!("no probe with id {}", params.probe));
+            }
+        }
+        let series = lock(&self.model).probe_history_series(probe, &channel);
+        ok_json(&series)
+    }
+
+    #[tool(
+        description = "One distance probe's recorded history. A valid probe with no recorded readings yet returns an empty series, not an error; an unknown probe id is a structured error."
+    )]
+    async fn get_distance_history(
+        &self,
+        Parameters(params): Parameters<DistanceProbeIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let probe = fieldcad_core::DistanceProbeId::new(params.probe);
+        {
+            let server = lock(&self.model);
+            if server.world().distance_probe(probe).is_none() {
+                return tool_error(format!("no distance probe with id {}", params.probe));
+            }
+        }
+        let series = lock(&self.model).distance_history_series(probe);
+        ok_json(&series)
+    }
+
+    #[tool(
+        description = "One mass-aggregate ('center of mass') probe's recorded history. A valid probe with no recorded readings yet returns an empty series, not an error; an unknown probe id is a structured error."
+    )]
+    async fn get_mass_aggregate_history(
+        &self,
+        Parameters(params): Parameters<MassAggregateProbeIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let probe = fieldcad_core::MassAggregateProbeId::new(params.probe);
+        {
+            let server = lock(&self.model);
+            if server.world().mass_aggregate_probe(probe).is_none() {
+                return tool_error(format!("no mass-aggregate probe with id {}", params.probe));
+            }
+        }
+        let series = lock(&self.model).mass_aggregate_history_series(probe);
+        ok_json(&series)
+    }
+
+    #[tool(
+        description = "One object's recorded kinematics trajectory (position, velocity, and the summed force it carried away from each tick it was advanced). A valid object with no recorded ticks yet returns an empty series, not an error; an unknown object id is a structured error."
+    )]
+    async fn get_trajectory(
+        &self,
+        Parameters(params): Parameters<ObjectIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let object = fieldcad_core::ObjectId::new(params.object);
+        {
+            let server = lock(&self.model);
+            if server.world().object(object).is_none() {
+                return tool_error(format!("no object with id {}", params.object));
+            }
+        }
+        match lock(&self.model).trajectory(object) {
+            Ok(samples) => ok_json(
+                &samples
+                    .into_iter()
+                    .map(TrajectorySampleResult::from)
+                    .collect::<Vec<_>>(),
+            ),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Every probe/channel, distance-probe, mass-aggregate-probe, and object with at least one retained observation right now — for discovery without guessing ids/channels via get_world first."
+    )]
+    async fn list_recorded_observations(&self) -> Result<CallToolResult, ErrorData> {
+        let inventory = lock(&self.model).recorded_observations();
+        match inventory {
+            Ok(inventory) => ok_json(&RecordedObservationsInventoryResult::from(inventory)),
+            Err(error) => tool_error(error.to_string()),
+        }
+    }
+
+    #[tool(
         description = "Begin a streamed interactive scene edit. Use only when sending intermediate mutations (for example a drag); ordinary agents should submit one final atomic commit_world transaction instead."
     )]
     async fn begin_interactive_edit(&self) -> Result<CallToolResult, ErrorData> {
@@ -1869,6 +2083,8 @@ impl McpServer {
                 Ok(document) => document,
                 Err(error) => return tool_error(error.to_string()),
             };
+            let (probe_history, distance_history, mass_aggregate_history) =
+                server.capture_observation_history();
             fieldcad_scene_document::SceneDocumentInputs {
                 domain: server.domain(),
                 time_step: server.time_step(),
@@ -1879,12 +2095,9 @@ impl McpServer {
                 world,
                 queue,
                 view: fieldcad_scene_document::SceneViewState::default(),
-                // MCP has no client-local probe-plot recording to capture —
-                // see this crate's module doc.
-                probe_history: fieldcad_scene_document::ProbeHistoryState::default(),
-                distance_history: fieldcad_scene_document::DistanceHistoryState::default(),
-                mass_aggregate_history: fieldcad_scene_document::MassAggregateHistoryState::default(
-                ),
+                probe_history,
+                distance_history,
+                mass_aggregate_history,
                 document_entries: server.document_entries().to_vec(),
                 quick_add_hidden: server.quick_add_hidden().to_vec(),
                 run_records: server.run_records().to_vec(),
@@ -1917,6 +2130,9 @@ impl McpServer {
         let document_entries = outcome.document.document_entries.clone();
         let quick_add_hidden = outcome.document.quick_add_hidden.clone();
         let run_records = outcome.document.run_records.clone();
+        let probe_history = outcome.document.probe_history.clone();
+        let distance_history = outcome.document.distance_history.clone();
+        let mass_aggregate_history = outcome.document.mass_aggregate_history.clone();
         let source_label = format!("{:?}", outcome.source);
         let (new_source, warnings) =
             match build_session((self.plugin_catalog)(), Some(outcome.document)) {
@@ -1927,6 +2143,7 @@ impl McpServer {
         server.replace_source(new_source);
         server.restore_document_catalog(document_entries, quick_add_hidden);
         server.restore_run_records(run_records);
+        server.restore_observation_history(probe_history, distance_history, mass_aggregate_history);
         if queue.paused
             && let Err(error) = server.submit(CommandPayload::PauseQueue)
         {

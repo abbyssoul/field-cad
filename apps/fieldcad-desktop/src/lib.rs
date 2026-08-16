@@ -5,7 +5,6 @@ mod electromagnetism_gpu;
 pub mod gpu;
 mod gpu_inverse_square;
 mod mcp;
-mod probe_history_state;
 mod profile;
 mod renderer;
 pub mod scene;
