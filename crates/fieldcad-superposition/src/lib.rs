@@ -85,12 +85,12 @@ fn contribution(
 ) -> Option<(DVec3, f64, DMat3)> {
     let displacement = position - source.position;
     let distance_squared = displacement.length_squared();
-    let distance = distance_squared.sqrt();
     match source.distribution {
         ChargeDistribution::Point { exclusion_radius } => {
-            if distance <= exclusion_radius {
+            if distance_squared < exclusion_radius * exclusion_radius {
                 return None;
             }
+            let distance = distance_squared.sqrt();
             let inverse_distance = distance.recip();
             Some((
                 coupling_constant * source.strength * displacement * inverse_distance.powi(3),
@@ -98,19 +98,22 @@ fn contribution(
                 point_jacobian(coupling_constant * source.strength, displacement, distance),
             ))
         }
-        ChargeDistribution::UniformSphere { radius } if distance < radius => Some((
-            coupling_constant * source.strength * displacement / radius.powi(3),
-            coupling_constant * source.strength / (2.0 * radius)
-                * (3.0 - distance_squared / radius.powi(2)),
-            // E_i = (k·strength/R³)·d_i is linear in `d`, so its Jacobian is
-            // the constant isotropic (k·strength/R³)·I — no singularity,
-            // unlike the exterior formula, which is exactly why the interior
-            // case is handled separately here too.
-            DMat3::from_diagonal(DVec3::splat(
-                coupling_constant * source.strength / radius.powi(3),
-            )),
-        )),
+        ChargeDistribution::UniformSphere { radius } if distance_squared < radius * radius => {
+            Some((
+                coupling_constant * source.strength * displacement / radius.powi(3),
+                coupling_constant * source.strength / (2.0 * radius)
+                    * (3.0 - distance_squared / radius.powi(2)),
+                // E_i = (k·strength/R³)·d_i is linear in `d`, so its Jacobian is
+                // the constant isotropic (k·strength/R³)·I — no singularity,
+                // unlike the exterior formula, which is exactly why the interior
+                // case is handled separately here too.
+                DMat3::from_diagonal(DVec3::splat(
+                    coupling_constant * source.strength / radius.powi(3),
+                )),
+            ))
+        }
         ChargeDistribution::UniformSphere { .. } => {
+            let distance = distance_squared.sqrt();
             let inverse_distance = distance.recip();
             Some((
                 coupling_constant * source.strength * displacement * inverse_distance.powi(3),
@@ -178,18 +181,14 @@ pub fn field_excluding(
     sources: impl IntoIterator<Item = InverseSquareSource>,
     position: DVec3,
 ) -> Option<DVec3> {
-    let mut field = DVec3::ZERO;
+    let mut field_acc = DVec3::ZERO;
     for source in sources {
-        if source.strength == 0.0 {
-            continue;
+        if let Some((field_contribution, _, _)) = contribution(coupling_constant, source, position)
+        {
+            field_acc += field_contribution;
         }
-        let Some((field_contribution, _, _)) = contribution(coupling_constant, source, position)
-        else {
-            continue;
-        };
-        field += field_contribution;
     }
-    field.is_finite().then_some(field)
+    field_acc.is_finite().then_some(field_acc)
 }
 
 /// Batch evaluator for an inverse-square coupling law.

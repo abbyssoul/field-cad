@@ -10,8 +10,8 @@ use std::sync::Arc;
 use fieldcad_core::quantities::{MassKg, SiScalar};
 use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, CoupledSource, DiagnosticSeverity, Dimension,
-    Domain, FieldColumn, FieldValueKind, GradientColumn, ObjectIndex, PluginId, PluginVersion,
-    SampleGeometry, SolverDiagnostic, WorldSnapshot,
+    Domain, FieldColumn, FieldValueKind, GradientColumn, ObjectId, ObjectIndex, PluginId,
+    PluginVersion, SampleGeometry, SolverDiagnostic, WorldSnapshot,
 };
 use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
@@ -251,23 +251,11 @@ impl EquationSystemSolver for NewtonianGravitySolver {
             let mass = self
                 .sources
                 .get(body.object)
-                .map(|source| source.coupling_value.into_si())
-                .unwrap_or(0.0);
+                .map_or(0.0, |source| source.coupling_value.into_si());
             if mass == 0.0 {
                 continue;
             }
-            let acceleration = fieldcad_superposition::field_excluding(
-                -GRAVITATIONAL_CONSTANT,
-                self.sources
-                    .iter_excluding(body.object)
-                    .map(inverse_square_source),
-                body.position,
-            )
-            .ok_or_else(|| {
-                PluginError::Solver(
-                    "gravitational acceleration overflowed to a non-finite value".to_owned(),
-                )
-            })?;
+            let acceleration = self.acceleration_excluding(body.object, body.position)?;
             *out_force += acceleration * mass;
         }
         Ok(())
@@ -289,6 +277,31 @@ impl EquationSystemSolver for NewtonianGravitySolver {
 }
 
 impl NewtonianGravitySolver {
+    /// The gravitational acceleration at `position` from every source except
+    /// `object`.
+    ///
+    /// Evaluated directly rather than through the batched evaluator, because the
+    /// source list differs per body and the evaluator's contract is one field
+    /// for one geometry from *all* sources.
+    fn acceleration_excluding(
+        &self,
+        object: ObjectId,
+        position: DVec3,
+    ) -> Result<DVec3, PluginError> {
+        fieldcad_superposition::field_excluding(
+            -GRAVITATIONAL_CONSTANT,
+            self.sources
+                .iter_excluding(object)
+                .map(inverse_square_source),
+            position,
+        )
+        .ok_or_else(|| {
+            PluginError::Solver(
+                "gravitational acceleration overflowed to a non-finite value".to_owned(),
+            )
+        })
+    }
+
     fn samples_for(
         &self,
         geometry: &SampleGeometry,
