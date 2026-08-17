@@ -167,16 +167,20 @@ In `crates/fieldcad-superposition/src/lib.rs`:
   variant); `lib.rs:96` — `field_contribution` (field-only, force path);
   `lib.rs:78-92` — `exterior_field`/`exterior_potential` shared helpers;
   `lib.rs:184` — `evaluate_sources` (end-of-sample finiteness check);
-  `lib.rs:241` — `field_excluding` (zero-strength skip); `lib.rs:310` —
+  `lib.rs:241` — `field_excluding` (zero-strength skip);
+  `lib.rs:258` — `field_excluding_at` (slice-based exclusion by index,
+  the per-body force entry point and the seed of Phase 3's
+  `field_excluding_into`); `lib.rs:340` —
   `CpuInverseSquareEvaluator` (Phase 5 sibling).
-- `plugins/gravity/src/lib.rs:249` — `add_forces`; `lib.rs:305` —
-  `samples_for` without the length check; `lib.rs:286` —
+- `plugins/gravity/src/lib.rs:164` — `sources()` (zero-coupling filter,
+  the index-alignment invariant); `lib.rs:249` — `add_forces`
+  (index-based, single lookup); `lib.rs:287` —
   `acceleration_excluding`.
-- `plugins/electrostatics/src/lib.rs:259` — `add_forces`; `lib.rs:311` —
-  `samples_for` with the check to generalize; `lib.rs:602` —
-  `CountingEvaluator` test double.
-- `crates/fieldcad-core/src/object_index.rs:64` — `iter_excluding` and
-  the order guarantee `index_of`-based exclusion relies on.
+- `plugins/electrostatics/src/lib.rs:180` — `sources()` (the same
+  filter/invariant); `lib.rs:259` — `add_forces`; `lib.rs:296` —
+  `field_excluding`; `lib.rs:602` — `CountingEvaluator` test double.
+- `crates/fieldcad-core/src/object_index.rs:54` — `index_of`, beside the
+  `iter_excluding` order guarantee it pairs with.
 - `crates/fieldcad-plugin-api/src/lib.rs:445` — `SampleCache` (identity
   keying, stale refill-in-place; unchanged by this task, context for
   Phase 6).
@@ -218,3 +222,41 @@ In `crates/fieldcad-superposition/src/lib.rs`:
   separately. After that migration, the full workspace passes:
   `cargo test --workspace` 834 passed (48 suites), `cargo clippy
   --workspace --all-targets` and `cargo fmt --all --check` clean.
+
+**2026-08-17 — Phase 2 landed** (working tree, uncommitted):
+
+- `ObjectIndex::index_of` added (with the
+  excluding-by-index ≡ `iter_excluding` contract test);
+  `fieldcad_superposition::field_excluding_at` added — slice-based
+  exclusion by index, parity-tested against `field_excluding` for every
+  exclusion position.
+- Both plugins: zero-coupling sources filtered at collection (the
+  filtered `ObjectIndex` and `inverse_square_sources` share one index
+  space by construction — the documented invariant); `add_forces` uses
+  one `index_of` lookup per body, takes the coupling value from
+  `inverse_square_sources[excluded].strength` (bit-identical to
+  `coupling_value.into_si()` by construction, avoiding the second source
+  array), and evaluates via `field_excluding_at`. Diagnostics now count
+  contributing sources only.
+- New tests per plugin: bit-for-bit `add_forces` vs manual superposition
+  parity (exterior + sphere interior), and zero-strength objects
+  neither exerting nor feeling forces (via
+  `independent_gravitational_mass_properties(0)` / `charge_properties(0)`,
+  both valid properties). PH-2/PH-3 regressions green; full workspace
+  841 passed, clippy/fmt clean.
+- **Measured detour worth recording:** the first cut excluded by
+  `sources[..i].iter().chain(sources[i+1..].iter()).copied()` — clean,
+  but reproducibly **10–18% slower** than HEAD's filter-map at 2–8
+  sources (sub-1% noise, both plugins). Disassembly showed the `Chain`
+  instantiation pays two loop-exhaustion tests per loop head plus
+  per-iteration register shuffles. Replaced with the kernel's
+  `field_excluding_at` (one plain enumerate-and-skip loop over the
+  slice) — this is effectively the core of Phase 3's
+  `field_excluding_into` pulled forward, since a batch wrapper over
+  bodies now reduces to calling it per body.
+- Measured vs HEAD (paired quiet-window runs, load < 1, per-unit medians,
+  both plugins agreeing within 0.5%): `gravity/forces` and
+  `electrostatics/forces` −4% to −13% across 1–32 sources. Sampling
+  paths are code-identical to Phase 1 and were not re-benched; the
+  earlier pre-Phase-2 baseline comparison under load-14 conditions was
+  discarded as noise (even untouched paths showed ±30%).

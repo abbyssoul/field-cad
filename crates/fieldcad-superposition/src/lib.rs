@@ -255,6 +255,34 @@ pub fn field_excluding(
     field_acc.is_finite().then_some(field_acc)
 }
 
+/// [`field_excluding`] over a slice, skipping `excluded`'s position rather
+/// than requiring the caller to build an excluding iterator.
+///
+/// Semantically identical to `field_excluding` over the slice with
+/// position `excluded` removed — same sources, same order, therefore the
+/// same sum bit-for-bit — but as one plain loop over the slice, which
+/// codegen keeps free of the per-iteration iterator bookkeeping an
+/// excluding iterator chain pays. This is the shape a per-tick force
+/// loop over many bodies wants: the slice is built once per world change,
+/// and each body excludes itself by index.
+pub fn field_excluding_at(
+    coupling_constant: f64,
+    sources: &[InverseSquareSource],
+    excluded: usize,
+    position: DVec3,
+) -> Option<DVec3> {
+    let mut field_acc = DVec3::ZERO;
+    for (index, source) in sources.iter().enumerate() {
+        if index == excluded || source.strength == 0.0 {
+            continue;
+        }
+        if let Some(contribution) = field_contribution(coupling_constant, *source, position) {
+            field_acc += contribution;
+        }
+    }
+    field_acc.is_finite().then_some(field_acc)
+}
+
 /// Batch evaluator for an inverse-square coupling law.
 ///
 /// A single evaluator can serve both electrostatic (Coulomb) and
@@ -569,6 +597,38 @@ mod tests {
             field_excluding(1.0, [coincident, real], DVec3::ZERO),
             Some(expected)
         );
+    }
+
+    /// The slice-based exclusion API must agree with the iterator-based one
+    /// for every exclusion position — same sources, same order, same sum.
+    #[test]
+    fn field_excluding_at_matches_field_excluding_for_every_exclusion() {
+        let sources = [
+            point(1.5, DVec3::new(-1.0, 0.2, 0.0)),
+            point(-0.8, DVec3::new(2.0, -0.5, 1.0)),
+            InverseSquareSource {
+                position: DVec3::new(0.3, 0.3, 0.3),
+                strength: 2.0,
+                distribution: ChargeDistribution::UniformSphere { radius: 1.5 },
+            },
+        ];
+        for position in [DVec3::ZERO, DVec3::X, DVec3::new(0.5, -0.5, 1.5)] {
+            for excluded in 0..sources.len() {
+                let via_iterator = field_excluding(
+                    1.0,
+                    sources
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, source)| (index != excluded).then_some(*source)),
+                    position,
+                );
+                let via_slice = field_excluding_at(1.0, &sources, excluded, position);
+                assert_eq!(
+                    via_iterator, via_slice,
+                    "diverged excluding {excluded} at {position:?}"
+                );
+            }
+        }
     }
 
     fn matrix_close(a: DMat3, b: DMat3, tolerance: f64) -> bool {

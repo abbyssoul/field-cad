@@ -55,6 +55,18 @@ impl<T: IdentifiedByObject> ObjectIndex<T> {
         self.index.get(&id).map(|&position| &self.items[position])
     }
 
+    /// The position of the item identified by `id` in [`Self::as_slice`],
+    /// or `None` if no such item is held.
+    ///
+    /// Inverse of slicing: `as_slice()[..i].iter().chain(as_slice()[i + 1..].iter())`
+    /// yields exactly what [`Self::iter_excluding`] yields, in the same
+    /// order — the shape a hot path that already holds a precomputed,
+    /// positionally-aligned copy of the items needs to exclude one item
+    /// with a single lookup and no per-item conversion.
+    pub fn index_of(&self, id: ObjectId) -> Option<usize> {
+        self.index.get(&id).copied()
+    }
+
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.items.iter()
     }
@@ -135,6 +147,40 @@ mod tests {
             .map(|item| item.value)
             .collect();
         assert_eq!(remaining, vec![10, 20]);
+    }
+
+    #[test]
+    fn index_of_returns_the_position_in_as_slice() {
+        let index = ObjectIndex::new(vec![item(1, 10), item(2, 20), item(3, 30)]);
+        assert_eq!(index.index_of(ObjectId::new(2)), Some(1));
+        assert_eq!(index.index_of(ObjectId::new(1)), Some(0));
+        assert_eq!(index.index_of(ObjectId::new(99)), None);
+    }
+
+    /// The contract `index_of` exists to serve: skipping one position over
+    /// `as_slice` must be indistinguishable from `iter_excluding`, item
+    /// for item and in order.
+    #[test]
+    fn excluding_by_index_matches_iter_excluding() {
+        let index = ObjectIndex::new(vec![item(1, 10), item(2, 20), item(3, 30)]);
+        for id in [
+            ObjectId::new(1),
+            ObjectId::new(2),
+            ObjectId::new(3),
+            ObjectId::new(99),
+        ] {
+            let by_iterator: Vec<u32> = index.iter_excluding(id).map(|item| item.value).collect();
+            let by_index: Vec<u32> = match index.index_of(id) {
+                Some(excluded) => index
+                    .as_slice()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, item)| (position != excluded).then_some(item.value))
+                    .collect(),
+                None => index.as_slice().iter().map(|item| item.value).collect(),
+            };
+            assert_eq!(by_iterator, by_index, "diverged excluding {id:?}");
+        }
     }
 
     #[test]

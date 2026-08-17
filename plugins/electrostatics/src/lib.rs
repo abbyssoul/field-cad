@@ -9,8 +9,7 @@ use std::sync::Arc;
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, GradientColumn,
-    ObjectId, ObjectIndex, PluginId, PluginVersion, SampleGeometry, SolverDiagnostic,
-    WorldSnapshot,
+    ObjectIndex, PluginId, PluginVersion, SampleGeometry, SolverDiagnostic, WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_properties, charge_property_id,
@@ -133,10 +132,7 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
                 context.domain.precision().label()
             )));
         }
-        let sources = ObjectIndex::new(
-            collect_sources(context.world)
-                .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
-        );
+        let sources = sources(context.world)?;
         let inverse_square_sources = sources
             .as_slice()
             .iter()
@@ -151,6 +147,29 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
             cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
         }))
     }
+}
+
+/// Collect the world's charge sources, dropping zero-charge ones before
+/// they reach the solver's indexes.
+///
+/// The returned `ObjectIndex` and the solver's `inverse_square_sources`
+/// buffer are built from the same filtered list, so position `i` in one is
+/// position `i` in the other — the alignment `add_forces`' index-based
+/// exclusion relies on. Dropping zero-charge sources here is observable
+/// only through sources whose field and force contributions are exactly
+/// zero (the kernel skips them anyway); it also keeps the reported source
+/// count to contributing sources.
+fn sources(world: &WorldSnapshot) -> Result<ObjectIndex<ChargeSource>, PluginError> {
+    collect_sources(world)
+        .map(|collected| {
+            ObjectIndex::new(
+                collected
+                    .into_iter()
+                    .filter(|source| source.coupling_value.into_si() != 0.0)
+                    .collect(),
+            )
+        })
+        .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
 }
 
 /// A subscription currently has probes plus any number of planes and one
@@ -184,10 +203,7 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     }
 
     fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        self.sources = ObjectIndex::new(
-            collect_sources(world)
-                .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))?,
-        );
+        self.sources = sources(world)?;
         self.inverse_square_sources = self
             .sources
             .as_slice()
@@ -258,15 +274,17 @@ impl EquationSystemSolver for ElectrostaticsSolver {
     /// dominate everything else if it were included.
     fn add_forces(&self, bodies: &[DynamicBody], out: &mut [DVec3]) -> Result<(), PluginError> {
         for (body, out_force) in bodies.iter().zip(out) {
-            let charge = self
-                .sources
-                .get(body.object)
-                .map_or(0.0, |source| source.coupling_value.into_si());
-            if charge == 0.0 {
-                // Uncharged: this field does not act on it at all.
+            // One lookup decides both questions: a body absent from the
+            // filtered index (not a source, or uncharged) neither exerts
+            // nor feels this field.
+            let Some(excluded) = self.sources.index_of(body.object) else {
                 continue;
-            }
-            let field = self.field_excluding(body.object, body.position)?;
+            };
+            // `strength` is `coupling_value.into_si()` by construction —
+            // the same number as the source's charge, without touching the
+            // second source array.
+            let charge = self.inverse_square_sources[excluded].strength;
+            let field = self.field_excluding(excluded, body.position)?;
             *out_force += field * charge;
         }
         Ok(())
@@ -288,17 +306,19 @@ impl EquationSystemSolver for ElectrostaticsSolver {
 }
 
 impl ElectrostaticsSolver {
-    /// The electric field at `position` from every source except `object`.
+    /// The electric field at `position` from every source except the one
+    /// at index `excluded` of the solver's positionally aligned source
+    /// slices.
     ///
-    /// Evaluated directly rather than through the batched evaluator, because the
-    /// source list differs per body and the evaluator's contract is one field
-    /// for one geometry from *all* sources.
-    fn field_excluding(&self, object: ObjectId, position: DVec3) -> Result<DVec3, PluginError> {
-        fieldcad_superposition::field_excluding(
+    /// Evaluated over the precomputed `inverse_square_sources` buffer via
+    /// the kernel's slice-based exclusion — the same items in the same
+    /// order `ObjectIndex::iter_excluding` yields, without re-mapping each
+    /// source per body per tick.
+    fn field_excluding(&self, excluded: usize, position: DVec3) -> Result<DVec3, PluginError> {
+        fieldcad_superposition::field_excluding_at(
             COULOMB_CONSTANT,
-            self.sources
-                .iter_excluding(object)
-                .map(inverse_square_source),
+            &self.inverse_square_sources,
+            excluded,
             position,
         )
         .ok_or_else(|| {
@@ -799,5 +819,195 @@ mod tests {
             }),
             Err(PluginError::InvalidConfiguration(_))
         ));
+    }
+
+    /// Phase 2 parity: `add_forces` over the solver's precomputed,
+    /// index-aligned buffer must equal the manual superposition it
+    /// replaced — map every collected source, exclude the body's own by
+    /// object id, sum via the kernel — bit-for-bit, over exterior points
+    /// and a sphere interior alike.
+    #[test]
+    fn add_forces_matches_manual_superposition_bit_for_bit() {
+        let plugin = ElectrostaticsPlugin::new();
+        let mut world = World::new();
+        world
+            .commit([
+                WorldCommand::RegisterComponentSchema(charge_component_schema()),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("positive")
+                        .with_transform(Transform::at_finite(DVec3::new(-1.0, 0.0, 0.0)))
+                        .with_shape(ObjectShape::point(0.01).unwrap())
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(2.0e-9)).unwrap(),
+                        ),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("sphere")
+                        .with_transform(Transform::at_finite(DVec3::new(1.0, 0.5, 0.0)))
+                        .with_shape(ObjectShape::sphere(1.5).unwrap())
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(-3.0e-9)).unwrap(),
+                        ),
+                ),
+                // Inside the sphere's radius, so its interior formula is on
+                // the parity path too.
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("probe")
+                        .with_transform(Transform::at_finite(DVec3::new(1.2, 0.4, 0.0)))
+                        .with_shape(ObjectShape::point(0.01).unwrap())
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
+                ),
+            ])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let domain = Domain::centred_cube(8.0, 4).unwrap();
+        let solver = plugin
+            .create_solver(SolverContext {
+                configuration: &PropertyBag::default(),
+                domain: &domain,
+                world: &snapshot,
+                initial_step: fieldcad_core::StepContext {
+                    tick: 0,
+                    time_seconds: 0.0,
+                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+                },
+                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
+            })
+            .unwrap();
+
+        let collected = collect_sources(&snapshot).unwrap();
+        let bodies: Vec<_> = collected
+            .iter()
+            .map(|source| DynamicBody {
+                object: source.object,
+                inertial_mass_kg: MassKg::new::<kilogram>(1.0),
+                position: source.position,
+                velocity: Default::default(),
+            })
+            .collect();
+        let mut forces = vec![DVec3::ZERO; bodies.len()];
+        solver.add_forces(&bodies, &mut forces).unwrap();
+
+        for (body, force) in bodies.iter().zip(&forces) {
+            let charge = collected
+                .iter()
+                .find(|source| source.object == body.object)
+                .unwrap()
+                .coupling_value
+                .into_si();
+            let expected_field = fieldcad_superposition::field_excluding(
+                COULOMB_CONSTANT,
+                collected
+                    .iter()
+                    .filter(|source| source.object != body.object)
+                    .map(inverse_square_source),
+                body.position,
+            )
+            .unwrap();
+            assert_eq!(
+                *force,
+                expected_field * charge,
+                "force on {:?} diverged from manual superposition",
+                body.object
+            );
+        }
+    }
+
+    /// A zero-charge object is collected (zero charge is a valid property)
+    /// but must be inert in both directions: filtered from the solver's
+    /// source indexes, so it exerts nothing (identical forces in a world
+    /// without it) and feels nothing (zero force of its own).
+    #[test]
+    fn a_zero_charge_object_neither_exerts_nor_feels_a_force() {
+        fn charged(name: &str, coulombs: f64, position: DVec3) -> ObjectSpec {
+            ObjectSpec::new(name)
+                .with_transform(Transform::at_finite(position))
+                .with_shape(ObjectShape::point(0.01).unwrap())
+                .with_component(
+                    charge_component_id(),
+                    charge_properties(ChargeCoulombs::new::<coulomb>(coulombs)).unwrap(),
+                )
+        }
+
+        fn solver_for(world: &World) -> Box<dyn EquationSystemSolver> {
+            let domain = Domain::centred_cube(8.0, 4).unwrap();
+            ElectrostaticsPlugin::new()
+                .create_solver(SolverContext {
+                    configuration: &PropertyBag::default(),
+                    domain: &domain,
+                    world: &world.snapshot(),
+                    initial_step: fieldcad_core::StepContext {
+                        tick: 0,
+                        time_seconds: 0.0,
+                        time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+                    },
+                    cancellation: fieldcad_plugin_api::SolverCancellation::default(),
+                })
+                .unwrap()
+        }
+
+        fn force_on_body(solver: &dyn EquationSystemSolver, body: DynamicBody) -> DVec3 {
+            let mut out = [DVec3::ZERO];
+            solver.add_forces(&[body], &mut out).unwrap();
+            out[0]
+        }
+
+        let body = |id, position| DynamicBody {
+            object: id,
+            inertial_mass_kg: MassKg::new::<kilogram>(1.0),
+            position,
+            velocity: Default::default(),
+        };
+
+        let mut with_zero = World::new();
+        let with_zero_report = with_zero
+            .commit([
+                WorldCommand::RegisterComponentSchema(charge_component_schema()),
+                WorldCommand::CreateObject(charged("primary", 2.0e-9, DVec3::new(-3.0, 0.0, 0.0))),
+                WorldCommand::CreateObject(charged("zero", 0.0, DVec3::new(0.5, 0.0, 0.0))),
+                WorldCommand::CreateObject(charged("probe", 1.0e-9, DVec3::new(1.0, 0.0, 0.0))),
+            ])
+            .unwrap();
+        let zero_id = with_zero_report.created_objects[1];
+        let probe_id = with_zero_report.created_objects[2];
+
+        let mut without_zero = World::new();
+        let without_zero_report = without_zero
+            .commit([
+                WorldCommand::RegisterComponentSchema(charge_component_schema()),
+                WorldCommand::CreateObject(charged("primary", 2.0e-9, DVec3::new(-3.0, 0.0, 0.0))),
+                WorldCommand::CreateObject(charged("probe", 1.0e-9, DVec3::new(1.0, 0.0, 0.0))),
+            ])
+            .unwrap();
+        let without_zero_probe_id = without_zero_report.created_objects[1];
+
+        let with_zero_solver = solver_for(&with_zero);
+        let without_zero_solver = solver_for(&without_zero);
+
+        assert_eq!(
+            force_on_body(
+                with_zero_solver.as_ref(),
+                body(probe_id, DVec3::new(1.0, 0.0, 0.0))
+            ),
+            force_on_body(
+                without_zero_solver.as_ref(),
+                body(without_zero_probe_id, DVec3::new(1.0, 0.0, 0.0))
+            ),
+            "the zero-charge object must not exert a field"
+        );
+        assert_eq!(
+            force_on_body(
+                with_zero_solver.as_ref(),
+                body(zero_id, DVec3::new(0.5, 0.0, 0.0))
+            ),
+            DVec3::ZERO,
+            "the zero-charge object must not feel a force"
+        );
     }
 }
