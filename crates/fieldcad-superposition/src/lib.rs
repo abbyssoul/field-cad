@@ -75,6 +75,58 @@ fn point_jacobian(coupling_strength: f64, displacement: DVec3, distance: f64) ->
     (coupling_strength / distance.powi(3)) * (DMat3::IDENTITY - 3.0 * outer)
 }
 
+/// The exterior field shared by a point source and a sphere source observed
+/// from outside its radius: `E = (k·strength / r³) · d`, taking the
+/// pre-fused coupling strength and `1/r` so both call sites keep one
+/// operation order (and therefore bit-identical results).
+fn exterior_field(coupling_strength: f64, displacement: DVec3, inverse_distance: f64) -> DVec3 {
+    coupling_strength * displacement * inverse_distance.powi(3)
+}
+
+/// The exterior potential shared by a point source and a sphere source
+/// observed from outside its radius: `φ = k·strength / r`.
+fn exterior_potential(coupling_strength: f64, inverse_distance: f64) -> f64 {
+    coupling_strength * inverse_distance
+}
+
+/// One source's field contribution only, or `None` if `position` sits inside
+/// that source's own exclusion geometry. The force path
+/// ([`field_excluding`]) needs no potential and no Jacobian, so this variant
+/// builds neither — half the per-(body × source) work of [`contribution`].
+fn field_contribution(
+    coupling_constant: f64,
+    source: InverseSquareSource,
+    position: DVec3,
+) -> Option<DVec3> {
+    let displacement = position - source.position;
+    let distance_squared = displacement.length_squared();
+    let coupling_strength = coupling_constant * source.strength;
+    match source.distribution {
+        ChargeDistribution::Point { exclusion_radius } => {
+            if distance_squared < exclusion_radius * exclusion_radius {
+                return None;
+            }
+            let inverse_distance = distance_squared.sqrt().recip();
+            Some(exterior_field(
+                coupling_strength,
+                displacement,
+                inverse_distance,
+            ))
+        }
+        ChargeDistribution::UniformSphere { radius } if distance_squared < radius * radius => {
+            Some(coupling_strength * displacement / radius.powi(3))
+        }
+        ChargeDistribution::UniformSphere { .. } => {
+            let inverse_distance = distance_squared.sqrt().recip();
+            Some(exterior_field(
+                coupling_strength,
+                displacement,
+                inverse_distance,
+            ))
+        }
+    }
+}
+
 /// One source's field/potential/gradient contribution at `position`, or
 /// `None` if `position` sits inside that source's own exclusion geometry —
 /// the analytic exterior field is undefined there, not merely large.
@@ -85,6 +137,7 @@ fn contribution(
 ) -> Option<(DVec3, f64, DMat3)> {
     let displacement = position - source.position;
     let distance_squared = displacement.length_squared();
+    let coupling_strength = coupling_constant * source.strength;
     match source.distribution {
         ChargeDistribution::Point { exclusion_radius } => {
             if distance_squared < exclusion_radius * exclusion_radius {
@@ -93,16 +146,15 @@ fn contribution(
             let distance = distance_squared.sqrt();
             let inverse_distance = distance.recip();
             Some((
-                coupling_constant * source.strength * displacement * inverse_distance.powi(3),
-                coupling_constant * source.strength * inverse_distance,
-                point_jacobian(coupling_constant * source.strength, displacement, distance),
+                exterior_field(coupling_strength, displacement, inverse_distance),
+                exterior_potential(coupling_strength, inverse_distance),
+                point_jacobian(coupling_strength, displacement, distance),
             ))
         }
         ChargeDistribution::UniformSphere { radius } if distance_squared < radius * radius => {
             Some((
-                coupling_constant * source.strength * displacement / radius.powi(3),
-                coupling_constant * source.strength / (2.0 * radius)
-                    * (3.0 - distance_squared / radius.powi(2)),
+                coupling_strength * displacement / radius.powi(3),
+                coupling_strength / (2.0 * radius) * (3.0 - distance_squared / radius.powi(2)),
                 // E_i = (k·strength/R³)·d_i is linear in `d`, so its Jacobian is
                 // the constant isotropic (k·strength/R³)·I — no singularity,
                 // unlike the exterior formula, which is exactly why the interior
@@ -116,9 +168,9 @@ fn contribution(
             let distance = distance_squared.sqrt();
             let inverse_distance = distance.recip();
             Some((
-                coupling_constant * source.strength * displacement * inverse_distance.powi(3),
-                coupling_constant * source.strength * inverse_distance,
-                point_jacobian(coupling_constant * source.strength, displacement, distance),
+                exterior_field(coupling_strength, displacement, inverse_distance),
+                exterior_potential(coupling_strength, inverse_distance),
+                point_jacobian(coupling_strength, displacement, distance),
             ))
         }
     }
@@ -149,9 +201,14 @@ pub fn evaluate_sources(
         field += field_contribution;
         potential += potential_contribution;
         gradient += gradient_contribution;
-        if !field.is_finite() || !potential.is_finite() || !matrix_is_finite(gradient) {
-            return InverseSquareSample::undefined(UndefinedReason::NumericalOverflow);
-        }
+    }
+    // A non-finite contribution propagates through the accumulators, so one
+    // end-of-sample check is equivalent to the per-source checks it replaces.
+    // A containment hit found earlier in the loop still wins: it returns
+    // before this line, keeping `InsideSourceRadius` the reported reason
+    // even when an earlier source already overflowed.
+    if !field.is_finite() || !potential.is_finite() || !matrix_is_finite(gradient) {
+        return InverseSquareSample::undefined(UndefinedReason::NumericalOverflow);
     }
     InverseSquareSample {
         field,
@@ -175,6 +232,11 @@ fn matrix_is_finite(matrix: DMat3) -> bool {
 /// point belongs to (a body does not feel its own field) — this function
 /// has no notion of source identity to do that filtering itself.
 ///
+/// Zero-strength sources are skipped, as in [`evaluate_sources`]: they
+/// contribute exactly zero, and skipping also keeps a coincident
+/// zero-strength source (whose `d/r` direction would be `0/0`) from
+/// poisoning the whole sum with NaN.
+///
 /// `None` if the summed field overflowed to a non-finite value.
 pub fn field_excluding(
     coupling_constant: f64,
@@ -183,9 +245,11 @@ pub fn field_excluding(
 ) -> Option<DVec3> {
     let mut field_acc = DVec3::ZERO;
     for source in sources {
-        if let Some((field_contribution, _, _)) = contribution(coupling_constant, source, position)
-        {
-            field_acc += field_contribution;
+        if source.strength == 0.0 {
+            continue;
+        }
+        if let Some(contribution) = field_contribution(coupling_constant, source, position) {
+            field_acc += contribution;
         }
     }
     field_acc.is_finite().then_some(field_acc)
@@ -386,6 +450,125 @@ mod tests {
         // from centre, not the exterior's inverse-square falloff — and is
         // not simply excluded to zero.
         assert!(field.length() > 0.0);
+    }
+
+    /// The force path's field-only variant must produce exactly the field
+    /// the sampling path computes — same formulas, same summation order,
+    /// bit-for-bit — over exterior points, sphere interiors, and
+    /// multi-source superpositions alike.
+    #[test]
+    fn field_excluding_matches_the_sampling_paths_field() {
+        let sources = [
+            point(1.5, DVec3::new(-1.0, 0.2, 0.0)),
+            point(-0.8, DVec3::new(2.0, -0.5, 1.0)),
+            InverseSquareSource {
+                position: DVec3::new(0.3, 0.3, 0.3),
+                strength: 2.0,
+                distribution: ChargeDistribution::UniformSphere { radius: 1.5 },
+            },
+        ];
+        for position in [
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::new(0.5, -0.5, 1.5),
+            DVec3::new(-2.0, 1.0, 0.3),
+        ] {
+            let sampled = evaluate_sources(1.0, sources, position);
+            assert_eq!(sampled.validity, SampleValidity::Exact);
+            assert_eq!(
+                field_excluding(1.0, sources, position),
+                Some(sampled.field),
+                "force and sampling paths diverged at {position:?}"
+            );
+        }
+    }
+
+    /// Pins the reason ordering the hoisted finiteness check introduced:
+    /// containment returns early from the loop, so a sample where an
+    /// earlier source overflows *and* a later source contains the position
+    /// now reports `InsideSourceRadius` where the per-source check used to
+    /// report `NumericalOverflow` first. Both remain `Undefined`; only the
+    /// reason differs.
+    #[test]
+    fn a_later_containment_hit_outranks_an_earlier_overflow() {
+        let overflowing = InverseSquareSource {
+            position: DVec3::X,
+            strength: f64::MAX,
+            distribution: ChargeDistribution::Point {
+                exclusion_radius: 0.0,
+            },
+        };
+        let containing = InverseSquareSource {
+            position: DVec3::new(-2.0, 0.0, 0.0),
+            strength: 1.0,
+            distribution: ChargeDistribution::Point {
+                exclusion_radius: 4.0,
+            },
+        };
+        let sample = evaluate_sources(1.0, [overflowing, containing], DVec3::new(0.5, 0.0, 0.0));
+        assert_eq!(
+            sample.validity,
+            SampleValidity::Undefined(UndefinedReason::InsideSourceRadius)
+        );
+    }
+
+    #[test]
+    fn an_overflow_alone_still_reports_numerical_overflow() {
+        let overflowing = InverseSquareSource {
+            position: DVec3::X,
+            strength: f64::MAX,
+            distribution: ChargeDistribution::Point {
+                exclusion_radius: 0.0,
+            },
+        };
+        let sample = evaluate_sources(1.0, [overflowing], DVec3::new(0.5, 0.0, 0.0));
+        assert_eq!(
+            sample.validity,
+            SampleValidity::Undefined(UndefinedReason::NumericalOverflow)
+        );
+    }
+
+    /// A zero-strength source contributes nothing anywhere — not even its
+    /// exclusion geometry may undefine a sample. The skip precedes the
+    /// containment check in both paths; this pins that ordering.
+    #[test]
+    fn a_zero_strength_sources_exclusion_radius_does_not_undefine_a_sample() {
+        let zero = InverseSquareSource {
+            position: DVec3::ZERO,
+            strength: 0.0,
+            distribution: ChargeDistribution::Point {
+                exclusion_radius: 2.0,
+            },
+        };
+        let real = point(1.0, DVec3::new(5.0, 0.0, 0.0));
+        let sample = evaluate_sources(1.0, [zero, real], DVec3::X);
+        assert_eq!(sample.validity, SampleValidity::Exact);
+        // Positive source at +5, sample at +1: the field points back
+        // toward the source, i.e. −x.
+        assert!(sample.field.x < 0.0);
+    }
+
+    /// Before the zero-strength skip, a zero-strength point source sitting
+    /// exactly on the query point produced a `0 · inf = NaN` direction and
+    /// voided the *entire* summed field to `None` — one coincident
+    /// mass-less object killed all gravity on that body. The skip must
+    /// hold: the source is ignored, and the real source's field comes
+    /// through bit-for-bit as the sampling path computes it.
+    #[test]
+    fn field_excluding_skips_a_coincident_zero_strength_source() {
+        let coincident = InverseSquareSource {
+            position: DVec3::ZERO,
+            strength: 0.0,
+            distribution: ChargeDistribution::Point {
+                exclusion_radius: 0.0,
+            },
+        };
+        let real = point(1.0, DVec3::new(-3.0, 0.0, 0.0));
+        let expected = evaluate_sources(1.0, [real], DVec3::ZERO).field;
+        assert_eq!(
+            field_excluding(1.0, [coincident, real], DVec3::ZERO),
+            Some(expected)
+        );
     }
 
     fn matrix_close(a: DMat3, b: DMat3, tolerance: f64) -> bool {

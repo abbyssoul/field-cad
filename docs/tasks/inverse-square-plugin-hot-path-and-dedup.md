@@ -163,10 +163,11 @@ In `crates/fieldcad-superposition/src/lib.rs`:
 
 ## Relevant code
 
-- `crates/fieldcad-superposition/src/lib.rs:81` — `contribution`, the
-  split target; `lib.rs:132` — `evaluate_sources` (finiteness hoist,
-  zero-strength skip); `lib.rs:179` — `field_excluding` (field-only
-  variant, future `field_excluding_into`); `lib.rs:258` —
+- `crates/fieldcad-superposition/src/lib.rs:133` — `contribution` (full
+  variant); `lib.rs:96` — `field_contribution` (field-only, force path);
+  `lib.rs:78-92` — `exterior_field`/`exterior_potential` shared helpers;
+  `lib.rs:184` — `evaluate_sources` (end-of-sample finiteness check);
+  `lib.rs:241` — `field_excluding` (zero-strength skip); `lib.rs:310` —
   `CpuInverseSquareEvaluator` (Phase 5 sibling).
 - `plugins/gravity/src/lib.rs:249` — `add_forces`; `lib.rs:305` —
   `samples_for` without the length check; `lib.rs:286` —
@@ -179,7 +180,41 @@ In `crates/fieldcad-superposition/src/lib.rs`:
 - `crates/fieldcad-plugin-api/src/lib.rs:445` — `SampleCache` (identity
   keying, stale refill-in-place; unchanged by this task, context for
   Phase 6).
-- `crates/fieldcad-bench/src/workload.rs:437` — `gravity/forces`, the
-  template for the missing `electrostatics/forces`.
+- `crates/fieldcad-bench/src/workload.rs:423` — `electrostatics_forces`
+  (added in Phase 0); `lib.rs:464` — `gravity_forces`, its template.
 - `docs/perf/2026-08-17-inverse-square-plugin-audit.md` — the revalidated
   findings this plan executes.
+
+## Progress log
+
+**2026-08-17 — Phases 0 and 1 landed** (working tree, uncommitted):
+
+- Phase 0: added the `electrostatics/forces` bench workload; baselines
+  saved under `target/bench-baselines/` (machine-local, not committed).
+- Phase 1: kernel split (`field_contribution` vs `contribution`),
+  `exterior_field`/`exterior_potential` helpers, fused `k·strength`,
+  end-of-sample finiteness check, zero-strength skip in
+  `field_excluding`, six new kernel tests. All expressions keep the
+  original left-associative operation order, so well-defined results are
+  bit-identical; the two behavior deltas are exactly the documented pair
+  (containment-vs-overflow reason ordering; coincident zero-strength
+  source no longer NaNs the force sum).
+- Measured vs pre-Phase-1 baselines (per-scene medians):
+  `gravity/forces` −41…−78%, `electrostatics/forces` −44…−82%,
+  `electrostatics/sample-by-charges` −33…−49%, `electrostatics/
+  sample-plane` −25…−35% (290–16.6k samples). The 66k-sample plane scene
+  is bandwidth-bound with 40–70% run-to-run noise: parity on re-run, no
+  regression signal. `gravity/solver-init` unchanged within noise, as
+  expected for an untouched path.
+- Verification: `cargo test` green for `fieldcad-superposition`,
+  `fieldcad-gravity`, `fieldcad-electrostatics`, `fieldcad-bench`
+  (57 tests, 9 suites); `cargo clippy` and `cargo fmt --check` clean for
+  the same crates. Follow-up: the WIP HEAD commit had commented out
+  `Transform::at` (in favor of `Transform::at_finite`,
+  `crates/fieldcad-core/src/world.rs:55`) leaving ~30 unmigrated call
+  sites in `fieldcad-server` tests, `fieldcad-desktop`, and
+  `fieldcad-bench`; this task migrated `fieldcad-bench`'s four sites
+  (required to run the baselines), and the remaining sites were migrated
+  separately. After that migration, the full workspace passes:
+  `cargo test --workspace` 834 passed (48 suites), `cargo clippy
+  --workspace --all-targets` and `cargo fmt --all --check` clean.

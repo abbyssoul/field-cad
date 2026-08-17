@@ -161,7 +161,7 @@ fn gravity_world(scene: &Scene) -> World {
         let mass_kg = 1.0e10 / (scene.charges as f64).sqrt().max(1.0);
         commands.push(WorldCommand::CreateObject(
             ObjectSpec::new(format!("mass {index}"))
-                .with_transform(Transform::at(position).expect("mass position is finite"))
+                .with_transform(Transform::at_finite(position))
                 .with_shape(ObjectShape::point(0.15).expect("source radius is positive"))
                 .with_component(
                     inertial_mass_component_id(),
@@ -353,8 +353,7 @@ fn maxwell_edit_charge(scene: &Scene, config: &MeasureConfig) -> Timing {
             world
                 .commit([WorldCommand::SetTransform {
                     object: charge,
-                    transform: Transform::at(DVec3::new(offset, 0.2, 0.35))
-                        .expect("edit position is finite"),
+                    transform: Transform::at_finite(DVec3::new(offset, 0.2, 0.35)),
                 }])
                 .expect("moving a charge is a valid edit");
             world.snapshot()
@@ -416,6 +415,35 @@ fn electrostatics_sample_plane(scene: &Scene, config: &MeasureConfig) -> Timing 
             solver
                 .sample(ELECTRIC_FIELD_HANDLE, &geometry)
                 .expect("the electric channel is published")
+        },
+    )
+}
+
+/// Coulomb force on one charged body from every other source.
+///
+/// The body's inertial mass is a placeholder: the electrostatic force law is
+/// `F = qE`, derived from the world's charge by object id, and never reads
+/// it — unlike `gravity_forces`, whose `F = ma` needs the real mass.
+fn electrostatics_forces(scene: &Scene, config: &MeasureConfig) -> Timing {
+    let world = scene.world();
+    let snapshot = world.snapshot();
+    let sources = fieldcad_electromagnetic_sources::collect_charge_sources(&snapshot)
+        .expect("scene charges are valid charge sources");
+    let body = DynamicBody {
+        object: sources[0].object,
+        inertial_mass_kg: MassKg::new::<kilogram>(1.0),
+        position: sources[0].position,
+        velocity: Default::default(),
+    };
+    measure(
+        config,
+        || electrostatics_solver(scene, &world),
+        |solver, _| {
+            let mut out = [DVec3::ZERO];
+            solver
+                .add_forces(&[body], &mut out)
+                .expect("force calculation from a valid scene is defined");
+            out[0]
         },
     )
 }
@@ -488,8 +516,7 @@ fn runtime_commit_charge_edit(scene: &Scene, config: &MeasureConfig) -> Timing {
             runtime
                 .commit_world_commands(vec![WorldCommand::SetTransform {
                     object: charge,
-                    transform: Transform::at(DVec3::new(offset, 0.2, 0.35))
-                        .expect("edit position is finite"),
+                    transform: Transform::at_finite(DVec3::new(offset, 0.2, 0.35)),
                 }])
                 .expect("moving a charge is a valid edit")
         },
@@ -829,6 +856,17 @@ pub fn benchmarks(quick: bool) -> Vec<Benchmark> {
                 quick,
             ),
             runner: electrostatics_sample_plane,
+        },
+        Benchmark {
+            id: "electrostatics/forces",
+            group: "electrostatics",
+            what: "Coulomb force on one body from every other source",
+            why: "the electrostatic half of the per-tick force cost; shares \
+                  gravity's kernel, so the two must agree on exponent",
+            parameter: Parameter::Charges,
+            declared: Complexity::Linear,
+            scenes: charge_sweep(default.clone().with_name("forces"), quick),
+            runner: electrostatics_forces,
         },
         Benchmark {
             id: "gravity/sample-plane",
