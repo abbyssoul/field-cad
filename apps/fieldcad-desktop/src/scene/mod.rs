@@ -806,12 +806,12 @@ mod tests {
             .commit([
                 WorldCommand::CreateObject(
                     ObjectSpec::new("near")
-                        .with_transform(Transform::at(DVec3::new(0.0, -3.0, 0.0)).unwrap())
+                        .with_transform(Transform::at_finite(DVec3::new(0.0, -3.0, 0.0)))
                         .with_shape(ObjectShape::boxed(DVec3::splat(0.5)).unwrap()),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("far")
-                        .with_transform(Transform::at(DVec3::new(0.0, 3.0, 0.0)).unwrap())
+                        .with_transform(Transform::at_finite(DVec3::new(0.0, 3.0, 0.0)))
                         .with_shape(ObjectShape::boxed(DVec3::splat(0.5)).unwrap()),
                 ),
             ])

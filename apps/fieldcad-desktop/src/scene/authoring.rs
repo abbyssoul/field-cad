@@ -805,7 +805,7 @@ mod tests {
         world
             .commit([WorldCommand::SetTransform {
                 object: anchor,
-                transform: CoreTransform::at(DVec3::new(1.0, 2.0, 3.0)).unwrap(),
+                transform: CoreTransform::at_finite(DVec3::new(1.0, 2.0, 3.0)),
             }])
             .unwrap();
         let snapshot = world.snapshot();
@@ -885,11 +885,11 @@ mod tests {
         world
             .commit([
                 WorldCommand::CreateObject(
-                    ObjectSpec::new("a").with_transform(CoreTransform::at(DVec3::ZERO).unwrap()),
+                    ObjectSpec::new("a").with_transform(CoreTransform::default()),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("b")
-                        .with_transform(CoreTransform::at(DVec3::new(3.0, 0.0, 0.0)).unwrap()),
+                        .with_transform(CoreTransform::at_finite(DVec3::new(3.0, 0.0, 0.0))),
                 ),
             ])
             .unwrap();

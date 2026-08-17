@@ -1606,7 +1606,7 @@ mod tests {
             .commit([
                 WorldCommand::CreateObject(
                     ObjectSpec::new("Test source")
-                        .with_transform(Transform::at(DVec3::new(0.0, 0.0, 0.6)).unwrap())
+                        .with_transform(Transform::at_finite(DVec3::new(0.0, 0.0, 0.6)))
                         .with_shape(ObjectShape::boxed(DVec3::splat(0.6)).unwrap()),
                 ),
                 WorldCommand::CreateProbe(ProbeSpec::at(

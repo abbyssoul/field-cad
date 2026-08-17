@@ -221,7 +221,7 @@ impl Scene {
         for (index, position) in self.charge_positions().into_iter().enumerate() {
             commands.push(WorldCommand::CreateObject(
                 ObjectSpec::new(format!("charge {index}"))
-                    .with_transform(Transform::at(position).expect("charge position is finite"))
+                    .with_transform(Transform::at_finite(position))
                     .with_shape(ObjectShape::point(0.15).expect("source radius is positive"))
                     .with_component(
                         charge_component_id(),

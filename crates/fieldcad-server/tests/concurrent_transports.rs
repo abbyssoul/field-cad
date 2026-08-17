@@ -77,7 +77,7 @@ async fn concurrent_pumpers_do_not_hang_or_cross_deliver_completions() {
         tasks.spawn(async move {
             let payload = CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(
                 ObjectSpec::new(format!("object-{index}"))
-                    .with_transform(Transform::at(DVec3::new(f64::from(index), 0.0, 0.0)).unwrap())
+                    .with_transform(Transform::at_finite(DVec3::new(f64::from(index), 0.0, 0.0)))
                     .with_shape(ObjectShape::point(0.05).unwrap()),
             )]);
             let event = submit_and_await(&model, payload).await;
@@ -143,8 +143,8 @@ async fn dropped_receiver_is_pruned_on_the_next_publish() {
         .submit_and_await(CommandPayload::CommitWorld(vec![
             WorldCommand::CreateObject(
                 ObjectSpec::new("prune-safety-check")
-                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
-                    .with_shape(ObjectShape::point(0.1).unwrap()),
+                    .with_transform(Transform::default())
+                    .with_shape(ObjectShape::default()),
             ),
         ]))
         .expect("submission accepted");

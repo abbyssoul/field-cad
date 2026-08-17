@@ -318,7 +318,7 @@ mod tests {
     fn a_shapeless_gizmo_given_mass_is_a_point_body() {
         let (component, properties) = inertial(2.0);
         let world = world_with([ObjectSpec::new("gizmo")
-            .with_transform(Transform::at(DVec3::Y).unwrap())
+            .with_transform(Transform::at_finite(DVec3::Y))
             .with_component(component, properties)
             .with_component(
                 gravitational_mass_component_id(),
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn gravitational_mass_alone_sources_gravity() {
         let world = world_with([ObjectSpec::new("moon")
-            .with_transform(Transform::at(DVec3::X * 10.0).unwrap())
+            .with_transform(Transform::at_finite(DVec3::X * 10.0))
             .with_component(
                 gravitational_mass_component_id(),
                 independent_gravitational_mass_properties(MassKg::new::<kilogram>(7.0)).unwrap(),

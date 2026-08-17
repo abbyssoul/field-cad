@@ -475,7 +475,7 @@ mod tests {
     ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
         let mut world = World::new();
         let mut spec = ObjectSpec::new("charged")
-            .with_transform(Transform::at(DVec3::ZERO).unwrap())
+            .with_transform(Transform::at_finite(DVec3::ZERO))
             .with_component(
                 charge_component_id(),
                 charge_properties(ChargeCoulombs::new::<coulomb>(1.0)).unwrap(),
@@ -541,7 +541,7 @@ mod tests {
                 WorldCommand::RegisterComponentSchema(schema),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("sphere")
-                        .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                        .with_transform(Transform::default())
                         .with_shape(ObjectShape::sphere(1.0).unwrap())
                         .with_component(
                             charge_component_id(),
@@ -550,7 +550,7 @@ mod tests {
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("probe charge")
-                        .with_transform(Transform::at(DVec3::X * 0.4).unwrap())
+                        .with_transform(Transform::at_finite(DVec3::X * 0.4))
                         .with_shape(ObjectShape::point(0.01).unwrap())
                         .with_component(
                             charge_component_id(),

@@ -1220,7 +1220,7 @@ mod tests {
         commands.push(
             WorldCommand::CreateObject(
                 ObjectSpec::new("free")
-                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_transform(Transform::default())
                     .with_shape(ObjectShape::point(0.05).unwrap())
                     .with_component(
                         inertial_mass_component_id(),

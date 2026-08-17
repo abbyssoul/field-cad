@@ -490,7 +490,7 @@ mod tests {
         runtime
             .commit_world_commands(vec![WorldCommand::SetShape {
                 object,
-                shape: Some(ObjectShape::point(0.1).unwrap()),
+                shape: Some(ObjectShape::default()),
             }])
             .unwrap();
         runtime.set_field_system_enabled(&plugin, true).unwrap();
@@ -650,7 +650,7 @@ mod tests {
                         ),
                         WorldCommand::CreateObject(
                             ObjectSpec::new("free")
-                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
@@ -813,7 +813,7 @@ mod tests {
                         ),
                         WorldCommand::CreateObject(
                             ObjectSpec::new("free")
-                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
@@ -880,9 +880,7 @@ mod tests {
                             ),
                             WorldCommand::CreateObject(
                                 ObjectSpec::new("free")
-                                    .with_transform(
-                                        Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap(),
-                                    )
+                                    .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
                                     .with_shape(ObjectShape::point(0.05).unwrap())
                                     .with_component(
                                         charge_component_id(),
@@ -939,7 +937,7 @@ mod tests {
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("massless")
-                        .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                        .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
                         .with_shape(ObjectShape::point(0.05).unwrap())
                         .with_component(
                             charge_component_id(),
@@ -977,7 +975,7 @@ mod tests {
             .commit_world_commands(vec![
                 WorldCommand::CreateObject(
                     ObjectSpec::new("charge")
-                        .with_shape(ObjectShape::point(0.1).unwrap())
+                        .with_shape(ObjectShape::default())
                         .with_component(
                             charge_component_id(),
                             charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
@@ -1378,7 +1376,7 @@ mod tests {
                         ),
                         WorldCommand::CreateObject(
                             ObjectSpec::new("free")
-                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
@@ -2441,8 +2439,8 @@ mod tests {
             .commit_world_commands(vec![
                 WorldCommand::CreateObject(
                     ObjectSpec::new("positive point charge")
-                        .with_transform(Transform::at(DVec3::ZERO).unwrap())
-                        .with_shape(ObjectShape::point(0.1).unwrap())
+                        .with_transform(Transform::default())
+                        .with_shape(ObjectShape::default())
                         .with_component(
                             charge_component_id(),
                             charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
@@ -2563,7 +2561,7 @@ mod tests {
         runtime
             .commit_world_commands(vec![WorldCommand::SetTransform {
                 object,
-                transform: Transform::at(DVec3::X * 0.5).unwrap(),
+                transform: Transform::at_finite(DVec3::X * 0.5),
             }])
             .unwrap();
         let after = runtime.latest_snapshot();
@@ -2661,7 +2659,7 @@ mod tests {
             .commit_world_commands(vec![
                 WorldCommand::CreateObject(
                     ObjectSpec::new("charge")
-                        .with_shape(ObjectShape::point(0.1).unwrap())
+                        .with_shape(ObjectShape::default())
                         .with_component(
                             charge_component_id(),
                             charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
@@ -3076,7 +3074,7 @@ mod tests {
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("free")
-                        .with_transform(Transform::at(DVec3::X).unwrap())
+                        .with_transform(Transform::at_finite(DVec3::X))
                         .with_shape(ObjectShape::point(0.05).unwrap())
                         .with_component(
                             charge_component_id(),
@@ -3145,7 +3143,7 @@ mod tests {
             .execute(command(CommandPayload::CommitWorld(vec![
                 WorldCommand::SetTransform {
                     object,
-                    transform: Transform::at(DVec3::X * x).unwrap(),
+                    transform: Transform::at_finite(DVec3::X * x),
                 },
             ])))
             .unwrap();

@@ -3315,9 +3315,7 @@ fn demo_scene_commands() -> Result<Vec<WorldCommand>, String> {
     Ok(vec![
         WorldCommand::CreateObject(
             ObjectSpec::new("Positive point charge")
-                .with_transform(
-                    Transform::at(DVec3::new(0.0, 0.0, 0.6)).map_err(|e| e.to_string())?,
-                )
+                .with_transform(Transform::at_finite(DVec3::new(0.0, 0.0, 0.6)))
                 .with_shape(ObjectShape::point(0.15).map_err(|error| error.to_string())?)
                 .with_component(
                     charge_component_id(),

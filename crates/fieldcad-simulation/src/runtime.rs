@@ -2530,11 +2530,10 @@ impl SimulationRuntime {
                 };
                 if let Some(anchor) = world.object(probe.anchor)
                     && anchor.transform.translation != sample.center_of_mass
-                    && let Ok(transform) = Transform::at(sample.center_of_mass)
                 {
                     commands.push(WorldCommand::SetTransform {
                         object: probe.anchor,
-                        transform,
+                        transform: Transform::at_finite(sample.center_of_mass),
                     });
                 }
             }
@@ -3160,8 +3159,8 @@ mod tests {
             Ok(SolverStepOutcome {
                 object_kinematics: vec![ObjectKinematicsUpdate {
                     object: self.object,
-                    transform: Transform::at(DVec3::X * context.time_seconds).unwrap(),
-                    velocity: Velocity::new(DVec3::X, DVec3::ZERO).unwrap(),
+                    transform: Transform::at_finite(DVec3::X * context.time_seconds),
+                    velocity: Velocity::new_linear_finite(DVec3::X),
                 }],
             })
         }
@@ -3296,11 +3295,11 @@ mod tests {
         world
             .commit([
                 WorldCommand::CreateObject(
-                    ObjectSpec::new("a").with_transform(Transform::at(DVec3::ZERO).unwrap()),
+                    ObjectSpec::new("a").with_transform(Transform::default()),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("b")
-                        .with_transform(Transform::at(DVec3::new(3.0, 4.0, 0.0)).unwrap()),
+                        .with_transform(Transform::at_finite(DVec3::new(3.0, 4.0, 0.0))),
                 ),
             ])
             .unwrap();
@@ -3331,7 +3330,7 @@ mod tests {
     fn mass_object(name: &str, position: DVec3) -> WorldCommand {
         WorldCommand::CreateObject(
             ObjectSpec::new(name)
-                .with_transform(Transform::at(position).unwrap())
+                .with_transform(Transform::at_finite(position))
                 .with_component(
                     fieldcad_sources::inertial_mass_component_id(),
                     fieldcad_sources::inertial_mass_properties(
@@ -3458,7 +3457,7 @@ mod tests {
         runtime
             .adopt_world_commands(vec![WorldCommand::SetTransform {
                 object: mass_object_id,
-                transform: Transform::at(DVec3::new(4.0, 0.0, 0.0)).unwrap(),
+                transform: Transform::at_finite(DVec3::new(4.0, 0.0, 0.0)),
             }])
             .unwrap();
         // Lags by one commit (see `adopt_world_commands`): this commit moved
@@ -3657,7 +3656,7 @@ mod tests {
         runtime
             .commit_world_commands(vec![WorldCommand::SetTransform {
                 object,
-                transform: Transform::at(DVec3::X).unwrap(),
+                transform: Transform::at_finite(DVec3::X),
             }])
             .unwrap();
 
@@ -3696,7 +3695,7 @@ mod tests {
         runtime
             .commit_world_commands(vec![WorldCommand::SetTransform {
                 object,
-                transform: Transform::at(DVec3::X).unwrap(),
+                transform: Transform::at_finite(DVec3::X),
             }])
             .unwrap();
         // Deferred: the commit above must not have resampled anything, only
@@ -4044,7 +4043,7 @@ mod tests {
         )
         .unwrap();
         let electron = ObjectSpec::new("Electron")
-            .with_transform(Transform::at(DVec3::ZERO).unwrap())
+            .with_transform(Transform::default())
             .with_velocity(Velocity::new(DVec3::X * 1.0e8, DVec3::ZERO).unwrap())
             .with_shape(ObjectShape::point(0.01).unwrap())
             .with_pinned(true)
@@ -4075,7 +4074,7 @@ mod tests {
         runtime
             .commit_world_commands(vec![WorldCommand::SetTransform {
                 object: particle,
-                transform: Transform::at(DVec3::new(0.2, 0.0, 0.0)).unwrap(),
+                transform: Transform::at_finite(DVec3::new(0.2, 0.0, 0.0)),
             }])
             .unwrap();
         assert!(coupling_diagnostic(&runtime).contains("interventions 1"));
@@ -4137,7 +4136,7 @@ mod tests {
         )
         .unwrap();
         let proton = ObjectSpec::new("Proton")
-            .with_transform(Transform::at(DVec3::new(-0.25, 0.0, 0.0)).unwrap())
+            .with_transform(Transform::at_finite(DVec3::new(-0.25, 0.0, 0.0)))
             .with_velocity(Velocity::new(DVec3::new(0.0, -1.0e5, 0.0), DVec3::ZERO).unwrap())
             .with_shape(ObjectShape::point(0.01).unwrap())
             .with_component(
@@ -4150,7 +4149,7 @@ mod tests {
                     .unwrap(),
             );
         let electron = ObjectSpec::new("Electron")
-            .with_transform(Transform::at(DVec3::new(0.25, 0.0, 0.0)).unwrap())
+            .with_transform(Transform::at_finite(DVec3::new(0.25, 0.0, 0.0)))
             .with_velocity(Velocity::new(DVec3::new(0.0, 1.0e5, 0.0), DVec3::ZERO).unwrap())
             .with_shape(ObjectShape::point(0.01).unwrap())
             .with_component(
@@ -4518,7 +4517,7 @@ mod tests {
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("b")
-                        .with_transform(Transform::at(DVec3::new(10.0, 0.0, 0.0)).unwrap()),
+                        .with_transform(Transform::at_finite(DVec3::new(10.0, 0.0, 0.0))),
                 ),
                 WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
                     "gap",
@@ -4632,7 +4631,7 @@ mod tests {
             .commit_scene_edit(SceneEdit {
                 world_commands: vec![WorldCommand::SetTransform {
                     object: other,
-                    transform: Transform::at(DVec3::new(20.0, 0.0, 0.0)).unwrap(),
+                    transform: Transform::at_finite(DVec3::new(20.0, 0.0, 0.0)),
                 }],
                 expression_commands: vec![ExpressionCommand::SetPropertyExpression(
                     fieldcad_expressions::PropertyBinding {
@@ -4719,7 +4718,7 @@ mod tests {
             .world
             .commit([WorldCommand::SetTransform {
                 object: other,
-                transform: Transform::at(DVec3::ZERO).unwrap(),
+                transform: Transform::default(),
             }])
             .unwrap();
         let clock = runtime.clock_snapshot();
@@ -4756,7 +4755,7 @@ mod tests {
             .world
             .commit([WorldCommand::SetTransform {
                 object: other,
-                transform: Transform::at(DVec3::new(14.0, 0.0, 0.0)).unwrap(),
+                transform: Transform::at_finite(DVec3::new(14.0, 0.0, 0.0)),
             }])
             .unwrap();
         runtime.step_once().unwrap();

@@ -2355,7 +2355,7 @@ fn demo_scene_commands() -> Result<Vec<WorldCommand>, String> {
     Ok(vec![
         WorldCommand::CreateObject(
             ObjectSpec::new("Positive point charge")
-                .with_transform(Transform::at(DVec3::ZERO).map_err(|error| error.to_string())?)
+                .with_transform(Transform::default())
                 .with_shape(ObjectShape::point(0.1).map_err(|error| error.to_string())?)
                 .with_component(
                     charge_component_id(),
@@ -2704,8 +2704,8 @@ mod tests {
         let commands = vec![
             WorldCommand::CreateObject(
                 ObjectSpec::new("Point charge")
-                    .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
-                    .with_shape(ObjectShape::point(0.1).unwrap())
+                    .with_transform(Transform::default())
+                    .with_shape(ObjectShape::default())
                     .with_component(
                         charge_component_id(),
                         charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
@@ -4014,8 +4014,8 @@ mod tests {
                 commands: vec![
                     serde_json::to_value(WorldCommand::CreateObject(
                         ObjectSpec::new("hand built")
-                            .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
-                            .with_shape(ObjectShape::point(0.1).unwrap())
+                            .with_transform(Transform::default())
+                            .with_shape(ObjectShape::default())
                             .with_component(
                                 charge_component_id(),
                                 charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
@@ -4139,8 +4139,8 @@ mod tests {
                 commands: vec![
                     serde_json::to_value(WorldCommand::CreateObject(
                         ObjectSpec::new("plain object")
-                            .with_transform(Transform::at(glam::DVec3::ZERO).unwrap())
-                            .with_shape(ObjectShape::point(0.1).unwrap()),
+                            .with_transform(Transform::default())
+                            .with_shape(ObjectShape::default()),
                     ))
                     .unwrap(),
                 ],

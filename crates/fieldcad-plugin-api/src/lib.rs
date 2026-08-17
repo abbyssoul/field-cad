@@ -173,7 +173,7 @@ pub struct SampledColumn {
 pub struct DynamicBody {
     pub object: ObjectId,
     /// The inertia a total force will be divided by. Always finite and positive.
-    pub inertial_mass_kg: MassKg,
+    pub inertial_mass_kg: MassKg, // TODO: Use a finite positive new type!
     pub position: glam::DVec3,
     pub velocity: glam::DVec3,
 }

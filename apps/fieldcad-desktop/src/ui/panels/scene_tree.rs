@@ -539,6 +539,7 @@ enum ObjectPreset {
     Catalog(fieldcad_core::CatalogEntryRef),
 }
 
+// TODO: Ensure that position is finite and within bounds
 fn next_object_position(world: &WorldSnapshot) -> glam::DVec3 {
     let index = world.objects().len();
     glam::DVec3::new(index as f64 * 0.6, 0.0, 0.6)
@@ -548,9 +549,7 @@ pub(super) fn new_object_command(world: &WorldSnapshot) -> CommandPayload {
     let index = world.objects().len() + 1;
     CommandPayload::CommitWorld(vec![fieldcad_core::WorldCommand::CreateObject(
         ObjectSpec::new(format!("Object {index}"))
-            .with_transform(
-                Transform::at(next_object_position(world)).expect("static position is finite"),
-            )
+            .with_transform(Transform::at_finite(next_object_position(world)))
             .with_shape(
                 ObjectShape::point(DEFAULT_AUTHORING_RADIUS).expect("static radius is valid"),
             ),
@@ -578,7 +577,7 @@ pub(super) fn catalog_object_command(
     let pos = next_object_position(frame.world);
     let placement = fieldcad_catalog::InstantiationPlacement {
         display_name,
-        transform: Transform::at(pos).expect("static position is finite"),
+        transform: Transform::at_finite(pos),
         velocity: Velocity::default(),
         pinned: false,
         fallback_shape_radius: DEFAULT_AUTHORING_RADIUS,

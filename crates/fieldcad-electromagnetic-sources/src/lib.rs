@@ -191,8 +191,8 @@ mod tests {
                 WorldCommand::RegisterComponentSchema(charge_component_schema()),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("p1")
-                        .with_transform(Transform::at(DVec3::X).unwrap())
-                        .with_shape(ObjectShape::point(0.1).unwrap())
+                        .with_transform(Transform::at_finite(DVec3::X))
+                        .with_shape(ObjectShape::default())
                         .with_component(
                             charge_component_id(),
                             charge_properties(ChargeCoulombs::new::<coulomb>(2.0)).unwrap(),

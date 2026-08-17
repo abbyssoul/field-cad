@@ -141,7 +141,7 @@ mod tests {
     fn a_charge_without_mass_is_not_a_particle() {
         // It is still a field source; it simply has no inertia to integrate.
         let world = world_with([ObjectSpec::new("static charge")
-            .with_shape(fieldcad_core::ObjectShape::point(0.1).unwrap())
+            .with_shape(fieldcad_core::ObjectShape::default())
             .with_component(
                 charge_component_id(),
                 charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),

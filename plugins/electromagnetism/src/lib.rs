@@ -1742,7 +1742,7 @@ mod tests {
                 WorldCommand::RegisterComponentSchema(charge_component_schema()),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("static charge")
-                        .with_transform(Transform::at(position).unwrap())
+                        .with_transform(Transform::at_finite(position))
                         .with_shape(ObjectShape::point(0.15).unwrap())
                         .with_component(
                             charge_component_id(),
@@ -1898,7 +1898,7 @@ mod tests {
                 WorldCommand::RegisterComponentSchema(charge_component_schema()),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("static charge")
-                        .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                        .with_transform(Transform::default())
                         .with_shape(ObjectShape::point(0.15).unwrap())
                         .with_component(
                             charge_component_id(),
@@ -1962,7 +1962,7 @@ mod tests {
         world
             .commit([WorldCommand::SetTransform {
                 object: charge,
-                transform: Transform::at(DVec3::new(2.0, 0.0, 0.0)).unwrap(),
+                transform: Transform::at_finite(DVec3::new(2.0, 0.0, 0.0)),
             }])
             .unwrap();
         let moved = world.snapshot();
@@ -2209,7 +2209,7 @@ mod tests {
                 WorldCommand::RegisterComponentSchema(charge_component_schema()),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("degenerate point charge")
-                        .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                        .with_transform(Transform::default())
                         .with_shape(ObjectShape::point(0.0).unwrap())
                         .with_component(
                             charge_component_id(),
@@ -2304,7 +2304,7 @@ mod tests {
         world
             .commit([WorldCommand::SetTransform {
                 object: charge,
-                transform: Transform::at(DVec3::new(2.0, 0.0, 0.0)).unwrap(),
+                transform: Transform::at_finite(DVec3::new(2.0, 0.0, 0.0)),
             }])
             .unwrap();
         assert!(
@@ -2394,7 +2394,7 @@ mod tests {
         world
             .commit([WorldCommand::CreateObject(
                 ObjectSpec::new("charge")
-                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_transform(Transform::default())
                     .with_shape(ObjectShape::point(0.15).unwrap())
                     .with_component(
                         charge_component_id(),
@@ -2466,7 +2466,7 @@ mod tests {
         initial
             .commit([WorldCommand::CreateObject(
                 ObjectSpec::new("charge")
-                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_transform(Transform::default())
                     .with_shape(ObjectShape::point(0.15).unwrap())
                     .with_component(
                         charge_component_id(),
@@ -2508,7 +2508,7 @@ mod tests {
         extreme
             .commit([WorldCommand::CreateObject(
                 ObjectSpec::new("extreme charge")
-                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_transform(Transform::default())
                     .with_shape(ObjectShape::point(0.15).unwrap())
                     .with_component(
                         charge_component_id(),

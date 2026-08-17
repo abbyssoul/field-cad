@@ -444,20 +444,25 @@ fn validated_mass(body: &DynamicBody) -> Result<f64, DynamicsError> {
 /// for subluminal motion, so the result is held just short of it.
 const MAX_SPEED_FRACTION: f64 = 1.0 - 1.0e-12;
 
+const SPEED_CEILING: f64 = SPEED_OF_LIGHT * MAX_SPEED_FRACTION;
+
 /// `v = p / (m sqrt(1 + (p/mc)²))`, the inverse that cannot exceed `c`.
 fn velocity_from_momentum(momentum: DVec3, mass_kg: f64) -> DVec3 {
     let scaled = momentum.length() / (mass_kg * SPEED_OF_LIGHT);
     let lorentz = (1.0 + scaled * scaled).sqrt();
     let velocity = momentum / (mass_kg * lorentz);
     let speed = velocity.length();
-    let ceiling = SPEED_OF_LIGHT * MAX_SPEED_FRACTION;
-    if speed > ceiling {
-        velocity * (ceiling / speed)
+
+    if speed > SPEED_CEILING {
+        velocity * (SPEED_CEILING / speed)
     } else {
         velocity
     }
 }
 
+// TODO:
+// 1. Ensure inputs are finite
+// 2. Change signature to not return a result, but direct value
 fn kinematics(
     object: ObjectId,
     position: DVec3,
@@ -465,8 +470,8 @@ fn kinematics(
 ) -> Result<ObjectKinematicsUpdate, DynamicsError> {
     Ok(ObjectKinematicsUpdate {
         object,
-        transform: Transform::at(position)?,
-        velocity: Velocity::new(velocity, DVec3::ZERO)?,
+        transform: Transform::at_finite(position),
+        velocity: Velocity::new_linear_finite(velocity),
     })
 }
 
@@ -627,7 +632,7 @@ mod tests {
                             inertial_mass_component_id(),
                             inertial_mass_properties(MassKg::new::<kilogram>(1.0)).unwrap(),
                         )
-                        .with_transform(CoreTransform::at(DVec3::ZERO).unwrap()),
+                        .with_transform(CoreTransform::default()),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("carried")
@@ -682,7 +687,7 @@ mod tests {
             .chain([
                 WorldCommand::CreateObject(
                     ObjectSpec::new("a")
-                        .with_transform(CoreTransform::at(DVec3::ZERO).unwrap())
+                        .with_transform(CoreTransform::default())
                         .with_component(
                             inertial_mass_component_id(),
                             inertial_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap(),
@@ -690,7 +695,7 @@ mod tests {
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("b")
-                        .with_transform(CoreTransform::at(DVec3::new(4.0, 0.0, 0.0)).unwrap())
+                        .with_transform(CoreTransform::at_finite(DVec3::new(4.0, 0.0, 0.0)))
                         .with_velocity(Velocity::new(DVec3::X, DVec3::ZERO).unwrap())
                         .with_component(
                             inertial_mass_component_id(),
@@ -699,7 +704,7 @@ mod tests {
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("c")
-                        .with_transform(CoreTransform::at(DVec3::new(100.0, 0.0, 0.0)).unwrap())
+                        .with_transform(CoreTransform::at_finite(DVec3::new(100.0, 0.0, 0.0)))
                         .with_component(
                             inertial_mass_component_id(),
                             inertial_mass_properties(MassKg::new::<kilogram>(2.0)).unwrap(),

@@ -451,7 +451,7 @@ mod tests {
         world
             .commit([WorldCommand::CreateObject(
                 ObjectSpec::new("body")
-                    .with_transform(Transform::at(DVec3::new(0.0, 0.0, 0.6)).unwrap())
+                    .with_transform(Transform::at_finite(DVec3::new(0.0, 0.0, 0.6)))
                     .with_shape(ObjectShape::sphere(0.25).unwrap()),
             )])
             .unwrap();
@@ -548,7 +548,7 @@ mod tests {
         world
             .commit([WorldCommand::CreateObject(
                 ObjectSpec::new("source")
-                    .with_transform(Transform::at(DVec3::new(0.0, 0.0, 0.6)).unwrap())
+                    .with_transform(Transform::at_finite(DVec3::new(0.0, 0.0, 0.6)))
                     .with_shape(ObjectShape::sphere(0.25).unwrap()),
             )])
             .unwrap();

@@ -221,10 +221,8 @@ impl ParticleCoupling {
             particle.velocity = new_velocity;
             updates.push(ObjectKinematicsUpdate {
                 object: particle.object,
-                transform: Transform::at(new_position)
-                    .map_err(|error| PluginError::Solver(error.to_string()))?,
-                velocity: Velocity::new(new_velocity, DVec3::ZERO)
-                    .map_err(|error| PluginError::Solver(error.to_string()))?,
+                transform: Transform::at_finite(new_position),
+                velocity: Velocity::new_linear_finite(new_velocity),
             });
         }
 

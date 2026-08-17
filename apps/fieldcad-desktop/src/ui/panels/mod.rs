@@ -783,11 +783,11 @@ mod tests {
         world
             .commit([
                 WorldCommand::CreateObject(
-                    ObjectSpec::new("near").with_transform(Transform::at(DVec3::ZERO).unwrap()),
+                    ObjectSpec::new("near").with_transform(Transform::default()),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("far")
-                        .with_transform(Transform::at(DVec3::new(3.0, 4.0, 0.0)).unwrap()),
+                        .with_transform(Transform::at_finite(DVec3::new(3.0, 4.0, 0.0))),
                 ),
             ])
             .unwrap();

@@ -45,13 +45,28 @@ impl Transform {
         })
     }
 
-    pub fn at(translation: DVec3) -> Result<Self, WorldError> {
-        Self::new(translation, DQuat::IDENTITY)
+    pub fn at_finite(translation: DVec3) -> Self {
+        Self {
+            translation,
+            rotation: DQuat::IDENTITY,
+        }
     }
+
+    // pub fn at(translation: DVec3) -> Result<Self, WorldError> {
+    //     Self::new(translation, DQuat::IDENTITY)
+    // }
 
     /// Transform a point from object space into world space.
     pub fn apply(self, point: DVec3) -> DVec3 {
         self.translation + self.rotation * point
+    }
+
+    /// Returns `true` if, and only if, translations and rotation are finite.
+    /// If any element is either `NaN`, positive or negative infinity, this will return `false`.
+    #[inline]
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.translation.is_finite() && self.rotation.is_finite()
     }
 
     /// The same transform with a unit rotation.
@@ -70,10 +85,7 @@ impl Transform {
     }
 
     pub(crate) fn validate(self) -> Result<(), WorldError> {
-        if !self.translation.is_finite()
-            || !self.rotation.is_finite()
-            || self.rotation.length_squared() == 0.0
-        {
+        if !self.is_finite() || self.rotation.length_squared() == 0.0 {
             return Err(WorldError::InvalidTransform);
         }
         Ok(())
@@ -93,8 +105,23 @@ impl Velocity {
         Ok(candidate)
     }
 
+    pub fn new_linear_finite(linear: DVec3) -> Self {
+        Self {
+            linear,
+            angular: DVec3::ZERO,
+        }
+    }
+
+    /// Returns `true` if, and only if, linear and rotation velocity are finite.
+    /// If any element is either `NaN`, positive or negative infinity, this will return `false`.
+    #[inline]
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.linear.is_finite() && self.angular.is_finite()
+    }
+
     pub(crate) fn validate(self) -> Result<(), WorldError> {
-        if !self.linear.is_finite() || !self.angular.is_finite() {
+        if !self.is_finite() {
             return Err(WorldError::InvalidVelocity);
         }
         Ok(())
@@ -118,6 +145,12 @@ pub enum ObjectShape {
     Box {
         half_extent: DVec3,
     },
+}
+
+impl Default for ObjectShape {
+    fn default() -> Self {
+        Self::Point { radius: 0.1 }
+    }
 }
 
 impl ObjectShape {
@@ -3305,7 +3338,7 @@ mod tests {
         world
             .commit([WorldCommand::CreateObject(
                 ObjectSpec::new("source")
-                    .with_transform(Transform::at(DVec3::new(2.0, 0.0, 0.0)).unwrap()),
+                    .with_transform(Transform::at_finite(DVec3::new(2.0, 0.0, 0.0))),
             )])
             .unwrap();
         world
@@ -3329,11 +3362,11 @@ mod tests {
         world
             .commit([
                 WorldCommand::CreateObject(
-                    ObjectSpec::new("a").with_transform(Transform::at(DVec3::ZERO).unwrap()),
+                    ObjectSpec::new("a").with_transform(Transform::at_finite(DVec3::ZERO)),
                 ),
                 WorldCommand::CreateObject(
                     ObjectSpec::new("b")
-                        .with_transform(Transform::at(DVec3::new(3.0, 4.0, 0.0)).unwrap()),
+                        .with_transform(Transform::at_finite(DVec3::new(3.0, 4.0, 0.0))),
                 ),
             ])
             .unwrap();
@@ -3353,7 +3386,7 @@ mod tests {
         world
             .commit([WorldCommand::SetTransform {
                 object: ObjectId::new(1),
-                transform: Transform::at(DVec3::new(3.0, 0.0, 0.0)).unwrap(),
+                transform: Transform::at_finite(DVec3::new(3.0, 0.0, 0.0)),
             }])
             .unwrap();
         let snapshot = world.snapshot();
@@ -3524,7 +3557,7 @@ mod tests {
         world
             .commit([WorldCommand::SetTransform {
                 object: ObjectId::new(0),
-                transform: Transform::at(DVec3::new(1.0, 2.0, 3.0)).unwrap(),
+                transform: Transform::at_finite(DVec3::new(1.0, 2.0, 3.0)),
             }])
             .unwrap();
         assert_eq!(

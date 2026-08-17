@@ -11,13 +11,12 @@ use std::time::{Duration, Instant};
 use fieldcad_core::{ObjectShape, ObjectSpec, Transform, WorldCommand};
 use fieldcad_server::{HeadlessServer, SessionEvent, WatchEvent};
 use fieldcad_simulation::{CommandDisposition, CommandEvent, CommandPayload};
-use glam::DVec3;
 
 fn create_object(name: &str) -> CommandPayload {
     CommandPayload::CommitWorld(vec![WorldCommand::CreateObject(
         ObjectSpec::new(name)
-            .with_transform(Transform::at(DVec3::ZERO).unwrap())
-            .with_shape(ObjectShape::point(0.1).unwrap()),
+            .with_transform(Transform::default())
+            .with_shape(ObjectShape::default()),
     )])
 }
 

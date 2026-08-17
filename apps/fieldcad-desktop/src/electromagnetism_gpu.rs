@@ -846,7 +846,7 @@ mod tests {
                     WorldCommand::RegisterComponentSchema(charge_component_schema()),
                     WorldCommand::CreateObject(
                         ObjectSpec::new("static charge")
-                            .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                            .with_transform(Transform::default())
                             .with_shape(ObjectShape::point(0.15).unwrap())
                             .with_component(
                                 charge_component_id(),
@@ -934,7 +934,7 @@ mod tests {
             const ELECTRON_MASS_KG: f64 = 9.109_383_713_9e-31;
             const ELEMENTARY_CHARGE_COULOMBS: f64 = 1.602_176_634e-19;
             let electron = ObjectSpec::new("Electron")
-                .with_transform(Transform::at(DVec3::new(-0.2, 0.0, 0.0)).unwrap())
+                .with_transform(Transform::at_finite(DVec3::new(-0.2, 0.0, 0.0)))
                 .with_velocity(Velocity::new(DVec3::X * 1.0e8, DVec3::ZERO).unwrap())
                 .with_shape(ObjectShape::point(0.01).unwrap())
                 .with_pinned(true)

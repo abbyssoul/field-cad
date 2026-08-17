@@ -359,7 +359,7 @@ mod tests {
         world
             .commit([WorldCommand::CreateObject(
                 ObjectSpec::new("source")
-                    .with_transform(Transform::at(DVec3::ZERO).unwrap())
+                    .with_transform(Transform::default())
                     .with_shape(ObjectShape::point(0.01).unwrap())
                     .with_component(
                         inertial_mass_component_id(),
@@ -426,7 +426,7 @@ mod tests {
             .unwrap();
 
         let primary = ObjectSpec::new("primary")
-            .with_transform(Transform::at(DVec3::new(-10.0, 0.0, 0.0)).unwrap())
+            .with_transform(Transform::at_finite(DVec3::new(-10.0, 0.0, 0.0)))
             .with_shape(ObjectShape::point(0.01).unwrap())
             .with_component(
                 inertial_mass_component_id(),
@@ -439,7 +439,7 @@ mod tests {
         // Small and irrelevant except for its exclusion radius, which the
         // sample point (the origin) sits well inside.
         let grazing = ObjectSpec::new("grazing")
-            .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+            .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
             .with_shape(ObjectShape::point(2.0).unwrap())
             .with_component(
                 inertial_mass_component_id(),
@@ -450,7 +450,7 @@ mod tests {
                 linked_gravitational_mass_properties(),
             );
         let body = ObjectSpec::new("body")
-            .with_transform(Transform::at(DVec3::ZERO).unwrap())
+            .with_transform(Transform::default())
             .with_shape(ObjectShape::point(0.01).unwrap())
             .with_component(
                 inertial_mass_component_id(),

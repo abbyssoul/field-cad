@@ -36,8 +36,8 @@ fn charge_and_probe() -> Vec<WorldCommand> {
     vec![
         WorldCommand::CreateObject(
             ObjectSpec::new("Point charge")
-                .with_transform(Transform::at(DVec3::ZERO).unwrap())
-                .with_shape(ObjectShape::point(0.1).unwrap())
+                .with_transform(Transform::default())
+                .with_shape(ObjectShape::default())
                 .with_component(
                     charge_component_id(),
                     charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
@@ -317,8 +317,8 @@ fn server_side_probe_history_honors_each_probes_own_declared_capacity() {
     let commands = vec![
         WorldCommand::CreateObject(
             ObjectSpec::new("Point charge")
-                .with_transform(Transform::at(DVec3::ZERO).unwrap())
-                .with_shape(ObjectShape::point(0.1).unwrap())
+                .with_transform(Transform::default())
+                .with_shape(ObjectShape::default())
                 .with_component(
                     charge_component_id(),
                     charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
@@ -381,7 +381,7 @@ fn commit_charge_source_and_free_body(server: &mut HeadlessServer) -> fieldcad_c
         ),
         WorldCommand::CreateObject(
             ObjectSpec::new("free")
-                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
                 .with_shape(ObjectShape::point(0.05).unwrap())
                 .with_component(
                     charge_component_id(),

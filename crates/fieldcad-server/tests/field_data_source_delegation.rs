@@ -72,7 +72,7 @@ fn body_forces_reach_the_trait_object_not_just_the_inherent_method() {
                         ),
                         WorldCommand::CreateObject(
                             ObjectSpec::new("free")
-                                .with_transform(Transform::at(DVec3::new(1.0, 0.0, 0.0)).unwrap())
+                                .with_transform(Transform::at_finite(DVec3::new(1.0, 0.0, 0.0)))
                                 .with_shape(ObjectShape::point(0.05).unwrap())
                                 .with_component(
                                     charge_component_id(),
