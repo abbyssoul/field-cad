@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
-    CatalogEntryRef, CatalogLink, ComponentSchema, ComponentTypeId, ObjectShape, ObjectSpec,
-    Transform, Velocity,
+    CatalogEntryRef, CatalogLink, ComponentSchema, ComponentTypeId, ObjectColor, ObjectShape,
+    ObjectSpec, Transform, Velocity,
 };
 
 use crate::availability::{AvailabilityReason, resolve_components, resolve_object_kind};
-use crate::structure::{TemplateShape, TemplateSpec};
+use crate::structure::{TemplateColor, TemplateShape, TemplateSpec};
 
 /// Placement inputs — everything instantiation supplies that a template
 /// deliberately does not carry. See the catalog document contract: "Do not
@@ -72,10 +72,25 @@ pub fn instantiate_template(
             mode: fieldcad_core::CatalogLinkMode::Tracking,
             source_description: format!("{}/{}", reference.catalog, reference.template),
         });
+    // A one-time seed, not a template-owned value: unlike shape/components,
+    // nothing ever re-applies this from the template after instantiation —
+    // the object's color is free from this point on, like its name.
+    if let Some(color) = spec.default_color {
+        object = object.with_color(to_object_color(color));
+    }
     for (component_type, bag) in components.expect("reasons empty implies components resolved") {
         object = object.with_component(component_type, bag);
     }
     Ok(object)
+}
+
+fn to_object_color(color: TemplateColor) -> ObjectColor {
+    ObjectColor {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: color.a,
+    }
 }
 
 fn to_object_shape(shape: Option<TemplateShape>, fallback_radius: f64) -> ObjectShape {
@@ -150,6 +165,7 @@ mod tests {
         TemplateSpec {
             object_kind: "world-object".to_owned(),
             shape,
+            default_color: None,
             components: vec![TemplateComponentInstance {
                 component_type: inertial_mass_component_id(),
                 properties: [(
@@ -184,6 +200,34 @@ mod tests {
             object.shape,
             Some(ObjectShape::point(0.15).unwrap()),
             "no template shape falls back to the placement radius"
+        );
+        assert_eq!(
+            object.color, None,
+            "a template with no declared default color instantiates unset"
+        );
+    }
+
+    #[test]
+    fn a_declared_default_color_seeds_the_instantiated_objects_color() {
+        let mut spec = spec_with_mass(None);
+        spec.default_color = Some(TemplateColor {
+            r: 0.2,
+            g: 0.56,
+            b: 0.88,
+            a: 1.0,
+        });
+
+        let object =
+            instantiate_template(&spec, &reference(), &registry_with_mass(), placement()).unwrap();
+
+        assert_eq!(
+            object.color,
+            Some(ObjectColor {
+                r: 0.2,
+                g: 0.56,
+                b: 0.88,
+                a: 1.0,
+            })
         );
     }
 

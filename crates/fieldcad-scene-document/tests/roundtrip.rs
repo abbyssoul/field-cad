@@ -739,6 +739,7 @@ fn document_catalog_entries_and_preferences_round_trip() {
     let spec = TemplateSpec {
         object_kind: "world-object".to_owned(),
         shape: None,
+        default_color: None,
         components: vec![component],
     };
     let entry = DocumentCatalogEntry {

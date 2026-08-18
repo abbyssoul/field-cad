@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BoxId, BoxLattice, CatalogEntryRef, CatalogLink, ChannelId, ComponentSchema, ComponentTypeId,
-    DistanceProbeId, MassAggregateProbeId, ObjectId, PlaneId, PlaneLattice, ProbeId, PropertyBag,
-    SchemaError, SphereId, SphereLattice, WorldRevision,
+    DistanceProbeId, MassAggregateProbeId, ObjectColor, ObjectId, PlaneId, PlaneLattice, ProbeId,
+    PropertyBag, SchemaError, SphereId, SphereLattice, WorldRevision,
 };
 
 /// A finite, non-degenerate direction. Used for plane normals and in-plane axes.
@@ -223,6 +223,11 @@ pub struct ObjectSpec {
     /// command or scene predating this field still deserializes.
     #[serde(default)]
     pub catalog_link: Option<CatalogLink>,
+    /// Presentation-only display tint — see [`WorldObject::color`].
+    /// `#[serde(default)]` so a `CreateObject` command or scene predating
+    /// this field still deserializes.
+    #[serde(default)]
+    pub color: Option<ObjectColor>,
 }
 
 impl ObjectSpec {
@@ -237,6 +242,7 @@ impl ObjectSpec {
             components: BTreeMap::new(),
             derived: false,
             catalog_link: None,
+            color: None,
         }
     }
 
@@ -265,6 +271,12 @@ impl ObjectSpec {
         self
     }
 
+    /// Set a display-only color — see [`WorldObject::color`].
+    pub fn with_color(mut self, color: ObjectColor) -> Self {
+        self.color = Some(color);
+        self
+    }
+
     pub fn with_component(mut self, component: ComponentTypeId, properties: PropertyBag) -> Self {
         self.components.insert(component, properties);
         self
@@ -288,6 +300,9 @@ impl ObjectSpec {
         self.velocity.validate()?;
         if let Some(shape) = self.shape {
             shape.validate()?;
+        }
+        if let Some(color) = self.color {
+            color.validate()?;
         }
         Ok(())
     }
@@ -334,6 +349,20 @@ pub struct WorldObject {
     /// loads with `None`.
     #[serde(default)]
     pub catalog_link: Option<CatalogLink>,
+    /// Presentation-only display tint — never read by any solver or
+    /// equation system, purely for telling objects apart in the viewport.
+    /// `None` means "no color has ever been set," a state distinct from any
+    /// particular color: the renderer owns what an uncolored object looks
+    /// like, the same way it owns the selection-highlight color.
+    ///
+    /// Unlike `shape`/`components`, this is never re-synced from a catalog
+    /// template and is never made read-only by [`CatalogLinkMode::Tracking`]
+    /// — once set (including by a catalog template's default color at
+    /// instantiation), it behaves exactly like `name`: fully free, and not
+    /// linked back. `#[serde(default)]` so a scene saved before this field
+    /// existed still loads with `None`.
+    #[serde(default)]
+    pub color: Option<ObjectColor>,
 }
 
 impl WorldObject {
@@ -1533,6 +1562,13 @@ pub enum WorldCommand {
         object: ObjectId,
         visible: bool,
     },
+    /// Presentation-only display tint. `None` clears back to "unset" (the
+    /// renderer's own default). Never made read-only by a catalog link's
+    /// `Tracking` mode, unlike `SetShape` — see [`WorldObject::color`].
+    SetObjectColor {
+        object: ObjectId,
+        color: Option<ObjectColor>,
+    },
     /// Hand authority over an object's motion to the user, or back to solvers.
     SetObjectPinned {
         object: ObjectId,
@@ -1690,6 +1726,7 @@ impl WorldCommand {
             Self::SetVelocity { .. } => "Set velocity",
             Self::SetShape { .. } => "Change shape",
             Self::SetObjectVisible { .. } => "Show or hide object",
+            Self::SetObjectColor { .. } => "Set object color",
             Self::SetObjectPinned { .. } => "Change motion authority",
             Self::UnlinkCatalogTemplate { .. } => "Unlink object from catalog",
             Self::ApplyCatalogTemplate { .. } => "Apply catalog template",
@@ -2007,6 +2044,7 @@ fn apply_command(
                     components: spec.components,
                     derived: spec.derived,
                     catalog_link: spec.catalog_link,
+                    color: spec.color,
                 },
             );
             report.created_objects.push(id);
@@ -2086,6 +2124,12 @@ fn apply_command(
         }
         WorldCommand::SetObjectVisible { object, visible } => {
             object_mut(state, object)?.visible = visible;
+        }
+        WorldCommand::SetObjectColor { object, color } => {
+            if let Some(color) = color {
+                color.validate()?;
+            }
+            object_mut(state, object)?.color = color;
         }
         WorldCommand::SetObjectPinned { object, pinned } => {
             object_mut(state, object)?.pinned = pinned;
@@ -2451,6 +2495,7 @@ fn apply_command(
                     components: BTreeMap::new(),
                     derived: true,
                     catalog_link: None,
+                    color: None,
                 },
             );
             mass_aggregate_probes_mut(state).insert(
@@ -2595,6 +2640,8 @@ pub enum WorldError {
     InvalidVelocity,
     #[error("object shape requires finite, non-negative dimensions")]
     InvalidShape,
+    #[error("object color channels must be finite and within 0.0..=1.0")]
+    InvalidColor,
     #[error("slice plane requires a finite origin, non-zero normal, and positive extent")]
     InvalidPlane,
     #[error("field box requires a finite origin, unit rotation, and positive half extent")]
@@ -2762,6 +2809,77 @@ mod tests {
         let object = snapshot.object(id).unwrap();
         assert_eq!(object.id, id);
         assert_eq!(object.name, "after");
+    }
+
+    #[test]
+    fn setting_an_objects_color_preserves_its_identity() {
+        let mut world = World::new();
+        let id = world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("body"))])
+            .unwrap()
+            .created_objects[0];
+        let color = ObjectColor::opaque(0.2, 0.56, 0.88);
+
+        world
+            .commit([WorldCommand::SetObjectColor {
+                object: id,
+                color: Some(color),
+            }])
+            .unwrap();
+
+        let snapshot = world.snapshot();
+        let object = snapshot.object(id).unwrap();
+        assert_eq!(object.id, id);
+        assert_eq!(object.color, Some(color));
+    }
+
+    #[test]
+    fn clearing_an_objects_color_returns_it_to_unset() {
+        let mut world = World::new();
+        let id = world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("body").with_color(ObjectColor::opaque(1.0, 0.0, 0.0)),
+            )])
+            .unwrap()
+            .created_objects[0];
+
+        world
+            .commit([WorldCommand::SetObjectColor {
+                object: id,
+                color: None,
+            }])
+            .unwrap();
+
+        assert_eq!(world.snapshot().object(id).unwrap().color, None);
+    }
+
+    #[test]
+    fn setting_a_tracking_linked_objects_color_is_not_read_only() {
+        // Unlike `SetShape`, which rejects an edit to a `Tracking`-linked
+        // object's template-owned shape, color is never synced from a
+        // catalog template — it behaves like `name`, not `shape`.
+        let mut world = World::new();
+        let link = CatalogLink {
+            entry: None,
+            mode: crate::CatalogLinkMode::Tracking,
+            source_description: "catalog.yaml (document 1)".to_owned(),
+        };
+        let id = world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("body").with_catalog_link(link),
+            )])
+            .unwrap()
+            .created_objects[0];
+        let color = ObjectColor::opaque(0.2, 0.56, 0.88);
+
+        world
+            .commit([WorldCommand::SetObjectColor {
+                object: id,
+                color: Some(color),
+            }])
+            .unwrap();
+
+        assert_eq!(world.snapshot().object(id).unwrap().color, Some(color));
     }
 
     #[test]
@@ -3088,6 +3206,31 @@ mod tests {
         assert!(!snapshot.probe(probe).unwrap().visible);
         assert_eq!(snapshot.objects().len(), 1);
         assert_eq!(snapshot.probes().len(), 1);
+    }
+
+    #[test]
+    fn object_color_is_revisioned_without_removing_the_entity() {
+        let mut world = World::new();
+        let object = world
+            .commit([WorldCommand::CreateObject(ObjectSpec::new("source"))])
+            .unwrap()
+            .created_objects[0];
+        let before = world.revision();
+
+        world
+            .commit([WorldCommand::SetObjectColor {
+                object,
+                color: Some(ObjectColor::opaque(0.2, 0.56, 0.88)),
+            }])
+            .unwrap();
+        let snapshot = world.snapshot();
+
+        assert_eq!(snapshot.revision(), before.next());
+        assert_eq!(
+            snapshot.object(object).unwrap().color,
+            Some(ObjectColor::opaque(0.2, 0.56, 0.88))
+        );
+        assert_eq!(snapshot.objects().len(), 1);
     }
 
     #[test]
@@ -3755,6 +3898,41 @@ mod tests {
         let spec: ObjectSpec = serde_json::from_value(json).unwrap();
 
         assert_eq!(spec.catalog_link, None);
+    }
+
+    #[test]
+    fn object_color_survives_a_world_document_round_trip() {
+        let mut world = World::new();
+        let color = ObjectColor::opaque(0.2, 0.56, 0.88);
+        world
+            .commit([WorldCommand::CreateObject(
+                ObjectSpec::new("x").with_color(color),
+            )])
+            .unwrap();
+
+        let document = world.to_document();
+        let json = serde_json::to_vec(&document).unwrap();
+        let restored: WorldDocument = serde_json::from_slice(&json).unwrap();
+        let restored = World::from_document(restored);
+
+        let object = restored
+            .snapshot()
+            .object(ObjectId::new(0))
+            .unwrap()
+            .clone();
+        assert_eq!(object.color, Some(color));
+    }
+
+    #[test]
+    fn an_object_missing_the_color_field_deserializes_as_none() {
+        // Simulates an old scene, or a `CreateObject` command from a client
+        // built before this field existed: the JSON simply has no `color`
+        // key at all.
+        let mut json = serde_json::to_value(ObjectSpec::new("x")).unwrap();
+        json.as_object_mut().unwrap().remove("color");
+        let spec: ObjectSpec = serde_json::from_value(json).unwrap();
+
+        assert_eq!(spec.color, None);
     }
 
     #[test]

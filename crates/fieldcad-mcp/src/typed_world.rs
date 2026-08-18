@@ -27,10 +27,10 @@
 use std::collections::BTreeMap;
 
 use fieldcad_core::{
-    BoxId, ChannelId, ComponentSchema, ComponentTypeId, FieldBoxSpec, FieldSphereSpec, ObjectId,
-    ObjectShape, ObjectSpec, PlaneId, PluginId, ProbeId, ProbePosition, ProbeSpec, PropertyBag,
-    PropertyId, PropertyKind, PropertyValue, Quantity, SlicePlaneSpec, SphereId, Transform,
-    VectorQuantity, Velocity, WorldCommand, WorldError,
+    BoxId, ChannelId, ComponentSchema, ComponentTypeId, FieldBoxSpec, FieldSphereSpec, ObjectColor,
+    ObjectId, ObjectShape, ObjectSpec, PlaneId, PluginId, ProbeId, ProbePosition, ProbeSpec,
+    PropertyBag, PropertyId, PropertyKind, PropertyValue, Quantity, SlicePlaneSpec, SphereId,
+    Transform, VectorQuantity, Velocity, WorldCommand, WorldError,
 };
 use glam::{DQuat, DVec2, DVec3};
 use rmcp::schemars;
@@ -151,6 +151,36 @@ impl TryFrom<ObjectShapeParam> for ObjectShape {
             ObjectShapeParam::Sphere { radius_m } => ObjectShape::sphere(radius_m),
             ObjectShapeParam::Box { half_extent_m } => ObjectShape::boxed(half_extent_m.into()),
         }
+    }
+}
+
+/// A cosmetic, display-only object tint — see `ObjectColor`. `a` defaults to
+/// fully opaque so a client that only cares about hue doesn't have to name it.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+pub struct ObjectColorParam {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    #[serde(default = "default_opaque_alpha")]
+    pub a: f32,
+}
+
+fn default_opaque_alpha() -> f32 {
+    1.0
+}
+
+impl TryFrom<ObjectColorParam> for ObjectColor {
+    type Error = WorldError;
+
+    fn try_from(value: ObjectColorParam) -> Result<Self, Self::Error> {
+        let color = ObjectColor {
+            r: value.r,
+            g: value.g,
+            b: value.b,
+            a: value.a,
+        };
+        color.validate()?;
+        Ok(color)
     }
 }
 
@@ -452,6 +482,13 @@ pub enum WorldEditParam {
         object: u64,
         visible: bool,
     },
+    /// Cosmetic-only display tint. Omit or pass `null` to clear back to the
+    /// renderer's default. Never made read-only by a catalog link.
+    SetObjectColor {
+        object: u64,
+        #[serde(default)]
+        color: Option<ObjectColorParam>,
+    },
     /// Hand authority over an object's motion to the user, or back to solvers.
     SetObjectPinned {
         object: u64,
@@ -668,6 +705,13 @@ pub fn into_world_command(
         WorldEditParam::SetObjectVisible { object, visible } => WorldCommand::SetObjectVisible {
             object: ObjectId::new(object),
             visible,
+        },
+        WorldEditParam::SetObjectColor { object, color } => WorldCommand::SetObjectColor {
+            object: ObjectId::new(object),
+            color: color
+                .map(TryInto::try_into)
+                .transpose()
+                .map_err(describe_world_error)?,
         },
         WorldEditParam::SetObjectPinned { object, pinned } => WorldCommand::SetObjectPinned {
             object: ObjectId::new(object),

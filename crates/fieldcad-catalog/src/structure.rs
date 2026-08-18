@@ -15,7 +15,8 @@ use glam::DVec3;
 
 use crate::diagnostics::{Diagnostic, InvalidReason};
 use crate::document::{
-    CatalogComponentInstance, CatalogEntryDocument, CatalogPropertyValue, CatalogShape,
+    CatalogColor, CatalogComponentInstance, CatalogEntryDocument, CatalogPropertyValue,
+    CatalogShape,
 };
 use crate::ids::{CatalogScopeName, TemplateName};
 
@@ -25,7 +26,22 @@ pub struct TemplateSpec {
     /// decides instantiability, this type only decides parsability.
     pub object_kind: String,
     pub shape: Option<TemplateShape>,
+    /// A one-time seed for a newly-instantiated object's display color.
+    /// Not a template-owned, read-only-when-linked value like `shape` —
+    /// see `instantiate::instantiate_template`, which copies this into the
+    /// new object's own free `color` field and never touches it again.
+    pub default_color: Option<TemplateColor>,
     pub components: Vec<TemplateComponentInstance>,
+}
+
+/// Structurally-clean mirror of [`CatalogColor`] — same shape, but every
+/// channel is guaranteed finite and within `0.0..=1.0`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TemplateColor {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -56,6 +72,10 @@ fn positive_finite(value: f64) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
+fn unit_range_finite(value: f64) -> Option<f32> {
+    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value as f32)
+}
+
 /// Structurally validate a parsed document, collecting every problem found
 /// rather than stopping at the first one.
 ///
@@ -82,17 +102,52 @@ pub fn validate_structure(
     }
 
     let shape = validate_shape(&document.spec.shape, &mut diagnostics);
+    let default_color = validate_color(&document.spec.default_color, &mut diagnostics);
     let components = validate_components(&document.spec.components, &mut diagnostics);
 
     if diagnostics.is_empty() {
         Ok(TemplateSpec {
             object_kind: document.spec.object_kind.clone(),
             shape,
+            default_color,
             components,
         })
     } else {
         Err(diagnostics)
     }
+}
+
+fn validate_color(
+    color: &Option<CatalogColor>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<TemplateColor> {
+    let color = color.as_ref()?;
+    let channels = [
+        ("r", color.r),
+        ("g", color.g),
+        ("b", color.b),
+        ("a", color.a),
+    ];
+    let mut valid = [0.0f32; 4];
+    let mut all_valid = true;
+    for (index, (name, value)) in channels.into_iter().enumerate() {
+        match unit_range_finite(value) {
+            Some(channel) => valid[index] = channel,
+            None => {
+                diagnostics.push(Diagnostic {
+                    field_path: Some(format!("spec.defaultColor.{name}")),
+                    reason: InvalidReason::ColorChannelOutOfRange { value },
+                });
+                all_valid = false;
+            }
+        }
+    }
+    all_valid.then_some(TemplateColor {
+        r: valid[0],
+        g: valid[1],
+        b: valid[2],
+        a: valid[3],
+    })
 }
 
 fn validate_shape(
@@ -321,6 +376,7 @@ mod tests {
             spec: crate::document::CatalogSpec {
                 object_kind: "world-object".to_owned(),
                 shape: None,
+                default_color: None,
                 components: Vec::new(),
             },
         }
@@ -361,6 +417,46 @@ mod tests {
             diagnostics[0].reason,
             InvalidReason::NonPositiveOrNonFiniteExtent { .. }
         ));
+    }
+
+    #[test]
+    fn a_declared_default_color_validates_into_the_template() {
+        let mut document = base_document();
+        document.spec.default_color = Some(crate::document::CatalogColor {
+            r: 0.2,
+            g: 0.56,
+            b: 0.88,
+            a: 1.0,
+        });
+
+        let spec = validate_structure(&document).expect("in-range color validates");
+        assert_eq!(
+            spec.default_color,
+            Some(TemplateColor {
+                r: 0.2,
+                g: 0.56,
+                b: 0.88,
+                a: 1.0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_color_channel() {
+        let mut document = base_document();
+        document.spec.default_color = Some(crate::document::CatalogColor {
+            r: 1.5,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+
+        let diagnostics = validate_structure(&document).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| matches!(d.reason, InvalidReason::ColorChannelOutOfRange { .. }))
+        );
     }
 
     #[test]

@@ -46,6 +46,47 @@ pub(super) fn note_held_edit(response: &egui::Response, editing: &mut bool) -> b
     response.changed()
 }
 
+/// A cosmetic-only object color picker. `color` previews
+/// `crate::renderer::OBJECT_COLOR` (the renderer's own default) whenever the
+/// object has none set, so the swatch always shows what the object actually
+/// looks like right now.
+///
+/// Returns `None` for "nothing changed this frame," `Some(None)` for "clear
+/// back to unset" (the Reset button), `Some(Some(color))` for a picked
+/// color — the outer `Option` is change-detection, the inner one is the
+/// command payload's own "set or clear" shape (mirroring `SetShape`'s
+/// `Option<ObjectShape>`). Commits live, every frame the picker is actively
+/// dragged, matching `coordinate_editor`'s behavior rather than
+/// `name_editor`'s draft/Enter-to-commit shape — a color picker has no
+/// "typed but not yet submitted" state to protect.
+pub(super) fn color_editor(
+    ui: &mut egui::Ui,
+    color: Option<fieldcad_core::ObjectColor>,
+    editing: &mut bool,
+) -> Option<Option<fieldcad_core::ObjectColor>> {
+    let mut channels = color.map_or(crate::renderer::OBJECT_COLOR, |color| {
+        [color.r, color.g, color.b, color.a]
+    });
+    let mut result = None;
+    ui.horizontal(|ui| {
+        ui.label("Color");
+        let response = ui.color_edit_button_rgba_unmultiplied(&mut channels);
+        if note_held_edit(&response, editing) {
+            result = Some(Some(fieldcad_core::ObjectColor {
+                r: channels[0],
+                g: channels[1],
+                b: channels[2],
+                a: channels[3],
+            }));
+        }
+        if color.is_some() && ui.small_button("Reset").clicked() {
+            *editing = false;
+            result = Some(None);
+        }
+    });
+    result
+}
+
 pub(super) fn coordinate_editor(
     ui: &mut egui::Ui,
     label: &str,

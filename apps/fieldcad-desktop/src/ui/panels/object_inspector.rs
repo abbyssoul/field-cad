@@ -12,7 +12,7 @@ use fieldcad_sources::{inertial_mass_component_id, mass_property_id};
 use glam::DVec3;
 
 use super::scene_tree::DEFAULT_AUTHORING_RADIUS;
-use super::{coordinate_editor, name_editor, note_held_edit};
+use super::{color_editor, coordinate_editor, name_editor, note_held_edit};
 use crate::scene::TrajectoryDisplay;
 use crate::ui::compute::{ComputeView, format_engineering};
 use crate::ui::{CameraAction, CatalogAction, UiFrameOutput};
@@ -142,6 +142,16 @@ pub(super) fn object_properties(
         output.edit(vec![WorldCommand::SetObjectName {
             object: object.id,
             name,
+        }]);
+    }
+    // Cosmetic-only, so — unlike `shape_editor` in `placement_editors` below
+    // — deliberately not gated behind `!tracking`: an object's color is
+    // never re-synced from its catalog template and stays freely editable
+    // even while linked, the same way `name` already does above.
+    if let Some(color) = color_editor(ui, object.color, &mut output.scene_edit_in_progress) {
+        output.edit(vec![WorldCommand::SetObjectColor {
+            object: object.id,
+            color,
         }]);
     }
     super::section(ui, "inspector_placement", "Placement", true, |ui| {

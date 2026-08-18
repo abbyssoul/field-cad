@@ -74,6 +74,8 @@ pub enum InvalidReason {
     },
     #[error("shape value must be positive and finite, got {value}")]
     NonPositiveOrNonFiniteExtent { value: f64 },
+    #[error("color channel must be finite and within 0.0..=1.0, got {value}")]
+    ColorChannelOutOfRange { value: f64 },
     #[error("value must be finite, got {value}")]
     NonFiniteValue { value: f64 },
     #[error("component '{component}' is listed more than once in this entry")]

@@ -2343,6 +2343,7 @@ impl WindowState {
                             fieldcad_catalog::TemplateSpec {
                                 object_kind: "world-object".to_owned(),
                                 shape: None,
+                                default_color: None,
                                 components: Vec::new(),
                             },
                         )
@@ -2378,6 +2379,7 @@ impl WindowState {
                             fieldcad_catalog::TemplateSpec {
                                 object_kind: "world-object".to_owned(),
                                 shape: None,
+                                default_color: None,
                                 components: Vec::new(),
                             },
                         )

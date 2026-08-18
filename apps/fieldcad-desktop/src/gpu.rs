@@ -181,6 +181,7 @@ pub async fn smoke_test(config: GpuConfig, frames: u32) -> Result<SmokeTestRepor
         half_extent: glam::Vec3::ONE,
         mesh: crate::scene::ObjectMesh::Sphere,
         selected: false,
+        color: None,
     }];
     let field = crate::scene::FieldGeometry::default();
 

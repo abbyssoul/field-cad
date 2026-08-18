@@ -693,6 +693,7 @@ impl CatalogEditorDraft {
         fieldcad_catalog::TemplateSpec {
             object_kind: self.object_kind.clone(),
             shape: self.shape.clone(),
+            default_color: None,
             components: self.components.clone(),
         }
     }

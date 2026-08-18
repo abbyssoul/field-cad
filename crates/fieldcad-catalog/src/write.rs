@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::structure::{
-    TemplateComponentInstance, TemplatePropertyValue, TemplateShape, TemplateSpec,
+    TemplateColor, TemplateComponentInstance, TemplatePropertyValue, TemplateShape, TemplateSpec,
 };
 
 /// Captured file metadata used to detect external modifications between load
@@ -481,6 +481,9 @@ fn spec_to_yaml(spec: &TemplateSpec) -> serde_norway::Value {
     if let Some(shape) = &spec.shape {
         items.push(("shape", shape_to_yaml(shape)));
     }
+    if let Some(color) = &spec.default_color {
+        items.push(("defaultColor", color_to_yaml(color)));
+    }
     if !spec.components.is_empty() {
         let components: Vec<_> = spec.components.iter().map(component_to_yaml).collect();
         items.push(("components", serde_norway::Value::Sequence(components)));
@@ -514,6 +517,15 @@ fn shape_to_yaml(shape: &TemplateShape) -> serde_norway::Value {
     }
 
     yaml_map(items)
+}
+
+fn color_to_yaml(color: &TemplateColor) -> serde_norway::Value {
+    yaml_map(vec![
+        ("r", yaml_f64(color.r as f64)),
+        ("g", yaml_f64(color.g as f64)),
+        ("b", yaml_f64(color.b as f64)),
+        ("a", yaml_f64(color.a as f64)),
+    ])
 }
 
 fn component_to_yaml(component: &TemplateComponentInstance) -> serde_norway::Value {
@@ -601,6 +613,7 @@ mod tests {
             shape: Some(TemplateShape::Point {
                 exclusion_radius: LengthMetres::from_si(0.15),
             }),
+            default_color: None,
             components: vec![TemplateComponentInstance {
                 component_type,
                 properties: props,

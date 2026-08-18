@@ -17,7 +17,10 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     b: 0.055,
     a: 1.0,
 };
-const OBJECT_COLOR: [f32; 4] = [0.2, 0.56, 0.88, 1.0];
+/// `pub(crate)`, not private: the object inspector's color picker shows this
+/// as the live preview for an object whose `color` is unset, so a user sees
+/// exactly what "unset" looks like rather than a UI-invented placeholder.
+pub(crate) const OBJECT_COLOR: [f32; 4] = [0.2, 0.56, 0.88, 1.0];
 const SELECTED_COLOR: [f32; 4] = [1.0, 0.48, 0.08, 1.0];
 
 /// The shader source, exposed so a test can compile it without a GPU.
@@ -520,7 +523,9 @@ impl InstanceRaw {
             tint: if instance.selected {
                 SELECTED_COLOR
             } else {
-                OBJECT_COLOR
+                instance
+                    .color
+                    .map_or(OBJECT_COLOR, |color| [color.r, color.g, color.b, color.a])
             },
         }
     }
@@ -1507,6 +1512,7 @@ mod tests {
             half_extent: Vec3::ONE,
             mesh: ObjectMesh::Box,
             selected: false,
+            color: None,
         };
         let selected = ObjectInstance {
             selected: true,
@@ -1519,6 +1525,62 @@ mod tests {
         assert_eq!(plain.model, highlighted.model);
         assert_ne!(plain.tint, highlighted.tint);
         assert_eq!(highlighted.tint, SELECTED_COLOR);
+    }
+
+    #[test]
+    fn an_unselected_instance_uses_its_own_color_when_set() {
+        let color = fieldcad_core::ObjectColor {
+            r: 0.9,
+            g: 0.1,
+            b: 0.1,
+            a: 1.0,
+        };
+        let instance = ObjectInstance {
+            id: ObjectId::new(0),
+            model: Mat4::IDENTITY,
+            half_extent: Vec3::ONE,
+            mesh: ObjectMesh::Box,
+            selected: false,
+            color: Some(color),
+        };
+
+        let raw = InstanceRaw::from_instance(&instance);
+
+        assert_eq!(raw.tint, [color.r, color.g, color.b, color.a]);
+    }
+
+    #[test]
+    fn an_uncolored_instance_falls_back_to_the_default_object_color() {
+        let instance = ObjectInstance {
+            id: ObjectId::new(0),
+            model: Mat4::IDENTITY,
+            half_extent: Vec3::ONE,
+            mesh: ObjectMesh::Box,
+            selected: false,
+            color: None,
+        };
+
+        assert_eq!(InstanceRaw::from_instance(&instance).tint, OBJECT_COLOR);
+    }
+
+    #[test]
+    fn selection_overrides_a_set_object_color() {
+        let color = fieldcad_core::ObjectColor {
+            r: 0.9,
+            g: 0.1,
+            b: 0.1,
+            a: 1.0,
+        };
+        let instance = ObjectInstance {
+            id: ObjectId::new(0),
+            model: Mat4::IDENTITY,
+            half_extent: Vec3::ONE,
+            mesh: ObjectMesh::Box,
+            selected: true,
+            color: Some(color),
+        };
+
+        assert_eq!(InstanceRaw::from_instance(&instance).tint, SELECTED_COLOR);
     }
 
     #[test]

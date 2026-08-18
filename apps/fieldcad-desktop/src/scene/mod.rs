@@ -35,8 +35,8 @@ pub use pick::pick_scene;
 pub use trajectory::append_trajectory_geometry;
 
 use fieldcad_core::{
-    BoxId, MassAggregateProbeId, ObjectId, ObjectShape, PlaneId, ProbeId, SampleGeometry,
-    SceneScale, SphereId, WorldObject, WorldSnapshot,
+    BoxId, MassAggregateProbeId, ObjectColor, ObjectId, ObjectShape, PlaneId, ProbeId,
+    SampleGeometry, SceneScale, SphereId, WorldObject, WorldSnapshot,
 };
 use glam::{DQuat, DVec3, Mat4, Quat, Vec3, Vec4};
 
@@ -50,6 +50,10 @@ pub struct ObjectInstance {
     pub half_extent: Vec3,
     pub mesh: ObjectMesh,
     pub selected: bool,
+    /// Cosmetic display tint — `None` falls back to the renderer's own
+    /// default (see `renderer::OBJECT_COLOR`). Never affects `model`/
+    /// `half_extent`/`mesh`, since it carries no physical meaning.
+    pub color: Option<ObjectColor>,
 }
 
 impl ObjectInstance {
@@ -80,6 +84,7 @@ impl ObjectInstance {
             half_extent,
             mesh,
             selected,
+            color: object.color,
         }
     }
 

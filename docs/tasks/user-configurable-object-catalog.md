@@ -209,6 +209,12 @@ spec:
   links to the matching catalog editor when it is installed and editable.
   Position and other non-template instance concerns remain ordinary scene
   authoring controls.
+- A template's optional `defaultColor` is a one-time seed, not a
+  template-owned value: it sets a newly-instantiated object's display color
+  once, the same moment a display name is generated from the template name.
+  From then on the object's color is instance-owned, alongside name and
+  position — never read-only, never re-synced by `ApplyCatalogTemplate`, even
+  while the object is still tracking its catalog link.
 
 ### Propagation and unlinking
 

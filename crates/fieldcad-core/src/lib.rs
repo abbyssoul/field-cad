@@ -5,6 +5,7 @@
 //! window, or graphics crate, and it must remain testable without a GPU.
 
 pub mod catalog_link;
+pub mod color;
 pub mod domain;
 pub mod hermite;
 pub mod ids;
@@ -20,6 +21,7 @@ pub mod units;
 pub mod world;
 
 pub use catalog_link::*;
+pub use color::*;
 pub use domain::*;
 pub use hermite::*;
 pub use ids::*;

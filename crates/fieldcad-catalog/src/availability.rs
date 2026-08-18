@@ -288,6 +288,7 @@ mod tests {
         TemplateSpec {
             object_kind: "world-object".to_owned(),
             shape: None,
+            default_color: None,
             components: vec![TemplateComponentInstance {
                 component_type: inertial_mass_component_id(),
                 properties: [(
@@ -389,6 +390,7 @@ mod tests {
         let spec = TemplateSpec {
             object_kind: "world-object".to_owned(),
             shape: None,
+            default_color: None,
             components: vec![TemplateComponentInstance {
                 component_type: inertial_mass_component_id(),
                 properties: BTreeMap::new(),

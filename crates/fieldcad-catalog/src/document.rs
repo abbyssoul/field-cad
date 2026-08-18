@@ -62,8 +62,25 @@ pub struct CatalogSpec {
     pub object_kind: String,
     #[serde(default)]
     pub shape: Option<CatalogShape>,
+    /// A one-time seed for a newly-instantiated object's display color —
+    /// see [`crate::structure::TemplateSpec::default_color`]. Never read
+    /// back once instantiated: an object's color is free from that moment
+    /// on, exactly like its name.
+    #[serde(default)]
+    pub default_color: Option<CatalogColor>,
     #[serde(default)]
     pub components: Vec<CatalogComponentInstance>,
+}
+
+/// `f64` for consistency with [`CatalogShape`]'s wire fields, narrowed to
+/// `f32` (the renderer's native precision) during [`crate::structure::validate_structure`].
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogColor {
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+    pub a: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
