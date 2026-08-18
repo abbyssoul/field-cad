@@ -68,10 +68,10 @@ impl InverseSquareSample {
 /// observed from outside its radius: `∇E = (k·strength / r³) · (I − 3 d̂⊗d̂)`.
 /// Symmetric (`∂E_i/∂x_j = ∂E_j/∂x_i`), which is exactly the curl-free
 /// property an electrostatic (or gravitational) field must have.
-fn point_jacobian(coupling_strength: f64, displacement: DVec3, distance: f64) -> DMat3 {
-    let d_hat = displacement / distance;
+fn point_jacobian(coupling_strength: f64, displacement: DVec3, inverse_distance: f64) -> DMat3 {
+    let d_hat = displacement * inverse_distance;
     let outer = DMat3::from_cols(d_hat.x * d_hat, d_hat.y * d_hat, d_hat.z * d_hat);
-    (coupling_strength / distance.powi(3)) * (DMat3::IDENTITY - 3.0 * outer)
+    (coupling_strength * inverse_distance.powi(3)) * (DMat3::IDENTITY - 3.0 * outer)
 }
 
 /// The exterior field shared by a point source and a sphere source observed
@@ -148,20 +148,20 @@ fn contribution(
             Some((
                 exterior_field(coupling_strength, displacement, inverse_distance),
                 exterior_potential(coupling_strength, inverse_distance),
-                point_jacobian(coupling_strength, displacement, distance),
+                point_jacobian(coupling_strength, displacement, inverse_distance),
             ))
         }
         ChargeDistribution::UniformSphere { radius } if distance_squared < radius * radius => {
+            let r2 = radius * radius;
+            let r3 = r2 * radius;
             Some((
-                coupling_strength * displacement / radius.powi(3),
-                coupling_strength / (2.0 * radius) * (3.0 - distance_squared / radius.powi(2)),
+                coupling_strength * displacement / r3,
+                coupling_strength / (2.0 * radius) * (3.0 - distance_squared / r2),
                 // E_i = (k·strength/R³)·d_i is linear in `d`, so its Jacobian is
                 // the constant isotropic (k·strength/R³)·I — no singularity,
                 // unlike the exterior formula, which is exactly why the interior
                 // case is handled separately here too.
-                DMat3::from_diagonal(DVec3::splat(
-                    coupling_constant * source.strength / radius.powi(3),
-                )),
+                DMat3::from_diagonal(DVec3::splat(coupling_constant * source.strength / r3)),
             ))
         }
         ChargeDistribution::UniformSphere { .. } => {
@@ -170,7 +170,7 @@ fn contribution(
             Some((
                 exterior_field(coupling_strength, displacement, inverse_distance),
                 exterior_potential(coupling_strength, inverse_distance),
-                point_jacobian(coupling_strength, displacement, distance),
+                point_jacobian(coupling_strength, displacement, inverse_distance),
             ))
         }
     }

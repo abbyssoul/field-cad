@@ -605,6 +605,15 @@ pub struct SimulationRuntime {
     /// per-tick `contributions: Vec<Vec<DVec3>>` this used to build and the
     /// `total: Vec<DVec3>` summing it used to allocate.
     force_scratch: Vec<DVec3>,
+    /// Scratch buffer for the `WorldCommand` batch a kinematic tick adopts:
+    /// two commands (`SetTransform`, `SetVelocity`) per moved body, built
+    /// fresh every tick but over a buffer that stabilizes at its steady-state
+    /// capacity rather than being reallocated each time — same shape as
+    /// `force_scratch`. Handed to [`Self::adopt_world_commands`] by
+    /// reference and taken/restored around that call
+    /// ([`std::mem::take`]) so the borrow checker allows a `&mut self`
+    /// method call with one of `self`'s own fields as its argument.
+    command_scratch: Vec<WorldCommand>,
     /// Wall-clock time `apply_tick` took to complete its most recent tick,
     /// in milliseconds — everything a fixed step actually costs: force
     /// collection, every time-stepped solver's own advance, dynamics
@@ -1013,6 +1022,7 @@ impl SimulationRuntime {
             last_forces: BTreeMap::new(),
             body_history: BodyHistory::default(),
             force_scratch: Vec::new(),
+            command_scratch: Vec::new(),
             last_tick_compute_ms: 0.0,
         };
         runtime.check_single_provider_per_field()?;
@@ -1020,7 +1030,7 @@ impl SimulationRuntime {
         // mass-aggregate probe with a stale anchor position in it
         // (`RuntimeConfig::with_world`) — in the far more common case of
         // starting fresh, there is nothing yet for this to reposition.
-        runtime.adopt_world_commands(Vec::new())?;
+        runtime.adopt_world_commands(&[])?;
         let world_snapshot = runtime.world.snapshot();
         for slot in runtime.plugins.iter_mut().filter(|slot| slot.enabled) {
             slot.solver_mut().on_world_changed(&world_snapshot)?;
@@ -2153,18 +2163,26 @@ impl SimulationRuntime {
         // step are for.
         self.history.clear();
 
-        let mut commands = Vec::with_capacity(kinematics.len() * 2);
+        self.command_scratch.clear();
         for update in kinematics.into_values() {
-            commands.push(WorldCommand::SetTransform {
+            self.command_scratch.push(WorldCommand::SetTransform {
                 object: update.object,
                 transform: update.transform,
             });
-            commands.push(WorldCommand::SetVelocity {
+            self.command_scratch.push(WorldCommand::SetVelocity {
                 object: update.object,
                 velocity: update.velocity,
             });
         }
-        self.adopt_world_commands(commands)?;
+        // `command_scratch` is taken out and restored around the call rather
+        // than borrowed in place: `adopt_world_commands` takes `&mut self`,
+        // and the borrow checker cannot see that it only reads the slice —
+        // `self.adopt_world_commands(&self.command_scratch)` would borrow
+        // `self` both ways at once.
+        let commands = std::mem::take(&mut self.command_scratch);
+        let outcome = self.adopt_world_commands(&commands);
+        self.command_scratch = commands;
+        outcome?;
 
         // Object motion can change analytic fields as well as time-stepped
         // fields, so a kinematic tick must republish every active system.
@@ -2507,9 +2525,17 @@ impl SimulationRuntime {
     /// Validate and adopt a world edit without choosing a publication policy.
     /// Both authored commands and solver-produced kinematics cross this same
     /// Interface, keeping one authoritative world mutation path.
+    ///
+    /// Takes `commands` by reference rather than by value: the per-tick
+    /// caller ([`Self::apply_tick_inner`]) rebuilds the same command batch
+    /// every tick and wants to reuse one buffer's allocation across ticks
+    /// rather than hand its ownership away here. Nothing in this method
+    /// needs to mutate the caller's list in place — the mass-aggregate
+    /// anchor sync below is collected separately and chained in, rather than
+    /// appended to it.
     fn adopt_world_commands(
         &mut self,
-        mut commands: Vec<WorldCommand>,
+        commands: &[WorldCommand],
     ) -> Result<CommitReport, RuntimeError> {
         // Keep every mass-aggregate probe's anchor positioned at its live
         // centroid. Computed from `self.world` — the state *before* this
@@ -2522,6 +2548,7 @@ impl SimulationRuntime {
         // explicitly creates one — so an empty world still has exactly zero
         // objects.
         let world = self.world.snapshot();
+        let mut anchor_sync = Vec::new();
         if !world.mass_aggregate_probes().is_empty() {
             let bodies = dynamics::collect_mass_bearing_bodies(&world).unwrap_or_default();
             for probe in world.mass_aggregate_probes().values() {
@@ -2531,7 +2558,7 @@ impl SimulationRuntime {
                 if let Some(anchor) = world.object(probe.anchor)
                     && anchor.transform.translation != sample.center_of_mass
                 {
-                    commands.push(WorldCommand::SetTransform {
+                    anchor_sync.push(WorldCommand::SetTransform {
                         object: probe.anchor,
                         transform: Transform::at_finite(sample.center_of_mass),
                     });
@@ -2539,9 +2566,9 @@ impl SimulationRuntime {
             }
         }
 
-        let authored_commands = commands.clone();
         let mut candidate = self.world.clone();
-        let mut report = candidate.commit(commands)?;
+        let mut report =
+            candidate.commit(commands.iter().cloned().chain(anchor_sync.iter().cloned()))?;
         if report.revision == self.world.revision() {
             return Ok(report);
         }
@@ -2568,7 +2595,11 @@ impl SimulationRuntime {
         if !resolved.is_empty() {
             // Rebuild from the committed base so authored and derived property
             // updates land at one world revision, not two observable commits.
-            let mut atomic_commands = authored_commands;
+            // Built here, not unconditionally above: a kinematic tick with no
+            // expression bindings on a moved property — the common case —
+            // never reaches this branch, and so never pays for it.
+            let mut atomic_commands = commands.to_vec();
+            atomic_commands.extend(anchor_sync);
             atomic_commands.extend(resolved);
             candidate = self.world.clone();
             report = candidate.commit(atomic_commands)?;
@@ -3385,9 +3416,7 @@ mod tests {
         // Unlike the old lazy singleton, the anchor is minted immediately by
         // `CreateMassAggregateProbe` itself — no one-commit lag to create it,
         // only to reposition it once mass moves.
-        runtime
-            .adopt_world_commands(vec![universe_probe()])
-            .unwrap();
+        runtime.adopt_world_commands(&[universe_probe()]).unwrap();
         let derived: Vec<_> = runtime
             .world
             .snapshot()
@@ -3400,7 +3429,7 @@ mod tests {
 
         // Adding a mass-bearing object afterward must not mint a second one.
         runtime
-            .adopt_world_commands(vec![mass_object("a", DVec3::ZERO)])
+            .adopt_world_commands(&[mass_object("a", DVec3::ZERO)])
             .unwrap();
         let derived_after: Vec<_> = runtime
             .world
@@ -3425,9 +3454,7 @@ mod tests {
             .unwrap();
         let mut runtime = runtime_with_mass_schema(world, 0x302);
 
-        let report = runtime
-            .adopt_world_commands(vec![universe_probe()])
-            .unwrap();
+        let report = runtime.adopt_world_commands(&[universe_probe()]).unwrap();
         let probe_id = report.created_mass_aggregate_probes[0];
         let anchor = runtime
             .world
@@ -3437,12 +3464,12 @@ mod tests {
             .anchor;
 
         let report = runtime
-            .adopt_world_commands(vec![mass_object("a", DVec3::ZERO)])
+            .adopt_world_commands(&[mass_object("a", DVec3::ZERO)])
             .unwrap();
         // The anchor claimed id 0 when the probe was created above, so the
         // mass object created here is not `ObjectId::new(0)`.
         let mass_object_id = report.created_objects[0];
-        runtime.adopt_world_commands(Vec::new()).unwrap();
+        runtime.adopt_world_commands(&[]).unwrap();
         assert_eq!(
             runtime
                 .world
@@ -3455,7 +3482,7 @@ mod tests {
         );
 
         runtime
-            .adopt_world_commands(vec![WorldCommand::SetTransform {
+            .adopt_world_commands(&[WorldCommand::SetTransform {
                 object: mass_object_id,
                 transform: Transform::at_finite(DVec3::new(4.0, 0.0, 0.0)),
             }])
@@ -3474,7 +3501,7 @@ mod tests {
             DVec3::ZERO
         );
         // ...and catches up on the very next commit.
-        runtime.adopt_world_commands(Vec::new()).unwrap();
+        runtime.adopt_world_commands(&[]).unwrap();
         assert_eq!(
             runtime
                 .world

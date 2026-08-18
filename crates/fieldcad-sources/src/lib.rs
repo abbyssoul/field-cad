@@ -21,6 +21,8 @@
 //! physical quantity, so attaching mass to an object never drags in a motion
 //! model, a catalog identity, or a charge.
 
+use std::sync::OnceLock;
+
 use fieldcad_core::quantities::{MassKg, SiScalar};
 use fieldcad_core::{
     ChargeDistribution, ComponentSchema, ComponentTypeId, Dimension, PluginId, PointOrSphereError,
@@ -34,27 +36,53 @@ pub const GRAVITATIONAL_MASS_COMPONENT: &str = "gravitational-mass";
 pub const MASS_PROPERTY: &str = "mass";
 pub const FOLLOWS_INERTIAL_PROPERTY: &str = "follows-inertial";
 
-pub fn schema_namespace_id() -> PluginId {
-    PluginId::new(SCHEMA_NAMESPACE).expect("static schema namespace is valid")
+/// Every one of this module's `_id()` helpers is called once per source (or
+/// once per body) on every tick — `collect_gravity_sources`,
+/// `fieldcad_dynamics::collect_bodies`, `collect_mass_bearing_bodies` — over
+/// an ID built from the same `&'static str` every time. `PluginId`/
+/// `ComponentTypeId`/`PropertyId` store an `Arc<str>` internally
+/// specifically so a memoized instance can be handed back with a refcount
+/// bump instead of `new()`'s validation-plus-allocation on every call.
+macro_rules! cached_id {
+    ($vis:vis fn $name:ident() -> $ty:ty { $body:expr }) => {
+        $vis fn $name() -> $ty {
+            static ID: OnceLock<$ty> = OnceLock::new();
+            ID.get_or_init(|| $body).clone()
+        }
+    };
 }
 
-pub fn inertial_mass_component_id() -> ComponentTypeId {
-    ComponentTypeId::new(schema_namespace_id(), INERTIAL_MASS_COMPONENT)
-        .expect("static component ID is valid")
-}
+cached_id!(
+    pub fn schema_namespace_id() -> PluginId {
+        PluginId::new(SCHEMA_NAMESPACE).expect("static schema namespace is valid")
+    }
+);
 
-pub fn gravitational_mass_component_id() -> ComponentTypeId {
-    ComponentTypeId::new(schema_namespace_id(), GRAVITATIONAL_MASS_COMPONENT)
-        .expect("static component ID is valid")
-}
+cached_id!(
+    pub fn inertial_mass_component_id() -> ComponentTypeId {
+        ComponentTypeId::new(schema_namespace_id(), INERTIAL_MASS_COMPONENT)
+            .expect("static component ID is valid")
+    }
+);
 
-pub fn mass_property_id() -> PropertyId {
-    PropertyId::new(MASS_PROPERTY).expect("static property ID is valid")
-}
+cached_id!(
+    pub fn gravitational_mass_component_id() -> ComponentTypeId {
+        ComponentTypeId::new(schema_namespace_id(), GRAVITATIONAL_MASS_COMPONENT)
+            .expect("static component ID is valid")
+    }
+);
 
-pub fn follows_inertial_property_id() -> PropertyId {
-    PropertyId::new(FOLLOWS_INERTIAL_PROPERTY).expect("static property ID is valid")
-}
+cached_id!(
+    pub fn mass_property_id() -> PropertyId {
+        PropertyId::new(MASS_PROPERTY).expect("static property ID is valid")
+    }
+);
+
+cached_id!(
+    pub fn follows_inertial_property_id() -> PropertyId {
+        PropertyId::new(FOLLOWS_INERTIAL_PROPERTY).expect("static property ID is valid")
+    }
+);
 
 /// The mass given to an object when either component is first attached.
 ///
@@ -305,6 +333,34 @@ mod tests {
             .chain(specs.into_iter().map(WorldCommand::CreateObject));
         world.commit(commands).unwrap();
         world
+    }
+
+    /// The point of `cached_id!`: repeat calls hand back the same `Arc<str>`
+    /// allocation (same backing pointer), not a freshly validated and
+    /// allocated one — this is what turns the per-tick, per-source call into
+    /// a refcount bump.
+    #[test]
+    fn id_helpers_are_memoized_not_rebuilt() {
+        assert_eq!(
+            schema_namespace_id().as_str().as_ptr(),
+            schema_namespace_id().as_str().as_ptr()
+        );
+        assert_eq!(
+            inertial_mass_component_id().name().as_ptr(),
+            inertial_mass_component_id().name().as_ptr()
+        );
+        assert_eq!(
+            gravitational_mass_component_id().name().as_ptr(),
+            gravitational_mass_component_id().name().as_ptr()
+        );
+        assert_eq!(
+            mass_property_id().as_str().as_ptr(),
+            mass_property_id().as_str().as_ptr()
+        );
+        assert_eq!(
+            follows_inertial_property_id().as_str().as_ptr(),
+            follows_inertial_property_id().as_str().as_ptr()
+        );
     }
 
     fn inertial(kilograms: f64) -> (ComponentTypeId, PropertyBag) {

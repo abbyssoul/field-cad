@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,15 +28,22 @@ fn validate_identifier(value: &str) -> Result<(), IdentifierError> {
 
 macro_rules! string_id {
     ($name:ident) => {
+        // `Arc<str>` rather than `String`: an ID computed from a `&'static`
+        // constant (as every plugin's `xyz_id()` helper does — see
+        // `fieldcad-sources`, `fieldcad-electromagnetic-sources`) is cheap to
+        // memoize behind a `OnceLock` only if handing out repeat copies is a
+        // refcount bump, not a fresh allocation. `Clone` stays the same
+        // signature either way, so this is invisible to every existing
+        // caller.
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
-        pub struct $name(String);
+        pub struct $name(Arc<str>);
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
                 let value = value.into();
                 validate_identifier(&value)?;
-                Ok(Self(value))
+                Ok(Self(value.into()))
             }
 
             pub fn as_str(&self) -> &str {
@@ -61,14 +69,17 @@ string_id!(PropertyId);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct QualifiedName {
     plugin: PluginId,
-    name: String,
+    name: Arc<str>,
 }
 
 impl QualifiedName {
     fn new(plugin: PluginId, name: impl Into<String>) -> Result<Self, IdentifierError> {
         let name = name.into();
         validate_identifier(&name)?;
-        Ok(Self { plugin, name })
+        Ok(Self {
+            plugin,
+            name: name.into(),
+        })
     }
 }
 

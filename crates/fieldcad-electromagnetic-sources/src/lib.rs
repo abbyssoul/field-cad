@@ -13,6 +13,8 @@
 //! say — stay in that plugin's own namespace, because they are diagnostics of a
 //! discretization rather than quantities the world has.
 
+use std::sync::OnceLock;
+
 use fieldcad_core::quantities::{ChargeCoulombs, SiScalar};
 use fieldcad_core::{
     ChannelId, ChannelSchema, ChargeDistribution, ComponentSchema, ComponentTypeId, Dimension,
@@ -31,9 +33,27 @@ pub const ELECTRIC_FIELD_CHANNEL: &str = "electric-field";
 pub const MAGNETIC_FIELD_CHANNEL: &str = "magnetic-flux-density";
 pub const ELECTRIC_POTENTIAL_CHANNEL: &str = "electric-potential";
 
-pub fn schema_namespace_id() -> PluginId {
-    PluginId::new(SCHEMA_NAMESPACE).expect("static schema namespace is valid")
+/// `schema_namespace_id`/`charge_component_id`/`charge_property_id` are each
+/// called once per charge source (or once per collection pass) on every
+/// tick via `collect_charge_sources`/`source_from_object`, over an ID built
+/// from the same `&'static str` every time. `PluginId`/`ComponentTypeId`/
+/// `PropertyId` store an `Arc<str>` internally specifically so a memoized
+/// instance can be handed back with a refcount bump instead of `new()`'s
+/// validation-plus-allocation on every call.
+macro_rules! cached_id {
+    ($vis:vis fn $name:ident() -> $ty:ty { $body:expr }) => {
+        $vis fn $name() -> $ty {
+            static ID: OnceLock<$ty> = OnceLock::new();
+            ID.get_or_init(|| $body).clone()
+        }
+    };
 }
+
+cached_id!(
+    pub fn schema_namespace_id() -> PluginId {
+        PluginId::new(SCHEMA_NAMESPACE).expect("static schema namespace is valid")
+    }
+);
 
 pub fn field_namespace_id() -> PluginId {
     PluginId::new(FIELD_NAMESPACE).expect("static field namespace is valid")
@@ -84,14 +104,18 @@ pub fn electric_potential_channel_schema() -> ChannelSchema {
     }
 }
 
-pub fn charge_component_id() -> ComponentTypeId {
-    ComponentTypeId::new(schema_namespace_id(), CHARGE_COMPONENT)
-        .expect("static component ID is valid")
-}
+cached_id!(
+    pub fn charge_component_id() -> ComponentTypeId {
+        ComponentTypeId::new(schema_namespace_id(), CHARGE_COMPONENT)
+            .expect("static component ID is valid")
+    }
+);
 
-pub fn charge_property_id() -> PropertyId {
-    PropertyId::new(CHARGE_PROPERTY).expect("static property ID is valid")
-}
+cached_id!(
+    pub fn charge_property_id() -> PropertyId {
+        PropertyId::new(CHARGE_PROPERTY).expect("static property ID is valid")
+    }
+);
 
 pub fn charge_component_schema() -> ComponentSchema {
     ComponentSchema {
@@ -182,6 +206,26 @@ mod tests {
     use glam::DVec3;
 
     use super::*;
+
+    /// The point of `cached_id!`: repeat calls hand back the same `Arc<str>`
+    /// allocation (same backing pointer), not a freshly validated and
+    /// allocated one — this is what turns the per-tick, per-source call into
+    /// a refcount bump.
+    #[test]
+    fn id_helpers_are_memoized_not_rebuilt() {
+        assert_eq!(
+            schema_namespace_id().as_str().as_ptr(),
+            schema_namespace_id().as_str().as_ptr()
+        );
+        assert_eq!(
+            charge_component_id().name().as_ptr(),
+            charge_component_id().name().as_ptr()
+        );
+        assert_eq!(
+            charge_property_id().as_str().as_ptr(),
+            charge_property_id().as_str().as_ptr()
+        );
+    }
 
     #[test]
     fn point_and_sphere_objects_become_solver_neutral_charge_sources() {
