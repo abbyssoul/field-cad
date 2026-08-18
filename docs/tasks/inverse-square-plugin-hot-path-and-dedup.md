@@ -423,4 +423,52 @@ uncommitted; Phase 5 parked per review):
 - Verification: `cargo test --workspace` 843 passed (50 suites, +1 for
   the new memoization test), `cargo clippy --workspace --all-targets` and
   `cargo fmt --all --check` clean. Phase 5 (rayon evaluator) remains
-  parked. This closes the task.
+  parked.
+
+**2026-08-18 — `perf`-driven follow-up on the Phase 6 sample path**
+(post-closure, found profiling `profile_scene` against a real
+hand-authored scene, `~/Documents/field-cad/earth-moon-titan.fcscene`,
+under `perf record --call-graph=dwarf`, `kernel.perf_event_paranoid=1`):
+
+- `SampleGeometry::positions()` (`crates/fieldcad-core/src/sampling.rs`)
+  was `(0..len).filter_map(|i| self.position(i))`. `position(i)` is
+  `None` only for `i >= len()`, which the range never produces — every
+  variant's `position` impl confirms this, and every call site (verified
+  by grep) zips the iterator 1:1 against a same-length buffer — so the
+  `None` arm was unreachable by construction. `filter_map` can't be
+  `ExactSizeIterator`, so every `.collect()` over it (the per-tick sample
+  buffer in `CpuInverseSquareEvaluator::evaluate`) grew by repeated
+  reallocation instead of one upfront allocation. Changed to
+  `.map(...).expect(...)`; `Map` over `Range<usize>` is
+  `ExactSizeIterator`, so `.collect()` now sizes the buffer once.
+  Confirmed via `perf`: `__rust_realloc`/`CountingAlloc::realloc` no
+  longer appear above the 0.5% sample threshold (previously 5.61% of
+  cycles). Also fixed `profile_scene`'s `CountingAlloc`, which only
+  overrode `alloc`/`dealloc` — without a `realloc` override,
+  `GlobalAlloc`'s default falls back to alloc-copy-dealloc instead of
+  letting the system allocator extend in place, inflating the profiler's
+  own realloc cost above what an instrumented build would otherwise pay.
+- `GeometrySamples::from_samples` (`fieldcad-superposition-solver`) did
+  five separate `.iter().map(...).collect()` passes over one sample
+  slice. Fused into one loop over pre-sized `Vec`s. The measured win
+  wasn't the five-passes-over-cache-lines angle expected going in — it
+  was that the old `jacobians` column collected through
+  `Option<Vec<_>>>`'s `FromIterator` impl, which routes through a
+  `GenericShunt` adapter (for early-exit on the first `None`) that can't
+  report a size hint, so it grew by reallocation even though the other
+  four columns' plain collects were already exact-sized. The fused loop's
+  plain `Vec::with_capacity` + push has no such gap.
+- Measured (paired runs, same scene, same machine/load window):
+  allocations per tick **183 → 173** (`positions()` fix) **→ 167**
+  (`from_samples` fusion), reproducible to 3 decimal places across
+  repeated runs. Wall-clock min/mean/median were within the session's
+  machine noise (~load 4 on a 20-core box) either side of both fixes —
+  a real, `perf`-confirmed allocation-count win, not a wall-clock claim.
+- Verification: `cargo build/test/clippy/fmt --workspace` clean, 844
+  tests passing (both fixes are behavior-preserving: no channel, gradient,
+  or validity semantics changed, only how the buffers backing them are
+  built).
+
+This closes the task. Phase 5 (rayon evaluator) remains the only
+deliberately parked item — additive, measurement-gated, no correctness or
+dedup debt attached to leaving it parked.

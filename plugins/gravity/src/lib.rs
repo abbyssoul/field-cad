@@ -374,6 +374,7 @@ mod tests {
         let mut forces = vec![DVec3::ZERO; bodies.len()];
         solver.add_forces(&bodies, &mut forces).unwrap();
 
+        let inverse_square_sources: Vec<_> = collected.iter().map(inverse_square_source).collect();
         for (body, force) in bodies.iter().zip(&forces) {
             let mass = collected
                 .iter()
@@ -381,12 +382,14 @@ mod tests {
                 .unwrap()
                 .coupling_value
                 .into_si();
-            let expected_field = fieldcad_superposition::field_excluding(
+            let excluded = collected
+                .iter()
+                .position(|source| source.object == body.object)
+                .unwrap();
+            let expected_field = fieldcad_superposition::field_excluding_at(
                 -GRAVITATIONAL_CONSTANT,
-                collected
-                    .iter()
-                    .filter(|source| source.object != body.object)
-                    .map(inverse_square_source),
+                &inverse_square_sources,
+                excluded,
                 body.position,
             )
             .unwrap();

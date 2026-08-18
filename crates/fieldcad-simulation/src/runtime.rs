@@ -2005,8 +2005,8 @@ impl SimulationRuntime {
         );
         for slot in self.plugins.iter().filter(|slot| slot.enabled) {
             slot.solver().add_forces(bodies, &mut self.force_scratch)?;
-            dynamics::validate_forces_finite(&self.force_scratch)?;
         }
+        dynamics::validate_forces_finite(&self.force_scratch)?;
         Ok(())
     }
 

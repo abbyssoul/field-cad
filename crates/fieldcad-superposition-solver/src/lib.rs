@@ -28,9 +28,59 @@ use fieldcad_plugin_api::{
 };
 use fieldcad_superposition::{
     CpuInverseSquareEvaluator, InverseSquareBatchEvaluator, InverseSquareSample,
-    InverseSquareSource,
+    InverseSquareSource, field_excluding_at,
 };
 use glam::{DMat3, DVec3};
+
+/// Why a batched force accumulation failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddForcesError {
+    /// The summed field on body `body` overflowed to a non-finite value.
+    NonFinite { body: usize },
+}
+
+/// Accumulate the force on every body into `out` in one call.
+///
+/// `bodies` yields, per body, that body's own position in `sources` (its
+/// field does not act on itself) and its position; `None` means the body
+/// is not a source of this coupling: it neither exerts nor feels this
+/// force, and its accumulator is left untouched. The accumulated
+/// contribution is the field from every other source, times the body's
+/// own strength — the one law that is both `F = ma` (gravity) and
+/// `F = qE` (electrostatics), since the coupling value a source exerts
+/// with is the same number it feels with.
+///
+/// Forces are **accumulated** into `out`, never overwritten, so several
+/// equation systems can contribute to one resultant per body — the
+/// `add_forces` contract the dynamics runtime drives. `bodies` and `out`
+/// are consumed in lockstep and expected to agree in length, as that
+/// contract guarantees.
+///
+/// An own-position, where `Some`, must be a valid index into `sources`.
+/// Per body the summation order over sources is ascending index, exactly
+/// as `field_excluding_at`, so results are bit-identical to driving
+/// that function per body. Non-finiteness is detected in the summed
+/// field only — the `× own strength` product is unchecked, as on the
+/// per-body path, leaving accumulated-force validation to the caller
+/// (the dynamics runtime performs it once per tick).
+#[inline]
+fn add_forces_excluding_into(
+    coupling_constant: f64,
+    sources: &[InverseSquareSource],
+    bodies: impl Iterator<Item = (Option<usize>, DVec3)>,
+    out: &mut [DVec3],
+) -> Result<(), AddForcesError> {
+    for (body, ((excluded, position), out_force)) in bodies.zip(out.iter_mut()).enumerate() {
+        let Some(excluded) = excluded else {
+            continue;
+        };
+        let Some(field) = field_excluding_at(coupling_constant, sources, excluded, position) else {
+            return Err(AddForcesError::NonFinite { body });
+        };
+        *out_force += field * sources[excluded].strength;
+    }
+    Ok(())
+}
 
 /// One geometry's evaluation plus every column both channels publish,
 /// derived once per evaluation rather than once per channel read.
@@ -376,7 +426,7 @@ impl<C: InverseSquareCoupling> EquationSystemSolver for InverseSquareSolver<C> {
         // coupling) neither exerts nor feels this force — `None`, skipped
         // by the kernel. One call per tick; the force law itself lives in
         // the kernel, once, with its tests.
-        fieldcad_superposition::add_forces_excluding_into(
+        add_forces_excluding_into(
             C::COUPLING_CONSTANT,
             &self.inverse_square_sources,
             bodies
@@ -385,7 +435,7 @@ impl<C: InverseSquareCoupling> EquationSystemSolver for InverseSquareSolver<C> {
             out,
         )
         .map_err(|error| match error {
-            fieldcad_superposition::AddForcesError::NonFinite { .. } => {
+            AddForcesError::NonFinite { .. } => {
                 PluginError::Solver(C::NON_FINITE_MESSAGE.to_owned())
             }
         })
@@ -520,6 +570,16 @@ mod tests {
     use fieldcad_plugin_api::SolverCancellation;
 
     use super::*;
+
+    fn point(strength: f64, position: DVec3) -> InverseSquareSource {
+        InverseSquareSource {
+            position,
+            strength,
+            distribution: fieldcad_core::ChargeDistribution::Point {
+                exclusion_radius: 0.0,
+            },
+        }
+    }
 
     /// A minimal coupling over unitless point sources, for contract tests
     /// that are about the skeleton, not any physics.
@@ -856,6 +916,67 @@ mod tests {
         assert!(
             Arc::ptr_eq(&field_first.validity, &potential.validity),
             "the field and potential channels of one geometry must share one validity buffer"
+        );
+    }
+
+    /// The batch entry point must be bit-identical to driving
+    /// `field_excluding_at` per body — over exterior points, a sphere
+    /// interior, and non-source bodies alike — and must accumulate into
+    /// `out` rather than overwrite it.
+    #[test]
+    fn add_forces_excluding_into_matches_the_per_body_path_bit_for_bit() {
+        let sources = [
+            point(1.5, DVec3::new(-1.0, 0.2, 0.0)),
+            point(-0.8, DVec3::new(2.0, -0.5, 1.0)),
+            InverseSquareSource {
+                position: DVec3::new(0.3, 0.3, 0.3),
+                strength: 2.0,
+                distribution: fieldcad_core::ChargeDistribution::UniformSphere { radius: 1.5 },
+            },
+        ];
+        let bodies = [
+            (Some(0), DVec3::ZERO),
+            (None, DVec3::X),
+            (Some(2), DVec3::new(0.4, 0.2, 0.3)),
+            (Some(1), DVec3::new(-2.0, 1.0, 0.3)),
+        ];
+        // A prior resultant from another equation system: the batch must
+        // add onto it, and a non-source body must keep it untouched.
+        let prior = DVec3::new(1.0, 2.0, 3.0);
+        let mut out = [prior; 4];
+        add_forces_excluding_into(1.0, &sources, bodies.into_iter(), &mut out).unwrap();
+
+        for ((excluded, position), force) in bodies.iter().zip(&out) {
+            let expected = match excluded {
+                Some(excluded) => {
+                    let field = field_excluding_at(1.0, &sources, *excluded, *position).unwrap();
+                    field * sources[*excluded].strength
+                }
+                None => DVec3::ZERO,
+            };
+            assert_eq!(*force, prior + expected);
+        }
+    }
+
+    #[test]
+    fn a_non_finite_force_sum_reports_the_offending_body() {
+        // Overflow is detected in the summed field, exactly where
+        // `field_excluding_at` detects it: body 1 evaluates the huge
+        // source from two metres out, where the `MAX · d` intermediate is
+        // already infinite. Body 0 excludes that source and feels only the
+        // mild one, staying finite — so the error must name body 1.
+        let sources = [
+            point(f64::MAX, DVec3::ZERO),
+            point(1.0, DVec3::new(5.0, 0.0, 0.0)),
+        ];
+        let bodies = [
+            (Some(0), DVec3::new(1.0, 0.0, 0.0)),
+            (Some(1), DVec3::new(2.0, 0.0, 0.0)),
+        ];
+        let mut out = [DVec3::ZERO; 2];
+        assert_eq!(
+            add_forces_excluding_into(1.0, &sources, bodies.into_iter(), &mut out),
+            Err(AddForcesError::NonFinite { body: 1 })
         );
     }
 }
