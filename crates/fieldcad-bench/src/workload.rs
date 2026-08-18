@@ -448,6 +448,11 @@ fn electrostatics_forces(scene: &Scene, config: &MeasureConfig) -> Timing {
     )
 }
 
+fn electrostatics_solver_init(scene: &Scene, config: &MeasureConfig) -> Timing {
+    let world = scene.world();
+    measure(config, || (), |(), _| electrostatics_solver(scene, &world))
+}
+
 fn gravity_sample_plane(scene: &Scene, config: &MeasureConfig) -> Timing {
     let world = gravity_world(scene);
     let geometry = plane_geometry(scene);
@@ -867,6 +872,18 @@ pub fn benchmarks(quick: bool) -> Vec<Benchmark> {
             declared: Complexity::Linear,
             scenes: charge_sweep(default.clone().with_name("forces"), quick),
             runner: electrostatics_forces,
+        },
+        Benchmark {
+            id: "electrostatics/solver-init",
+            group: "electrostatics",
+            what: "create_solver for the analytic electrostatics backend",
+            why: "runs on activation; the analytic solver is trivially \
+                  constructed, so this is the electrostatics analogue of \
+                  gravity/solver-init and the two should agree",
+            parameter: Parameter::Cells,
+            declared: Complexity::Constant,
+            scenes: cell_sweep(default.clone().with_name("e-init"), quick),
+            runner: electrostatics_solver_init,
         },
         Benchmark {
             id: "gravity/sample-plane",

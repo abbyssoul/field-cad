@@ -2,14 +2,13 @@
 //!
 //! This is the first physical equation-system plugin. The CPU `f64` evaluator
 //! is deliberately small and explicit: it is the correctness oracle for every
-//! later parallel or GPU implementation.
+//! later parallel or GPU implementation. The solver and the plugin wrapper
+//! are shared with gravity, in `fieldcad-superposition-solver`; this crate
+//! owns the identity, schemas, constants, and the `ChargeSource` coupling.
 
-use std::sync::Arc;
-
-use fieldcad_core::quantities::SiScalar;
+use fieldcad_core::quantities::ChargeCoulombs;
 use fieldcad_core::{
-    ChannelSchema, ComponentSchema, DiagnosticSeverity, Domain, FieldColumn, GradientColumn,
-    ObjectIndex, PluginId, PluginVersion, SampleGeometry, SolverDiagnostic, WorldSnapshot,
+    ChannelSchema, ComponentSchema, CoupledSource, PluginId, PluginVersion, WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_properties, charge_property_id,
@@ -18,26 +17,28 @@ pub use fieldcad_electromagnetic_sources::{
 use fieldcad_electromagnetic_sources::{
     charge_component_schema, electric_field_channel_schema, electric_potential_channel_schema,
 };
-use fieldcad_plugin_api::{
-    ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
-    PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
-};
-use fieldcad_superposition::{
-    CpuInverseSquareEvaluator, InverseSquareBatchEvaluator, InverseSquareSample,
-    InverseSquareSource,
-};
+use fieldcad_plugin_api::PluginMetadata;
+use fieldcad_superposition::InverseSquareSample;
+use fieldcad_superposition_solver::{InverseSquareCoupling, InverseSquarePlugin};
 use glam::DVec3;
 
 #[cfg(test)]
-use fieldcad_core::{Precision, PropertyBag, SampleValidity};
+use fieldcad_core::{Domain, Precision, PropertyBag, SampleGeometry, SampleValidity};
+#[cfg(test)]
+use std::sync::Arc;
 
 pub const PLUGIN_ID: &str = "fieldcad.electrostatics";
 
 /// Coulomb constant in N·m²/C² (CODATA conventional value used by the oracle).
 pub const COULOMB_CONSTANT: f64 = 8.987_551_792_3e9;
 
-pub const ELECTRIC_FIELD_HANDLE: ChannelHandle = ChannelHandle::new(0);
-pub const ELECTRIC_POTENTIAL_HANDLE: ChannelHandle = ChannelHandle::new(1);
+/// The solver skeleton owns the handle ordering; these aliases keep the
+/// plugin's own names for the same values, so what `channels()` advertises
+/// and what the skeleton's `sample` matches cannot drift apart.
+pub use fieldcad_superposition_solver::{
+    FIELD_CHANNEL_HANDLE as ELECTRIC_FIELD_HANDLE,
+    POTENTIAL_CHANNEL_HANDLE as ELECTRIC_POTENTIAL_HANDLE,
+};
 
 pub fn plugin_id() -> PluginId {
     PluginId::new(PLUGIN_ID).expect("static plugin ID is valid")
@@ -50,18 +51,10 @@ pub use fieldcad_electromagnetic_sources::{
     electric_field_channel_id, electric_potential_channel_id,
 };
 
-/// `ChargeSource` → the shared, coupling-value-agnostic source shape
-/// `fieldcad-superposition`'s kernel (and any GPU evaluator built over it)
-/// actually operates on. Public so a GPU evaluator can build its own source
-/// buffer from the same mapping this crate's CPU reference uses, rather than
-/// duplicating it.
-pub fn inverse_square_source(source: &ChargeSource) -> InverseSquareSource {
-    InverseSquareSource {
-        position: source.position,
-        strength: source.coupling_value.into_si(),
-        distribution: source.distribution,
-    }
-}
+/// The one generic `CoupledSource<T>` → `InverseSquareSource` mapping,
+/// under this plugin's own name: a GPU evaluator builds its source buffer
+/// from the same mapping the CPU reference uses.
+pub use fieldcad_superposition_solver::coupled_inverse_square_source as inverse_square_source;
 
 /// Evaluate the superposed electrostatic field and potential in SI units.
 pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> InverseSquareSample {
@@ -72,33 +65,24 @@ pub fn evaluate_sources(sources: &[ChargeSource], position: DVec3) -> InverseSqu
     )
 }
 
-/// Analytic electrostatics over a pluggable batched evaluator.
-pub struct ElectrostaticsPlugin {
-    evaluator: Arc<dyn InverseSquareBatchEvaluator>,
-}
+/// Analytic electrostatics over a pluggable batched evaluator — the shared
+/// plugin wrapper, parameterized by this crate's coupling.
+pub type ElectrostaticsPlugin = InverseSquarePlugin<ElectrostaticsCoupling>;
 
-impl Default for ElectrostaticsPlugin {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Electrostatics as an [`InverseSquareCoupling`]: everything Coulomb's law
+/// differs from Newtonian gravity by, and nothing else — the solver and
+/// the plugin wrapper are shared, in `fieldcad-superposition-solver`.
+pub struct ElectrostaticsCoupling;
 
-impl ElectrostaticsPlugin {
-    /// Backed by the reference `f64` evaluator.
-    pub fn new() -> Self {
-        Self {
-            evaluator: Arc::new(CpuInverseSquareEvaluator),
-        }
-    }
+impl InverseSquareCoupling for ElectrostaticsCoupling {
+    type Strength = ChargeCoulombs;
+    const COUPLING_CONSTANT: f64 = COULOMB_CONSTANT;
+    const SYSTEM_LABEL: &str = "electrostatics";
+    const NON_FINITE_MESSAGE: &str = "electrostatic force evaluation produced a non-finite field";
+    const DIAGNOSTIC_CODE: &str = "electrostatic-source-count";
+    const SOURCE_NOUN: &str = "charge";
 
-    /// Backed by a host-owned evaluator, typically a `wgpu` compute backend.
-    pub fn with_evaluator(evaluator: Arc<dyn InverseSquareBatchEvaluator>) -> Self {
-        Self { evaluator }
-    }
-}
-
-impl EquationSystemPlugin for ElectrostaticsPlugin {
-    fn metadata(&self) -> PluginMetadata {
+    fn metadata() -> PluginMetadata {
         PluginMetadata {
             id: plugin_id(),
             version: PluginVersion::new(0, 1, 0),
@@ -107,264 +91,21 @@ impl EquationSystemPlugin for ElectrostaticsPlugin {
         }
     }
 
-    fn channels(&self) -> Vec<ChannelSchema> {
+    fn channels() -> Vec<ChannelSchema> {
         vec![
             electric_field_channel_schema(),
             electric_potential_channel_schema(),
         ]
     }
 
-    fn component_schemas(&self) -> Vec<ComponentSchema> {
+    fn component_schemas() -> Vec<ComponentSchema> {
         vec![charge_component_schema()]
     }
 
-    fn create_solver(
-        &self,
-        context: SolverContext<'_>,
-    ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
-        // A snapshot's precision metadata must describe the numbers it actually
-        // carries, or an `f32` interactive result is indistinguishable from the
-        // `f64` oracle it is checked against.
-        if context.domain.precision() != self.evaluator.precision() {
-            return Err(PluginError::InvalidConfiguration(format!(
-                "electrostatics evaluator produces {}, but the domain declares {}",
-                self.evaluator.precision().label(),
-                context.domain.precision().label()
-            )));
-        }
-        let sources = sources(context.world)?;
-        let inverse_square_sources = sources
-            .as_slice()
-            .iter()
-            .map(inverse_square_source)
-            .collect();
-        Ok(Box::new(ElectrostaticsSolver {
-            domain: *context.domain,
-            sources,
-            inverse_square_sources,
-            world_revision: context.world.revision(),
-            evaluator: Arc::clone(&self.evaluator),
-            cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
-        }))
-    }
-}
-
-/// Collect the world's charge sources, dropping zero-charge ones before
-/// they reach the solver's indexes.
-///
-/// The returned `ObjectIndex` and the solver's `inverse_square_sources`
-/// buffer are built from the same filtered list, so position `i` in one is
-/// position `i` in the other — the alignment `add_forces`' index-based
-/// exclusion relies on. Dropping zero-charge sources here is observable
-/// only through sources whose field and force contributions are exactly
-/// zero (the kernel skips them anyway); it also keeps the reported source
-/// count to contributing sources.
-fn sources(world: &WorldSnapshot) -> Result<ObjectIndex<ChargeSource>, PluginError> {
-    collect_sources(world)
-        .map(|collected| {
-            ObjectIndex::new(
-                collected
-                    .into_iter()
-                    .filter(|source| source.coupling_value.into_si() != 0.0)
-                    .collect(),
-            )
-        })
-        .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
-}
-
-/// A subscription currently has probes plus any number of planes and one
-/// grid. Bounds stale entries left by density changes without complicating
-/// the plugin contract with publication lifecycle callbacks.
-const SAMPLE_CACHE_CAPACITY: usize = 16;
-
-struct ElectrostaticsSolver {
-    domain: Domain,
-    sources: ObjectIndex<ChargeSource>,
-    /// Rebuilt with the object-indexed sources on creation/world changes;
-    /// this is the cache-local input shape the shared evaluator expects,
-    /// converted once per world change rather than on every channel read.
-    inverse_square_sources: Vec<InverseSquareSource>,
-    world_revision: fieldcad_core::WorldRevision,
-    evaluator: Arc<dyn InverseSquareBatchEvaluator>,
-    /// Runtime publication asks for E and V separately. Retain the small set of
-    /// geometries from this publication so both channels share one evaluation.
-    cache: SampleCache<InverseSquareSample>,
-}
-
-impl EquationSystemSolver for ElectrostaticsSolver {
-    fn kind(&self) -> SolverKind {
-        SolverKind::Analytic
-    }
-
-    fn validate_world(&self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        collect_sources(world)
-            .map(|_| ())
-            .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
-    }
-
-    fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        self.sources = sources(world)?;
-        self.inverse_square_sources = self
-            .sources
-            .as_slice()
-            .iter()
-            .map(inverse_square_source)
-            .collect();
-        self.world_revision = world.revision();
-        self.cache.clear()
-    }
-
-    fn sample(
-        &self,
-        channel: ChannelHandle,
-        geometry: &SampleGeometry,
-    ) -> Result<SampledColumn, PluginError> {
-        let samples = self.samples_for(geometry)?;
-        let validity = samples.iter().map(|sample| sample.validity).collect();
-        // A gradient is published only if *every* sample in the batch
-        // reported one — the rest of the pipeline treats "does this batch
-        // carry a gradient" as one per-batch decision, not a per-point one.
-        let gradients = samples
-            .iter()
-            .map(|sample| sample.gradient)
-            .collect::<Option<Vec<_>>>();
-        match channel {
-            ELECTRIC_FIELD_HANDLE => {
-                let column = SampledColumn::new(
-                    FieldColumn::vectors(samples.iter().map(|sample| sample.field).collect()),
-                    validity,
-                );
-                Ok(match gradients {
-                    Some(jacobians) => {
-                        column.with_gradient(GradientColumn::Vector(jacobians.into()))
-                    }
-                    None => column,
-                })
-            }
-            ELECTRIC_POTENTIAL_HANDLE => {
-                let column = SampledColumn::new(
-                    FieldColumn::scalars(samples.iter().map(|sample| sample.potential).collect()),
-                    validity,
-                );
-                // ∇φ = −E: the potential's gradient is exactly minus the
-                // field this solver already computed, so no separate math is
-                // needed — only whether `gradients.is_some()` still gates it,
-                // to keep both channels' gradient availability consistent
-                // for the same evaluator.
-                Ok(match gradients {
-                    Some(_) => column.with_gradient(GradientColumn::Scalar(
-                        samples.iter().map(|sample| -sample.field).collect(),
-                    )),
-                    None => column,
-                })
-            }
-            other => Err(PluginError::UnknownChannel(other.index())),
-        }
-    }
-
-    /// Add the Coulomb force on each dynamic body into `out`: `F = qE`.
-    ///
-    /// Note the field, not the potential. `qφ` is the potential *energy* in
-    /// joules; the force is the charge times the field, which is minus the
-    /// gradient of that potential. The evaluator already returns `E`, so this is
-    /// the one multiplication.
-    ///
-    /// A body's own charge is excluded from the field acting on it — a point
-    /// charge does not accelerate itself, and its own Coulomb singularity would
-    /// dominate everything else if it were included.
-    fn add_forces(&self, bodies: &[DynamicBody], out: &mut [DVec3]) -> Result<(), PluginError> {
-        for (body, out_force) in bodies.iter().zip(out) {
-            // One lookup decides both questions: a body absent from the
-            // filtered index (not a source, or uncharged) neither exerts
-            // nor feels this field.
-            let Some(excluded) = self.sources.index_of(body.object) else {
-                continue;
-            };
-            // `strength` is `coupling_value.into_si()` by construction —
-            // the same number as the source's charge, without touching the
-            // second source array.
-            let charge = self.inverse_square_sources[excluded].strength;
-            let field = self.field_excluding(excluded, body.position)?;
-            *out_force += field * charge;
-        }
-        Ok(())
-    }
-
-    fn diagnostics(&self) -> Vec<SolverDiagnostic> {
-        vec![SolverDiagnostic {
-            plugin: plugin_id(),
-            severity: DiagnosticSeverity::Info,
-            code: "electrostatic-source-count".to_owned(),
-            message: format!(
-                "{} charge source(s), {} batched evaluator, world revision {}",
-                self.sources.len(),
-                self.evaluator.precision().label(),
-                self.world_revision
-            ),
-        }]
-    }
-}
-
-impl ElectrostaticsSolver {
-    /// The electric field at `position` from every source except the one
-    /// at index `excluded` of the solver's positionally aligned source
-    /// slices.
-    ///
-    /// Evaluated over the precomputed `inverse_square_sources` buffer via
-    /// the kernel's slice-based exclusion — the same items in the same
-    /// order `ObjectIndex::iter_excluding` yields, without re-mapping each
-    /// source per body per tick.
-    fn field_excluding(&self, excluded: usize, position: DVec3) -> Result<DVec3, PluginError> {
-        fieldcad_superposition::field_excluding_at(
-            COULOMB_CONSTANT,
-            &self.inverse_square_sources,
-            excluded,
-            position,
-        )
-        .ok_or_else(|| {
-            PluginError::Solver(
-                "electrostatic force evaluation produced a non-finite field".to_owned(),
-            )
-        })
-    }
-
-    fn samples_for(
-        &self,
-        geometry: &SampleGeometry,
-    ) -> Result<Arc<[InverseSquareSample]>, PluginError> {
-        self.cache.get_or_try_insert_with(
-            geometry,
-            || {
-                let evaluated = self
-                    .evaluator
-                    .evaluate(
-                        COULOMB_CONSTANT,
-                        &self.inverse_square_sources,
-                        &self.domain,
-                        geometry,
-                    )
-                    .map_err(PluginError::Solver)?;
-                if evaluated.len() != geometry.len() {
-                    return Err(PluginError::Solver(format!(
-                        "batched evaluator returned {} samples for a geometry of length {}",
-                        evaluated.len(),
-                        geometry.len()
-                    )));
-                }
-                Ok(evaluated)
-            },
-            |out| {
-                self.evaluator
-                    .evaluate_into(
-                        COULOMB_CONSTANT,
-                        &self.inverse_square_sources,
-                        &self.domain,
-                        geometry,
-                        out,
-                    )
-                    .map_err(PluginError::Solver)
-            },
-        )
+    fn collect_sources(
+        world: &WorldSnapshot,
+    ) -> Result<Vec<CoupledSource<ChargeCoulombs>>, String> {
+        collect_sources(world).map_err(|error| error.to_string())
     }
 }
 
@@ -374,8 +115,14 @@ mod tests {
 
     use fieldcad_core::quantities::{ChargeCoulombs, MassKg, SiScalar, coulomb, kilogram};
     use fieldcad_core::{
-        BoundaryConditions, ChargeDistribution, DomainBounds, ObjectId, ObjectShape, ObjectSpec,
-        PlaneLattice, Resolution, Transform, UndefinedReason, Velocity, World, WorldCommand,
+        ChargeDistribution, ObjectId, ObjectShape, ObjectSpec, PlaneLattice, Transform,
+        UndefinedReason, Velocity, World, WorldCommand,
+    };
+    use fieldcad_plugin_api::{
+        DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError, SolverContext,
+    };
+    use fieldcad_superposition::{
+        CpuInverseSquareEvaluator, InverseSquareBatchEvaluator, InverseSquareSource,
     };
     use glam::UVec2;
 
@@ -705,120 +452,6 @@ mod tests {
         for (batched, position) in batched.iter().zip(geometry.positions()) {
             assert_eq!(*batched, evaluate_sources(&sources, position));
         }
-    }
-
-    #[test]
-    fn accelerated_channels_share_one_batch_evaluation() {
-        let evaluator = Arc::new(CountingEvaluator {
-            calls: AtomicUsize::new(0),
-        });
-        let plugin = ElectrostaticsPlugin::with_evaluator(evaluator.clone());
-        let world = World::new().snapshot();
-        let domain = Domain::new(
-            DomainBounds::centred_cube(2.0).unwrap(),
-            Resolution::uniform(4).unwrap(),
-            BoundaryConditions::default(),
-            Precision::F32,
-        );
-        let configuration = PropertyBag::default();
-        let mut solver = plugin
-            .create_solver(SolverContext {
-                configuration: &configuration,
-                domain: &domain,
-                world: &world,
-                initial_step: fieldcad_core::StepContext {
-                    tick: 0,
-                    time_seconds: 0.0,
-                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
-                },
-                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
-            })
-            .unwrap();
-        solver.on_world_changed(&world).unwrap();
-        let geometry = SampleGeometry::Plane {
-            plane: fieldcad_core::PlaneId::new(0),
-            lattice: PlaneLattice::new(DVec3::ZERO, DVec3::X, DVec3::Y, UVec2::splat(3)),
-        };
-
-        solver.sample(ELECTRIC_FIELD_HANDLE, &geometry).unwrap();
-        solver.sample(ELECTRIC_POTENTIAL_HANDLE, &geometry).unwrap();
-
-        assert_eq!(evaluator.calls.load(Ordering::Relaxed), 1);
-    }
-
-    /// A plane offset from the origin, comfortably outside a default-radius
-    /// point charge's exclusion zone, for tests that need every sample to
-    /// come back `Exact` rather than `Undefined`.
-    fn plane_away_from_the_origin() -> SampleGeometry {
-        SampleGeometry::Plane {
-            plane: fieldcad_core::PlaneId::new(0),
-            lattice: PlaneLattice::new(
-                DVec3::new(-1.0, -1.0, 0.5),
-                DVec3::new(0.5, 0.0, 0.0),
-                DVec3::new(0.0, 0.5, 0.0),
-                UVec2::splat(3),
-            ),
-        }
-    }
-
-    #[test]
-    fn the_electric_field_channel_publishes_its_jacobian() {
-        let solver = solver_for_charged_shape(None).unwrap();
-        let geometry = plane_away_from_the_origin();
-
-        let column = solver.sample(ELECTRIC_FIELD_HANDLE, &geometry).unwrap();
-
-        match column.gradient {
-            Some(GradientColumn::Vector(jacobians)) => assert_eq!(jacobians.len(), geometry.len()),
-            other => panic!("expected a Jacobian per sample, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_potential_channel_publishes_minus_the_field_as_its_gradient() {
-        let solver = solver_for_charged_shape(None).unwrap();
-        let geometry = plane_away_from_the_origin();
-
-        let field_column = solver.sample(ELECTRIC_FIELD_HANDLE, &geometry).unwrap();
-        let potential_column = solver.sample(ELECTRIC_POTENTIAL_HANDLE, &geometry).unwrap();
-
-        let FieldColumn::Vector(fields) = field_column.values else {
-            panic!("expected a vector field column");
-        };
-        let Some(GradientColumn::Scalar(gradients)) = potential_column.gradient else {
-            panic!("expected the potential channel to publish a gradient");
-        };
-
-        assert_eq!(fields.len(), gradients.len());
-        for (field, gradient) in fields.iter().zip(gradients.iter()) {
-            assert!((*gradient - (-*field)).length() < 1.0e-12);
-        }
-    }
-
-    #[test]
-    fn accelerated_evaluator_precision_must_match_snapshot_metadata() {
-        let evaluator = Arc::new(CountingEvaluator {
-            calls: AtomicUsize::new(0),
-        });
-        let plugin = ElectrostaticsPlugin::with_evaluator(evaluator);
-        let world = World::new().snapshot();
-        let domain = Domain::centred_cube(2.0, 4).unwrap();
-        let configuration = PropertyBag::default();
-
-        assert!(matches!(
-            plugin.create_solver(SolverContext {
-                configuration: &configuration,
-                domain: &domain,
-                world: &world,
-                initial_step: fieldcad_core::StepContext {
-                    tick: 0,
-                    time_seconds: 0.0,
-                    time_step: fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
-                },
-                cancellation: fieldcad_plugin_api::SolverCancellation::default(),
-            }),
-            Err(PluginError::InvalidConfiguration(_))
-        ));
     }
 
     /// Phase 2 parity: `add_forces` over the solver's precomputed,

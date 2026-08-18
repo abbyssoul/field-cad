@@ -25,8 +25,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use clap::Parser;
 use fieldcad_mcp::McpServer;
 use fieldcad_server::HeadlessServer;
+use fieldcad_simulation::{CommandPayload, PlaybackSpeed};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8642";
@@ -37,37 +39,54 @@ const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8642";
 /// against typical simulation time steps.
 const DRIVE_INTERVAL: Duration = Duration::from_millis(16);
 
-const HELP: &str = "\
-fieldcad-mcp — MCP transport onto the Field CAD simulation model
-
-USAGE:
-    fieldcad-mcp [OPTIONS]
-
-OPTIONS:
-    --stdio           Serve over stdio. Default if no transport is given.
-    --http [ADDR]     Serve Streamable HTTP at ADDR (default 127.0.0.1:8642),
-                      mounted at /mcp. ADDR must be a loopback address —
-                      remote access needs an explicit opt-in that does not
-                      exist yet (docs/mcp-plan.md phase 5). Always requires a
-                      bearer token: pass --token, or one is generated and
-                      printed once.
-    --token TOKEN     The bearer token --http requires. Ignored without
-                      --http.
-    --unix PATH       Serve Streamable HTTP over a Unix domain socket at
-                      PATH, mounted at /mcp. Local IPC only, never a network
-                      listener, and unauthenticated — the socket file's 0600
-                      permissions are its trust boundary. Requires a Unix
-                      platform.
-    -h, --help        Show this message.
-
+const AFTER_HELP: &str = "\
 Options are additive: pass more than one to serve the same session over
 several transports at once.
 
 ENVIRONMENT:
-    RUST_LOG          e.g. fieldcad_mcp=debug
-";
+    RUST_LOG          e.g. fieldcad_mcp=debug";
 
-#[derive(Default)]
+#[derive(Parser)]
+#[command(
+    name = "fieldcad-mcp",
+    version,
+    about = "MCP transport onto the Field CAD simulation model",
+    after_help = AFTER_HELP
+)]
+struct Cli {
+    /// Serve over stdio. Default if no transport is given.
+    #[arg(long)]
+    stdio: bool,
+
+    /// Serve Streamable HTTP at ADDR, mounted at /mcp. ADDR must be a
+    /// loopback address — remote access needs an explicit opt-in that does
+    /// not exist yet (docs/mcp-plan.md phase 5). Always requires a bearer
+    /// token: pass --token, or one is generated and printed once.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        num_args = 0..=1,
+        default_missing_value = DEFAULT_HTTP_ADDR
+    )]
+    http: Option<SocketAddr>,
+
+    /// The bearer token --http requires. Ignored without --http.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+
+    /// Serve Streamable HTTP over a Unix domain socket at PATH, mounted at
+    /// /mcp. Local IPC only, never a network listener, and unauthenticated —
+    /// the socket file's 0600 permissions are its trust boundary. Requires a
+    /// Unix platform.
+    #[arg(long, value_name = "PATH")]
+    unix: Option<PathBuf>,
+
+    /// Load this authored scene document at startup instead of the
+    /// built-in default session.
+    #[arg(long, value_name = "PATH")]
+    scene: Option<PathBuf>,
+}
+
 struct Transports {
     stdio: bool,
     http: Option<SocketAddr>,
@@ -75,53 +94,22 @@ struct Transports {
     unix: Option<PathBuf>,
 }
 
-enum ArgOutcome {
-    Run(Transports),
-    Help,
-}
-
-fn parse_args(args: impl Iterator<Item = String>) -> Result<ArgOutcome, String> {
-    let mut transports = Transports::default();
-    let mut args = args.peekable();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(ArgOutcome::Help),
-            "--stdio" => transports.stdio = true,
-            "--http" => {
-                let addr = match args.peek() {
-                    Some(next) if !next.starts_with("--") => args.next().unwrap(),
-                    _ => DEFAULT_HTTP_ADDR.to_owned(),
-                };
-                let addr: SocketAddr = addr
-                    .parse()
-                    .map_err(|error| format!("invalid --http address '{addr}': {error}"))?;
-                if !addr.ip().is_loopback() {
-                    return Err(format!(
-                        "refusing to bind {addr}: only loopback addresses are accepted \
-                         (docs/mcp-plan.md phase 5)"
-                    ));
-                }
-                transports.http = Some(addr);
-            }
-            "--token" => {
-                transports.token = Some(
-                    args.next()
-                        .ok_or_else(|| "--token requires a value".to_owned())?,
-                );
-            }
-            "--unix" => {
-                let path = args
-                    .next()
-                    .ok_or_else(|| "--unix requires a socket path".to_owned())?;
-                transports.unix = Some(PathBuf::from(path));
-            }
-            other => return Err(format!("unrecognized argument '{other}'")),
-        }
+fn parse_args(cli: &Cli) -> Result<Transports, String> {
+    if let Some(addr) = cli.http
+        && !addr.ip().is_loopback()
+    {
+        return Err(format!(
+            "refusing to bind {addr}: only loopback addresses are accepted \
+             (docs/mcp-plan.md phase 5)"
+        ));
     }
-    if !transports.stdio && transports.http.is_none() && transports.unix.is_none() {
-        transports.stdio = true;
-    }
-    Ok(ArgOutcome::Run(transports))
+    let stdio = cli.stdio || (cli.http.is_none() && cli.unix.is_none());
+    Ok(Transports {
+        stdio,
+        http: cli.http,
+        token: cli.token.clone(),
+        unix: cli.unix.clone(),
+    })
 }
 
 #[tokio::main]
@@ -138,26 +126,36 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    let transports = match parse_args(std::env::args().skip(1)) {
-        Ok(ArgOutcome::Help) => {
-            print!("{HELP}");
-            return ExitCode::SUCCESS;
-        }
-        Ok(ArgOutcome::Run(transports)) => transports,
+    let cli = Cli::parse();
+    let transports = match parse_args(&cli) {
+        Ok(transports) => transports,
         Err(error) => {
-            eprintln!("{error}\n\n{HELP}");
+            eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
 
-    let source = match fieldcad_server::default_session() {
-        Ok(source) => source,
-        Err(error) => {
-            tracing::error!(%error, "failed to build the default session");
-            return ExitCode::FAILURE;
-        }
+    let loaded = match &cli.scene {
+        Some(path) => fieldcad_server::session_from_document(path).map_err(|error| {
+            tracing::error!(%error, scene = %path.display(), "failed to load scene");
+        }),
+        None => fieldcad_server::default_session()
+            .map(|source| (source, PlaybackSpeed::default()))
+            .map_err(|error| {
+                tracing::error!(%error, "failed to build the default session");
+            }),
     };
-    let model = Arc::new(Mutex::new(HeadlessServer::new(source)));
+    let (source, playback_speed) = match loaded {
+        Ok(loaded) => loaded,
+        Err(()) => return ExitCode::FAILURE,
+    };
+
+    let mut headless = HeadlessServer::new(source);
+    if let Err(error) = headless.submit(CommandPayload::SetPlaybackSpeed(playback_speed)) {
+        tracing::error!(%error, "failed to apply the scene's playback speed");
+        return ExitCode::FAILURE;
+    }
+    let model = Arc::new(Mutex::new(headless));
     let server = McpServer::new(
         Arc::clone(&model),
         Arc::new(fieldcad_mcp::mcp_plugin_catalog),

@@ -398,8 +398,33 @@ impl SampleGeometry {
         }
     }
 
+    /// Every position this geometry describes, in index order.
+    ///
+    /// `map`, not `filter_map`: `position(index)` is `None` only for
+    /// `index >= self.len()`, which `0..self.len()` never produces, so the
+    /// `None` arm is unreachable here by construction. `filter_map` cannot
+    /// be `ExactSizeIterator` (a predicate might drop items), which used to
+    /// stop every `.collect()` over this iterator — the per-sample
+    /// evaluation buffer, once per solver publication — from specializing
+    /// to a single upfront allocation; it grew by repeated reallocation
+    /// instead. `Map` over `Range<usize>` (already `ExactSizeIterator`) is
+    /// `ExactSizeIterator` too, so `.collect()` sizes the buffer once.
+    /// Every position this geometry describes, in index order.
+    ///
+    /// `map`, not `filter_map`: `position(index)` is `None` only for
+    /// `index >= self.len()`, which `0..self.len()` never produces, so the
+    /// `None` arm is unreachable here by construction. `filter_map` cannot
+    /// be `ExactSizeIterator` (a predicate might drop items), which used to
+    /// stop every `.collect()` over this iterator — the per-sample
+    /// evaluation buffer, once per solver publication — from specializing
+    /// to a single upfront allocation; it grew by repeated reallocation
+    /// instead. `Map` over `Range<usize>` (already `ExactSizeIterator`) is
+    /// `ExactSizeIterator` too, so `.collect()` sizes the buffer once.
     pub fn positions(&self) -> impl Iterator<Item = DVec3> + '_ {
-        (0..self.len()).filter_map(|index| self.position(index))
+        (0..self.len()).map(|index| {
+            self.position(index)
+                .expect("index < self.len() always has a position")
+        })
     }
 
     pub const fn plane_id(&self) -> Option<PlaneId> {
@@ -538,12 +563,15 @@ pub struct FieldBatch {
 
 impl FieldBatch {
     /// Lengths are checked once per batch here, rather than once per value at
-    /// every call site that reads the batch.
+    /// every call site that reads the batch. `validity` is taken as shared
+    /// parts when the caller already holds an `Arc` column (a solver's
+    /// memoized derivation) and as an owned `Vec` otherwise.
     pub fn new(
         geometry: SampleGeometry,
         values: FieldColumn,
-        validity: Vec<SampleValidity>,
+        validity: impl Into<Arc<[SampleValidity]>>,
     ) -> Result<Self, SamplingError> {
+        let validity = validity.into();
         if values.len() != geometry.len() {
             return Err(SamplingError::LengthMismatch {
                 geometry: geometry.len(),
@@ -562,7 +590,7 @@ impl FieldBatch {
         Ok(Self {
             geometry,
             values,
-            validity: validity.into(),
+            validity,
             gradient: None,
         })
     }

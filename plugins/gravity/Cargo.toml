@@ -8,5 +8,6 @@ description = "Analytic Newtonian gravity equation-system plugin"
 fieldcad-core = { workspace = true }
 fieldcad-sources = { workspace = true }
 fieldcad-superposition = { workspace = true }
+fieldcad-superposition-solver = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 glam = { workspace = true }

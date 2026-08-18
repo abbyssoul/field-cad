@@ -14,16 +14,20 @@
 //! own standalone binary and embedded inside the desktop app, sharing one
 //! session with the desktop UI's own commands.
 
-use std::{collections::BTreeMap, collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, collections::HashMap, path::Path, path::PathBuf, sync::Arc,
+    time::Duration,
+};
 
 use fieldcad_core::{
     CatalogEntryRef, CatalogLinkMode, CommitReport, Domain, FieldSnapshot, ObjectId, PluginId,
-    PropertyBag, SceneScale, SessionId, TimeStep, TimeStepError, Transform, Velocity, WorldCommand,
-    WorldSnapshot,
+    PropertyBag, SceneScale, SessionId, TimeStep, TimeStepError, Transform, Velocity, World,
+    WorldCommand, WorldSnapshot,
 };
 use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
-use fieldcad_scene_document::{FieldSystemComposition, RunRecord};
+use fieldcad_gravity::NewtonianGravityPlugin;
+use fieldcad_scene_document::{FieldSystemComposition, LoadError, ResolveError, RunRecord};
 use fieldcad_simulation::{
     AsyncLocalDataSource, BodySample, Command, CommandDisposition, CommandEvent, CommandId,
     CommandPayload, CommandReceipt, CommandSequencer, DataSourceStatus, DistanceHistory,
@@ -160,9 +164,8 @@ mod history_capture;
 pub use event_hub::{EventHub, EventWatcher, SessionEvent, WatchEvent};
 
 /// Builds the default session: a numerical domain and the same solver
-/// composition rule the desktop app uses (one electric field, two candidate
-/// models — electrostatics active, Maxwell composed but inactive), starting
-/// from an empty world.
+/// composition rule the desktop app uses (electrostatics active, gravity and
+/// Maxwell composed but inactive), starting from an empty world.
 ///
 /// Deliberately empty rather than pre-populated: what scene to author is a
 /// client decision (desktop's demo scene is a UI convenience, not part of the
@@ -179,15 +182,20 @@ pub fn default_session() -> Result<AsyncLocalDataSource, SessionError> {
     Ok(AsyncLocalDataSource::new(LocalDataSource::new(runtime)))
 }
 
-/// The headless server's CPU-only plugin composition: one electric field,
-/// two candidate models — electrostatics active, Maxwell composed but
-/// inactive. Factored out of [`default_session`] so a scene-lifecycle
-/// loader (new/save/load, `fieldcad-scene-document`) can rebuild a session
-/// from this same composition rather than a hardcoded one, the way the
-/// desktop app's GPU-backed catalog does for its own host.
+/// The headless server's CPU-only plugin composition: electrostatics
+/// active, gravity and Maxwell composed but inactive — the same three-model
+/// mix the desktop app's own catalog registers (`desktop_plugin_catalog`),
+/// so a document authored there resolves here without a missing-plugin
+/// error just because this host never mentioned a model the document
+/// referenced but left disabled. Factored out of [`default_session`] so a
+/// scene-lifecycle loader (new/save/load, `fieldcad-scene-document`) can
+/// rebuild a session from this same composition rather than a hardcoded
+/// one.
 pub fn server_plugin_catalog() -> Vec<PluginRegistration> {
     vec![
         PluginRegistration::with_default_configuration(Box::new(ElectrostaticsPlugin::new())),
+        PluginRegistration::with_default_configuration(Box::new(NewtonianGravityPlugin::new()))
+            .with_enabled(false),
         PluginRegistration::with_default_configuration(Box::new(ElectromagnetismPlugin::new()))
             .with_enabled(false),
     ]
@@ -199,6 +207,60 @@ pub enum SessionError {
     Domain(#[from] fieldcad_core::DomainError),
     #[error(transparent)]
     TimeStep(#[from] TimeStepError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+}
+
+/// Build a session from an authored `.fcscene` document over
+/// [`server_plugin_catalog`], for any standalone binary hosting this crate
+/// (`fieldcad-server`, `fieldcad-mcp`) that wants to start from a saved
+/// scene instead of an empty default session.
+///
+/// Returns the document's own [`PlaybackSpeed`] alongside the source: the
+/// runtime's `TickPacer` paces simulated ticks against *wall-clock* seconds
+/// at a 1:1 default, so a scene authored with `dt` on the order of hours per
+/// tick needs its saved playback multiplier restored via
+/// `CommandPayload::SetPlaybackSpeed` or it advances at a real-time crawl.
+/// `RuntimeConfig` has no field for it because it is a runtime command, not
+/// construction state.
+pub fn session_from_document(
+    path: &Path,
+) -> Result<(AsyncLocalDataSource, PlaybackSpeed), SceneSessionError> {
+    let outcome = fieldcad_scene_document::load_newest_valid(path)?;
+    let doc = outcome.document;
+
+    let (plugins, warnings) =
+        fieldcad_scene_document::resolve_plugins(server_plugin_catalog(), &doc.field_systems)?;
+    for warning in &warnings {
+        tracing::warn!(
+            plugin = %warning.plugin,
+            document_version = %warning.document_version,
+            linked_version = %warning.linked_version,
+            "plugin version mismatch"
+        );
+    }
+
+    let mut config = RuntimeConfig::new(doc.domain, doc.time_step, SessionId::from_u128(1))
+        .with_world(World::from_document(doc.world))
+        .with_scene_scale(doc.scene_scale)
+        .with_integration_scheme(doc.integration_scheme);
+    for plugin in plugins {
+        config = config.with_plugin_registration(plugin);
+    }
+
+    let runtime = SimulationRuntime::new(config)?;
+    Ok((
+        AsyncLocalDataSource::new(LocalDataSource::new(runtime)),
+        doc.playback_speed,
+    ))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SceneSessionError {
+    #[error(transparent)]
+    Load(#[from] LoadError),
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
 }

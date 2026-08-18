@@ -15,6 +15,7 @@ members = [
     "crates/fieldcad-server",
     "crates/fieldcad-simulation",
     "crates/fieldcad-superposition",
+    "crates/fieldcad-superposition-solver",
     "plugins/electrostatics",
     "plugins/electromagnetism",
     "plugins/gravity",
@@ -91,6 +92,7 @@ fieldcad-scene-document = { path = "crates/fieldcad-scene-document" }
 fieldcad-server = { path = "crates/fieldcad-server" }
 fieldcad-simulation = { path = "crates/fieldcad-simulation" }
 fieldcad-superposition = { path = "crates/fieldcad-superposition" }
+fieldcad-superposition-solver = { path = "crates/fieldcad-superposition-solver" }
 fieldcad-electrostatics = { path = "plugins/electrostatics" }
 fieldcad-electromagnetism = { path = "plugins/electromagnetism" }
 fieldcad-gravity = { path = "plugins/gravity" }

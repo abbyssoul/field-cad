@@ -168,17 +168,21 @@ In `crates/fieldcad-superposition/src/lib.rs`:
   `lib.rs:78-92` — `exterior_field`/`exterior_potential` shared helpers;
   `lib.rs:184` — `evaluate_sources` (end-of-sample finiteness check);
   `lib.rs:241` — `field_excluding` (zero-strength skip);
-  `lib.rs:258` — `field_excluding_at` (slice-based exclusion by index,
-  the per-body force entry point and the seed of Phase 3's
-  `field_excluding_into`); `lib.rs:340` —
+  `lib.rs:258` — `field_excluding_at` (slice-based exclusion by index);
+  `lib.rs:286-335` — `AddForcesError` and `add_forces_excluding_into`
+  (the one-call-per-tick force entry point); `lib.rs:385` —
   `CpuInverseSquareEvaluator` (Phase 5 sibling).
-- `plugins/gravity/src/lib.rs:164` — `sources()` (zero-coupling filter,
-  the index-alignment invariant); `lib.rs:249` — `add_forces`
-  (index-based, single lookup); `lib.rs:287` —
-  `acceleration_excluding`.
-- `plugins/electrostatics/src/lib.rs:180` — `sources()` (the same
-  filter/invariant); `lib.rs:259` — `add_forces`; `lib.rs:296` —
-  `field_excluding`; `lib.rs:602` — `CountingEvaluator` test double.
+- `plugins/gravity/src/lib.rs:147` — `GravityCoupling`; `lib.rs:133` —
+  `create_solver` (one call into the skeleton); `lib.rs:71` —
+  `inverse_square_source` / `evaluate_sources` oracle free fns. Since
+  Phase 4 the plugin holds no solver code.
+- `plugins/electrostatics/src/lib.rs:145` — `ElectrostaticsCoupling`;
+  the same adapter shape plus the charge schema re-exports.
+- `crates/fieldcad-superposition-solver/src/lib.rs:52` —
+  `InverseSquareCoupling` trait; `lib.rs:97` — `InverseSquareSolver`
+  (the shared skeleton: filtering invariant, precision gate,
+  batch-length check, cache, force delegation); `lib.rs:36` — the
+  channel handles both plugins alias.
 - `crates/fieldcad-core/src/object_index.rs:54` — `index_of`, beside the
   `iter_excluding` order guarantee it pairs with.
 - `crates/fieldcad-plugin-api/src/lib.rs:445` — `SampleCache` (identity
@@ -260,3 +264,163 @@ In `crates/fieldcad-superposition/src/lib.rs`:
   paths are code-identical to Phase 1 and were not re-benched; the
   earlier pre-Phase-2 baseline comparison under load-14 conditions was
   discarded as noise (even untouched paths showed ±30%).
+
+**2026-08-18 — Phase 3 landed, re-scoped to its remainder** (working
+tree, uncommitted):
+
+- Phase 2's `field_excluding_at` had already absorbed the original
+  Phase 3 motivation (per-body iterator chains, per-source re-mapping,
+  per-tick allocation); what landed is the remainder: one public batch
+  entry point so the force law (`F = field × own strength`, covering
+  both `F = ma` and `F = qE`) lives in the kernel once, with its tests,
+  and both plugins' `add_forces` become a single kernel call per tick.
+- Kernel: `add_forces_excluding_into(coupling, sources, bodies, out)`
+  where `bodies: impl Iterator<Item = (Option<usize>, DVec3)>` — per
+  body its own source index (`None` = not a source: neither exerts nor
+  feels) and position; accumulates into `out` (multi-system resultant
+  contract); `AddForcesError::NonFinite { body }` names the first body
+  whose summed field overflowed. The × own-strength product is
+  unchecked, matching the per-body path — the dynamics runtime
+  validates accumulated forces once per tick. Sources-outer SIMD
+  variant explicitly deferred as a measured follow-up; rayon-over-bodies
+  (Phase 5) needs no further API change.
+- Tests: kernel batch-vs-per-body bit-for-bit parity (exterior, sphere
+  interior, `None` bodies, accumulation onto a prior resultant);
+  offending-body error index. Both plugins' existing parity, zero-
+  strength, and PH-2/PH-3 tests pass unchanged through the new path.
+- **Two measured detours worth recording.** (1) The first cut took
+  per-body slices and the plugins materialized them through a
+  `Mutex<ForceScratch>` (SampleCache precedent): reproducibly
+  **+10–96% slower** (sub-2% noise, both plugins) — the uncontended
+  lock plus scratch materialization dominates at small body counts.
+  Replaced with the iterator shape: zero scratch, zero lock. (2) The
+  iterator version still showed a reproducible +6–7% at 1–2 bodies
+  (< 1 ns absolute, harness-insignificant): the generic batch fn was
+  not inlining across the crate boundary. `#[inline]` on it resolved
+  this to exact parity.
+- Measured vs pre-Phase-3 HEAD (paired quiet-window runs, sub-2% noise):
+  `gravity/forces` and `electrostatics/forces` **−1.0% to +1.1%** across
+  1–32 sources, stable on repeat — parity, as an API-shaping phase
+  should be. Full workspace 843 passed, clippy/fmt clean.
+
+**2026-08-18 — Phase 4 landed** (working tree, uncommitted):
+
+- New crate `crates/fieldcad-superposition-solver`: the shared
+  `InverseSquareSolver<C>` skeleton (`EquationSystemSolver` impl,
+  per-geometry `SampleCache`, zero-coupling filtering with the
+  index-alignment invariant, precision gate, batch-length verification,
+  force delegation to `add_forces_excluding_into`) parameterized by an
+  `InverseSquareCoupling` trait (constant, labels, collection, mapping,
+  strength). Also owns `FIELD_CHANNEL_HANDLE`/`POTENTIAL_CHANNEL_HANDLE`;
+  both plugins' handle constants are re-export aliases of these, so
+  advertised schemas and matched handles cannot drift. The crate keeps
+  `fieldcad-superposition` dependency-light (its "no plugin" boundary
+  statement stands); layering is core ← {plugin-api, superposition} ←
+  superposition-solver ← plugins.
+- Plugins are adapters: identity/metadata/schemas/constants, the public
+  oracle free fns (`inverse_square_source`, `evaluate_sources` — desktop's
+  GPU evaluator consumes these), a private coupling impl, and a one-call
+  `create_solver`. Gravity 789→624 lines, electrostatics 993→746 (net
+  −570 across the pair, new crate 591 including tests). Public plugin
+  APIs unchanged — bench, desktop, server, mcp compile untouched.
+- Contract tests carried once in the new crate (toy coupling +
+  `CountingEvaluator`/`WrongLengthEvaluator` doubles): both-channels-
+  share-one-evaluation, world-change cache invalidation, evaluator/domain
+  precision rejection, **wrong-length batch rejection with solver
+  context** (§3.4 closed for gravity), diagnostics identity. Pruned the
+  now-duplicated plugin-side tests per review decision (gravity's
+  precision-mismatch; electrostatics' cache-sharing and
+  precision-mismatch; both replaced by the crate-level tests). All
+  physics/regression tests (PH-2/PH-3, bit-parity, zero-strength,
+  evaluator-contract, Jacobian channels) pass unchanged through the
+  skeleton. Full workspace 845 passed (50 suites), clippy/fmt clean.
+  Benching skipped per review decision — the delegation chain is
+  provably identical to Phase 3's measured-parity path.
+
+**2026-08-18 — Phase 4 follow-up: residual dedup audit** (working tree,
+uncommitted; Phase 5 parked per review):
+
+- A re-audit of both plugins found two residual implementation mirrors
+  and one uncovered skeleton contract. Fixed: (1) the plugin struct +
+  constructor trio + `create_solver` (identical except the type name)
+  moved into the solver crate as a generic
+  `InverseSquarePlugin<C: InverseSquareCoupling>`; the coupling trait
+  grew `metadata()`/`channels()`/`component_schemas()` and dropped its
+  `PLUGIN_ID` const (metadata is now the single identity source —
+  diagnostics report `metadata().id`), so identity cannot drift between
+  the two. Plugins are `pub type` aliases over their public couplings —
+  `::new()`/`::with_evaluator`/trait-object usage unchanged at every
+  call site. (2) The public `inverse_square_source` mapping (the one the
+  desktop GPU evaluator consumes) is now one generic
+  `coupled_inverse_square_source<T: SiScalar>` in the solver crate,
+  re-exported under each plugin's existing name. (3) The four mirrored
+  plugin gradient-channel tests (skeleton logic since Phase 4, which the
+  skeleton's own `CountingEvaluator` tests — `gradient: None` — did not
+  cover) were replaced by one skeleton test driving the real
+  `CpuInverseSquareEvaluator`, asserting the field channel's per-sample
+  Jacobian and the potential channel's exact `−field` gradient.
+- Kept as accepted mirroring: per-plugin force-parity and zero-strength
+  tests (world authoring, collection, and coupling mapping are the
+  plugin-specific content), and `evaluate_sources`/channel constants
+  (identity by design).
+- End state: gravity 530 lines (145 non-test), electrostatics 648,
+  solver crate 734 (incl. tests); net −473 lines vs pre-Phase-4 while
+  adding coverage. Full workspace 842 passed (50 suites), clippy/fmt
+  clean. Phase 5 (rayon evaluator) parked; Phase 6 remains
+  measurement-gated on the sample path.
+
+**2026-08-18 — Phase 6 landed** (working tree, uncommitted):
+
+- Gate opened per Phase 6a's own criterion: the `sample_path` example
+  (`crates/fieldcad-bench/examples/sample_path.rs`, added this phase)
+  isolates the cache-hit steady-state read cost from evaluation. Pre-6b,
+  each `sample()` call re-derived validity/gradient/values buffers by
+  iterating the cached raw samples — an O(n) allocation pass per channel
+  read, present even on a cache hit. That share was decisively over the
+  ~10% bar (it *was* the entire steady-state cost), so 6b proceeded.
+- `InverseSquareSolver`'s cache changed from `SampleCache<InverseSquareSample>`
+  to `SampleCache<GeometrySamples>`: `GeometrySamples` bundles one
+  evaluation's raw samples plus every derived column (validity, jacobians,
+  field/potential values, negated-field gradient) as `Arc`s, computed once.
+  `sample()` shrank to a lock, one cache fetch, and per-channel `Arc::clone`s
+  via `SampledColumn::from_shared_parts` (new small constructor added to
+  `fieldcad-plugin-api`, since `SampledColumn`'s fields are private).
+- **Documented caveat**: `SampleCache<T>`'s in-place `refresh` path is
+  gated on `entry.len() == geometry.len()`, a check written for its
+  original per-sample-point `T`. With `T = GeometrySamples` (one bundle
+  per geometry, so `entry.len()` is always 1), that guard only re-admits
+  `refresh` when `geometry.len() == 1` (a single probe); every
+  multi-sample geometry (planes, grids, boxes, spheres) takes the
+  `compute` fallback on a stale hit and pays one fresh evaluation — the
+  same cost the pre-Phase-6 cache always paid there. No correctness loss
+  (the fallback is always valid), only a foregone secondary optimization
+  the plan's design didn't fully account for. Recorded here rather than
+  silently accepted, per the no-SampleCache-API-change decision in the
+  locked plan.
+- New test: `repeated_reads_of_one_geometry_share_the_same_validity_and_
+  value_buffers`, pinning the memoization itself via `Arc::ptr_eq` — both
+  channels of one geometry, and two reads of an unchanged world, hand out
+  the identical buffer, not merely an equal one.
+- Measured (release, `sample_path`, paired quiet-window runs): steady-state
+  per-read cost is now **flat at ~58–62 ns regardless of geometry size**
+  across 4,225/16,641/66,049 samples — down from an O(n) per-read
+  derivation to the lock + `Arc::clone` floor the design targeted. Drag
+  publication (evaluate + both channels after a world change) is
+  unaffected, as expected: it was never on the memoized path, and the
+  Phase-6 caveat above means multi-sample geometries still re-evaluate
+  fully on every drag tick, same as before. `profile_scene`'s
+  `CountingAlloc` cross-check was skipped — no `.fcscene` sample file
+  exists in the repo to drive it; the direct steady-state measurement
+  already demonstrates the O(1) read the phase set out to prove.
+- Also fixed in passing: an unrelated pre-existing regression in the
+  working tree — `fieldcad-sources::inertial_mass_of` had dropped its
+  `mass > 0` validation when refactored to share `inertial_mass_property`
+  with `fieldcad-dynamics` (which correctly wants the permissive
+  finite-only filter, since it only sees already-validated masses).
+  Restored the `> 0` check at `inertial_mass_of`'s call site, where the
+  guarantee is actually enforced. Caught by the workspace test suite,
+  unrelated to Phase 6 itself.
+- Verification: `cargo test --workspace` 843 passed (50 suites, +1 for
+  the new memoization test), `cargo clippy --workspace --all-targets` and
+  `cargo fmt --all --check` clean. Phase 5 (rayon evaluator) remains
+  parked. This closes the task.

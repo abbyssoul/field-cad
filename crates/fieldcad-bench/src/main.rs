@@ -5,29 +5,14 @@
 
 use std::{path::PathBuf, process::ExitCode};
 
+use clap::{Parser, ValueEnum};
 use fieldcad_bench::{
     RunConfig, report,
     report::{Change, Report},
     run, selected,
 };
 
-const USAGE: &str = "\
-fieldcad-bench — headless compute performance harness
-
-USAGE:
-    fieldcad-bench [OPTIONS]
-
-OPTIONS:
-    --filter <SUBSTRING>   Run only benchmarks whose ID contains SUBSTRING
-    --quick                Fewer samples and smaller sweeps, for iterating
-    --format <table|json>  Output format (default: table)
-    --list                 List benchmarks and their sweeps, without running
-    --baseline <PATH>      Compare this run against a saved JSON report
-    --save-baseline <PATH> Write this run's JSON report to PATH
-    --fail-on-regression   Exit non-zero if a benchmark is slower than baseline,
-                           or if any measured growth exceeds its declared O()
-    -h, --help             Show this help
-
+const AFTER_HELP: &str = "\
 EXAMPLES:
     # What is slow, and does anything scale worse than it claims?
     fieldcad-bench
@@ -40,91 +25,71 @@ EXAMPLES:
     fieldcad-bench --baseline perf.json --fail-on-regression
 
     # Machine-readable
-    fieldcad-bench --format json --quick
-";
+    fieldcad-bench --format json --quick";
 
+#[derive(Parser)]
+#[command(
+    name = "fieldcad-bench",
+    version,
+    about = "Headless compute performance harness",
+    after_help = AFTER_HELP
+)]
 struct Options {
-    config: RunConfig,
+    /// Run only benchmarks whose ID contains SUBSTRING.
+    #[arg(long, value_name = "SUBSTRING")]
+    filter: Option<String>,
+
+    /// Fewer samples and smaller sweeps, for iterating rather than recording.
+    #[arg(long)]
+    quick: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Table)]
     format: Format,
+
+    /// List benchmarks and their sweeps, without running.
+    #[arg(long)]
     list: bool,
+
+    /// Compare this run against a saved JSON report.
+    #[arg(long, value_name = "PATH")]
     baseline: Option<PathBuf>,
+
+    /// Write this run's JSON report to PATH.
+    #[arg(long, value_name = "PATH")]
     save_baseline: Option<PathBuf>,
+
+    /// Exit non-zero if a benchmark is slower than baseline, or if any
+    /// measured growth exceeds its declared O().
+    #[arg(long)]
     fail_on_regression: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Table,
     Json,
 }
 
-fn parse() -> Result<Option<Options>, String> {
-    let mut filter = None;
-    let mut quick = false;
-    let mut format = Format::Table;
-    let mut list = false;
-    let mut baseline = None;
-    let mut save_baseline = None;
-    let mut fail_on_regression = false;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "-h" | "--help" => {
-                print!("{USAGE}");
-                return Ok(None);
-            }
-            "--quick" => quick = true,
-            "--list" => list = true,
-            "--fail-on-regression" => fail_on_regression = true,
-            "--filter" => {
-                filter = Some(args.next().ok_or("--filter needs a substring")?);
-            }
-            "--format" => {
-                format = match args.next().ok_or("--format needs a value")?.as_str() {
-                    "table" => Format::Table,
-                    "json" => Format::Json,
-                    other => return Err(format!("unknown format '{other}'")),
-                };
-            }
-            "--baseline" => {
-                baseline = Some(PathBuf::from(args.next().ok_or("--baseline needs a path")?));
-            }
-            "--save-baseline" => {
-                save_baseline = Some(PathBuf::from(
-                    args.next().ok_or("--save-baseline needs a path")?,
-                ));
-            }
-            other => return Err(format!("unknown argument '{other}'\n\n{USAGE}")),
+impl Options {
+    fn run_config(&self) -> RunConfig {
+        RunConfig {
+            filter: self.filter.clone(),
+            quick: self.quick,
         }
     }
-
-    Ok(Some(Options {
-        config: RunConfig { filter, quick },
-        format,
-        list,
-        baseline,
-        save_baseline,
-        fail_on_regression,
-    }))
 }
 
 fn main() -> ExitCode {
-    let options = match parse() {
-        Ok(Some(options)) => options,
-        Ok(None) => return ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let options = Options::parse();
+    let config = options.run_config();
 
     if options.list {
-        list_benchmarks(&options.config);
+        list_benchmarks(&config);
         return ExitCode::SUCCESS;
     }
 
-    let benchmarks = selected(&options.config);
+    let benchmarks = selected(&config);
     if benchmarks.is_empty() {
         eprintln!("error: no benchmark matched the filter");
         return ExitCode::FAILURE;
@@ -150,7 +115,7 @@ fn main() -> ExitCode {
                 .sum::<usize>()
         );
     }
-    let report = run(&options.config, |id, scene| {
+    let report = run(&config, |id, scene| {
         if !quiet {
             eprint!("\r  {id} :: {scene}                    ");
         }
@@ -238,12 +203,15 @@ fn print_table(report: &Report, baseline: Option<&Report>) {
         );
 
         println!(
-            "  {: <24} {: >12} {: >12} {: >12} {: >9}{}",
+            "  {: <24} {: >10} {: >12} {: >12} {: >12} {: >12} {: >10} {: >12}{}",
             "scene",
             bench.parameter,
+            "min",
+            "mean",
             "median",
+            "max",
+            "iters",
             "per unit",
-            "noise",
             vs_baseline_header(&comparisons)
         );
         for point in &bench.points {
@@ -253,12 +221,15 @@ fn print_table(report: &Report, baseline: Option<&Report>) {
                     .find(|entry| entry.id == bench.id && entry.scene == point.scene)
             });
             println!(
-                "  {: <24} {: >12} {: >12} {: >12} {: >8.1}%{}",
+                "  {: <24} {: >10} {: >12} {: >12} {: >12} {: >12} {: >10} {: >12}{}",
                 point.scene,
                 report::format_count(point.n),
+                report::format_ns(point.timing.min_ns),
+                report::format_ns(point.timing.mean_ns),
                 report::format_ns(point.timing.median_ns),
+                report::format_ns(point.timing.max_ns),
+                report::format_count(point.timing.total_iterations() as f64),
                 report::format_ns(point.ns_per_unit),
-                point.timing.noise() * 100.0,
                 match comparison {
                     Some(comparison) if comparison.change == Change::New => "   new".to_owned(),
                     Some(comparison) => format!(

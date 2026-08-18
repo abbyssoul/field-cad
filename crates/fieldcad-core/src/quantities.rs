@@ -95,6 +95,20 @@ pub trait SiScalar: Sized + Copy {
     fn from_si(value: f64) -> Self;
 }
 
+/// The dimensionless identity case: a bare `f64` is its own SI magnitude.
+/// Exists for coupling-agnostic test doubles (e.g. a toy inverse-square
+/// coupling exercising shared solver contract tests) that need a
+/// `SiScalar` without pulling in a real physical quantity.
+impl SiScalar for f64 {
+    fn into_si(self) -> f64 {
+        self
+    }
+
+    fn from_si(value: f64) -> Self {
+        value
+    }
+}
+
 macro_rules! impl_si_scalar {
     ($ty:ty, $unit:path) => {
         impl SiScalar for $ty {

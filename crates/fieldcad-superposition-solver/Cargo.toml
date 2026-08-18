@@ -1,12 +1,11 @@
 [package]
-name = "fieldcad-electrostatics"
+name = "fieldcad-superposition-solver"
 version = "0.1.0"
 edition = "2024"
+description = "Shared equation-system solver skeleton over the inverse-square superposition kernel"
 
 [dependencies]
 fieldcad-core = { workspace = true }
-fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 fieldcad-superposition = { workspace = true }
-fieldcad-superposition-solver = { workspace = true }
 glam = { workspace = true }

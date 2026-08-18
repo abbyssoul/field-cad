@@ -74,7 +74,7 @@ use fieldcad_core::{
     WorldSnapshot, relativistic_momentum,
 };
 use fieldcad_plugin_api::{DynamicBody, ObjectKinematicsUpdate};
-use fieldcad_sources::{SourceError, inertial_mass_component_id, inertial_mass_of};
+use fieldcad_sources::{SourceError, inertial_mass_component_id, inertial_mass_property};
 use glam::DVec3;
 
 /// Which numerical scheme advances a dynamic body from its summed force.
@@ -128,8 +128,8 @@ pub fn collect_bodies(
 ) -> Result<(Vec<DynamicBody>, Vec<DynamicBody>), DynamicsError> {
     let mut dynamic = Vec::new();
     let mut carried = Vec::new();
-    for (object, _properties) in world.objects_with(&inertial_mass_component_id()) {
-        let inertial_mass_kg = inertial_mass_of(object)?;
+    for (object, properties) in world.objects_with(&inertial_mass_component_id()) {
+        let inertial_mass_kg = inertial_mass_property(properties).unwrap();
         let body = DynamicBody {
             object: object.id,
             inertial_mass_kg,
@@ -156,10 +156,10 @@ pub fn collect_mass_bearing_bodies(
 ) -> Result<Vec<DynamicBody>, DynamicsError> {
     world
         .objects_with(&inertial_mass_component_id())
-        .map(|(object, _properties)| {
+        .map(|(object, properties)| {
             Ok(DynamicBody {
                 object: object.id,
-                inertial_mass_kg: inertial_mass_of(object)?,
+                inertial_mass_kg: inertial_mass_property(properties).unwrap(),
                 position: object.transform.translation,
                 velocity: object.velocity.linear,
             })

@@ -2,26 +2,19 @@
 //! kernel — see `fieldcad-superposition`'s module doc. Newton's law of
 //! gravitation and Coulomb's law are the same functional form with a
 //! different coupling constant and an opposite sign; this plugin is the
-//! thin, gravity-specific adapter over that shared kernel, mirroring
-//! `plugins/electrostatics`.
+//! thin, gravity-specific adapter over that shared kernel, the shared
+//! solver skeleton, and the shared plugin wrapper
+//! (`fieldcad-superposition-solver`), mirroring `plugins/electrostatics`.
 
-use std::sync::Arc;
-
-use fieldcad_core::quantities::{MassKg, SiScalar};
+use fieldcad_core::quantities::MassKg;
 use fieldcad_core::{
-    ChannelId, ChannelSchema, ComponentSchema, CoupledSource, DiagnosticSeverity, Dimension,
-    Domain, FieldColumn, FieldValueKind, GradientColumn, ObjectIndex, PluginId, PluginVersion,
-    SampleGeometry, SolverDiagnostic, WorldSnapshot,
+    ChannelId, ChannelSchema, ComponentSchema, CoupledSource, Dimension, FieldValueKind, PluginId,
+    PluginVersion, WorldSnapshot,
 };
-use fieldcad_plugin_api::{
-    ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
-    PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
-};
+use fieldcad_plugin_api::PluginMetadata;
 use fieldcad_sources::{collect_gravity_sources, mass_component_schemas};
-use fieldcad_superposition::{
-    CpuInverseSquareEvaluator, InverseSquareBatchEvaluator, InverseSquareSample,
-    InverseSquareSource,
-};
+use fieldcad_superposition::InverseSquareSample;
+use fieldcad_superposition_solver::{InverseSquareCoupling, InverseSquarePlugin};
 use glam::DVec3;
 
 pub const PLUGIN_ID: &str = "fieldcad.gravity";
@@ -29,13 +22,18 @@ pub const PLUGIN_ID: &str = "fieldcad.gravity";
 pub const GRAVITATIONAL_CONSTANT: f64 = 6.674_30e-11;
 pub const GRAVITATIONAL_ACCELERATION: &str = "gravitational-acceleration";
 pub const GRAVITATIONAL_POTENTIAL: &str = "gravitational-potential";
-pub const GRAVITATIONAL_ACCELERATION_HANDLE: ChannelHandle = ChannelHandle::new(0);
-pub const GRAVITATIONAL_POTENTIAL_HANDLE: ChannelHandle = ChannelHandle::new(1);
+/// The one generic `CoupledSource<T>` → `InverseSquareSource` mapping,
+/// under this plugin's own name: a GPU evaluator builds its source buffer
+/// from the same mapping the CPU reference uses.
+pub use fieldcad_superposition_solver::coupled_inverse_square_source as inverse_square_source;
+/// The solver skeleton owns the handle ordering; these aliases keep the
+/// plugin's own names for the same values, so what `channels()` advertises
+/// and what the skeleton's `sample` matches cannot drift apart.
+pub use fieldcad_superposition_solver::{
+    FIELD_CHANNEL_HANDLE as GRAVITATIONAL_ACCELERATION_HANDLE,
+    POTENTIAL_CHANNEL_HANDLE as GRAVITATIONAL_POTENTIAL_HANDLE,
+};
 const POTENTIAL_DIMENSION: Dimension = Dimension::new(0, 2, -2, 0, 0, 0, 0);
-/// Retains the small set of geometries one runtime publication samples
-/// (each visible plane, box, sphere, the probe set) so multiple channels
-/// over the same geometry share one evaluation.
-const SAMPLE_CACHE_CAPACITY: usize = 16;
 
 pub fn plugin_id() -> PluginId {
     PluginId::new(PLUGIN_ID).expect("static plugin ID is valid")
@@ -45,34 +43,6 @@ pub fn gravitational_acceleration_channel_id() -> ChannelId {
 }
 pub fn gravitational_potential_channel_id() -> ChannelId {
     ChannelId::new(plugin_id(), GRAVITATIONAL_POTENTIAL).expect("static channel ID is valid")
-}
-
-fn channels() -> Vec<ChannelSchema> {
-    vec![
-        ChannelSchema {
-            id: gravitational_acceleration_channel_id(),
-            display_name: "Gravitational acceleration g".to_owned(),
-            value_kind: FieldValueKind::Vector(Dimension::ACCELERATION),
-        },
-        ChannelSchema {
-            id: gravitational_potential_channel_id(),
-            display_name: "Gravitational potential Φ".to_owned(),
-            value_kind: FieldValueKind::Scalar(POTENTIAL_DIMENSION),
-        },
-    ]
-}
-
-/// `CoupledSource<MassKg>` → the shared, coupling-value-agnostic source
-/// shape `fieldcad-superposition`'s kernel (and any GPU evaluator built over
-/// it) actually operates on. Public so a GPU evaluator can build its own
-/// source buffer from the same mapping this crate's CPU reference uses,
-/// rather than duplicating it.
-pub fn inverse_square_source(source: &CoupledSource<MassKg>) -> InverseSquareSource {
-    InverseSquareSource {
-        position: source.position,
-        strength: source.coupling_value.into_si(),
-        distribution: source.distribution,
-    }
 }
 
 /// Evaluate the superposed gravitational field and potential at a single
@@ -86,32 +56,23 @@ pub fn evaluate_sources(sources: &[CoupledSource<MassKg>], position: DVec3) -> I
 }
 
 /// Analytic, static Newtonian gravity over a pluggable batched evaluator —
-/// see `fieldcad-superposition`'s `InverseSquareBatchEvaluator`, shared with
-/// `plugins/electrostatics`.
-pub struct NewtonianGravityPlugin {
-    evaluator: Arc<dyn InverseSquareBatchEvaluator>,
-}
+/// the shared plugin wrapper, parameterized by this crate's coupling.
+pub type NewtonianGravityPlugin = InverseSquarePlugin<GravityCoupling>;
 
-impl Default for NewtonianGravityPlugin {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Gravity as an [`InverseSquareCoupling`]: everything Newtonian gravity
+/// differs from electrostatics by, and nothing else — the solver and the
+/// plugin wrapper are shared, in `fieldcad-superposition-solver`.
+pub struct GravityCoupling;
 
-impl NewtonianGravityPlugin {
-    pub fn new() -> Self {
-        Self {
-            evaluator: Arc::new(CpuInverseSquareEvaluator),
-        }
-    }
+impl InverseSquareCoupling for GravityCoupling {
+    type Strength = MassKg;
+    const COUPLING_CONSTANT: f64 = -GRAVITATIONAL_CONSTANT;
+    const SYSTEM_LABEL: &str = "gravity";
+    const NON_FINITE_MESSAGE: &str = "gravitational acceleration overflowed to a non-finite value";
+    const DIAGNOSTIC_CODE: &str = "newtonian-gravity-source-count";
+    const SOURCE_NOUN: &str = "mass";
 
-    pub fn with_evaluator(evaluator: Arc<dyn InverseSquareBatchEvaluator>) -> Self {
-        Self { evaluator }
-    }
-}
-
-impl EquationSystemPlugin for NewtonianGravityPlugin {
-    fn metadata(&self) -> PluginMetadata {
+    fn metadata() -> PluginMetadata {
         PluginMetadata {
             id: plugin_id(),
             version: PluginVersion::new(0, 1, 0),
@@ -122,245 +83,40 @@ impl EquationSystemPlugin for NewtonianGravityPlugin {
         }
     }
 
-    fn channels(&self) -> Vec<ChannelSchema> {
-        channels()
+    fn channels() -> Vec<ChannelSchema> {
+        vec![
+            ChannelSchema {
+                id: gravitational_acceleration_channel_id(),
+                display_name: "Gravitational acceleration g".to_owned(),
+                value_kind: FieldValueKind::Vector(Dimension::ACCELERATION),
+            },
+            ChannelSchema {
+                id: gravitational_potential_channel_id(),
+                display_name: "Gravitational potential Φ".to_owned(),
+                value_kind: FieldValueKind::Scalar(POTENTIAL_DIMENSION),
+            },
+        ]
     }
-    fn component_schemas(&self) -> Vec<ComponentSchema> {
+
+    fn component_schemas() -> Vec<ComponentSchema> {
         mass_component_schemas()
     }
 
-    fn create_solver(
-        &self,
-        context: SolverContext<'_>,
-    ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
-        // A snapshot's precision metadata must describe the numbers it
-        // actually carries, or an `f32` interactive result is
-        // indistinguishable from the `f64` oracle it is checked against —
-        // matching `plugins/electrostatics`.
-        if context.domain.precision() != self.evaluator.precision() {
-            return Err(PluginError::InvalidConfiguration(format!(
-                "gravity evaluator produces {}, but the domain declares {}",
-                self.evaluator.precision().label(),
-                context.domain.precision().label()
-            )));
-        }
-        let sources = sources(context.world)?;
-        let inverse_square_sources = sources
-            .as_slice()
-            .iter()
-            .map(inverse_square_source)
-            .collect();
-        Ok(Box::new(NewtonianGravitySolver {
-            domain: *context.domain,
-            sources,
-            inverse_square_sources,
-            world_revision: context.world.revision(),
-            evaluator: Arc::clone(&self.evaluator),
-            cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
-        }))
-    }
-}
-
-/// Collect the world's mass sources, dropping zero-mass ones before they
-/// reach the solver's indexes.
-///
-/// The returned `ObjectIndex` and the solver's `inverse_square_sources`
-/// buffer are built from the same filtered list, so position `i` in one is
-/// position `i` in the other — the alignment `add_forces`' index-based
-/// exclusion relies on. Dropping zero-mass sources here is observable only
-/// through sources whose field and force contributions are exactly zero
-/// (the kernel skips them anyway); it also keeps the reported source count
-/// to contributing sources.
-fn sources(world: &WorldSnapshot) -> Result<ObjectIndex<CoupledSource<MassKg>>, PluginError> {
-    collect_gravity_sources(world)
-        .map(|collected| {
-            ObjectIndex::new(
-                collected
-                    .into_iter()
-                    .filter(|source| source.coupling_value.into_si() != 0.0)
-                    .collect(),
-            )
-        })
-        .map_err(|error| PluginError::UnsupportedWorld(error.to_string()))
-}
-
-struct NewtonianGravitySolver {
-    domain: Domain,
-    sources: ObjectIndex<CoupledSource<MassKg>>,
-    /// Rebuilt with the object-indexed sources on creation/world changes;
-    /// this is the cache-local input shape the shared evaluator expects,
-    /// converted once per world change rather than on every channel read.
-    inverse_square_sources: Vec<InverseSquareSource>,
-    world_revision: fieldcad_core::WorldRevision,
-    evaluator: Arc<dyn InverseSquareBatchEvaluator>,
-    cache: SampleCache<InverseSquareSample>,
-}
-
-impl EquationSystemSolver for NewtonianGravitySolver {
-    fn kind(&self) -> SolverKind {
-        SolverKind::Analytic
-    }
-    fn validate_world(&self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        sources(world).map(|_| ())
-    }
-    fn on_world_changed(&mut self, world: &WorldSnapshot) -> Result<(), PluginError> {
-        self.sources = sources(world)?;
-        self.inverse_square_sources = self
-            .sources
-            .as_slice()
-            .iter()
-            .map(inverse_square_source)
-            .collect();
-        self.world_revision = world.revision();
-        self.cache.clear()
-    }
-
-    fn sample(
-        &self,
-        channel: ChannelHandle,
-        geometry: &SampleGeometry,
-    ) -> Result<SampledColumn, PluginError> {
-        let samples = self.samples_for(geometry)?;
-        let validity = samples.iter().map(|sample| sample.validity).collect();
-        // A gradient is published only if *every* sample in the batch
-        // reported one — the rest of the pipeline treats "does this batch
-        // carry a gradient" as one per-batch decision, not a per-point one.
-        let gradients = samples
-            .iter()
-            .map(|sample| sample.gradient)
-            .collect::<Option<Vec<_>>>();
-        match channel {
-            GRAVITATIONAL_ACCELERATION_HANDLE => {
-                let column = SampledColumn::new(
-                    FieldColumn::vectors(samples.iter().map(|sample| sample.field).collect()),
-                    validity,
-                );
-                Ok(match gradients {
-                    Some(jacobians) => {
-                        column.with_gradient(GradientColumn::Vector(jacobians.into()))
-                    }
-                    None => column,
-                })
-            }
-            GRAVITATIONAL_POTENTIAL_HANDLE => {
-                let column = SampledColumn::new(
-                    FieldColumn::scalars(samples.iter().map(|sample| sample.potential).collect()),
-                    validity,
-                );
-                // ∇Φ = −g: the potential's gradient is exactly minus the
-                // acceleration this solver already computed, so no separate
-                // math is needed — only whether `gradients.is_some()` still
-                // gates it, to keep both channels' gradient availability
-                // consistent for the same evaluator.
-                Ok(match gradients {
-                    Some(_) => column.with_gradient(GradientColumn::Scalar(
-                        samples.iter().map(|sample| -sample.field).collect(),
-                    )),
-                    None => column,
-                })
-            }
-            other => Err(PluginError::UnknownChannel(other.index())),
-        }
-    }
-
-    fn add_forces(&self, bodies: &[DynamicBody], out: &mut [DVec3]) -> Result<(), PluginError> {
-        for (body, out_force) in bodies.iter().zip(out) {
-            // One lookup decides both questions: a body absent from the
-            // filtered index (not a source, or zero mass) neither exerts
-            // nor feels gravity.
-            let Some(excluded) = self.sources.index_of(body.object) else {
-                continue;
-            };
-            // `strength` is `coupling_value.into_si()` by construction —
-            // the same number as the source's mass, without touching the
-            // second source array.
-            let mass = self.inverse_square_sources[excluded].strength;
-            let acceleration = self.acceleration_excluding(excluded, body.position)?;
-            *out_force += acceleration * mass;
-        }
-        Ok(())
-    }
-
-    fn diagnostics(&self) -> Vec<SolverDiagnostic> {
-        vec![SolverDiagnostic {
-            plugin: plugin_id(),
-            severity: DiagnosticSeverity::Info,
-            code: "newtonian-gravity-source-count".to_owned(),
-            message: format!(
-                "{} mass source(s), {} batched evaluator, world revision {}",
-                self.sources.len(),
-                self.evaluator.precision().label(),
-                self.world_revision
-            ),
-        }]
-    }
-}
-
-impl NewtonianGravitySolver {
-    /// The gravitational acceleration at `position` from every source
-    /// except the one at index `excluded` of the solver's positionally
-    /// aligned source slices.
-    ///
-    /// Evaluated over the precomputed `inverse_square_sources` buffer via
-    /// the kernel's slice-based exclusion — the same items in the same
-    /// order `ObjectIndex::iter_excluding` yields, without re-mapping each
-    /// source per body per tick.
-    fn acceleration_excluding(
-        &self,
-        excluded: usize,
-        position: DVec3,
-    ) -> Result<DVec3, PluginError> {
-        fieldcad_superposition::field_excluding_at(
-            -GRAVITATIONAL_CONSTANT,
-            &self.inverse_square_sources,
-            excluded,
-            position,
-        )
-        .ok_or_else(|| {
-            PluginError::Solver(
-                "gravitational acceleration overflowed to a non-finite value".to_owned(),
-            )
-        })
-    }
-
-    fn samples_for(
-        &self,
-        geometry: &SampleGeometry,
-    ) -> Result<Arc<[InverseSquareSample]>, PluginError> {
-        self.cache.get_or_try_insert_with(
-            geometry,
-            || {
-                self.evaluator
-                    .evaluate(
-                        -GRAVITATIONAL_CONSTANT,
-                        &self.inverse_square_sources,
-                        &self.domain,
-                        geometry,
-                    )
-                    .map_err(PluginError::Solver)
-            },
-            |out| {
-                self.evaluator
-                    .evaluate_into(
-                        -GRAVITATIONAL_CONSTANT,
-                        &self.inverse_square_sources,
-                        &self.domain,
-                        geometry,
-                        out,
-                    )
-                    .map_err(PluginError::Solver)
-            },
-        )
+    fn collect_sources(world: &WorldSnapshot) -> Result<Vec<CoupledSource<MassKg>>, String> {
+        collect_gravity_sources(world).map_err(|error| error.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fieldcad_core::quantities::kilogram;
+    use fieldcad_core::quantities::{SiScalar, kilogram};
     use fieldcad_core::{
-        BoundaryConditions, DomainBounds, ObjectShape, ObjectSpec, Precision, ProbeId, Resolution,
-        StepContext, TimeStep, Transform, World, WorldCommand,
+        Domain, FieldColumn, ObjectShape, ObjectSpec, ProbeId, SampleGeometry, StepContext,
+        TimeStep, Transform, World, WorldCommand,
+    };
+    use fieldcad_plugin_api::{
+        DynamicBody, EquationSystemPlugin, EquationSystemSolver, SolverContext,
     };
     use fieldcad_sources::{
         gravitational_mass_component_id, independent_gravitational_mass_properties,
@@ -525,80 +281,6 @@ mod tests {
              still feel the distant primary's pull; got {:?}",
             forces[0]
         );
-    }
-
-    /// Mirrors `plugins/electrostatics`' equivalent test — the CPU
-    /// evaluator now reports a closed-form Jacobian, and gravity's `sample`
-    /// must attach it the same way electrostatics' does.
-    #[test]
-    fn the_gravitational_acceleration_channel_publishes_its_jacobian() {
-        let solver = solver();
-        let geometry = SampleGeometry::probes(vec![ProbeId::new(0)], vec![DVec3::X]).unwrap();
-
-        let column = solver
-            .sample(GRAVITATIONAL_ACCELERATION_HANDLE, &geometry)
-            .unwrap();
-
-        match column.gradient {
-            Some(GradientColumn::Vector(jacobians)) => assert_eq!(jacobians.len(), geometry.len()),
-            other => panic!("expected a Jacobian per sample, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_potential_channel_publishes_minus_the_acceleration_as_its_gradient() {
-        let solver = solver();
-        let geometry = SampleGeometry::probes(vec![ProbeId::new(0)], vec![DVec3::X]).unwrap();
-
-        let acceleration_column = solver
-            .sample(GRAVITATIONAL_ACCELERATION_HANDLE, &geometry)
-            .unwrap();
-        let potential_column = solver
-            .sample(GRAVITATIONAL_POTENTIAL_HANDLE, &geometry)
-            .unwrap();
-
-        let FieldColumn::Vector(accelerations) = acceleration_column.values else {
-            panic!("expected a vector field column");
-        };
-        let Some(GradientColumn::Scalar(gradients)) = potential_column.gradient else {
-            panic!("expected the potential channel to publish a gradient");
-        };
-
-        assert_eq!(accelerations.len(), gradients.len());
-        for (acceleration, gradient) in accelerations.iter().zip(gradients.iter()) {
-            assert!((*gradient - (-*acceleration)).length() < 1.0e-12);
-        }
-    }
-
-    /// Mirrors `plugins/electrostatics`' equivalent test: this is the
-    /// behavior change `docs/tasks/unify-inverse-square-sample-and-evaluator.md`
-    /// made deliberate — a mismatched domain/evaluator precision must now be
-    /// rejected at `create_solver` instead of silently quantized.
-    #[test]
-    fn create_solver_rejects_a_domain_precision_mismatch() {
-        let plugin = NewtonianGravityPlugin::new();
-        let world = World::new();
-        let domain = Domain::new(
-            DomainBounds::centred_cube(2.0).unwrap(),
-            Resolution::uniform(4).unwrap(),
-            BoundaryConditions::default(),
-            Precision::F32,
-        );
-
-        assert!(matches!(
-            plugin.create_solver(SolverContext {
-                configuration: &Default::default(),
-                domain: &domain,
-                world: &world.snapshot(),
-                initial_step: StepContext {
-                    tick: 0,
-                    time_seconds: 0.0,
-                    time_step: TimeStep::from_seconds(1.0).unwrap(),
-                },
-                cancellation: Default::default(),
-            }),
-            Err(PluginError::InvalidConfiguration(_))
-        ));
     }
 
     /// Phase 2 parity: `add_forces` over the solver's precomputed,

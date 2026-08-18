@@ -189,8 +189,6 @@ pub fn independent_gravitational_mass_properties(
 
 pub use fieldcad_core::CoupledSource;
 
-pub type MassDistribution = ChargeDistribution;
-
 /// The exclusion radius given to a massive body with no authored shape.
 pub const DEFAULT_POINT_RADIUS: f64 = fieldcad_core::DEFAULT_PROXY_RADIUS;
 
@@ -235,20 +233,22 @@ pub fn gravitational_mass_of(object: &WorldObject) -> Result<Option<MassKg>, Sou
     Ok(Some(MassKg::from_si(mass)))
 }
 
+pub fn inertial_mass_property(props: &PropertyBag) -> Option<MassKg> {
+    props
+        .scalar(&mass_property_id())
+        .filter(|mass| mass.is_finite())
+        .map(MassKg::from_si)
+}
+
 pub fn inertial_mass_of(object: &WorldObject) -> Result<MassKg, SourceError> {
-    let mass = object
+    object
         .components
         .get(&inertial_mass_component_id())
-        .and_then(|properties| properties.scalar(&mass_property_id()))
+        .and_then(inertial_mass_property)
+        .filter(|mass| mass.into_si() > 0.0)
         .ok_or_else(|| SourceError::InvalidMass {
             object: object.name.clone(),
-        })?;
-    if !mass.is_finite() || mass <= 0.0 {
-        return Err(SourceError::InvalidMass {
-            object: object.name.clone(),
-        });
-    }
-    Ok(MassKg::from_si(mass))
+        })
 }
 
 fn source_from_object_for_coupling(

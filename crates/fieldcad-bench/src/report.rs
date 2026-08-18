@@ -208,7 +208,9 @@ mod tests {
             timing: Timing {
                 median_ns,
                 min_ns: median_ns,
+                mean_ns: median_ns,
                 p95_ns: median_ns,
+                max_ns: median_ns,
                 iterations: 1,
                 reps: 1,
             },

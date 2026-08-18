@@ -150,11 +150,13 @@ pub struct ResolvedFieldBrushStroke {
 /// One channel's values over one geometry, as produced by a solver.
 ///
 /// Values are columnar: the channel already declares dimension and shape once,
-/// so repeating them per sample costs memory and buys nothing.
+/// so repeating them per sample costs memory and buys nothing. Validity is a
+/// shared, immutable column so a solver that memoizes its per-geometry
+/// derivation can hand the same buffer to every read without copying.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampledColumn {
     pub values: FieldColumn,
-    pub validity: Vec<SampleValidity>,
+    pub validity: Arc<[SampleValidity]>,
     /// The channel's spatial derivative at each sample, if this solver can
     /// report one. Most cannot or do not bother — `None` means every
     /// consumer falls back to today's plain trilinear/bilinear
@@ -205,8 +207,26 @@ impl SampledColumn {
     pub fn new(values: FieldColumn, validity: Vec<SampleValidity>) -> Self {
         Self {
             values,
-            validity,
+            validity: validity.into(),
             gradient: None,
+        }
+    }
+
+    /// Assemble from already-shared parts, copying nothing — the shape a
+    /// solver that derives all of a geometry's columns once per world
+    /// change hands out per channel read. Length agreement between
+    /// `values` and `validity` is the caller's derivational invariant, the
+    /// same way [`Self::new`] trusts its own arguments; the runtime's
+    /// `FieldBatch` construction re-checks both against the geometry.
+    pub fn from_shared_parts(
+        values: FieldColumn,
+        validity: Arc<[SampleValidity]>,
+        gradient: Option<GradientColumn>,
+    ) -> Self {
+        Self {
+            values,
+            validity,
+            gradient,
         }
     }
 
@@ -215,7 +235,7 @@ impl SampledColumn {
         let validity = vec![SampleValidity::Exact; values.len()];
         Self {
             values,
-            validity,
+            validity: validity.into(),
             gradient: None,
         }
     }

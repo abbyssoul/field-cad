@@ -1176,6 +1176,7 @@ checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 name = "fieldcad-bench"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "fieldcad-core",
  "fieldcad-electromagnetic-sources",
  "fieldcad-electromagnetism",
@@ -1306,6 +1307,7 @@ dependencies = [
  "fieldcad-electromagnetic-sources",
  "fieldcad-plugin-api",
  "fieldcad-superposition",
+ "fieldcad-superposition-solver",
  "glam",
 ]
 
@@ -1327,6 +1329,7 @@ dependencies = [
  "fieldcad-plugin-api",
  "fieldcad-sources",
  "fieldcad-superposition",
+ "fieldcad-superposition-solver",
  "glam",
 ]
 
@@ -1335,6 +1338,7 @@ name = "fieldcad-mcp"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "clap",
  "fieldcad-catalog",
  "fieldcad-core",
  "fieldcad-dynamics",
@@ -1395,6 +1399,7 @@ dependencies = [
 name = "fieldcad-server"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "directories",
  "fieldcad-catalog",
  "fieldcad-core",
@@ -1402,6 +1407,7 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-expressions",
+ "fieldcad-gravity",
  "fieldcad-scene-document",
  "fieldcad-simulation",
  "fieldcad-sources",
@@ -1446,6 +1452,16 @@ name = "fieldcad-superposition"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
+ "glam",
+]
+
+[[package]]
+name = "fieldcad-superposition-solver"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "fieldcad-plugin-api",
+ "fieldcad-superposition",
  "glam",
 ]
 

@@ -2023,7 +2023,7 @@ mod tests {
 
         let column = solver.sample(ELECTRIC_FIELD_HANDLE, &geometry).unwrap();
 
-        for validity in &column.validity {
+        for validity in column.validity.iter() {
             assert_eq!(
                 *validity,
                 SampleValidity::Interpolated(InterpolationMethod::Hermite)
