@@ -1672,7 +1672,11 @@ impl Parser<'_> {
                 TokenKind::Minus => (BinaryOp::Subtract, 1),
                 TokenKind::Star => (BinaryOp::Multiply, 2),
                 TokenKind::Slash => (BinaryOp::Divide, 2),
-                _ if implicit => (BinaryOp::Multiply, 2),
+                // A unit suffix belongs to the quantity immediately before
+                // it. It therefore binds more tightly than explicit `*`/`/`:
+                // `distance.0 / 1 m` means `distance.0 / (1 m)`, not
+                // `(distance.0 / 1) * m`.
+                _ if implicit => (BinaryOp::Multiply, 3),
                 _ => break,
             };
             if precedence < minimum_precedence {
@@ -2054,6 +2058,15 @@ mod tests {
     }
 
     #[test]
+    fn unit_suffix_binds_as_one_quantity_across_division() {
+        let mut plan = compile_binding("distance.7 / 1 m", Dimension::DIMENSIONLESS);
+        let result = plan
+            .evaluate(&Distances([(DistanceProbeId::new(7), 3.0)].into()))
+            .unwrap();
+        assert_eq!(result.properties[&target()].si_value(), 3.0);
+    }
+
+    #[test]
     fn mismatched_target_is_rejected() {
         let error = EvaluationPlan::compile(
             &ExpressionDocument {
@@ -2327,6 +2340,20 @@ mod tests {
                 .iter()
                 .all(|item| item.provenance.as_deref() == Some("user-constants.json"))
         );
+
+        let embedded = ExpressionDocument {
+            constants: closure.clone(),
+            bindings: Vec::new(),
+        };
+        let mut different = library.clone();
+        different.constants[0].source = "3 g / cm^3".into();
+        assert_eq!(
+            different.available_updates(&embedded),
+            vec![ConstantId::new(1)]
+        );
+        // Detecting a local update is overlay state; it never mutates the
+        // reproducible embedded copy.
+        assert_eq!(embedded.constants, closure);
     }
 
     #[test]

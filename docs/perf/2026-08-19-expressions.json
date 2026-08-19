@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "scope": "Headless CPU compute: equation-system solvers and the simulation runtime. Visualization and GPU backends are not measured; see the crate README.",
+  "profile": "full, filtered by 'expressions'",
+  "benchmarks": [
+    {
+      "id": "expressions/evaluate-graph",
+      "group": "expressions",
+      "what": "evaluate one compiled acyclic constant graph into reusable storage",
+      "why": "runs before ticks for live bindings; graph construction and parsing are excluded",
+      "parameter": "expression nodes",
+      "declared_complexity": "Linear",
+      "declared_label": "O(N)",
+      "points": [
+        {
+          "scene": "expression-16",
+          "scene_summary": "acyclic derived-constant chain with 16 nodes",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 16 expression node(s), 0 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 16.0,
+          "timing": {
+            "median_ns": 455.94561250000004,
+            "min_ns": 451.40645,
+            "mean_ns": 455.35487916666665,
+            "p95_ns": 457.66472,
+            "max_ns": 457.802,
+            "iterations": 80000,
+            "reps": 12
+          },
+          "ns_per_unit": 28.496600781250002
+        },
+        {
+          "scene": "expression-32",
+          "scene_summary": "acyclic derived-constant chain with 32 nodes",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 32 expression node(s), 0 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 32.0,
+          "timing": {
+            "median_ns": 951.018613699683,
+            "min_ns": 940.9001344989913,
+            "mean_ns": 952.4721635123452,
+            "p95_ns": 965.8106050052838,
+            "max_ns": 967.6901239312134,
+            "iterations": 41636,
+            "reps": 12
+          },
+          "ns_per_unit": 29.719331678115093
+        },
+        {
+          "scene": "expression-64",
+          "scene_summary": "acyclic derived-constant chain with 64 nodes",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 64 expression node(s), 0 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 64.0,
+          "timing": {
+            "median_ns": 2002.05624480897,
+            "min_ns": 1946.359375,
+            "mean_ns": 1991.6750372023807,
+            "p95_ns": 2031.5868563122922,
+            "max_ns": 2038.3258409468438,
+            "iterations": 19264,
+            "reps": 12
+          },
+          "ns_per_unit": 31.282128825140155
+        },
+        {
+          "scene": "expression-128",
+          "scene_summary": "acyclic derived-constant chain with 128 nodes",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 128 expression node(s), 0 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 128.0,
+          "timing": {
+            "median_ns": 4124.506635622817,
+            "min_ns": 4101.072176949941,
+            "mean_ns": 4144.20128055879,
+            "p95_ns": 4244.492101280559,
+            "max_ns": 4278.634807916182,
+            "iterations": 8590,
+            "reps": 12
+          },
+          "ns_per_unit": 32.22270809080326
+        },
+        {
+          "scene": "expression-256",
+          "scene_summary": "acyclic derived-constant chain with 256 nodes",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 256 expression node(s), 0 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 256.0,
+          "timing": {
+            "median_ns": 9738.507911392406,
+            "min_ns": 9613.085706751055,
+            "mean_ns": 9799.010812236285,
+            "p95_ns": 10058.131065400845,
+            "max_ns": 10098.502109704641,
+            "iterations": 3792,
+            "reps": 12
+          },
+          "ns_per_unit": 38.041046528876585
+        },
+        {
+          "scene": "expression-512",
+          "scene_summary": "acyclic derived-constant chain with 512 nodes",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 512 expression node(s), 0 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 512.0,
+          "timing": {
+            "median_ns": 23497.719736842104,
+            "min_ns": 22913.87039473684,
+            "mean_ns": 23539.299067982458,
+            "p95_ns": 24070.90082236842,
+            "max_ns": 24194.384868421053,
+            "iterations": 1520,
+            "reps": 12
+          },
+          "ns_per_unit": 45.893983861019734
+        }
+      ],
+      "scaling": {
+        "exponent": 1.1299651681440384,
+        "r_squared": 0.9981892737285033,
+        "log_residual": 0.056971003396275866,
+        "per_unit_ns": 45.893983861019734,
+        "points": 6
+      },
+      "verdict": "AsDeclared"
+    },
+    {
+      "id": "expressions/evaluate-live-bindings",
+      "group": "expressions",
+      "what": "evaluate live scalar bindings from stable distance references",
+      "why": "measures the pre-tick dependency/provider path with compiled nodes and reused buffers",
+      "parameter": "live bindings",
+      "declared_complexity": "Linear",
+      "declared_label": "O(N)",
+      "points": [
+        {
+          "scene": "live-bindings-16",
+          "scene_summary": "16 live scalar bindings reading stable distance ids",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 0 expression node(s), 16 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 16.0,
+          "timing": {
+            "median_ns": 406.2494966750046,
+            "min_ns": 403.818070892563,
+            "mean_ns": 406.3929375199127,
+            "p95_ns": 408.5385292741952,
+            "max_ns": 409.1948426982287,
+            "iterations": 49173,
+            "reps": 12
+          },
+          "ns_per_unit": 25.390593542187787
+        },
+        {
+          "scene": "live-bindings-32",
+          "scene_summary": "32 live scalar bindings reading stable distance ids",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 0 expression node(s), 32 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 32.0,
+          "timing": {
+            "median_ns": 821.011439174585,
+            "min_ns": 816.8000897190163,
+            "mean_ns": 820.808116852222,
+            "p95_ns": 822.9240742628767,
+            "max_ns": 823.1862893030464,
+            "iterations": 49042,
+            "reps": 12
+          },
+          "ns_per_unit": 25.65660747420578
+        },
+        {
+          "scene": "live-bindings-64",
+          "scene_summary": "64 live scalar bindings reading stable distance ids",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 0 expression node(s), 64 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 64.0,
+          "timing": {
+            "median_ns": 1654.052225,
+            "min_ns": 1646.5456,
+            "mean_ns": 1655.1685916666665,
+            "p95_ns": 1662.1023175,
+            "max_ns": 1662.1046,
+            "iterations": 20000,
+            "reps": 12
+          },
+          "ns_per_unit": 25.844566015625
+        },
+        {
+          "scene": "live-bindings-128",
+          "scene_summary": "128 live scalar bindings reading stable distance ids",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 0 expression node(s), 128 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 128.0,
+          "timing": {
+            "median_ns": 3465.1565791745816,
+            "min_ns": 3441.314539803143,
+            "mean_ns": 3461.5394721694574,
+            "p95_ns": 3473.877283716111,
+            "max_ns": 3475.940424797099,
+            "iterations": 11582,
+            "reps": 12
+          },
+          "ns_per_unit": 27.07153577480142
+        },
+        {
+          "scene": "live-bindings-256",
+          "scene_summary": "256 live scalar bindings reading stable distance ids",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 0 expression node(s), 256 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 256.0,
+          "timing": {
+            "median_ns": 7515.18833595594,
+            "min_ns": 7477.375295043273,
+            "mean_ns": 7517.370656307368,
+            "p95_ns": 7558.3482494099135,
+            "max_ns": 7576.08910306845,
+            "iterations": 5084,
+            "reps": 12
+          },
+          "ns_per_unit": 29.35620443732789
+        },
+        {
+          "scene": "live-bindings-512",
+          "scene_summary": "512 live scalar bindings reading stable distance ids",
+          "scene_size": "32³=32768 cells, 1 charge(s), 1154 sample(s)/channel, 0 expression node(s), 512 live binding(s)",
+          "cells": 32768,
+          "charges": 1,
+          "samples_per_channel": 1154,
+          "n": 512.0,
+          "timing": {
+            "median_ns": 15413.403781512607,
+            "min_ns": 15285.065966386555,
+            "mean_ns": 15479.767647058825,
+            "p95_ns": 15714.554915966386,
+            "max_ns": 15787.100840336134,
+            "iterations": 2380,
+            "reps": 12
+          },
+          "ns_per_unit": 30.10430426076681
+        }
+      ],
+      "scaling": {
+        "exponent": 1.0536656893598286,
+        "r_squared": 0.9997131079904742,
+        "log_residual": 0.02112969516017308,
+        "per_unit_ns": 30.10430426076681,
+        "points": 6
+      },
+      "verdict": "AsDeclared"
+    }
+  ]
+}

@@ -98,6 +98,9 @@ pub struct LaunchOptions {
     /// fall-back to the demo scene: a user naming a specific file expects
     /// that file, not a surprise substitute.
     pub open_path: Option<PathBuf>,
+    /// Compose the test-only live-expression contract plugin. The CLI guards
+    /// this with the matching Cargo feature so production catalogs are unchanged.
+    pub expression_fixture: bool,
 }
 
 /// Run the application per `options`.
@@ -117,6 +120,7 @@ pub fn run_for(options: LaunchOptions) -> Result<(), RunError> {
         deadline: options.lifetime.map(|lifetime| Instant::now() + lifetime),
         mcp_autostart: options.mcp,
         open_path: options.open_path,
+        expression_fixture: options.expression_fixture,
         ..DesktopApplication::default()
     };
     event_loop.run_app(&mut application)?;
@@ -133,6 +137,7 @@ struct DesktopApplication {
     initialization_error: Option<String>,
     /// When set, the application exits cleanly at this instant.
     deadline: Option<Instant>,
+    expression_fixture: bool,
     /// Consumed by the first `resumed()` — `WindowState::new` starts the MCP
     /// server itself, once, rather than this being re-applied on every
     /// suspend/resume cycle a window can go through.
@@ -147,7 +152,12 @@ impl ApplicationHandler for DesktopApplication {
             return;
         }
 
-        match WindowState::new(event_loop, self.mcp_autostart.take(), self.open_path.take()) {
+        match WindowState::new(
+            event_loop,
+            self.mcp_autostart.take(),
+            self.open_path.take(),
+            self.expression_fixture,
+        ) {
             Ok(window_state) => self.window_state = Some(window_state),
             Err(error) => {
                 tracing::error!(%error, "application initialization failed");
@@ -573,6 +583,8 @@ struct WindowState {
     /// never freezes the render loop. `redraw` polls it non-blockingly once
     /// per frame rather than joining it.
     saving_scene: Option<SavingScene>,
+    /// Whether this run explicitly opted into the feature-gated expression fixture.
+    expression_fixture: bool,
 }
 
 /// One background scene-save's completion channel, plus the bookkeeping
@@ -592,6 +604,7 @@ impl WindowState {
         event_loop: &ActiveEventLoop,
         mcp_autostart: Option<SocketAddr>,
         open_path: Option<PathBuf>,
+        expression_fixture: bool,
     ) -> Result<Self, String> {
         let attributes = WindowAttributes::default()
             .with_title("Field CAD")
@@ -657,7 +670,7 @@ impl WindowState {
         ) = match open_path {
             None => {
                 let (source, warnings) = build_session(
-                    desktop_plugin_catalog(evaluator, gravity, maxwell),
+                    desktop_plugin_catalog(evaluator, gravity, maxwell, expression_fixture),
                     None,
                     true,
                 )?;
@@ -691,7 +704,7 @@ impl WindowState {
                 let quick_add_hidden = outcome.document.quick_add_hidden.clone();
                 let run_records = outcome.document.run_records.clone();
                 let (source, warnings) = build_session(
-                    desktop_plugin_catalog(evaluator, gravity, maxwell),
+                    desktop_plugin_catalog(evaluator, gravity, maxwell, expression_fixture),
                     Some(outcome.document),
                     false,
                 )?;
@@ -795,7 +808,11 @@ impl WindowState {
         // the one place guaranteed to reach it before any UI does.
         let mcp = match mcp_autostart {
             Some(addr) => {
-                match mcp::enable_at(data_source.clone(), addr, mcp_plugin_catalog_for(&renderer)) {
+                match mcp::enable_at(
+                    data_source.clone(),
+                    addr,
+                    mcp_plugin_catalog_for(&renderer, expression_fixture),
+                ) {
                     Ok(running) => {
                         tracing::info!(
                             addr = %running.addr,
@@ -868,6 +885,7 @@ impl WindowState {
             last_created_at: created_at,
             profile,
             saving_scene: None,
+            expression_fixture,
         })
     }
 
@@ -2495,7 +2513,7 @@ impl WindowState {
         );
         let maxwell: Arc<dyn MaxwellSolverBackend> =
             Arc::new(GpuMaxwellBackend::new(compute_device, compute_queue));
-        let catalog = desktop_plugin_catalog(evaluator, gravity, maxwell);
+        let catalog = desktop_plugin_catalog(evaluator, gravity, maxwell, self.expression_fixture);
 
         let (
             new_source,
@@ -2868,7 +2886,7 @@ impl WindowState {
             McpAction::Enable => {
                 self.mcp = match mcp::enable(
                     self.data_source.clone(),
-                    mcp_plugin_catalog_for(&self.renderer),
+                    mcp_plugin_catalog_for(&self.renderer, self.expression_fixture),
                 ) {
                     Ok(running) => McpSession::Running(running),
                     Err(error) => McpSession::Failed(error),
@@ -3270,7 +3288,10 @@ struct BoxFrame {
 /// called through the embedded MCP server build plugins with the same
 /// evaluator backends the desktop's own File menu would have used, not the
 /// standalone server's CPU-only catalog.
-fn mcp_plugin_catalog_for(renderer: &ViewportRenderer) -> mcp::PluginCatalog {
+fn mcp_plugin_catalog_for(
+    renderer: &ViewportRenderer,
+    expression_fixture: bool,
+) -> mcp::PluginCatalog {
     let (compute_device, compute_queue) = renderer.compute_handles();
     Arc::new(move || {
         let evaluator: Arc<dyn InverseSquareBatchEvaluator> = Arc::new(
@@ -3283,7 +3304,7 @@ fn mcp_plugin_catalog_for(renderer: &ViewportRenderer) -> mcp::PluginCatalog {
             compute_device.clone(),
             compute_queue.clone(),
         ));
-        desktop_plugin_catalog(evaluator, gravity, maxwell)
+        desktop_plugin_catalog(evaluator, gravity, maxwell, expression_fixture)
     })
 }
 
@@ -3291,8 +3312,10 @@ fn desktop_plugin_catalog(
     evaluator: Arc<dyn InverseSquareBatchEvaluator>,
     gravity: Arc<dyn InverseSquareBatchEvaluator>,
     maxwell: Arc<dyn MaxwellSolverBackend>,
+    expression_fixture: bool,
 ) -> Vec<PluginRegistration> {
-    vec![
+    #[allow(unused_mut)] // mutated only when the optional fixture is compiled in
+    let mut plugins = vec![
         PluginRegistration::with_default_configuration(Box::new(
             ElectrostaticsPlugin::with_evaluator(evaluator),
         )),
@@ -3304,7 +3327,16 @@ fn desktop_plugin_catalog(
             ElectromagnetismPlugin::with_backend(maxwell),
         ))
         .with_enabled(false),
-    ]
+    ];
+    #[cfg(feature = "expression-fixture")]
+    if expression_fixture {
+        plugins.push(PluginRegistration::with_default_configuration(Box::new(
+            fieldcad_test_field::TestFieldPlugin,
+        )));
+    }
+    #[cfg(not(feature = "expression-fixture"))]
+    let _ = expression_fixture;
+    plugins
 }
 
 /// The desktop's built-in demo scene: one positive point charge, a probe

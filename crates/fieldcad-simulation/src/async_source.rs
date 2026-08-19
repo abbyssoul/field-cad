@@ -1148,6 +1148,57 @@ mod tests {
         .unwrap()
     }
 
+    fn expression_runtime() -> SimulationRuntime {
+        let expressions = fieldcad_expressions::ExpressionDocument {
+            constants: vec![
+                fieldcad_expressions::ConstantDefinition {
+                    id: fieldcad_expressions::ConstantId::new(1),
+                    scope: fieldcad_expressions::ConstantScope::Document,
+                    name: "length".to_owned(),
+                    source: "2 m".into(),
+                    revision: None,
+                    provenance: None,
+                },
+                fieldcad_expressions::ConstantDefinition {
+                    id: fieldcad_expressions::ConstantId::new(2),
+                    scope: fieldcad_expressions::ConstantScope::Document,
+                    name: "ratio".to_owned(),
+                    source: "doc.length / 1 m".into(),
+                    revision: None,
+                    provenance: None,
+                },
+            ],
+            bindings: Vec::new(),
+        };
+        let domain = Domain::new(
+            DomainBounds::new(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)).unwrap(),
+            Resolution::new(8, 8, 8).unwrap(),
+            BoundaryConditions::uniform(BoundaryCondition::Periodic),
+            Precision::F64,
+        );
+        SimulationRuntime::new(
+            RuntimeConfig::new(
+                domain,
+                TimeStep::from_seconds(0.01).unwrap(),
+                SessionId::from_u128(100),
+            )
+            .with_expressions(expressions)
+            .with_plugin(Box::new(TestFieldPlugin)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn local_and_async_sources_project_the_complete_expression_state_identically() {
+        let local = LocalDataSource::new(expression_runtime());
+        let expected = local.expression_state();
+        let async_source = AsyncLocalDataSource::new(LocalDataSource::new(expression_runtime()));
+
+        // Equality covers the document, graph hash, resolved revision,
+        // deterministic node order, dependencies, values, statuses, and live diagnostics.
+        assert_eq!(async_source.expression_state(), expected);
+    }
+
     #[test]
     fn requesting_body_history_dedupes_in_flight_and_populates_the_cache_once_answered() {
         let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));

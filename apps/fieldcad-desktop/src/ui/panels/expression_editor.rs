@@ -8,49 +8,20 @@
 //! the widgets here render UI and hand back a finished draft rather than
 //! deciding how to commit it.
 
-use fieldcad_core::{PropertyKind, WorldSnapshot};
+use fieldcad_core::WorldSnapshot;
 use fieldcad_expressions::{
     ConstantDefinition, ConstantId, ConstantScope, EvaluationPlan, ExpressionCommand,
-    ExpressionDocument, UserConstantLibrary,
+    ExpressionDocument, ExpressionSubject, UserConstantLibrary,
 };
 use fieldcad_simulation::CommandPayload;
 
 use super::NoDistanceProvider;
 use crate::ui::compute::ComputeView;
+use crate::ui::expression_draft::{
+    AuthorityDraft, ConstantFields, ExistingConstantDraft, NewConstantDraft, SubmissionState,
+    UserLibraryDraft, subject_label,
+};
 use crate::ui::{UiFrameOutput, UiModel};
-
-pub(super) struct WorldDistanceProvider<'a>(pub &'a WorldSnapshot);
-
-impl fieldcad_expressions::ValueProvider for WorldDistanceProvider<'_> {
-    fn distance(&self, probe: fieldcad_core::DistanceProbeId) -> Option<f64> {
-        self.0
-            .distance_probe(probe)
-            .and_then(|probe| self.0.resolve_distance(probe).ok())
-    }
-}
-
-pub(super) fn preview_document(
-    document: &ExpressionDocument,
-    world: &WorldSnapshot,
-) -> Result<fieldcad_expressions::EvaluationResult, fieldcad_expressions::ExpressionError> {
-    let mut plan = EvaluationPlan::compile(document, |target| {
-        let object = world.object(target.object)?;
-        object.components.get(&target.component)?;
-        let schema = world.component_schemas().get(&target.component)?;
-        let property = schema
-            .properties
-            .iter()
-            .find(|property| property.id == target.property)?;
-        let PropertyKind::Scalar(dimension) = property.kind else {
-            return None;
-        };
-        Some(fieldcad_expressions::PropertyBindingSchema {
-            dimension,
-            live_binding: property.live_binding,
-        })
-    })?;
-    plan.evaluate(&WorldDistanceProvider(world))
-}
 
 /// A brand-new, uncommitted constant has no authoritative resolved value
 /// yet at any call site, so its preview always compiles and evaluates
@@ -92,21 +63,6 @@ fn preview_constant(
 }
 
 /// A staged, uncommitted name+source pair for a new constant.
-#[derive(Clone, Debug)]
-pub(super) struct ConstantDraft {
-    pub name: String,
-    pub source: String,
-}
-
-impl Default for ConstantDraft {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            source: "1 m".to_owned(),
-        }
-    }
-}
-
 /// Renders a small "Add new" button that reveals a staged name+source row
 /// with a resolved/dry-run preview line, and an explicit "Add"/"Cancel"
 /// pair. Returns the committed draft exactly once, the frame the user
@@ -120,7 +76,7 @@ pub(super) fn add_constant_control(
     scope_prefix: &str,
     existing_constants: &[ConstantDefinition],
     extra_source_ui: impl FnOnce(&mut egui::Ui, &mut String),
-) -> Option<ConstantDraft> {
+) -> Option<ConstantFields> {
     let open_id = id.with("open");
     let mut open = ui
         .data_mut(|data| data.get_temp::<bool>(open_id))
@@ -142,34 +98,50 @@ pub(super) fn add_constant_control(
 
     let draft_id = id.with("draft");
     let mut draft = ui
-        .data_mut(|data| data.get_temp::<ConstantDraft>(draft_id))
-        .unwrap_or_default();
-    let preview = preview_constant(scope, &draft.name, &draft.source, existing_constants);
-
+        .data_mut(|data| data.get_temp::<NewConstantDraft>(draft_id))
+        .unwrap_or_else(|| {
+            NewConstantDraft(AuthorityDraft::new(
+                ConstantFields {
+                    name: String::new(),
+                    source: "1 m".to_owned(),
+                },
+                "new",
+            ))
+        });
     let mut result = None;
+    let mut preview = None;
     ui.horizontal(|ui| {
         ui.label(scope_prefix);
-        ui.add(
-            egui::TextEdit::singleline(&mut draft.name)
+        let fields = draft.0.edited_mut();
+        let name = ui.add(
+            egui::TextEdit::singleline(&mut fields.name)
                 .id(id.with("name"))
                 .hint_text("name")
                 .desired_width(90.0),
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut draft.source)
+        let source = ui.add(
+            egui::TextEdit::singleline(&mut fields.source)
                 .id(id.with("source"))
                 .desired_width(120.0),
         );
-        extra_source_ui(ui, &mut draft.source);
+        extra_source_ui(ui, &mut fields.source);
+        preview = preview_constant(scope, &fields.name, &fields.source, existing_constants);
         let can_submit = preview.as_ref().is_some_and(Result::is_ok);
-        if ui
-            .add_enabled(can_submit, egui::Button::new("Add"))
-            .clicked()
+        let enter = (name.lost_focus() || source.lost_focus())
+            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if (enter
+            || ui
+                .add_enabled(can_submit, egui::Button::new("Add"))
+                .clicked())
+            && can_submit
         {
-            result = Some(draft.clone());
+            result = Some(fields.clone());
         }
-        if ui.small_button("Cancel").clicked() {
+        let escape = (name.has_focus() || source.has_focus())
+            && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if ui.small_button("Cancel").clicked() || escape {
             open = false;
+            draft.0.reset();
         }
     });
     match preview {
@@ -191,7 +163,7 @@ pub(super) fn add_constant_control(
 
     if result.is_some() {
         open = false;
-        draft = ConstantDraft::default();
+        draft.0.reset();
     }
     ui.data_mut(|data| {
         data.insert_temp(open_id, open);
@@ -208,6 +180,8 @@ pub(super) fn insert_constant_menu(
     source: &mut String,
     expressions: &ExpressionDocument,
     user_constants: &UserConstantLibrary,
+    world: &WorldSnapshot,
+    allow_distances: bool,
     output: &mut UiFrameOutput,
 ) {
     ui.menu_button("Insert", |ui| {
@@ -244,13 +218,18 @@ pub(super) fn insert_constant_menu(
                 }
             }
         }
+        if allow_distances && !world.distance_probes().is_empty() {
+            ui.separator();
+            for (label, token) in crate::ui::expression_draft::distance_insertions(world) {
+                // The label follows presentation renames; the inserted token
+                // is the durable numeric identity.
+                if ui.button(label).clicked() {
+                    source.push_str(&token);
+                    ui.close();
+                }
+            }
+        }
     });
-}
-
-#[derive(Clone, Debug)]
-struct VariableDraft {
-    name: String,
-    source: String,
 }
 
 /// The "Variables" inspector panel: document and embedded user constants.
@@ -267,68 +246,100 @@ pub(super) fn variables_editor(
     for constant in &compute.expressions.constants {
         let id = ui.make_persistent_id(("variable", constant.id));
         let mut draft = ui.data_mut(|data| {
-            data.get_temp::<VariableDraft>(id)
-                .unwrap_or_else(|| VariableDraft {
-                    name: constant.name.clone(),
-                    source: constant.source.as_str().to_owned(),
+            data.get_temp::<ExistingConstantDraft>(id)
+                .unwrap_or_else(|| {
+                    ExistingConstantDraft(AuthorityDraft::new(
+                        ConstantFields {
+                            name: constant.name.clone(),
+                            source: constant.source.as_str().to_owned(),
+                        },
+                        compute.expression_state.graph_hash.clone(),
+                    ))
                 })
         });
+        draft.0.reconcile(
+            ConstantFields {
+                name: constant.name.clone(),
+                source: constant.source.as_str().to_owned(),
+            },
+            compute.expression_state.graph_hash.clone(),
+        );
         ui.group(|ui| {
-            let mut commands = Vec::new();
-            if draft.name != constant.name {
-                commands.push(ExpressionCommand::RenameConstant {
-                    constant: constant.id,
-                    name: draft.name.clone(),
-                });
-            }
-            if draft.source != constant.source.as_str() {
-                commands.push(ExpressionCommand::SetConstantSource {
-                    constant: constant.id,
-                    source: draft.source.as_str().into(),
-                });
-            }
-            let preview = if commands.is_empty() {
-                None
-            } else {
-                Some(
-                    compute
-                        .expressions
-                        .apply(commands.clone())
-                        .and_then(|document| preview_document(&document, world)),
-                )
-            };
+            let mut enter = false;
+            let mut escape = false;
             ui.horizontal(|ui| {
                 ui.label(match constant.scope {
                     ConstantScope::Document => "doc.",
                     ConstantScope::User => "user.",
                 });
+                let edited = draft.0.edited_mut();
                 let name = ui.add(
-                    egui::TextEdit::singleline(&mut draft.name)
+                    egui::TextEdit::singleline(&mut edited.name)
                         .id(id.with("name"))
                         .desired_width(90.0),
                 );
                 let source = ui.add(
-                    egui::TextEdit::singleline(&mut draft.source)
+                    egui::TextEdit::singleline(&mut edited.source)
                         .id(id.with("source"))
                         .desired_width(130.0),
                 );
                 insert_constant_menu(
                     ui,
-                    &mut draft.source,
+                    &mut edited.source,
                     &compute.expressions,
                     user_constants,
+                    world,
+                    true,
                     output,
                 );
                 output.scene_edit_in_progress |= name.has_focus() || source.has_focus();
-                let enter = (name.lost_focus() || source.lost_focus())
+                enter = (name.lost_focus() || source.lost_focus())
                     && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                let valid = preview.as_ref().is_some_and(Result::is_ok);
+                escape = (name.has_focus() || source.has_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
+            });
+            let fields = draft.0.edited().clone();
+            let mut commands = Vec::new();
+            if fields.name != constant.name {
+                commands.push(ExpressionCommand::RenameConstant {
+                    constant: constant.id,
+                    name: fields.name.clone(),
+                });
+            }
+            if fields.source != constant.source.as_str() {
+                commands.push(ExpressionCommand::SetConstantSource {
+                    constant: constant.id,
+                    source: fields.source.as_str().into(),
+                });
+            }
+            let preview = if commands.is_empty() {
+                None
+            } else {
+                Some(match compute.expressions.apply(commands.clone()) {
+                    Ok(document) => crate::ui::expression_draft::preview_document(
+                        &document,
+                        world,
+                        ExpressionSubject::Constant(constant.id),
+                        &compute.expression_state,
+                    ),
+                    Err(error) => crate::ui::expression_draft::DraftPreview {
+                        values: None,
+                        diagnostic: Some(fieldcad_expressions::ExpressionDiagnostic {
+                            subject: ExpressionSubject::Constant(constant.id),
+                            error,
+                        }),
+                        dependents: Vec::new(),
+                    },
+                })
+            };
+            ui.horizontal(|ui| {
+                let valid = preview.as_ref().is_some_and(|preview| preview.valid());
                 if (enter || ui.add_enabled(valid, egui::Button::new("Apply")).clicked()) && valid {
                     output.submit(CommandPayload::CommitExpressions(commands.clone()));
+                    draft.0.mark_submitted();
                 }
-                if !commands.is_empty() && ui.small_button("Reset").clicked() {
-                    draft.name = constant.name.clone();
-                    draft.source = constant.source.as_str().to_owned();
+                if !commands.is_empty() && (escape || ui.small_button("Reset").clicked()) {
+                    draft.0.reset();
                 }
                 if constant.scope == ConstantScope::Document && ui.small_button("Delete").clicked()
                 {
@@ -337,11 +348,35 @@ pub(super) fn variables_editor(
                     ]));
                 }
             });
-            if let Some(Err(error)) = &preview {
-                ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
-                if let Some(span) = error.span {
+            if draft.0.authority_changed() {
+                ui.weak("Authoritative value changed; Reset restores the latest accepted value.");
+            } else if draft.0.submission() == SubmissionState::Submitted {
+                ui.weak("Awaiting authoritative acknowledgement…");
+            }
+            if let Some(diagnostic) = preview
+                .as_ref()
+                .and_then(|preview| preview.diagnostic.as_ref())
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 100, 90),
+                    diagnostic.error.to_string(),
+                );
+                if let Some(span) = diagnostic.error.span {
                     ui.weak(format!("Source bytes {}..{}", span.start, span.end));
                 }
+            }
+            if let Some(preview) = &preview
+                && !preview.dependents.is_empty()
+            {
+                ui.weak(format!(
+                    "Affected: {}",
+                    preview
+                        .dependents
+                        .iter()
+                        .map(|subject| subject_label(subject, &compute.expressions))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
             if let Some(value) = compute.resolved_constants.get(&constant.id) {
                 ui.small(format!(
@@ -420,7 +455,15 @@ pub(super) fn variables_editor(
         "doc.",
         &compute.expressions.constants,
         |ui, source| {
-            insert_constant_menu(ui, source, &compute.expressions, user_constants, output);
+            insert_constant_menu(
+                ui,
+                source,
+                &compute.expressions,
+                user_constants,
+                world,
+                true,
+                output,
+            );
         },
     );
     if let Some(draft) = committed {
@@ -453,9 +496,27 @@ pub(super) fn user_constants_editor(ui: &mut egui::Ui, model: &mut UiModel) {
     if let Some(status) = &model.user_constants_status {
         ui.colored_label(egui::Color32::from_rgb(220, 100, 90), status);
     }
+    let authoritative_hash = ExpressionDocument {
+        constants: model.user_constants.constants.clone(),
+        bindings: Vec::new(),
+    }
+    .content_hash();
+    let editor_id = ui.make_persistent_id("user-constant-library-draft");
+    let mut draft = ui.data_mut(|data| {
+        data.get_temp::<UserLibraryDraft>(editor_id)
+            .unwrap_or_else(|| {
+                UserLibraryDraft(AuthorityDraft::new(
+                    model.user_constants.clone(),
+                    authoritative_hash.clone(),
+                ))
+            })
+    });
+    draft
+        .0
+        .reconcile(model.user_constants.clone(), authoritative_hash);
     let mut save_library = false;
     let mut remove = None;
-    for constant in &mut model.user_constants.constants {
+    for constant in &mut draft.0.edited_mut().constants {
         ui.horizontal(|ui| {
             let mut source_text = constant.source.as_str().to_owned();
             ui.label("user.");
@@ -470,9 +531,45 @@ pub(super) fn user_constants_editor(ui: &mut egui::Ui, model: &mut UiModel) {
             }
         });
     }
+    if let Some(id) = remove {
+        draft.0.edited_mut().constants.retain(|item| item.id != id);
+        save_library = true;
+    }
+
+    let control_id = ui.make_persistent_id("add-user-constant");
+    let committed = add_constant_control(
+        ui,
+        control_id,
+        ConstantScope::User,
+        "user.",
+        &draft.0.edited().constants,
+        |_ui, _source| {},
+    );
+    if let Some(fields) = committed {
+        let next = draft
+            .0
+            .edited()
+            .constants
+            .iter()
+            .map(|constant| constant.id.get() & ((1_u64 << 63) - 1))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            | (1_u64 << 63);
+        draft.0.edited_mut().constants.push(ConstantDefinition {
+            id: ConstantId::new(next),
+            scope: ConstantScope::User,
+            name: fields.name.trim().to_owned(),
+            source: fields.source.trim().into(),
+            revision: None,
+            provenance: None,
+        });
+        save_library = true;
+    }
+
     let library_validation = EvaluationPlan::compile(
         &ExpressionDocument {
-            constants: model.user_constants.constants.clone(),
+            constants: draft.0.edited().constants.clone(),
             bindings: Vec::new(),
         },
         |_| None,
@@ -483,47 +580,32 @@ pub(super) fn user_constants_editor(ui: &mut egui::Ui, model: &mut UiModel) {
             format!("Library diagnostic: {error}"),
         );
     }
-    if let Some(id) = remove {
-        model.user_constants.constants.retain(|item| item.id != id);
-        save_library = true;
-    }
-
-    let control_id = ui.make_persistent_id("add-user-constant");
-    let committed = add_constant_control(
-        ui,
-        control_id,
-        ConstantScope::User,
-        "user.",
-        &model.user_constants.constants,
-        |_ui, _source| {},
-    );
-    if let Some(draft) = committed {
-        let next = model
-            .user_constants
-            .constants
-            .iter()
-            .map(|constant| constant.id.get() & ((1_u64 << 63) - 1))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-            | (1_u64 << 63);
-        model.user_constants.constants.push(ConstantDefinition {
-            id: ConstantId::new(next),
-            scope: ConstantScope::User,
-            name: draft.name.trim().to_owned(),
-            source: draft.source.trim().into(),
-            revision: None,
-            provenance: None,
-        });
-        save_library = true;
-    }
 
     if save_library && library_validation.is_ok() {
-        match crate::user_constants::save(&model.user_constants) {
-            Ok(()) => model.user_constants_status = None,
+        let candidate = draft.0.edited().clone();
+        match crate::user_constants::save(&candidate) {
+            Ok(()) => {
+                model.user_constants = candidate.clone();
+                model.user_constants_status = None;
+                draft.0.reconcile(
+                    candidate.clone(),
+                    ExpressionDocument {
+                        constants: candidate.constants,
+                        bindings: Vec::new(),
+                    }
+                    .content_hash(),
+                );
+            }
             Err(error) => model.user_constants_status = Some(error.to_string()),
         }
     } else if save_library {
         model.user_constants_status = Some("Invalid library draft was not saved".to_owned());
     }
+    if draft.0.authority_changed() {
+        ui.weak("The library changed on disk; local edits are preserved until saved or reset.");
+    }
+    if draft.0.dirty() && ui.small_button("Reset library draft").clicked() {
+        draft.0.reset();
+    }
+    ui.data_mut(|data| data.insert_temp(editor_id, draft));
 }

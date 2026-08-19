@@ -105,4 +105,19 @@ mod tests {
         assert_eq!(load_from(&path).unwrap(), library);
         assert!(!path.with_extension("json.tmp").exists());
     }
+
+    #[test]
+    fn incompatible_library_version_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("user-constants.json");
+        let incompatible = UserConstantLibrary {
+            format_version: 2,
+            ..UserConstantLibrary::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&incompatible).unwrap()).unwrap();
+        assert!(matches!(
+            load_from(&path),
+            Err(UserConstantLibraryError::Unsupported { version: 2, .. })
+        ));
+    }
 }

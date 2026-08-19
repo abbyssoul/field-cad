@@ -659,7 +659,7 @@ pub(super) fn property_editor(
 #[derive(Clone, Debug)]
 struct ExpressionDraft {
     active: bool,
-    source: String,
+    formula: crate::ui::expression_draft::PropertyFormulaDraft,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -695,21 +695,28 @@ fn expression_property_editor(
         })
         .unwrap_or_default();
     let editor_id = ui.make_persistent_id(("property-expression", &target));
+    let authoritative_source = binding.map_or_else(
+        || literal_expression_source(magnitude, dimension),
+        |binding| binding.source.as_str().to_owned(),
+    );
     let mut draft = ui.data_mut(|data| {
         data.get_temp::<ExpressionDraft>(editor_id)
             .unwrap_or_else(|| ExpressionDraft {
                 active: binding.is_some(),
-                source: binding.map_or_else(
-                    || literal_expression_source(magnitude, dimension),
-                    |binding| binding.source.as_str().to_owned(),
+                formula: crate::ui::expression_draft::PropertyFormulaDraft(
+                    crate::ui::expression_draft::AuthorityDraft::new(
+                        authoritative_source.clone(),
+                        expression_state.graph_hash.clone(),
+                    ),
                 ),
             })
     });
-    if let Some(binding) = binding
-        && !draft.active
-    {
+    draft
+        .formula
+        .0
+        .reconcile(authoritative_source, expression_state.graph_hash.clone());
+    if binding.is_some() && !draft.active {
         draft.active = true;
-        draft.source = binding.source.as_str().to_owned();
     }
 
     let mut literal_changed = false;
@@ -720,8 +727,9 @@ fn expression_property_editor(
             let _ = label.on_hover_text(description);
         }
         if draft.active {
+            let source_text = draft.formula.0.edited_mut();
             let response = ui.add(
-                egui::TextEdit::singleline(&mut draft.source)
+                egui::TextEdit::singleline(source_text)
                     .id(editor_id.with("source"))
                     .desired_width(150.0),
             );
@@ -730,9 +738,11 @@ fn expression_property_editor(
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             super::expression_editor::insert_constant_menu(
                 ui,
-                &mut draft.source,
+                source_text,
                 expressions,
                 user_constants,
+                world,
+                schema.live_binding,
                 output,
             );
             if ui
@@ -748,7 +758,7 @@ fn expression_property_editor(
                     ],
                 ));
                 draft.active = false;
-                draft.source = literal_expression_source(magnitude, dimension);
+                draft.formula.0.reset();
             }
         } else {
             let mut edited = magnitude;
@@ -767,55 +777,103 @@ fn expression_property_editor(
                 .clicked()
             {
                 draft.active = true;
-                draft.source = literal_expression_source(magnitude, dimension);
+                draft.formula.0.reset();
             }
         }
     });
 
     if draft.active {
         ui.indent(editor_id.with("details"), |ui| {
+            let drafted_source = draft.formula.0.edited().clone();
             let candidate = expressions.apply([
                 fieldcad_expressions::ExpressionCommand::SetPropertyExpression(
                     fieldcad_expressions::PropertyBinding {
                         target: target.clone(),
-                        source: draft.source.as_str().into(),
+                        source: drafted_source.as_str().into(),
                     },
                 ),
             ]);
-            let preview = candidate
-                .and_then(|document| super::expression_editor::preview_document(&document, world));
-            match preview {
-                Ok(result) => {
-                    if let Some(value) = result.properties.get(&target) {
-                        ui.weak(format!(
-                            "Resolved: {}",
-                            fieldcad_core::format_si_value(value.si_value(), dimension)
-                                .unwrap_or_else(|| format!(
-                                    "{} {}",
-                                    format_engineering(value.si_value()),
-                                    dimension.unit_symbol()
-                                ))
-                        ));
-                    }
-                    if commit_requested || ui.button("Apply").clicked() {
-                        output.submit(fieldcad_simulation::CommandPayload::CommitExpressions(
-                            vec![
-                                fieldcad_expressions::ExpressionCommand::SetPropertyExpression(
-                                    fieldcad_expressions::PropertyBinding {
-                                        target: target.clone(),
-                                        source: draft.source.as_str().into(),
-                                    },
-                                ),
-                            ],
-                        ));
-                    }
+            let preview = match candidate {
+                Ok(document) => crate::ui::expression_draft::preview_document(
+                    &document,
+                    world,
+                    fieldcad_expressions::ExpressionSubject::Property(target.clone()),
+                    expression_state,
+                ),
+                Err(error) => crate::ui::expression_draft::DraftPreview {
+                    values: None,
+                    diagnostic: Some(fieldcad_expressions::ExpressionDiagnostic {
+                        subject: fieldcad_expressions::ExpressionSubject::Property(target.clone()),
+                        error,
+                    }),
+                    dependents: Vec::new(),
+                },
+            };
+            if let Some(result) = &preview.values
+                && let Some(value) = result.properties.get(&target)
+            {
+                ui.weak(format!(
+                    "Resolved: {}",
+                    fieldcad_core::format_si_value(value.si_value(), dimension).unwrap_or_else(
+                        || format!(
+                            "{} {}",
+                            format_engineering(value.si_value()),
+                            dimension.unit_symbol()
+                        )
+                    )
+                ));
+            }
+            let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+            let valid_dirty =
+                crate::ui::expression_draft::should_submit(&draft.formula.0, &preview, true);
+            if (commit_requested
+                || ui
+                    .add_enabled(valid_dirty, egui::Button::new("Apply"))
+                    .clicked())
+                && valid_dirty
+            {
+                output.submit(fieldcad_simulation::CommandPayload::CommitExpressions(
+                    vec![
+                        fieldcad_expressions::ExpressionCommand::SetPropertyExpression(
+                            fieldcad_expressions::PropertyBinding {
+                                target: target.clone(),
+                                source: drafted_source.as_str().into(),
+                            },
+                        ),
+                    ],
+                ));
+                draft.formula.0.mark_submitted();
+            }
+            if ui.small_button("Cancel").clicked() || escape {
+                draft.formula.0.reset();
+            }
+            if let Some(diagnostic) = &preview.diagnostic {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 100, 90),
+                    diagnostic.error.to_string(),
+                );
+                if let Some(span) = diagnostic.error.span {
+                    ui.weak(format!("Source bytes {}..{}", span.start, span.end));
                 }
-                Err(error) => {
-                    ui.colored_label(egui::Color32::from_rgb(220, 100, 90), error.to_string());
-                    if let Some(span) = error.span {
-                        ui.weak(format!("Source bytes {}..{}", span.start, span.end));
-                    }
-                }
+            }
+            if !preview.dependents.is_empty() {
+                ui.weak(format!(
+                    "Affected: {}",
+                    preview
+                        .dependents
+                        .iter()
+                        .map(|subject| crate::ui::expression_draft::subject_label(
+                            subject,
+                            expressions
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if draft.formula.0.authority_changed() {
+                ui.weak(
+                    "Authoritative value changed; Cancel restores the latest accepted formula.",
+                );
             }
             if let Some(node) = expression_state.nodes.iter().find(|node| {
                 node.subject == fieldcad_expressions::ExpressionSubject::Property(target.clone())

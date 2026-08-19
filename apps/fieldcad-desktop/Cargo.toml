@@ -3,6 +3,10 @@ name = "fieldcad-desktop"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+expression-fixture = ["dep:fieldcad-test-field"]
+
 [[bin]]
 name = "fieldcad"
 path = "src/main.rs"
@@ -29,6 +33,7 @@ fieldcad-plugin-api = { workspace = true }
 fieldcad-server = { workspace = true }
 fieldcad-simulation = { workspace = true }
 fieldcad-superposition = { workspace = true }
+fieldcad-test-field = { workspace = true, optional = true }
 glam = { workspace = true }
 open = { workspace = true }
 pollster = { workspace = true }

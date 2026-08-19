@@ -37,6 +37,11 @@ struct Cli {
     #[arg(long, value_name = "ADDRESS")]
     mcp: Option<SocketAddr>,
 
+    /// Compose the test-only live-expression field fixture. This flag is
+    /// available only in binaries built with `--features expression-fixture`.
+    #[arg(long)]
+    expression_fixture: bool,
+
     /// Open this fieldcad.scene/v1 document at startup instead of the
     /// built-in demo scene. Fails to start, rather than falling back to the
     /// demo scene, if the file cannot be loaded.
@@ -55,6 +60,13 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
+    if cli.expression_fixture && !cfg!(feature = "expression-fixture") {
+        eprintln!(
+            "Error: --expression-fixture requires building with --features expression-fixture"
+        );
+        return ExitCode::FAILURE;
+    }
+
     if let Some(frames) = cli.smoke {
         return run_smoke_test(frames);
     }
@@ -65,6 +77,7 @@ fn main() -> ExitCode {
             .map(|seconds| Duration::from_secs_f64(seconds.max(0.1))),
         mcp: cli.mcp,
         open_path: cli.scene,
+        expression_fixture: cli.expression_fixture,
     };
     match fieldcad_desktop::run_for(options) {
         Ok(()) => ExitCode::SUCCESS,

@@ -3158,6 +3158,38 @@ mod tests {
         assert_eq!(state["document"]["constants"][0]["name"], "answer");
         assert_eq!(state["nodes"][0]["status"], "Resolved");
         assert_eq!(state["diagnostics"], serde_json::json!([]));
+
+        let canonical = serde_json::to_value(lock(&server.model).expression_state()).unwrap();
+        assert_eq!(state, canonical);
+
+        let before_world = lock(&server.model).world();
+        let before_objects = before_world.objects().len();
+        drop(before_world);
+        let invalid = fieldcad_expressions::ExpressionCommand::SetConstantSource {
+            constant: fieldcad_expressions::ConstantId::new(42),
+            source: "1 / 0".into(),
+        };
+        let _rejected = server
+            .edit_scene(Parameters(EditSceneParams {
+                world_commands: vec![crate::typed_world::WorldEditParam::CreateObject {
+                    name: "must roll back".to_owned(),
+                    transform: None,
+                    velocity: None,
+                    shape: None,
+                    visible: true,
+                    pinned: false,
+                    components: Vec::new(),
+                }],
+                expression_commands: vec![serde_json::to_value(invalid).unwrap()],
+            }))
+            .await
+            .unwrap();
+        let authority = lock(&server.model);
+        assert_eq!(authority.world().objects().len(), before_objects);
+        assert_eq!(
+            authority.expression_state(),
+            serde_json::from_value(state).unwrap()
+        );
     }
 
     #[tokio::test]

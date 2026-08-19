@@ -9,6 +9,7 @@
 //! individual panels and property editors, and [`plot`] the probe history plot.
 
 mod compute;
+mod expression_draft;
 mod help;
 mod panels;
 mod plot;

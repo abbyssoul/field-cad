@@ -173,3 +173,92 @@ without changing the expression language’s evaluation core.
 - Live feedback cycles are rejected rather than solved as algebraic systems.
 - Scalar expressions are the initial contract; vector-valued expressions and observation projections remain explicit future
 milestones.
+
+## Acceptance implementation (2026-08-19)
+
+The remaining acceptance implementation is complete, with final resolution
+held behind the manual interaction checklist below.
+
+- `fieldcad-test-field` 0.3.0 declares the test-only `live-gain` object
+  component. Its required dimensionless property is live-bindable, at most one
+  object may carry it, and `on_world_changed` rereads it before analytic
+  sampling. The configured plugin gain and object gain multiply.
+- The desktop composes that plugin only when built with
+  `--features expression-fixture` and launched with `--expression-fixture`.
+  The default production catalog is unchanged; the same opt-in catalog is used
+  for new/opened sessions and embedded MCP session replacement.
+- Expression draft reconciliation is egui-independent for existing/new
+  constants, property formulas, and the user library. Dirty drafts survive
+  authoritative changes, clean drafts follow them, accepted submissions are
+  acknowledged, and Reset/Cancel/Escape restore the latest accepted baseline.
+  User-library rows now stage a complete candidate and mutate the live model
+  only after a valid atomic save.
+- Candidate previews carry an owner-associated diagnostic/span and deterministic
+  transitive dependents. A valid candidate graph supplies affected targets;
+  the accepted graph supplies them when candidate compilation fails. Apply and
+  Enter require a valid dirty draft. Property formulas retain explicit Freeze
+  and add Cancel.
+- Document constants and live-bindable property formulas offer distance probes
+  by display name while inserting `distance.<stable-id>`. User-library
+  constants do not offer observations. Rename coverage proves labels change
+  without changing tokens.
+- The acceptance fixture found and fixed two contract defects: implicit unit
+  suffixes now bind as quantities (`distance.0 / 1 m` is dimensionless), and a
+  changed pre-tick live value forces analytic channels to republish rather than
+  retaining the prior tick's batch.
+
+Coverage now includes the consuming test solver's sampled pre-tick value and
+failure/retry behavior, full local/async `ExpressionState` equality, MCP JSON
+parity plus invalid mixed-edit rollback, desktop `ComputeView` parity, staged
+draft transitions, v7/v8 persistence compatibility, embedded dependency
+provenance/hash/value rebuild without a local library, explicit refresh with
+undo/redo, and user-library first-use/version/atomic-save behavior. Existing
+runtime tests continue covering queue replay, removal guards, deterministic
+recording replay, graph hashes, unrelated-component notification filtering,
+and transaction rollback.
+
+## Verification evidence (2026-08-19)
+
+- `cargo fmt --all --check` — passed.
+- `cargo test --workspace` — passed. The restricted sandbox initially refused
+  Unix-domain socket binds in four MCP transport tests; the same complete suite
+  passed outside that restriction.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  passed.
+- `cargo test -p fieldcad-expressions --test steady_state_allocations` — passed;
+  1,000 warmed evaluations allocate zero times inside the documented boundary.
+- `cargo run --release -p fieldcad-bench -- --filter expressions
+  --save-baseline docs/perf/2026-08-19-expressions.json` — both full sweeps
+  passed their linear declaration (`O(nodes^1.13)` and `O(bindings^1.05)`). See
+  `docs/perf/2026-08-19-expression-evaluation.md` and the dated JSON report.
+- `cargo run -p fieldcad-desktop -- --smoke 120` — passed on llvmpipe Vulkan.
+- `env -u WAYLAND_DISPLAY cargo run -p fieldcad-desktop --features
+  expression-fixture -- --expression-fixture --exit-after 3` — initialized the
+  Intel Iris Xe Vulkan window and shut down cleanly after the bounded launch.
+- A normal build invoked with `--expression-fixture` refuses startup and
+  explains that the Cargo feature is required.
+
+## Manual acceptance still required
+
+The bounded window launch verifies feature composition and lifecycle, but is
+not a human interaction pass. Before adding `## Status: resolved`, run
+
+```shell
+cargo run -p fieldcad-desktop --features expression-fixture -- --expression-fixture
+```
+
+and verify all of the following in-app:
+
+- formula, document-variable, new-variable, and user-library drafts;
+- byte-span diagnostics and transitive affected-target lists;
+- valid/invalid Enter, Apply disabling, Cancel/Reset/Escape, and Freeze;
+- invalid user-library save prevention;
+- distance labels/tokens across a probe rename;
+- running pre-tick binding, sampled field change, zero-distance failure, and
+  successful retry;
+- save/reload and explicit embedded-library refresh with undo/redo;
+- MCP expression inspection matching the desktop after accepted and rejected
+  edits.
+
+Quantity/vector/observation expansion and catalog/object-property references
+remain deferred to Milestone 6 follow-on work.

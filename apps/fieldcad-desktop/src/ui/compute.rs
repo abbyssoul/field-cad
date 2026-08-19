@@ -641,6 +641,42 @@ mod tests {
     }
 
     #[test]
+    fn compute_view_projects_the_complete_expression_state() {
+        use fieldcad_simulation::{LocalDataSource, RuntimeConfig, SimulationRuntime};
+
+        let expressions = fieldcad_expressions::ExpressionDocument {
+            constants: vec![fieldcad_expressions::ConstantDefinition {
+                id: fieldcad_expressions::ConstantId::new(9),
+                scope: fieldcad_expressions::ConstantScope::Document,
+                name: "scale".to_owned(),
+                source: "2 m".into(),
+                revision: None,
+                provenance: None,
+            }],
+            bindings: Vec::new(),
+        };
+        let source = LocalDataSource::new(
+            SimulationRuntime::new(
+                RuntimeConfig::new(
+                    fieldcad_core::Domain::centred_cube(4.0, 8).unwrap(),
+                    fieldcad_core::TimeStep::from_seconds(0.1).unwrap(),
+                    fieldcad_core::SessionId::from_u128(0xe91),
+                )
+                .with_expressions(expressions)
+                .with_plugin(Box::new(fieldcad_test_field::TestFieldPlugin)),
+            )
+            .unwrap(),
+        );
+        let authoritative = source.expression_state();
+        let world = source.world();
+        let view = ComputeView::build(&source, &world, None);
+
+        assert_eq!(view.expression_state, authoritative);
+        assert_eq!(view.expressions, authoritative.document);
+        assert_eq!(view.resolved_constants, source.resolved_constants());
+    }
+
+    #[test]
     fn boundary_summary_reports_uniform_and_mixed_domains() {
         assert_eq!(
             format_boundaries(BoundaryConditions::uniform(BoundaryCondition::Periodic)),

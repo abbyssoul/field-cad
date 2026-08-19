@@ -855,6 +855,14 @@ fn authored_expressions_round_trip_and_legacy_documents_default_empty() {
         .document;
     assert_eq!(loaded.expressions, document.expressions);
 
+    let mut legacy_v8 = serde_json::to_value(&document).unwrap();
+    legacy_v8["format_version"] = serde_json::json!(8);
+    std::fs::write(&path, serde_json::to_vec_pretty(&legacy_v8).unwrap()).unwrap();
+    let loaded = fieldcad_scene_document::load_newest_valid(&path)
+        .unwrap()
+        .document;
+    assert_eq!(loaded.expressions, document.expressions);
+
     let mut legacy = serde_json::to_value(document).unwrap();
     legacy["format_version"] = serde_json::json!(7);
     legacy.as_object_mut().unwrap().remove("expressions");
@@ -864,6 +872,144 @@ fn authored_expressions_round_trip_and_legacy_documents_default_empty() {
         .document;
     assert!(loaded.expressions.constants.is_empty());
     assert!(loaded.expressions.bindings.is_empty());
+}
+
+#[test]
+fn embedded_user_constants_bindings_hash_and_refresh_survive_reload() {
+    use fieldcad_expressions::{
+        ConstantDefinition, ConstantId, ConstantScope, ExpressionCommand, ExpressionDocument,
+        PropertyBinding, PropertyTarget,
+    };
+    use fieldcad_test_field::{
+        live_gain_component_id, live_gain_component_schema, live_gain_property_id,
+    };
+
+    let mut world = World::new();
+    let properties: PropertyBag = [(
+        live_gain_property_id(),
+        fieldcad_core::PropertyValue::Scalar(
+            fieldcad_core::Quantity::new(1.0, Dimension::DIMENSIONLESS).unwrap(),
+        ),
+    )]
+    .into_iter()
+    .collect();
+    let report = world
+        .commit([
+            WorldCommand::RegisterComponentSchema(live_gain_component_schema()),
+            WorldCommand::CreateObject(
+                ObjectSpec::new("fixture").with_component(live_gain_component_id(), properties),
+            ),
+            WorldCommand::CreateObject(ObjectSpec::new("endpoint").with_transform(
+                fieldcad_core::Transform::at_finite(DVec3::new(2.0, 0.0, 0.0)),
+            )),
+            WorldCommand::CreateDistanceProbe(fieldcad_core::DistanceProbeSpec::new(
+                "gap",
+                fieldcad_core::ObjectId::new(0),
+                fieldcad_core::ObjectId::new(1),
+            )),
+        ])
+        .unwrap();
+    let target = PropertyTarget {
+        object: report.created_objects[0],
+        component: live_gain_component_id(),
+        property: live_gain_property_id(),
+    };
+    let user = ConstantDefinition {
+        id: ConstantId::new(1_u64 << 63),
+        scope: ConstantScope::User,
+        name: "base".to_owned(),
+        source: "2".into(),
+        revision: Some("library-a".to_owned()),
+        provenance: Some("user-constants.json".to_owned()),
+    };
+    let expressions = ExpressionDocument {
+        constants: vec![
+            user.clone(),
+            ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::Document,
+                name: "live_scale".to_owned(),
+                source: "user.base * distance.0 / 1 m".into(),
+                revision: None,
+                provenance: None,
+            },
+        ],
+        bindings: vec![PropertyBinding {
+            target: target.clone(),
+            source: "doc.live_scale".into(),
+        }],
+    };
+    let config = RuntimeConfig::new(
+        domain(),
+        TimeStep::from_seconds(0.1).unwrap(),
+        SessionId::from_u128(0xe01),
+    )
+    .with_world(world)
+    .with_expressions(expressions);
+    let config = catalog().into_iter().fold(config, |config, registration| {
+        config.with_plugin_registration(registration)
+    });
+    let mut runtime = SimulationRuntime::new(config).unwrap();
+    let original_hash = runtime.expression_content_hash().to_owned();
+    assert_eq!(
+        runtime.world_snapshot().objects()[&target.object].components[&target.component]
+            .scalar(&target.property),
+        Some(4.0)
+    );
+
+    let mut capture = inputs(&runtime, QueueDocument::default());
+    capture.expressions = runtime.expression_document().clone();
+    let document = SceneDocument::capture(capture, "test", None);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("embedded-expressions.fcscene");
+    save_to_path(&document, &path).unwrap();
+    let loaded = fieldcad_scene_document::load_newest_valid(&path)
+        .unwrap()
+        .document;
+    let (plugins, warnings) = resolve_plugins(catalog(), &loaded.field_systems).unwrap();
+    assert!(warnings.is_empty());
+    let config = RuntimeConfig::new(loaded.domain, loaded.time_step, SessionId::from_u128(0xe02))
+        .with_world(World::from_document(loaded.world))
+        .with_expressions(loaded.expressions);
+    let config = plugins.into_iter().fold(config, |config, registration| {
+        config.with_plugin_registration(registration)
+    });
+    let reloaded = SimulationRuntime::new(config).unwrap();
+    assert_eq!(reloaded.expression_content_hash(), original_hash);
+    assert_eq!(reloaded.expression_document().constants[0], user);
+    assert_eq!(
+        reloaded.world_snapshot().objects()[&target.object].components[&target.component]
+            .scalar(&target.property),
+        Some(4.0)
+    );
+
+    let refreshed = ConstantDefinition {
+        source: "3".into(),
+        revision: Some("library-b".to_owned()),
+        ..user
+    };
+    runtime
+        .commit_expression_commands(vec![ExpressionCommand::ImportUserConstants(vec![
+            refreshed,
+        ])])
+        .unwrap();
+    assert_eq!(
+        runtime.world_snapshot().objects()[&target.object].components[&target.component]
+            .scalar(&target.property),
+        Some(6.0)
+    );
+    runtime.undo().unwrap();
+    assert_eq!(
+        runtime.world_snapshot().objects()[&target.object].components[&target.component]
+            .scalar(&target.property),
+        Some(4.0)
+    );
+    runtime.redo().unwrap();
+    assert_eq!(
+        runtime.world_snapshot().objects()[&target.object].components[&target.component]
+            .scalar(&target.property),
+        Some(6.0)
+    );
 }
 
 #[test]

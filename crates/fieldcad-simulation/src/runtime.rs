@@ -1838,11 +1838,14 @@ impl SimulationRuntime {
     }
 
     pub fn play(&mut self) -> Result<(), RuntimeError> {
-        if let Err(error) = self.refresh_expression_values() {
-            self.clock.pause();
-            return Err(error);
-        }
-        if self.world.revision() != self.latest.identity.world_revision {
+        let expression_changed = match self.refresh_expression_values() {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.clock.pause();
+                return Err(error);
+            }
+        };
+        if expression_changed || self.world.revision() != self.latest.identity.world_revision {
             self.publish_snapshot(SamplingPolicy::All)?;
         }
         self.clock.play();
@@ -1956,15 +1959,18 @@ impl SimulationRuntime {
         if self.clock.snapshot().mode == SimulationMode::Running {
             return Err(RuntimeError::CannotStepWhileRunning);
         }
-        if let Err(error) = self.refresh_expression_values() {
-            self.clock.pause();
-            return Err(error);
-        }
+        let expression_changed = match self.refresh_expression_values() {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.clock.pause();
+                return Err(error);
+            }
+        };
         let context = self
             .clock
             .step_once()
             .ok_or(RuntimeError::CannotStepWhileRunning)?;
-        self.apply_tick(context)
+        self.apply_tick(context, expression_changed)
     }
 
     /// Advance one tick if running. Returns whether a tick was taken.
@@ -1972,23 +1978,30 @@ impl SimulationRuntime {
         if self.clock.snapshot().mode != SimulationMode::Running {
             return Ok(false);
         }
-        if let Err(error) = self.refresh_expression_values() {
-            self.clock.pause();
-            return Err(error);
-        }
+        let expression_changed = match self.refresh_expression_values() {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.clock.pause();
+                return Err(error);
+            }
+        };
         let Some(context) = self.clock.advance_running() else {
             return Ok(false);
         };
-        self.apply_tick(context)?;
+        self.apply_tick(context, expression_changed)?;
         Ok(true)
     }
 
     /// Times `apply_tick_inner` and records the result regardless of outcome
     /// — a tick that errored out still cost wall-clock time, and hiding that
     /// would make a solver bug look like a free tick in the history.
-    fn apply_tick(&mut self, context: StepContext) -> Result<(), RuntimeError> {
+    fn apply_tick(
+        &mut self,
+        context: StepContext,
+        expression_changed: bool,
+    ) -> Result<(), RuntimeError> {
         let started = Instant::now();
-        let result = self.apply_tick_inner(context);
+        let result = self.apply_tick_inner(context, expression_changed);
         self.last_tick_compute_ms = started.elapsed().as_secs_f64() as f32 * 1_000.0;
         result
     }
@@ -2020,7 +2033,11 @@ impl SimulationRuntime {
         Ok(())
     }
 
-    fn apply_tick_inner(&mut self, context: StepContext) -> Result<(), RuntimeError> {
+    fn apply_tick_inner(
+        &mut self,
+        context: StepContext,
+        expression_changed: bool,
+    ) -> Result<(), RuntimeError> {
         // Resolve motion ownership before any solver advances. Discovering a
         // conflict after a field/particle integrator mutated its private state
         // would leave that state ahead of the authoritative world.
@@ -2152,7 +2169,11 @@ impl SimulationRuntime {
         }
 
         if kinematics.is_empty() {
-            return self.publish_snapshot(SamplingPolicy::TimeDependentOnly);
+            return self.publish_snapshot(if expression_changed {
+                SamplingPolicy::All
+            } else {
+                SamplingPolicy::TimeDependentOnly
+            });
         }
 
         // A solver has moved a body, so the world is no longer the authored
@@ -3110,11 +3131,15 @@ mod tests {
 
     use fieldcad_core::{
         BoundaryCondition, BoundaryConditions, Dimension, DistanceProbeSpec, DomainBounds,
-        ObjectSpec, PluginVersion, Precision, PropertyId, PropertyKind, PropertySchema,
-        PropertyValue, Quantity, Resolution, Transform, Velocity,
+        FieldColumn, ObjectSpec, PluginVersion, Precision, PropertyId, PropertyKind,
+        PropertySchema, PropertyValue, Quantity, Resolution, Transform, Velocity,
     };
     use fieldcad_plugin_api::{
         FieldBrushFalloff, ObjectKinematicsUpdate, SampledColumn, SolverKind, SolverStepOutcome,
+    };
+    use fieldcad_test_field::{
+        TestFieldPlugin, live_gain_component_id, live_gain_component_schema, live_gain_property_id,
+        scalar_channel_id,
     };
     use glam::DVec3;
 
@@ -4792,5 +4817,205 @@ mod tests {
                 .scalar(&target.property),
             Some(7.0)
         );
+    }
+
+    struct UnrelatedNotificationPlugin {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl EquationSystemPlugin for UnrelatedNotificationPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: PluginId::new("expression-unrelated").unwrap(),
+                version: PluginVersion::new(0, 1, 0),
+                display_name: "Unrelated notification fixture".to_owned(),
+                description: "Counts world notifications without consuming live-gain".to_owned(),
+            }
+        }
+
+        fn channels(&self) -> Vec<ChannelSchema> {
+            Vec::new()
+        }
+
+        fn create_solver(
+            &self,
+            _context: SolverContext<'_>,
+        ) -> Result<Box<dyn EquationSystemSolver>, PluginError> {
+            Ok(Box::new(UnrelatedNotificationSolver {
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+    }
+
+    struct UnrelatedNotificationSolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl EquationSystemSolver for UnrelatedNotificationSolver {
+        fn on_world_changed(&mut self, _world: &WorldSnapshot) -> Result<(), PluginError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn sample(
+            &self,
+            channel: ChannelHandle,
+            _geometry: &SampleGeometry,
+        ) -> Result<SampledColumn, PluginError> {
+            Err(PluginError::UnknownChannel(channel.index()))
+        }
+    }
+
+    fn test_field_live_runtime(
+        source: &str,
+    ) -> (SimulationRuntime, ObjectId, ObjectId, Arc<AtomicUsize>) {
+        let mut world = World::new();
+        let live_properties: PropertyBag = [(
+            live_gain_property_id(),
+            PropertyValue::Scalar(Quantity::new(1.0, Dimension::DIMENSIONLESS).unwrap()),
+        )]
+        .into_iter()
+        .collect();
+        let report = world
+            .commit([
+                WorldCommand::RegisterComponentSchema(live_gain_component_schema()),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("gain fixture")
+                        .with_component(live_gain_component_id(), live_properties),
+                ),
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("moving endpoint")
+                        .with_transform(Transform::at_finite(DVec3::new(2.0, 0.0, 0.0))),
+                ),
+                WorldCommand::CreateDistanceProbe(DistanceProbeSpec::new(
+                    "live gap",
+                    ObjectId::new(0),
+                    ObjectId::new(1),
+                )),
+                WorldCommand::CreateProbe(fieldcad_core::ProbeSpec::at(
+                    "sample",
+                    DVec3::X,
+                    vec![scalar_channel_id()],
+                )),
+            ])
+            .unwrap();
+        let fixture = report.created_objects[0];
+        let endpoint = report.created_objects[1];
+        let expressions = ExpressionDocument {
+            constants: Vec::new(),
+            bindings: vec![fieldcad_expressions::PropertyBinding {
+                target: PropertyTarget {
+                    object: fixture,
+                    component: live_gain_component_id(),
+                    property: live_gain_property_id(),
+                },
+                source: source.into(),
+            }],
+        };
+        let unrelated_calls = Arc::new(AtomicUsize::new(0));
+        let runtime = SimulationRuntime::new(
+            RuntimeConfig::new(
+                Domain::centred_cube(10.0, 8).unwrap(),
+                TimeStep::from_seconds(0.25).unwrap(),
+                SessionId::from_u128(0xf17),
+            )
+            .with_world(world)
+            .with_expressions(expressions)
+            .with_plugin(Box::new(TestFieldPlugin))
+            .with_plugin(Box::new(UnrelatedNotificationPlugin {
+                calls: Arc::clone(&unrelated_calls),
+            })),
+        )
+        .unwrap();
+        (runtime, fixture, endpoint, unrelated_calls)
+    }
+
+    fn sampled_test_scalar(runtime: &SimulationRuntime) -> f64 {
+        let snapshot = runtime.latest_snapshot();
+        let channel = snapshot
+            .channel(&scalar_channel_id())
+            .expect("test scalar is published");
+        let FieldColumn::Scalar(values) = channel.batches[0].values() else {
+            panic!("test scalar channel has scalar values");
+        };
+        values[0]
+    }
+
+    #[test]
+    fn test_field_sample_proves_pre_tick_live_gain_adoption_and_retry() {
+        let (mut runtime, fixture, endpoint, unrelated_calls) =
+            test_field_live_runtime("distance.0 / 1 m");
+        assert_eq!(sampled_test_scalar(&runtime), 2.0);
+        let unrelated_baseline = unrelated_calls.load(Ordering::SeqCst);
+
+        // Model a solver-owned endpoint move at state n. Preparation must
+        // resolve and notify test-field before advancing n -> n+1.
+        runtime
+            .world
+            .commit([WorldCommand::SetTransform {
+                object: endpoint,
+                transform: Transform::at_finite(DVec3::new(3.0, 0.0, 0.0)),
+            }])
+            .unwrap();
+        runtime.step_once().unwrap();
+        assert_eq!(runtime.clock_snapshot().tick(), 1);
+        assert_eq!(sampled_test_scalar(&runtime), 3.0);
+        assert_eq!(
+            unrelated_calls.load(Ordering::SeqCst),
+            unrelated_baseline,
+            "a solver declaring no consumption of live-gain is not notified"
+        );
+        assert_eq!(
+            runtime.world_snapshot().objects()[&fixture].components[&live_gain_component_id()]
+                .scalar(&live_gain_property_id()),
+            Some(3.0)
+        );
+
+        // Switch to an inverse form so a coincident endpoint exercises the
+        // live evaluation rollback path, while retaining the same dimension.
+        runtime
+            .commit_expression_commands(vec![ExpressionCommand::SetPropertyExpression(
+                fieldcad_expressions::PropertyBinding {
+                    target: PropertyTarget {
+                        object: fixture,
+                        component: live_gain_component_id(),
+                        property: live_gain_property_id(),
+                    },
+                    source: "1 m / distance.0".into(),
+                },
+            )])
+            .unwrap();
+
+        runtime
+            .world
+            .commit([WorldCommand::SetTransform {
+                object: endpoint,
+                transform: Transform::default(),
+            }])
+            .unwrap();
+        let clock = runtime.clock_snapshot();
+        let world_revision = runtime.world_snapshot().revision();
+        let snapshot = Arc::clone(&runtime.latest);
+        assert!(matches!(
+            runtime.step_once(),
+            Err(RuntimeError::Expression(_))
+        ));
+        assert_eq!(runtime.clock_snapshot(), clock);
+        assert_eq!(runtime.world_snapshot().revision(), world_revision);
+        assert!(Arc::ptr_eq(&runtime.latest, &snapshot));
+        assert_eq!(runtime.clock.mode(), SimulationMode::Paused);
+        assert_eq!(runtime.expression_state().diagnostics.len(), 1);
+
+        runtime
+            .world
+            .commit([WorldCommand::SetTransform {
+                object: endpoint,
+                transform: Transform::at_finite(DVec3::new(4.0, 0.0, 0.0)),
+            }])
+            .unwrap();
+        runtime.step_once().unwrap();
+        assert_eq!(runtime.clock_snapshot().tick(), 2);
+        assert_eq!(sampled_test_scalar(&runtime), 0.25);
+        assert!(runtime.expression_state().diagnostics.is_empty());
     }
 }
