@@ -116,7 +116,7 @@ mod tests {
     use crate::source::{DocumentOrdinal, SourceLocation, TemplateIdentity, global_entry_ref};
     use crate::structure::TemplateComponentInstance;
     use fieldcad_core::quantities::LengthMetres;
-    use fieldcad_sources::{
+    use fieldcad_gravity_sources::{
         inertial_mass_component_id, inertial_mass_component_schema, mass_property_id,
     };
     use glam::DVec3;

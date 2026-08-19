@@ -27,7 +27,7 @@ fieldcad-electrostatics = { workspace = true }
 fieldcad-gravitostatics = { workspace = true }
 fieldcad-catalog = { workspace = true }
 fieldcad-scene-document = { workspace = true }
-fieldcad-sources = { workspace = true }
+fieldcad-gravity-sources = { workspace = true }
 fieldcad-mcp = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 fieldcad-server = { workspace = true }

@@ -271,7 +271,7 @@ pub fn property_bag_to_template(
 mod tests {
     use super::*;
     use crate::structure::TemplateComponentInstance;
-    use fieldcad_sources::{
+    use fieldcad_gravity_sources::{
         inertial_mass_component_id, inertial_mass_component_schema, mass_property_id,
     };
 

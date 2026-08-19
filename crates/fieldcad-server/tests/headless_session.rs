@@ -10,9 +10,9 @@ use fieldcad_core::{
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electrostatics::electric_field_channel_id;
+use fieldcad_gravity_sources::{inertial_mass_component_id, inertial_mass_properties};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{CommandEvent, CommandPayload};
-use fieldcad_sources::{inertial_mass_component_id, inertial_mass_properties};
 use glam::DVec3;
 
 /// [`HeadlessServer`] wraps a non-blocking source (ADR 0011): a submission

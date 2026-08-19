@@ -2208,9 +2208,8 @@ impl SimulationRuntime {
         // claimed through `kinematic_objects` is excluded: that solver
         // integrates it with a scheme of its own, and two integrators moving one
         // body would each be right about a different trajectory.
-        let (all_dynamic, all_carried) = dynamics::collect_bodies(&world)?;
+        let (all_dynamic, all_carried) = dynamics::collect_bodies(&world);
         let bodies: Vec<_> = all_dynamic
-            .into_iter()
             .filter(|body| !kinematic_owners.contains_key(&body.object))
             .collect();
 
@@ -2294,7 +2293,6 @@ impl SimulationRuntime {
         // Pinned bodies with an authored velocity are carried at exactly that
         // velocity, integrating nothing.
         let carried: Vec<_> = all_carried
-            .into_iter()
             .filter(|body| !kinematic_owners.contains_key(&body.object))
             .collect();
         for update in dynamics::carry(&carried, seconds)? {
@@ -2771,7 +2769,7 @@ impl SimulationRuntime {
         let world = self.world.snapshot();
         let mut anchor_sync = Vec::new();
         if !world.mass_aggregate_probes().is_empty() {
-            let bodies = dynamics::collect_mass_bearing_bodies(&world).unwrap_or_default();
+            let bodies: Vec<_> = dynamics::collect_mass_bearing_bodies(&world).collect();
             for probe in world.mass_aggregate_probes().values() {
                 let Some(sample) = dynamics::mass_aggregate(bodies.iter(), &probe.selection) else {
                     continue;
@@ -3083,7 +3081,7 @@ impl SimulationRuntime {
             .collect();
 
         let mass_aggregates: Vec<(fieldcad_core::MassAggregateProbeId, MassAggregateSample)> = {
-            let bodies = dynamics::collect_mass_bearing_bodies(&world).unwrap_or_default();
+            let bodies: Vec<_> = dynamics::collect_mass_bearing_bodies(&world).collect();
             world
                 .mass_aggregate_probes()
                 .values()
@@ -3591,8 +3589,8 @@ mod tests {
             ObjectSpec::new(name)
                 .with_transform(Transform::at_finite(position))
                 .with_component(
-                    fieldcad_sources::inertial_mass_component_id(),
-                    fieldcad_sources::inertial_mass_properties(
+                    fieldcad_gravity_sources::inertial_mass_component_id(),
+                    fieldcad_gravity_sources::inertial_mass_properties(
                         fieldcad_core::quantities::MassKg::new::<
                             fieldcad_core::quantities::kilogram,
                         >(1.0),
@@ -3633,7 +3631,7 @@ mod tests {
         let mut world = World::new();
         world
             .commit(
-                fieldcad_sources::mass_component_schemas()
+                fieldcad_gravity_sources::mass_component_schemas()
                     .into_iter()
                     .map(WorldCommand::RegisterComponentSchema),
             )
@@ -3675,7 +3673,7 @@ mod tests {
         let mut world = World::new();
         world
             .commit(
-                fieldcad_sources::mass_component_schemas()
+                fieldcad_gravity_sources::mass_component_schemas()
                     .into_iter()
                     .map(WorldCommand::RegisterComponentSchema),
             )
@@ -4280,7 +4278,7 @@ mod tests {
         use fieldcad_core::{ObjectShape, ObjectSpec, Transform, Velocity};
         use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
         use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
-        use fieldcad_sources::{inertial_mass_component_id, inertial_mass_properties};
+        use fieldcad_gravity_sources::{inertial_mass_component_id, inertial_mass_properties};
 
         const ELECTRON_MASS_KG: f64 = 9.109_383_713_9e-31;
         const ELEMENTARY_CHARGE_COULOMBS: f64 = 1.602_176_634e-19;
@@ -4372,7 +4370,7 @@ mod tests {
         use fieldcad_core::{ObjectShape, ObjectSpec, Transform, Velocity};
         use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
         use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
-        use fieldcad_sources::{inertial_mass_component_id, inertial_mass_properties};
+        use fieldcad_gravity_sources::{inertial_mass_component_id, inertial_mass_properties};
 
         const ELECTRON_MASS_KG: f64 = 9.109_383_713_9e-31;
         const PROTON_MASS_KG: f64 = 1.672_621_925_95e-27;

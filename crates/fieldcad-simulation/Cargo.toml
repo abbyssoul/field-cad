@@ -7,7 +7,7 @@ edition = "2024"
 fieldcad-core = { workspace = true }
 fieldcad-dynamics = { workspace = true }
 fieldcad-expressions = { workspace = true }
-fieldcad-sources = { workspace = true }
+fieldcad-gravity-sources = { workspace = true }
 fieldcad-plugin-api = { workspace = true }
 glam = { workspace = true, features = ["serde"] }
 serde = { workspace = true }

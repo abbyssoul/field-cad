@@ -73,8 +73,8 @@ use fieldcad_core::{
     MassAggregateSample, MassSelection, ObjectId, SPEED_OF_LIGHT, Transform, Velocity, WorldError,
     WorldSnapshot, relativistic_momentum,
 };
+use fieldcad_gravity_sources::{SourceError, inertial_mass_component_id, inertial_mass_property};
 use fieldcad_plugin_api::{DynamicBody, ObjectKinematicsUpdate};
-use fieldcad_sources::{SourceError, inertial_mass_component_id, inertial_mass_property};
 use glam::DVec3;
 
 /// Which numerical scheme advances a dynamic body from its summed force.
@@ -125,24 +125,31 @@ impl IntegrationScheme {
 /// (force-integrated) and pinned-moving (carried at authored velocity) bodies.
 pub fn collect_bodies(
     world: &WorldSnapshot,
-) -> Result<(Vec<DynamicBody>, Vec<DynamicBody>), DynamicsError> {
-    let mut dynamic = Vec::new();
-    let mut carried = Vec::new();
-    for (object, properties) in world.objects_with(&inertial_mass_component_id()) {
-        let inertial_mass_kg = inertial_mass_property(properties).unwrap();
-        let body = DynamicBody {
+) -> (
+    impl Iterator<Item = DynamicBody> + '_,
+    impl Iterator<Item = DynamicBody> + '_,
+) {
+    let dynamic_component_id = inertial_mass_component_id();
+    let dynamic = world.objects().values().filter_map(move |object| {
+        let properties = object.components.get(&dynamic_component_id)?;
+        (!object.pinned).then(|| DynamicBody {
             object: object.id,
-            inertial_mass_kg,
+            inertial_mass_kg: inertial_mass_property(properties).unwrap(),
             position: object.transform.translation,
             velocity: object.velocity.linear,
-        };
-        if !object.pinned {
-            dynamic.push(body);
-        } else if object.velocity.linear != DVec3::ZERO {
-            carried.push(body);
-        }
-    }
-    Ok((dynamic, carried))
+        })
+    });
+    let carried_component_id = inertial_mass_component_id();
+    let carried = world.objects().values().filter_map(move |object| {
+        let properties = object.components.get(&carried_component_id)?;
+        (object.pinned && object.velocity.linear != DVec3::ZERO).then(|| DynamicBody {
+            object: object.id,
+            inertial_mass_kg: inertial_mass_property(properties).unwrap(),
+            position: object.transform.translation,
+            velocity: object.velocity.linear,
+        })
+    });
+    (dynamic, carried)
 }
 
 /// Every object carrying inertial mass, regardless of pinned state.
@@ -153,18 +160,17 @@ pub fn collect_bodies(
 /// that physical totals like center of mass and kinetic energy must include.
 pub fn collect_mass_bearing_bodies(
     world: &WorldSnapshot,
-) -> Result<Vec<DynamicBody>, DynamicsError> {
-    world
-        .objects_with(&inertial_mass_component_id())
-        .map(|(object, properties)| {
-            Ok(DynamicBody {
-                object: object.id,
-                inertial_mass_kg: inertial_mass_property(properties).unwrap(),
-                position: object.transform.translation,
-                velocity: object.velocity.linear,
-            })
+) -> impl Iterator<Item = DynamicBody> + '_ {
+    let component_id = inertial_mass_component_id();
+    world.objects().values().filter_map(move |object| {
+        let properties = object.components.get(&component_id)?;
+        Some(DynamicBody {
+            object: object.id,
+            inertial_mass_kg: inertial_mass_property(properties).unwrap(),
+            position: object.transform.translation,
+            velocity: object.velocity.linear,
         })
-        .collect()
+    })
 }
 
 /// Live totals over the mass-bearing bodies a [`MassSelection`] names —
@@ -501,7 +507,7 @@ mod tests {
         ObjectSpec, Transform as CoreTransform, World, WorldCommand,
         quantities::{MassKg, kilogram},
     };
-    use fieldcad_sources::{
+    use fieldcad_gravity_sources::{
         inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
     };
 
@@ -653,7 +659,9 @@ mod tests {
         world.commit(commands).unwrap();
         let snapshot = world.snapshot();
 
-        let (dynamic, carried) = collect_bodies(&snapshot).unwrap();
+        let (dynamic, carried) = collect_bodies(&snapshot);
+        let dynamic: Vec<_> = dynamic.collect();
+        let carried: Vec<_> = carried.collect();
 
         assert_eq!(dynamic.len(), 1, "only the unpinned body is integrated");
         assert_eq!(dynamic[0].object, ObjectId::new(0));
@@ -671,7 +679,7 @@ mod tests {
 
         // `collect_mass_bearing_bodies` keeps all three, including "held" —
         // it's about physical bookkeeping, not who needs a tick update.
-        let all = collect_mass_bearing_bodies(&snapshot).unwrap();
+        let all: Vec<_> = collect_mass_bearing_bodies(&snapshot).collect();
         assert_eq!(all.len(), 3);
     }
 
@@ -719,7 +727,7 @@ mod tests {
     #[test]
     fn mass_aggregate_is_none_without_any_mass() {
         let world = World::new();
-        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let bodies: Vec<_> = collect_mass_bearing_bodies(&world.snapshot()).collect();
         let selection = MassSelection::Universe {
             excluded: BTreeSet::new(),
         };
@@ -729,7 +737,7 @@ mod tests {
     #[test]
     fn mass_aggregate_computes_center_of_mass_velocity_momentum_and_energy() {
         let (world, [a, b, _c]) = three_body_world();
-        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let bodies: Vec<_> = collect_mass_bearing_bodies(&world.snapshot()).collect();
         let selection = MassSelection::Selection {
             included: BTreeSet::from([a, b]),
         };
@@ -779,7 +787,7 @@ mod tests {
     #[test]
     fn mass_aggregate_universe_mode_drops_an_excluded_object() {
         let (world, [_a, _b, c]) = three_body_world();
-        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let bodies: Vec<_> = collect_mass_bearing_bodies(&world.snapshot()).collect();
         let selection = MassSelection::Universe {
             excluded: BTreeSet::from([c]),
         };
@@ -796,7 +804,7 @@ mod tests {
     #[test]
     fn mass_aggregate_selection_mode_ignores_unlisted_objects() {
         let (world, [a, b, _c]) = three_body_world();
-        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let bodies: Vec<_> = collect_mass_bearing_bodies(&world.snapshot()).collect();
         let selection = MassSelection::Selection {
             included: BTreeSet::from([a, b]),
         };
@@ -810,7 +818,7 @@ mod tests {
     #[test]
     fn mass_aggregate_selection_mode_with_no_members_is_none() {
         let (world, _ids) = three_body_world();
-        let bodies = collect_mass_bearing_bodies(&world.snapshot()).unwrap();
+        let bodies: Vec<_> = collect_mass_bearing_bodies(&world.snapshot()).collect();
         let selection = MassSelection::Selection {
             included: BTreeSet::new(),
         };

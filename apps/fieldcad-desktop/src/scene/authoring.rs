@@ -146,7 +146,7 @@ pub fn append_authoring_geometry(
             // objects — actually contributing to `sample.member_count`.
             if is_selected && probe.show_member_lines {
                 for (member, _properties) in
-                    world.objects_with(&fieldcad_sources::inertial_mass_component_id())
+                    world.objects_with(&fieldcad_gravity_sources::inertial_mass_component_id())
                 {
                     if !probe.selection.includes(member.id) {
                         continue;

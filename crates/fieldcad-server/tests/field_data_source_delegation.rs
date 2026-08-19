@@ -13,13 +13,13 @@ use fieldcad_core::{
 };
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_properties};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
+use fieldcad_gravity_sources::{
+    inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
+};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{
     CommandEvent, CommandPayload, CommandSequencer, FieldDataSource, LocalDataSource,
     RuntimeConfig, SimulationRuntime,
-};
-use fieldcad_sources::{
-    inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
 };
 use glam::DVec3;
 

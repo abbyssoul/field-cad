@@ -29,6 +29,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-fieldcad-sources = { workspace = true }
+fieldcad-gravity-sources = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }

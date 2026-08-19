@@ -315,7 +315,7 @@ fn check_envelope(value: &serde_norway::Value) -> Result<(), Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fieldcad_sources::{inertial_mass_component_id, inertial_mass_component_schema};
+    use fieldcad_gravity_sources::{inertial_mass_component_id, inertial_mass_component_schema};
     use std::io::Write;
     use tempfile::TempDir;
 

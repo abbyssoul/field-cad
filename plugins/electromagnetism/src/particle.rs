@@ -5,13 +5,13 @@
 //! crate's component: [`collect_particles`] iterates authored masses, and
 //! charge is optional (an uncharged body is neutral, not invalid). This
 //! stays a private module of the sole consumer (`plugins/gravitostatics` already
-//! has its own `fieldcad_sources::collect_gravity_sources` and does not
+//! has its own `fieldcad_gravity_sources::collect_gravity_sources` and does not
 //! need this) rather than a new shared crate.
 
 use fieldcad_core::quantities::{ChargeCoulombs, MassKg, coulomb};
 use fieldcad_core::{ObjectId, WorldSnapshot};
 use fieldcad_electromagnetic_sources::{charge_component_id, charge_property_id};
-use fieldcad_sources::{SourceError, inertial_mass_component_id, inertial_mass_of};
+use fieldcad_gravity_sources::{SourceError, inertial_mass_component_id, inertial_mass_of};
 use glam::DVec3;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,7 +95,7 @@ mod tests {
     use fieldcad_core::quantities::{coulomb, kilogram};
     use fieldcad_core::{ObjectSpec, Velocity, World, WorldCommand};
     use fieldcad_electromagnetic_sources::charge_properties;
-    use fieldcad_sources::{inertial_mass_properties, mass_component_schemas};
+    use fieldcad_gravity_sources::{inertial_mass_properties, mass_component_schemas};
 
     fn schema_commands() -> Vec<WorldCommand> {
         mass_component_schemas()

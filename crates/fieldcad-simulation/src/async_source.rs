@@ -1297,7 +1297,7 @@ mod tests {
     #[test]
     fn a_moving_body_s_recorded_history_round_trips_through_the_worker() {
         use fieldcad_core::{ObjectShape, ObjectSpec, Transform, Velocity, WorldCommand};
-        use fieldcad_sources::{inertial_mass_component_id, mass_component_schemas};
+        use fieldcad_gravity_sources::{inertial_mass_component_id, mass_component_schemas};
 
         let mut source = AsyncLocalDataSource::new(LocalDataSource::new(runtime()));
 
@@ -1314,7 +1314,7 @@ mod tests {
                     .with_shape(ObjectShape::point(0.05).unwrap())
                     .with_component(
                         inertial_mass_component_id(),
-                        fieldcad_sources::inertial_mass_properties(
+                        fieldcad_gravity_sources::inertial_mass_properties(
                             fieldcad_core::quantities::MassKg::new::<
                                 fieldcad_core::quantities::kilogram,
                             >(1.0),

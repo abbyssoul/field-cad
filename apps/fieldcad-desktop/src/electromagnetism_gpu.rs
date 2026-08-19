@@ -721,10 +721,10 @@ mod tests {
         ElectromagnetismPlugin, MAGNETIC_DIVERGENCE_HANDLE, MAGNETIC_FIELD_HANDLE, courant_limit,
         prescribed_plane_wave_configuration,
     };
-    use fieldcad_plugin_api::{EquationSystemPlugin, SolverContext};
-    use fieldcad_sources::{
+    use fieldcad_gravity_sources::{
         inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
     };
+    use fieldcad_plugin_api::{EquationSystemPlugin, SolverContext};
     use glam::UVec3;
 
     use super::*;

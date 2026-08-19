@@ -1183,10 +1183,10 @@ dependencies = [
  "fieldcad-electrostatics",
  "fieldcad-expressions",
  "fieldcad-gravitostatics",
+ "fieldcad-gravity-sources",
  "fieldcad-plugin-api",
  "fieldcad-scene-document",
  "fieldcad-simulation",
- "fieldcad-sources",
  "glam",
  "serde",
  "serde_json",
@@ -1197,7 +1197,7 @@ name = "fieldcad-catalog"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
- "fieldcad-sources",
+ "fieldcad-gravity-sources",
  "glam",
  "serde",
  "serde_json",
@@ -1239,12 +1239,12 @@ dependencies = [
  "fieldcad-electrostatics",
  "fieldcad-expressions",
  "fieldcad-gravitostatics",
+ "fieldcad-gravity-sources",
  "fieldcad-mcp",
  "fieldcad-plugin-api",
  "fieldcad-scene-document",
  "fieldcad-server",
  "fieldcad-simulation",
- "fieldcad-sources",
  "fieldcad-superposition",
  "fieldcad-test-field",
  "glam",
@@ -1270,8 +1270,8 @@ name = "fieldcad-dynamics"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
+ "fieldcad-gravity-sources",
  "fieldcad-plugin-api",
- "fieldcad-sources",
  "glam",
  "serde",
  "thiserror 2.0.20",
@@ -1293,8 +1293,8 @@ dependencies = [
  "fieldcad-core",
  "fieldcad-electromagnetic-sources",
  "fieldcad-electrostatics",
+ "fieldcad-gravity-sources",
  "fieldcad-plugin-api",
- "fieldcad-sources",
  "glam",
  "thiserror 2.0.20",
 ]
@@ -1326,11 +1326,20 @@ name = "fieldcad-gravitostatics"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
+ "fieldcad-gravity-sources",
  "fieldcad-plugin-api",
- "fieldcad-sources",
  "fieldcad-superposition",
  "fieldcad-superposition-solver",
  "glam",
+]
+
+[[package]]
+name = "fieldcad-gravity-sources"
+version = "0.1.0"
+dependencies = [
+ "fieldcad-core",
+ "glam",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1410,10 +1419,10 @@ dependencies = [
  "fieldcad-electrostatics",
  "fieldcad-expressions",
  "fieldcad-gravitostatics",
+ "fieldcad-gravity-sources",
  "fieldcad-plugin-api",
  "fieldcad-scene-document",
  "fieldcad-simulation",
- "fieldcad-sources",
  "glam",
  "tempfile",
  "thiserror 2.0.20",
@@ -1433,20 +1442,11 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-expressions",
+ "fieldcad-gravity-sources",
  "fieldcad-plugin-api",
- "fieldcad-sources",
  "fieldcad-test-field",
  "glam",
  "serde",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "fieldcad-sources"
-version = "0.1.0"
-dependencies = [
- "fieldcad-core",
- "glam",
  "thiserror 2.0.20",
 ]
 

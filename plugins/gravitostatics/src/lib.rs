@@ -11,8 +11,8 @@ use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, CoupledSource, Dimension, FieldValueKind, PluginId,
     PluginVersion, PropertyId, Quantity, WorldSnapshot,
 };
+use fieldcad_gravity_sources::{collect_gravity_sources, mass_component_schemas};
 use fieldcad_plugin_api::{ExportedVariable, PluginMetadata};
-use fieldcad_sources::{collect_gravity_sources, mass_component_schemas};
 use fieldcad_superposition::InverseSquareSample;
 use fieldcad_superposition_solver::{InverseSquareCoupling, InverseSquarePlugin};
 use glam::DVec3;
@@ -131,12 +131,12 @@ mod tests {
         Domain, FieldColumn, ObjectShape, ObjectSpec, ProbeId, SampleGeometry, StepContext,
         TimeStep, Transform, World, WorldCommand,
     };
-    use fieldcad_plugin_api::{
-        DynamicBody, EquationSystemPlugin, EquationSystemSolver, SolverContext,
-    };
-    use fieldcad_sources::{
+    use fieldcad_gravity_sources::{
         gravitational_mass_component_id, independent_gravitational_mass_properties,
         inertial_mass_component_id, inertial_mass_properties, linked_gravitational_mass_properties,
+    };
+    use fieldcad_plugin_api::{
+        DynamicBody, EquationSystemPlugin, EquationSystemSolver, SolverContext,
     };
 
     fn solver() -> Box<dyn EquationSystemSolver> {
@@ -377,7 +377,7 @@ mod tests {
             })
             .unwrap();
 
-        let collected = fieldcad_sources::collect_gravity_sources(&snapshot).unwrap();
+        let collected = fieldcad_gravity_sources::collect_gravity_sources(&snapshot).unwrap();
         let bodies: Vec<_> = collected
             .iter()
             .map(|source| DynamicBody {

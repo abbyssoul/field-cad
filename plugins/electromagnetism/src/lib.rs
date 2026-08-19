@@ -31,12 +31,12 @@ use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_component_schema, collect_charge_sources,
     electric_field_channel_schema, magnetic_field_channel_schema,
 };
+use fieldcad_gravity_sources::mass_component_schemas;
 use fieldcad_plugin_api::{
     ChannelHandle, EquationSystemPlugin, EquationSystemSolver, PluginConfigurationSchema,
     PluginError, PluginMetadata, ResolvedFieldBrushStroke, SampledColumn, SolverCancellation,
     SolverContext, SolverKind, SolverStepOutcome,
 };
-use fieldcad_sources::mass_component_schemas;
 use glam::{DMat3, DVec3, IVec3, UVec3};
 
 use coupling::{ParticleCoupling, collect_coupled_particles, coupling_is_requested};
@@ -2368,7 +2368,7 @@ mod tests {
         use fieldcad_electromagnetic_sources::{
             charge_component_id, charge_component_schema, charge_properties,
         };
-        use fieldcad_sources::{
+        use fieldcad_gravity_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 
@@ -2443,7 +2443,7 @@ mod tests {
         use fieldcad_electromagnetic_sources::{
             charge_component_id, charge_component_schema, charge_properties,
         };
-        use fieldcad_sources::{
+        use fieldcad_gravity_sources::{
             inertial_mass_component_id, inertial_mass_properties, mass_component_schemas,
         };
 

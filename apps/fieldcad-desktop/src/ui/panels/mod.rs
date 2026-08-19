@@ -278,11 +278,11 @@ mod tests {
         WorldCommand,
         quantities::{MassKg, kilogram},
     };
-    use fieldcad_simulation::CommandPayload;
-    use fieldcad_sources::{
+    use fieldcad_gravity_sources::{
         gravitational_mass_component_schema, independent_gravitational_mass_properties,
         inertial_mass_component_schema, linked_gravitational_mass_properties, mass_property_id,
     };
+    use fieldcad_simulation::CommandPayload;
     use fieldcad_test_field::vector_channel_id;
     use glam::{DQuat, DVec3};
 
@@ -1138,7 +1138,7 @@ mod tests {
     fn every_registered_component_schema_can_be_attached_from_the_generic_menu() {
         for schema in [
             fieldcad_electromagnetic_sources::charge_component_schema(),
-            fieldcad_sources::inertial_mass_component_schema(),
+            fieldcad_gravity_sources::inertial_mass_component_schema(),
         ] {
             let properties = schema
                 .default_properties()
@@ -1204,7 +1204,7 @@ mod tests {
         assert!(!mass.is_relevant(&values));
 
         values.insert(
-            fieldcad_sources::follows_inertial_property_id(),
+            fieldcad_gravity_sources::follows_inertial_property_id(),
             fieldcad_core::PropertyValue::Boolean(false),
         );
 
@@ -1228,7 +1228,7 @@ mod tests {
         world
             .commit([
                 WorldCommand::RegisterComponentSchema(
-                    fieldcad_sources::inertial_mass_component_schema(),
+                    fieldcad_gravity_sources::inertial_mass_component_schema(),
                 ),
                 WorldCommand::CreateObject(ObjectSpec::new("gizmo")),
             ])
@@ -1241,9 +1241,11 @@ mod tests {
         world
             .commit([WorldCommand::AttachComponent {
                 object,
-                component: fieldcad_sources::inertial_mass_component_id(),
-                properties: fieldcad_sources::inertial_mass_properties(MassKg::new::<kilogram>(
-                    3.5,
+                component: fieldcad_gravity_sources::inertial_mass_component_id(),
+                properties: fieldcad_gravity_sources::inertial_mass_properties(MassKg::new::<
+                    kilogram,
+                >(
+                    3.5
                 ))
                 .unwrap(),
             }])

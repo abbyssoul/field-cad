@@ -8,7 +8,7 @@ use fieldcad_core::{
     PropertySchema, PropertyValue, Quantity, Transform, VectorQuantity, Velocity, WorldCommand,
     WorldObject, WorldSnapshot, relativistic_kinetic_energy, relativistic_momentum,
 };
-use fieldcad_sources::{inertial_mass_component_id, mass_property_id};
+use fieldcad_gravity_sources::{inertial_mass_component_id, mass_property_id};
 use glam::DVec3;
 
 use super::scene_tree::DEFAULT_AUTHORING_RADIUS;

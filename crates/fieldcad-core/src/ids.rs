@@ -30,7 +30,7 @@ macro_rules! string_id {
     ($name:ident) => {
         // `Arc<str>` rather than `String`: an ID computed from a `&'static`
         // constant (as every plugin's `xyz_id()` helper does — see
-        // `fieldcad-sources`, `fieldcad-electromagnetic-sources`) is cheap to
+        // `fieldcad-gravity-sources`, `fieldcad-electromagnetic-sources`) is cheap to
         // memoize behind a `OnceLock` only if handing out repeat copies is a
         // refcount bump, not a fresh allocation. `Clone` stays the same
         // signature either way, so this is invisible to every existing

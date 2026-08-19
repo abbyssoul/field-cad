@@ -8,7 +8,7 @@ members = [
     "crates/fieldcad-dynamics",
     "crates/fieldcad-expressions",
     "crates/fieldcad-electromagnetic-sources",
-    "crates/fieldcad-sources",
+    "crates/fieldcad-gravity-sources",
     "crates/fieldcad-mcp",
     "crates/fieldcad-plugin-api",
     "crates/fieldcad-scene-document",
@@ -85,7 +85,7 @@ fieldcad-core = { path = "crates/fieldcad-core" }
 fieldcad-dynamics = { path = "crates/fieldcad-dynamics" }
 fieldcad-expressions = { path = "crates/fieldcad-expressions" }
 fieldcad-electromagnetic-sources = { path = "crates/fieldcad-electromagnetic-sources" }
-fieldcad-sources = { path = "crates/fieldcad-sources" }
+fieldcad-gravity-sources = { path = "crates/fieldcad-gravity-sources" }
 fieldcad-mcp = { path = "crates/fieldcad-mcp" }
 fieldcad-plugin-api = { path = "crates/fieldcad-plugin-api" }
 fieldcad-scene-document = { path = "crates/fieldcad-scene-document" }

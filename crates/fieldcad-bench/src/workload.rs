@@ -31,14 +31,14 @@ use fieldcad_expressions::{
     PropertyBinding, PropertyBindingSchema, PropertyTarget, ValueProvider,
 };
 use fieldcad_gravitostatics::GRAVITATIONAL_ACCELERATION_HANDLE;
+use fieldcad_gravity_sources::{
+    gravitational_mass_component_id, inertial_mass_component_id, inertial_mass_properties,
+    linked_gravitational_mass_properties, mass_component_schemas,
+};
 use fieldcad_plugin_api::{
     DynamicBody, EquationSystemPlugin, EquationSystemSolver, SolverCancellation, SolverContext,
 };
 use fieldcad_simulation::{RuntimeConfig, SimulationRuntime};
-use fieldcad_sources::{
-    gravitational_mass_component_id, inertial_mass_component_id, inertial_mass_properties,
-    linked_gravitational_mass_properties, mass_component_schemas,
-};
 use glam::{DVec3, UVec2};
 
 use crate::{
@@ -470,10 +470,10 @@ fn gravity_sample_plane(scene: &Scene, config: &MeasureConfig) -> Timing {
 fn gravity_forces(scene: &Scene, config: &MeasureConfig) -> Timing {
     let world = gravity_world(scene);
     let snapshot = world.snapshot();
-    let sources = fieldcad_sources::collect_gravity_sources(&snapshot)
+    let sources = fieldcad_gravity_sources::collect_gravity_sources(&snapshot)
         .expect("gravity world has valid mass sources");
     let inertial_mass_kg =
-        fieldcad_sources::inertial_mass_of(snapshot.object(sources[0].object).unwrap())
+        fieldcad_gravity_sources::inertial_mass_of(snapshot.object(sources[0].object).unwrap())
             .expect("body has inertial mass");
     let body = DynamicBody {
         object: sources[0].object,
