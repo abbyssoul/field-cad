@@ -12,7 +12,7 @@ use fieldcad_simulation::BodySample;
 use glam::{DVec3, Vec4};
 
 use super::flow_lines::build_flow_ribbon;
-use super::{FieldGeometry, TrajectoryDisplay};
+use super::{FlowRibbonVertex, TrajectoryDisplay};
 
 /// Smoothing substeps evaluated per recorded sample interval. Unlike a
 /// field streamline's adaptive step (which is approximating an unknown
@@ -26,6 +26,19 @@ const SUBSTEPS_PER_INTERVAL: usize = 8;
 /// transparent instead of ending in a hard, high-contrast cutoff against
 /// whatever is behind it in the scene.
 const TAIL_ALPHA_FLOOR: f32 = 0.05;
+
+/// The ribbon vertex count [`append_trajectory_geometry`] will produce once
+/// `history` has filled to `capacity_samples` — its own `hermite_polyline`
+/// and `build_flow_ribbon` math, run in reverse, so a caller can reserve a
+/// trajectory ribbon buffer once, up front, instead of letting it regrow
+/// tick by tick while history fills toward a capacity that
+/// [`super::TrajectoryDisplay::required_body_history_capacity`] already
+/// pins down exactly (it changes only when a user edits `trail_seconds` or
+/// the session's own `dt`, not every tick).
+pub(crate) fn max_ribbon_vertices(capacity_samples: usize) -> usize {
+    let polyline_len = capacity_samples.saturating_sub(1) * SUBSTEPS_PER_INTERVAL + 1;
+    polyline_len.saturating_sub(1) * 6
+}
 
 /// Append one object's trajectory ribbon to `output`, built from `history`
 /// (oldest sample first, exactly as [`fieldcad_simulation::FieldDataSource::body_history`]
@@ -44,7 +57,7 @@ const TAIL_ALPHA_FLOOR: f32 = 0.05;
 /// Appends nothing if the display is off, or if `history` itself has fewer
 /// than two samples — there is no direction to draw a line in yet.
 pub fn append_trajectory_geometry(
-    output: &mut FieldGeometry,
+    output: &mut Vec<FlowRibbonVertex>,
     history: &[BodySample],
     display: TrajectoryDisplay,
     base_color: Vec4,
@@ -64,12 +77,7 @@ pub fn append_trajectory_geometry(
 
     let polyline = hermite_polyline(trimmed);
     let colors = recency_fade(polyline.len(), base_color);
-    output.flow_ribbons.extend(build_flow_ribbon(
-        &polyline,
-        &colors,
-        display.into(),
-        scene_scale,
-    ));
+    build_flow_ribbon(&polyline, &colors, display.into(), scene_scale, output);
 }
 
 /// Cubic Hermite spline through consecutive samples, using each sample's own
@@ -153,7 +161,7 @@ mod tests {
 
     #[test]
     fn a_history_shorter_than_two_samples_draws_nothing() {
-        let mut output = FieldGeometry::default();
+        let mut output = Vec::new();
         append_trajectory_geometry(
             &mut output,
             &[sample(0.0, DVec3::ZERO, DVec3::X)],
@@ -161,12 +169,12 @@ mod tests {
             Vec4::ONE,
             SceneScale::metre(),
         );
-        assert!(output.flow_ribbons.is_empty());
+        assert!(output.is_empty());
     }
 
     #[test]
     fn a_hidden_display_draws_nothing_even_with_history() {
-        let mut output = FieldGeometry::default();
+        let mut output = Vec::new();
         let history = [
             sample(0.0, DVec3::ZERO, DVec3::X),
             sample(1.0, DVec3::X, DVec3::X),
@@ -178,7 +186,7 @@ mod tests {
             Vec4::ONE,
             SceneScale::metre(),
         );
-        assert!(output.flow_ribbons.is_empty());
+        assert!(output.is_empty());
     }
 
     /// Constant velocity, evenly spaced samples: the Hermite fit degenerates
@@ -219,7 +227,7 @@ mod tests {
         // (t=2) too — see `append_trajectory_geometry`'s doc comment — so a
         // trail_seconds shorter than the runtime's actual sample interval
         // draws the one most recent leg of motion instead of nothing.
-        let mut output = FieldGeometry::default();
+        let mut output = Vec::new();
         append_trajectory_geometry(
             &mut output,
             &history,
@@ -228,13 +236,13 @@ mod tests {
             SceneScale::metre(),
         );
         assert!(
-            !output.flow_ribbons.is_empty(),
+            !output.is_empty(),
             "a trail_seconds narrower than one recorded interval should still draw the \
              most recent leg of motion, not nothing"
         );
 
         // A wide enough trail_seconds keeps every sample and draws something.
-        let mut output = FieldGeometry::default();
+        let mut output = Vec::new();
         append_trajectory_geometry(
             &mut output,
             &history,
@@ -242,7 +250,7 @@ mod tests {
             Vec4::ONE,
             SceneScale::metre(),
         );
-        assert!(!output.flow_ribbons.is_empty());
+        assert!(!output.is_empty());
     }
 
     /// Regression for the reported bug: an astronomical-scale scene ticking
@@ -257,7 +265,7 @@ mod tests {
             sample(0.0, DVec3::ZERO, DVec3::X),
             sample(86_400.0, DVec3::new(1.0e6, 0.0, 0.0), DVec3::X),
         ];
-        let mut output = FieldGeometry::default();
+        let mut output = Vec::new();
         append_trajectory_geometry(
             &mut output,
             &history,
@@ -266,7 +274,7 @@ mod tests {
             SceneScale::metre(),
         );
         assert!(
-            !output.flow_ribbons.is_empty(),
+            !output.is_empty(),
             "a one-day tick interval against a 30-second requested trail_seconds should \
              still draw the only leg of motion recorded, not nothing"
         );

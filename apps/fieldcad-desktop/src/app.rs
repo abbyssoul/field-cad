@@ -244,6 +244,38 @@ fn window_title(known_path: Option<&Path>) -> String {
     }
 }
 
+/// One object's memoized trajectory ribbon, plus the inputs it was built
+/// from — see [`WindowState::redraw`]'s trajectory loop.
+///
+/// Rebuilding a trajectory ribbon is `O(history length)`: a full Hermite
+/// refit, recency-fade, and ribbon-vertex build over the whole trimmed
+/// window, same shape as [`scene::region_geometry`]'s streamline cost that
+/// [`RegionGeometryCache`] already exists to avoid paying every redraw.
+/// `request_body_history` only produces new data roughly once per
+/// simulation tick — far less often than redraws run — so without this
+/// cache every one of those extra redraws (an orbit camera drag, egui
+/// hover, animated-trail scroll) repaid the full rebuild for no reason.
+struct TrajectoryGeometryCache {
+    inputs: TrajectoryGeometryInputs,
+    ribbon: Arc<Vec<scene::FlowRibbonVertex>>,
+}
+
+/// Everything one object's trajectory ribbon depends on. `history_len` and
+/// `newest_tick` stand in for the recorded history's actual content: the
+/// history a `BodyHistory` ring buffer produces for a given object is
+/// determined by how many samples it holds and which tick the newest one
+/// is (older samples age out from the front in strict tick order, so
+/// nothing else about the *set* of retained samples can change between two
+/// reads with the same `(len, newest_tick)` without a run-generation reset,
+/// which already invalidates this cache by changing `newest_tick`).
+#[derive(Clone, Copy, PartialEq)]
+struct TrajectoryGeometryInputs {
+    history_len: usize,
+    newest_tick: u64,
+    display: scene::TrajectoryDisplay,
+    scene_scale: fieldcad_core::SceneScale,
+}
+
 /// One region's memoized contribution to the channel-layer geometry, plus
 /// the inputs it was built from — see [`compute_field_layer_geometry`].
 struct RegionGeometryCache {
@@ -393,35 +425,51 @@ fn compute_field_layer_geometry(
                 let settings = resolve_region_settings(region, layers, layer.whole_domain);
                 let world_visible = region_world_visible(region, world);
                 let key = (channel_id.clone(), region);
-                let entry = match cache.remove(&key) {
-                    Some(entry)
-                        if entry.inputs.batch == *batch
-                            && entry.inputs.settings == settings
-                            && entry.inputs.world_visible == world_visible
-                            && entry.inputs.show == show
-                            && entry.inputs.scene_scale == scene_scale =>
-                    {
-                        entry
-                    }
-                    _ => {
-                        any_rebuilt = true;
-                        RegionGeometryCache {
-                            inputs: RegionGeometryInputs {
-                                batch: batch.clone(),
-                                settings,
-                                world_visible,
-                                show,
-                                scene_scale,
-                            },
-                            geometry: Arc::new(scene::region_geometry(
-                                batch,
-                                layer.whole_domain,
-                                layers,
-                                show,
-                                world,
-                                scene_scale,
-                            )),
-                        }
+                let stale = cache.remove(&key);
+                let entry = if let Some(entry) = &stale
+                    && entry.inputs.batch == *batch
+                    && entry.inputs.settings == settings
+                    && entry.inputs.world_visible == world_visible
+                    && entry.inputs.show == show
+                    && entry.inputs.scene_scale == scene_scale
+                {
+                    stale.unwrap()
+                } else {
+                    any_rebuilt = true;
+                    // Reclaim the outgoing entry's buffers (if any) instead
+                    // of starting from empty `Vec`s: a region's batch
+                    // changes on virtually every frame once anything in the
+                    // scene animates, so `region_geometry` reruns every
+                    // frame, and a moving body's streamlines are usually a
+                    // similar size frame to frame — carrying over last
+                    // frame's capacity turns that into amortized zero-growth
+                    // instead of a fresh allocate-and-copy every time.
+                    let reused = stale
+                        .and_then(|entry| Arc::try_unwrap(entry.geometry).ok())
+                        .map(|mut geometry| {
+                            geometry.surface_triangles.clear();
+                            geometry.vector_lines.clear();
+                            geometry.flow_ribbons.clear();
+                            geometry
+                        })
+                        .unwrap_or_default();
+                    RegionGeometryCache {
+                        inputs: RegionGeometryInputs {
+                            batch: batch.clone(),
+                            settings,
+                            world_visible,
+                            show,
+                            scene_scale,
+                        },
+                        geometry: Arc::new(scene::region_geometry(
+                            batch,
+                            layer.whole_domain,
+                            layers,
+                            show,
+                            world,
+                            scene_scale,
+                            reused,
+                        )),
                     }
                 };
                 ordered.push(Arc::clone(&entry.geometry));
@@ -437,7 +485,21 @@ fn compute_field_layer_geometry(
     if unchanged && let Some(previous) = previous_geometry {
         return (previous, new_cache);
     }
-    let mut geometry = scene::FieldGeometry::default();
+    // Sized once for the merged total up front: an `extend` per entry into
+    // an initially-empty `Vec` would otherwise re-grow (reallocate and copy
+    // everything merged so far) on roughly every entry, every frame this
+    // runs on — which, for a scene with continuously moving bodies, is every
+    // frame. Streamline ribbons make this worst: a single region's flow
+    // lines can run to hundreds of thousands of vertices, so the
+    // save-then-copy cost of missing this reservation dwarfs everything
+    // else the merge does.
+    let mut geometry = scene::FieldGeometry {
+        surface_triangles: Vec::with_capacity(
+            ordered.iter().map(|g| g.surface_triangles.len()).sum(),
+        ),
+        vector_lines: Vec::with_capacity(ordered.iter().map(|g| g.vector_lines.len()).sum()),
+        flow_ribbons: Vec::with_capacity(ordered.iter().map(|g| g.flow_ribbons.len()).sum()),
+    };
     for entry_geometry in &ordered {
         geometry
             .surface_triangles
@@ -483,12 +545,23 @@ struct WindowState {
     /// Each visible region's last-built geometry, plus the inputs it was
     /// built from — see [`WindowState::field_layer_geometry`].
     region_geometry_cache: BTreeMap<(ChannelId, scene::RegionId), RegionGeometryCache>,
+    /// Each watched object's last-built trajectory ribbon, plus the inputs
+    /// it was built from — see [`TrajectoryGeometryCache`].
+    trajectory_geometry_cache: BTreeMap<fieldcad_core::ObjectId, TrajectoryGeometryCache>,
     /// Last frame's merged result from [`WindowState::field_layer_geometry`]
     /// — reused verbatim when every region in `region_geometry_cache` is
     /// still a hit, so a redraw that changes nothing about the scene (an
     /// animated flow line's shader-only scroll, most commonly) costs a
     /// refcount bump instead of a fresh multi-region copy.
     cached_field_layer_geometry: Option<Arc<scene::FieldGeometry>>,
+    /// `overlay.flow_ribbons.len()` from the last redraw — `overlay` itself
+    /// is deliberately rebuilt fresh every frame (see the comment where it's
+    /// built in [`Self::redraw`]), but a watched trajectory's ribbon is
+    /// usually a similar size frame to frame, so reserving this many slots
+    /// up front turns the trajectory loop's growth into one allocation
+    /// instead of the repeated grow-and-copy an empty `Vec` would need to
+    /// reach the same size.
+    overlay_flow_ribbons_capacity_hint: usize,
     /// A clone of the server's authoritative probe/distance/mass-aggregate
     /// observation history (`HeadlessServer::{probe_history,
     /// distance_history, mass_aggregate_history}`), refreshed only when
@@ -860,7 +933,9 @@ impl WindowState {
             quick_add_hidden,
             compute: None,
             region_geometry_cache: BTreeMap::new(),
+            trajectory_geometry_cache: BTreeMap::new(),
             cached_field_layer_geometry: None,
+            overlay_flow_ribbons_capacity_hint: 0,
             probe_history_cache: (
                 None,
                 ProbeHistory::default(),
@@ -1279,7 +1354,10 @@ impl WindowState {
             &compute.vector_channels,
             scene_scale,
         );
-        let mut overlay = scene::FieldGeometry::default();
+        let mut overlay = scene::FieldGeometry {
+            flow_ribbons: Vec::with_capacity(self.overlay_flow_ribbons_capacity_hint),
+            ..scene::FieldGeometry::default()
+        };
         scene::append_authoring_geometry(
             &mut overlay,
             &self.world,
@@ -1321,6 +1399,7 @@ impl WindowState {
         // recently completed fetch found, same one-round-trip staleness
         // tolerance the field snapshot itself already has.
         if show.objects {
+            let mut new_trajectory_cache = BTreeMap::new();
             for (&object_id, &display) in &self.ui_model.object_trajectories {
                 if !display.visible {
                     continue;
@@ -1331,22 +1410,54 @@ impl WindowState {
                 if !object.visible {
                     continue;
                 }
+                let history_capacity =
+                    display.required_body_history_capacity(compute.time_step_seconds);
                 let mut model = self.model();
-                model.set_body_history_capacity(
-                    object_id,
-                    display.required_body_history_capacity(compute.time_step_seconds),
-                );
+                model.set_body_history_capacity(object_id, history_capacity);
                 model.request_body_history(object_id);
                 let history = model.body_history(object_id);
                 drop(model);
-                scene::append_trajectory_geometry(
-                    &mut overlay,
-                    &history,
+                let inputs = TrajectoryGeometryInputs {
+                    history_len: history.len(),
+                    newest_tick: history.last().map_or(0, |sample| sample.tick),
                     display,
-                    Vec4::ONE,
                     scene_scale,
-                );
+                };
+                let stale = self.trajectory_geometry_cache.remove(&object_id);
+                let ribbon = if let Some(entry) = &stale
+                    && entry.inputs == inputs
+                {
+                    Arc::clone(&entry.ribbon)
+                } else {
+                    // Reclaim the outgoing ribbon's capacity instead of
+                    // starting from empty — `request_body_history` produces
+                    // new data roughly once per simulation tick, far less
+                    // often than redraws run, so most rebuilds are the same
+                    // size as last time.
+                    let mut buffer = stale
+                        .and_then(|entry| Arc::try_unwrap(entry.ribbon).ok())
+                        .unwrap_or_default();
+                    buffer.clear();
+                    // `history_capacity` is what `set_body_history_capacity`
+                    // just pinned the runtime's retention to, so this is the
+                    // most this ribbon can ever hold at the current
+                    // `trail_seconds`/`dt` — reserving it now means the
+                    // buffer never needs to regrow while history fills
+                    // toward that capacity, one tick at a time.
+                    buffer.reserve(scene::max_ribbon_vertices(history_capacity));
+                    scene::append_trajectory_geometry(
+                        &mut buffer,
+                        &history,
+                        display,
+                        Vec4::ONE,
+                        scene_scale,
+                    );
+                    Arc::new(buffer)
+                };
+                overlay.flow_ribbons.extend(ribbon.iter().copied());
+                new_trajectory_cache.insert(object_id, TrajectoryGeometryCache { inputs, ribbon });
             }
+            self.trajectory_geometry_cache = new_trajectory_cache;
         }
         // Kept for next frame's `ComputeView::build` to reuse whatever is
         // still current — every other use of `compute` above is a borrow, so
@@ -1370,6 +1481,7 @@ impl WindowState {
                 scene_scale,
             );
         }
+        self.overlay_flow_ribbons_capacity_hint = overlay.flow_ribbons.len();
 
         let status = self.renderer.render(
             SceneFrame {

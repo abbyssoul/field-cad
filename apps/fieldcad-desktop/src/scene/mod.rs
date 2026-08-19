@@ -32,6 +32,7 @@ pub use gizmo::{
     selection_gizmo_length_with_display, selection_origin, view_plane_translation,
 };
 pub use pick::pick_scene;
+pub(crate) use trajectory::max_ribbon_vertices;
 pub use trajectory::append_trajectory_geometry;
 
 use fieldcad_core::{

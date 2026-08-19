@@ -282,14 +282,15 @@ pub(super) fn build_flow_ribbon(
     colors: &[glam::Vec4],
     style: RibbonStyle,
     scene_scale: SceneScale,
-) -> Vec<FlowRibbonVertex> {
+    output: &mut Vec<FlowRibbonVertex>,
+) {
     debug_assert_eq!(
         polyline.len(),
         colors.len(),
         "one colour per polyline vertex"
     );
     if polyline.len() < 2 {
-        return Vec::new();
+        return;
     }
     let render: Vec<Vec3> = polyline
         .iter()
@@ -297,7 +298,7 @@ pub(super) fn build_flow_ribbon(
         .collect();
     let speed = if style.animated { style.speed } else { 0.0 };
 
-    let mut vertices = Vec::with_capacity((render.len() - 1) * 6);
+    output.reserve((render.len() - 1) * 6);
     let mut arclength = 0.0_f32;
     for index in 0..render.len() - 1 {
         let from = render[index];
@@ -326,12 +327,11 @@ pub(super) fn build_flow_ribbon(
         // comment above.
         let to_right = vertex(to, from, -1.0, to_arclength, to_color);
         let to_left = vertex(to, from, 1.0, to_arclength, to_color);
-        vertices.extend([
+        output.extend([
             from_left, from_right, to_right, //
             from_left, to_right, to_left,
         ]);
     }
-    vertices
 }
 
 /// A permutation of `0..n` in which any *prefix* is already spread roughly
@@ -366,6 +366,7 @@ fn low_discrepancy_order(n: usize) -> Vec<usize> {
 
 /// Streamlines seeded uniformly through the published domain lattice, the
 /// same resampling `append_domain_vectors` already does for arrows.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn trace_domain_streamlines(
     lattice: GridLattice,
     values: &[DVec3],
@@ -374,7 +375,8 @@ pub(super) fn trace_domain_streamlines(
     display: FlowLineDisplay,
     scene_scale: SceneScale,
     gradient: Option<&[DMat3]>,
-) -> Vec<FlowRibbonVertex> {
+    output: &mut Vec<FlowRibbonVertex>,
+) {
     let floor = scale.noise_floor();
     let sample = |point: DVec3| -> Option<DVec3> {
         let index = lattice.fractional_coordinates(point);
@@ -405,7 +407,6 @@ pub(super) fn trace_domain_streamlines(
     let y_order = low_discrepancy_order(ys.len());
     let z_order = low_discrepancy_order(zs.len());
     let max_points = fair_share_points_per_direction(xs.len() * ys.len() * zs.len());
-    let mut vertices = Vec::new();
     'seeds: for &xi in &x_order {
         let x = xs[xi];
         for &yi in &y_order {
@@ -427,23 +428,24 @@ pub(super) fn trace_domain_streamlines(
                         field_color(scale.normalized(magnitude)).extend(1.0)
                     })
                     .collect();
-                vertices.extend(build_flow_ribbon(
+                build_flow_ribbon(
                     &polyline,
                     &colors,
                     display.into(),
                     scene_scale,
-                ));
-                if vertices.len() >= MAX_RIBBON_VERTICES {
+                    output,
+                );
+                if output.len() >= MAX_RIBBON_VERTICES {
                     break 'seeds;
                 }
             }
         }
     }
-    vertices
 }
 
 /// Streamlines seeded uniformly through an oriented field box, mirroring
 /// `append_box_vectors`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn trace_box_streamlines(
     lattice: BoxLattice,
     values: &[DVec3],
@@ -452,7 +454,8 @@ pub(super) fn trace_box_streamlines(
     display: FlowLineDisplay,
     scene_scale: SceneScale,
     gradient: Option<&[DMat3]>,
-) -> Vec<FlowRibbonVertex> {
+    output: &mut Vec<FlowRibbonVertex>,
+) {
     let floor = scale.noise_floor();
     let sample = |point: DVec3| -> Option<DVec3> {
         let index = lattice.fractional_coordinates(point);
@@ -483,7 +486,6 @@ pub(super) fn trace_box_streamlines(
     let y_order = low_discrepancy_order(ys.len());
     let z_order = low_discrepancy_order(zs.len());
     let max_points = fair_share_points_per_direction(xs.len() * ys.len() * zs.len());
-    let mut vertices = Vec::new();
     'seeds: for &xi in &x_order {
         let x = xs[xi];
         for &yi in &y_order {
@@ -505,24 +507,25 @@ pub(super) fn trace_box_streamlines(
                         field_color(scale.normalized(magnitude)).extend(1.0)
                     })
                     .collect();
-                vertices.extend(build_flow_ribbon(
+                build_flow_ribbon(
                     &polyline,
                     &colors,
                     display.into(),
                     scene_scale,
-                ));
-                if vertices.len() >= MAX_RIBBON_VERTICES {
+                    output,
+                );
+                if output.len() >= MAX_RIBBON_VERTICES {
                     break 'seeds;
                 }
             }
         }
     }
-    vertices
 }
 
 /// Streamlines seeded uniformly through a field sphere's bounding cube,
 /// culled to the inscribed sphere the same way `append_sphere_vectors` culls
 /// its arrows.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn trace_sphere_streamlines(
     lattice: SphereLattice,
     values: &[DVec3],
@@ -531,7 +534,8 @@ pub(super) fn trace_sphere_streamlines(
     display: FlowLineDisplay,
     scene_scale: SceneScale,
     gradient: Option<&[DMat3]>,
-) -> Vec<FlowRibbonVertex> {
+    output: &mut Vec<FlowRibbonVertex>,
+) {
     let grid = lattice.grid();
     let floor = scale.noise_floor();
     let sample = |point: DVec3| -> Option<DVec3> {
@@ -559,7 +563,6 @@ pub(super) fn trace_sphere_streamlines(
     let y_order = low_discrepancy_order(ys.len());
     let z_order = low_discrepancy_order(zs.len());
     let max_points = fair_share_points_per_direction(xs.len() * ys.len() * zs.len());
-    let mut vertices = Vec::new();
     'seeds: for &xi in &x_order {
         let x = xs[xi];
         for &yi in &y_order {
@@ -584,19 +587,19 @@ pub(super) fn trace_sphere_streamlines(
                         field_color(scale.normalized(magnitude)).extend(1.0)
                     })
                     .collect();
-                vertices.extend(build_flow_ribbon(
+                build_flow_ribbon(
                     &polyline,
                     &colors,
                     display.into(),
                     scene_scale,
-                ));
-                if vertices.len() >= MAX_RIBBON_VERTICES {
+                    output,
+                );
+                if output.len() >= MAX_RIBBON_VERTICES {
                     break 'seeds;
                 }
             }
         }
     }
-    vertices
 }
 
 /// Streamlines seeded uniformly across a slice plane, mirroring
@@ -606,6 +609,7 @@ pub(super) fn trace_sphere_streamlines(
 /// draws (see `displayed_plane_vector`): a 2D streamline cannot depict an
 /// out-of-plane component, so a plane's flow lines always trace that
 /// projection regardless of the plane's arrow `vector_mode`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn trace_plane_streamlines(
     lattice: PlaneLattice,
     values: &[DVec3],
@@ -614,7 +618,8 @@ pub(super) fn trace_plane_streamlines(
     display: FlowLineDisplay,
     scene_scale: SceneScale,
     gradient: Option<&[DMat3]>,
-) -> Vec<FlowRibbonVertex> {
+    output: &mut Vec<FlowRibbonVertex>,
+) {
     let floor = scale.noise_floor();
     let sample = |point: DVec3| -> Option<DVec3> {
         let index = lattice.fractional_coordinates(point);
@@ -640,7 +645,6 @@ pub(super) fn trace_plane_streamlines(
     let x_order = low_discrepancy_order(xs.len());
     let y_order = low_discrepancy_order(ys.len());
     let max_points = fair_share_points_per_direction(xs.len() * ys.len());
-    let mut vertices = Vec::new();
     'seeds: for &xi in &x_order {
         let x = xs[xi];
         for &yi in &y_order {
@@ -660,18 +664,18 @@ pub(super) fn trace_plane_streamlines(
                     field_color(scale.normalized(magnitude)).extend(1.0)
                 })
                 .collect();
-            vertices.extend(build_flow_ribbon(
+            build_flow_ribbon(
                 &polyline,
                 &colors,
                 display.into(),
                 scene_scale,
-            ));
-            if vertices.len() >= MAX_RIBBON_VERTICES {
+                output,
+            );
+            if output.len() >= MAX_RIBBON_VERTICES {
                 break 'seeds;
             }
         }
     }
-    vertices
 }
 
 #[cfg(test)]
@@ -925,7 +929,8 @@ mod tests {
         let scale = MagnitudeScale::over(&values, &validity);
         let display = FlowLineDisplay::new(true, 20);
 
-        let vertices = trace_box_streamlines(
+        let mut vertices = Vec::new();
+        trace_box_streamlines(
             lattice,
             &values,
             &validity,
@@ -933,6 +938,7 @@ mod tests {
             display,
             SceneScale::metre(),
             None,
+            &mut vertices,
         );
 
         assert!(
@@ -992,7 +998,8 @@ mod tests {
         let scale = MagnitudeScale::over(&values, &validity);
         let display = FlowLineDisplay::new(true, 10);
 
-        let vertices = trace_box_streamlines(
+        let mut vertices = Vec::new();
+        trace_box_streamlines(
             lattice,
             &values,
             &validity,
@@ -1000,6 +1007,7 @@ mod tests {
             display,
             SceneScale::metre(),
             None,
+            &mut vertices,
         );
 
         assert!(
@@ -1034,11 +1042,13 @@ mod tests {
     fn build_flow_ribbon_alternates_sides_and_accumulates_arclength() {
         let polyline = vec![DVec3::ZERO, DVec3::X, DVec3::new(2.0, 0.0, 0.0)];
         let colors = vec![glam::Vec4::ONE; 3];
-        let vertices = build_flow_ribbon(
+        let mut vertices = Vec::new();
+        build_flow_ribbon(
             &polyline,
             &colors,
             FlowLineDisplay::new(true, 4).into(),
             SceneScale::metre(),
+            &mut vertices,
         );
 
         assert_eq!(vertices.len(), 12, "two segments, six vertices each");
@@ -1059,14 +1069,14 @@ mod tests {
 
     #[test]
     fn build_flow_ribbon_is_empty_for_a_degenerate_polyline() {
-        assert!(
-            build_flow_ribbon(
-                &[DVec3::ZERO],
-                &[glam::Vec4::ONE],
-                FlowLineDisplay::new(true, 4).into(),
-                SceneScale::metre(),
-            )
-            .is_empty()
+        let mut vertices = Vec::new();
+        build_flow_ribbon(
+            &[DVec3::ZERO],
+            &[glam::Vec4::ONE],
+            FlowLineDisplay::new(true, 4).into(),
+            SceneScale::metre(),
+            &mut vertices,
         );
+        assert!(vertices.is_empty());
     }
 }

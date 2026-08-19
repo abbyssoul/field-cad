@@ -44,6 +44,7 @@ default-members = ["apps/fieldcad-desktop"]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
+dhat = "0.3.3"
 directories = "6"
 egui = "0.35"
 egui-wgpu = "0.35"
@@ -97,3 +98,10 @@ fieldcad-electrostatics = { path = "plugins/electrostatics" }
 fieldcad-electromagnetism = { path = "plugins/electromagnetism" }
 fieldcad-gravitostatics = { path = "plugins/gravitostatics" }
 fieldcad-test-field = { path = "plugins/test-field" }
+
+# Build with `cargo build --profile profiling` for a release-optimized binary
+# that keeps debug info, so dhat (behind each crate's `dhat` feature) can
+# symbolicate allocation call sites in an otherwise-optimized build.
+[profile.profiling]
+inherits = "release"
+debug = true

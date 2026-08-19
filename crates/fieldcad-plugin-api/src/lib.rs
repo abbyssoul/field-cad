@@ -536,6 +536,17 @@ impl SampleGeometryIdentity {
 struct SampleCacheEntry<T> {
     identity: SampleGeometryIdentity,
     samples: Arc<[T]>,
+    /// The geometry's sample-point count as of the last compute/refresh —
+    /// `geometry.len()`, not `samples.len()`. They coincide for a caller
+    /// whose `T` is one value per sample point, but not for a caller like
+    /// `InverseSquareSolver` that bundles a whole geometry's evaluation into
+    /// a single `T` (its `GeometrySamples`): there `samples.len()` is always
+    /// 1 regardless of how many points the geometry has, so comparing
+    /// against it would only ever re-admit the refresh path for a
+    /// single-point geometry. Tracked separately so the refresh guard below
+    /// checks what it means to: whether the *previous* buffer this entry
+    /// wraps was sized for as many points as `geometry` has now.
+    len: usize,
     /// Set by [`SampleCache::clear`]; a moved source invalidates the
     /// *values* here without changing the geometry's identity (the
     /// geometry a runtime publication samples — a plane, box, sphere, or
@@ -578,6 +589,7 @@ impl<T> SampleCache<T> {
         refresh: impl FnOnce(&mut [T]) -> Result<(), PluginError>,
     ) -> Result<Arc<[T]>, PluginError> {
         let identity = SampleGeometryIdentity::of(geometry);
+        let len = geometry.len();
         let mut entries = self
             .entries
             .lock()
@@ -586,13 +598,14 @@ impl<T> SampleCache<T> {
             if !entry.stale {
                 return Ok(Arc::clone(&entry.samples));
             }
-            if entry.samples.len() == geometry.len()
+            if entry.len == len
                 && let Some(slice) = Arc::get_mut(&mut entry.samples)
             {
                 refresh(slice)?;
             } else {
                 entry.samples = compute()?.into();
             }
+            entry.len = len;
             entry.stale = false;
             return Ok(Arc::clone(&entry.samples));
         }
@@ -603,6 +616,7 @@ impl<T> SampleCache<T> {
         entries.push_back(SampleCacheEntry {
             identity,
             samples: Arc::clone(&samples),
+            len,
             stale: false,
         });
         Ok(samples)

@@ -3,6 +3,14 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 use clap::Parser;
 use fieldcad_desktop::LaunchOptions;
 
+/// Active only in builds compiled with `--features dhat`. dhat needs to own
+/// every allocation to attribute it to a call site, so the global allocator
+/// swap has to live at the top of the binary crate, not behind a runtime
+/// flag.
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 const ENV_HELP: &str = "\
 ENVIRONMENT:
     WGPU_BACKEND            vulkan | gl | metal | dx12 (comma-separated list)
@@ -50,6 +58,16 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    // Held for the rest of `main`; dropping it (on any return path below,
+    // including the smoke-test and CLI-error early returns) is what flushes
+    // `dhat-heap.json`. A killed process (Ctrl-C, window-manager kill) skips
+    // the drop and writes nothing — quit the app normally (window close or
+    // the app's own Quit action) to capture a profile.
+    #[cfg(feature = "dhat")]
+    let _profiler = dhat::Profiler::builder()
+        .file_name("dhat-heap-desktop.json")
+        .build();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {

@@ -50,12 +50,7 @@ pub fn field_geometry(
     };
     let mut output = FieldGeometry::default();
     for batch in channel.batches.iter() {
-        let contribution = region_geometry(batch, settings, layers, show, world, scene_scale);
-        output
-            .surface_triangles
-            .extend(contribution.surface_triangles);
-        output.vector_lines.extend(contribution.vector_lines);
-        output.flow_ribbons.extend(contribution.flow_ribbons);
+        output = region_geometry(batch, settings, layers, show, world, scene_scale, output);
     }
     output
 }
@@ -65,6 +60,13 @@ pub fn field_geometry(
 /// caller that already knows only one region's batch changed (see
 /// `app.rs`'s per-region geometry cache) can rebuild just that region
 /// instead of every batch in the channel.
+///
+/// `output` is filled in place rather than built fresh: a caller tracing
+/// dense streamlines every tick for a moving body (`app.rs`'s per-region
+/// cache rebuilds on essentially every frame once anything in the scene is
+/// animating) can hand back last frame's buffer, already sized to roughly
+/// the right capacity, instead of paying a `Vec::new()`-then-grow for
+/// hundreds of thousands of ribbon vertices on every single frame.
 pub(crate) fn region_geometry(
     batch: &FieldBatch,
     settings: FieldLayerSettings,
@@ -72,8 +74,8 @@ pub(crate) fn region_geometry(
     show: SceneVisibility,
     world: &WorldSnapshot,
     scene_scale: SceneScale,
+    mut output: FieldGeometry,
 ) -> FieldGeometry {
-    let mut output = FieldGeometry::default();
     let FieldColumn::Vector(values) = batch.values() else {
         return output;
     };
@@ -155,7 +157,7 @@ pub(crate) fn region_geometry(
                 // Traces the same in-plane-projected values the arrows
                 // above draw: a 2D streamline cannot depict an
                 // out-of-plane component either.
-                output.flow_ribbons.extend(trace_plane_streamlines(
+                trace_plane_streamlines(
                     *lattice,
                     &displayed_values,
                     batch.validity(),
@@ -163,7 +165,8 @@ pub(crate) fn region_geometry(
                     plane_settings.flow_lines,
                     scene_scale,
                     displayed_gradient,
-                ));
+                    &mut output.flow_ribbons,
+                );
             }
         }
         SampleGeometry::Grid(lattice)
@@ -185,7 +188,7 @@ pub(crate) fn region_geometry(
                 );
             }
             if settings.flow_lines.visible {
-                output.flow_ribbons.extend(trace_domain_streamlines(
+                trace_domain_streamlines(
                     *lattice,
                     values,
                     batch.validity(),
@@ -193,7 +196,8 @@ pub(crate) fn region_geometry(
                     settings.flow_lines,
                     scene_scale,
                     gradient,
-                ));
+                    &mut output.flow_ribbons,
+                );
             }
         }
         SampleGeometry::Box { region, lattice } => {
@@ -229,7 +233,7 @@ pub(crate) fn region_geometry(
                 );
             }
             if box_settings.flow_lines.visible {
-                output.flow_ribbons.extend(trace_box_streamlines(
+                trace_box_streamlines(
                     *lattice,
                     values,
                     batch.validity(),
@@ -237,7 +241,8 @@ pub(crate) fn region_geometry(
                     box_settings.flow_lines,
                     scene_scale,
                     gradient,
-                ));
+                    &mut output.flow_ribbons,
+                );
             }
         }
         SampleGeometry::Sphere { region, lattice } => {
@@ -273,7 +278,7 @@ pub(crate) fn region_geometry(
                 );
             }
             if sphere_settings.flow_lines.visible {
-                output.flow_ribbons.extend(trace_sphere_streamlines(
+                trace_sphere_streamlines(
                     *lattice,
                     values,
                     batch.validity(),
@@ -281,7 +286,8 @@ pub(crate) fn region_geometry(
                     sphere_settings.flow_lines,
                     scene_scale,
                     gradient,
-                ));
+                    &mut output.flow_ribbons,
+                );
             }
         }
         _ => {}
@@ -1320,7 +1326,8 @@ mod tests {
         // follow (`append_domain_vectors` does not itself re-check
         // `VectorDisplay::visible` either) — checked at the `field_geometry`
         // level below, not inside the tracer.
-        let ribbons = trace_domain_streamlines(
+        let mut ribbons = Vec::new();
+        trace_domain_streamlines(
             lattice,
             &values,
             &validity,
@@ -1328,6 +1335,7 @@ mod tests {
             FlowLineDisplay::new(true, 3),
             SceneScale::metre(),
             None,
+            &mut ribbons,
         );
         assert!(
             !ribbons.is_empty(),

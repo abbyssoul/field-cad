@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+dhat = { workspace = true, optional = true }
 fieldcad-core = { workspace = true }
 fieldcad-electromagnetic-sources = { workspace = true }
 fieldcad-electromagnetism = { workspace = true }
@@ -25,3 +26,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 fieldcad-scene-document = { workspace = true }
+
+[features]
+dhat = ["dep:dhat"]

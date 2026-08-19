@@ -92,8 +92,20 @@ fn add_forces_excluding_into(
 /// instead of an O(samples) allocation pass. `samples` is retained only
 /// so a stale-refill can `evaluate_into` it in place, reusing its
 /// allocation; nothing reads it after derivation.
+///
+/// The `*_scratch` buffers are the same idea one layer down: a moving body
+/// re-derives every column on every tick (`refill` below), and each
+/// published `Arc<[T]>` must stay a fresh allocation — older snapshot
+/// readers may still hold the previous one — but the mutable staging `Vec`
+/// that feeds it does not, so it is kept here and `clear()`ed rather than
+/// reallocated with `Vec::with_capacity` on every refresh.
 struct GeometrySamples {
     samples: Vec<InverseSquareSample>,
+    validity_scratch: Vec<SampleValidity>,
+    jacobians_scratch: Vec<DMat3>,
+    field_values_scratch: Vec<DVec3>,
+    potential_values_scratch: Vec<f64>,
+    negated_fields_scratch: Vec<DVec3>,
     validity: Arc<[SampleValidity]>,
     /// `Some` only when *every* sample reported a gradient — the
     /// per-batch capability decision the published columns share.
@@ -147,8 +159,27 @@ impl GeometrySamples {
                 &mut self.samples,
             )
             .map_err(PluginError::Solver)?;
-        *self = Self::from_samples(std::mem::take(&mut self.samples));
+        self.derive_columns();
         Ok(())
+    }
+
+    fn from_samples(samples: Vec<InverseSquareSample>) -> Self {
+        let capacity = samples.len();
+        let mut result = Self {
+            samples,
+            validity_scratch: Vec::with_capacity(capacity),
+            jacobians_scratch: Vec::with_capacity(capacity),
+            field_values_scratch: Vec::with_capacity(capacity),
+            potential_values_scratch: Vec::with_capacity(capacity),
+            negated_fields_scratch: Vec::with_capacity(capacity),
+            validity: Arc::from([]),
+            jacobians: None,
+            field_values: Arc::from([]),
+            potential_values: Arc::from([]),
+            negated_fields: Arc::from([]),
+        };
+        result.derive_columns();
+        result
     }
 
     /// One pass over `samples`, not five: each column used to be its own
@@ -159,29 +190,31 @@ impl GeometrySamples {
     /// capability gate ([`GeometrySamples`]'s doc comment) means an
     /// evaluator either reports a gradient for every sample or none at all,
     /// so the discard case this trades against is not the common one.
-    fn from_samples(samples: Vec<InverseSquareSample>) -> Self {
-        let mut validity = Vec::with_capacity(samples.len());
-        let mut jacobians = Vec::with_capacity(samples.len());
-        let mut field_values = Vec::with_capacity(samples.len());
-        let mut potential_values = Vec::with_capacity(samples.len());
-        let mut negated_fields = Vec::with_capacity(samples.len());
+    ///
+    /// The scratch buffers are reused across calls (`clear()`, not a fresh
+    /// `Vec`), so only the final `Arc<[T]>` copy allocates.
+    fn derive_columns(&mut self) {
+        self.validity_scratch.clear();
+        self.jacobians_scratch.clear();
+        self.field_values_scratch.clear();
+        self.potential_values_scratch.clear();
+        self.negated_fields_scratch.clear();
         let mut every_sample_has_a_gradient = true;
-        for sample in &samples {
-            validity.push(sample.validity);
-            jacobians.push(sample.gradient.unwrap_or(DMat3::ZERO));
+        for sample in &self.samples {
+            self.validity_scratch.push(sample.validity);
+            self.jacobians_scratch
+                .push(sample.gradient.unwrap_or(DMat3::ZERO));
             every_sample_has_a_gradient &= sample.gradient.is_some();
-            field_values.push(sample.field);
-            potential_values.push(sample.potential);
-            negated_fields.push(-sample.field);
+            self.field_values_scratch.push(sample.field);
+            self.potential_values_scratch.push(sample.potential);
+            self.negated_fields_scratch.push(-sample.field);
         }
-        Self {
-            samples,
-            validity: validity.into(),
-            jacobians: every_sample_has_a_gradient.then(|| jacobians.into()),
-            field_values: field_values.into(),
-            potential_values: potential_values.into(),
-            negated_fields: negated_fields.into(),
-        }
+        self.validity = self.validity_scratch.as_slice().into();
+        self.jacobians =
+            every_sample_has_a_gradient.then(|| self.jacobians_scratch.as_slice().into());
+        self.field_values = self.field_values_scratch.as_slice().into();
+        self.potential_values = self.potential_values_scratch.as_slice().into();
+        self.negated_fields = self.negated_fields_scratch.as_slice().into();
     }
 }
 

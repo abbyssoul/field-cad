@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = []
 expression-fixture = ["dep:fieldcad-test-field"]
+dhat = ["dep:dhat"]
 
 [[bin]]
 name = "fieldcad"
@@ -14,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 bytemuck = { workspace = true }
 clap = { workspace = true }
+dhat = { workspace = true, optional = true }
 directories = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
