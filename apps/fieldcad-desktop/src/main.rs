@@ -38,6 +38,16 @@ struct Cli {
     #[arg(long, value_name = "SECONDS")]
     exit_after: Option<f64>,
 
+    /// Start the simulation running immediately instead of waiting for the
+    /// user to press Play. Combine with SCENE and `--exit-after` for a
+    /// scripted, reproducible windowed run — the foundation for perf/
+    /// memory profiling and future automated testing that needs a real
+    /// window and GPU without any input-injection tooling (see
+    /// `apps/fieldcad-desktop/AGENTS.md` on this app having none). Example:
+    /// `fieldcad scene.fcscene --autorun --exit-after 100`.
+    #[arg(long)]
+    autorun: bool,
+
     /// Start with the embedded MCP server already listening at ADDRESS
     /// (e.g. 127.0.0.1:8642) and print its bearer token to the startup log,
     /// instead of leaving MCP off until a user opens the panel. For an agent
@@ -96,6 +106,7 @@ fn main() -> ExitCode {
         mcp: cli.mcp,
         open_path: cli.scene,
         expression_fixture: cli.expression_fixture,
+        autorun: cli.autorun,
     };
     match fieldcad_desktop::run_for(options) {
         Ok(()) => ExitCode::SUCCESS,

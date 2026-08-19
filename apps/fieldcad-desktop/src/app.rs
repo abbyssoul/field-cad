@@ -101,6 +101,12 @@ pub struct LaunchOptions {
     /// Compose the test-only live-expression contract plugin. The CLI guards
     /// this with the matching Cargo feature so production catalogs are unchanged.
     pub expression_fixture: bool,
+    /// Submit `Play` immediately at startup instead of waiting for the user
+    /// to press it — for a scripted run (combined with `lifetime`) that
+    /// needs the simulation actually advancing without any GUI input, e.g.
+    /// perf/memory profiling. See `--autorun`'s own doc comment in
+    /// `main.rs` for the CLI-facing explanation.
+    pub autorun: bool,
 }
 
 /// Run the application per `options`.
@@ -121,6 +127,7 @@ pub fn run_for(options: LaunchOptions) -> Result<(), RunError> {
         mcp_autostart: options.mcp,
         open_path: options.open_path,
         expression_fixture: options.expression_fixture,
+        autorun: options.autorun,
         ..DesktopApplication::default()
     };
     event_loop.run_app(&mut application)?;
@@ -144,6 +151,11 @@ struct DesktopApplication {
     mcp_autostart: Option<SocketAddr>,
     /// Consumed by the first `resumed()`, same reasoning as `mcp_autostart`.
     open_path: Option<PathBuf>,
+    /// Submit `Play` at startup — see [`LaunchOptions::autorun`]. Not
+    /// consumed like `open_path`/`mcp_autostart`: re-submitting `Play` on a
+    /// rare suspend/resume cycle is harmless (a no-op against an
+    /// already-running session), so a plain `bool` copy is simplest.
+    autorun: bool,
 }
 
 impl ApplicationHandler for DesktopApplication {
@@ -157,6 +169,7 @@ impl ApplicationHandler for DesktopApplication {
             self.mcp_autostart.take(),
             self.open_path.take(),
             self.expression_fixture,
+            self.autorun,
         ) {
             Ok(window_state) => self.window_state = Some(window_state),
             Err(error) => {
@@ -554,14 +567,19 @@ struct WindowState {
     /// animated flow line's shader-only scroll, most commonly) costs a
     /// refcount bump instead of a fresh multi-region copy.
     cached_field_layer_geometry: Option<Arc<scene::FieldGeometry>>,
-    /// `overlay.flow_ribbons.len()` from the last redraw — `overlay` itself
-    /// is deliberately rebuilt fresh every frame (see the comment where it's
-    /// built in [`Self::redraw`]), but a watched trajectory's ribbon is
-    /// usually a similar size frame to frame, so reserving this many slots
-    /// up front turns the trajectory loop's growth into one allocation
-    /// instead of the repeated grow-and-copy an empty `Vec` would need to
-    /// reach the same size.
-    overlay_flow_ribbons_capacity_hint: usize,
+    /// `overlay.flow_ribbons`'s buffer, reclaimed at the end of one
+    /// [`Self::redraw`] and handed back at the start of the next — `overlay`
+    /// itself is deliberately rebuilt fresh every frame (see the comment
+    /// where it's built in `redraw`; the rest of it depends on live
+    /// drag/selection state that genuinely can't be cached the same way),
+    /// but `flow_ribbons` specifically is large enough (a watched
+    /// trajectory's ribbon can run past 100k vertices) that a fresh
+    /// `Vec::with_capacity` every single frame is its own allocator churn —
+    /// a `dhat`+`massif` pass confirmed this call site as a real
+    /// large-object allocate/free cycle happening every redraw, not just a
+    /// one-time cost. Reusing the buffer (`.clear()`, refill) turns that
+    /// into zero allocations once its capacity has stabilized.
+    overlay_flow_ribbons: Vec<scene::FlowRibbonVertex>,
     /// A clone of the server's authoritative probe/distance/mass-aggregate
     /// observation history (`HeadlessServer::{probe_history,
     /// distance_history, mass_aggregate_history}`), refreshed only when
@@ -678,6 +696,7 @@ impl WindowState {
         mcp_autostart: Option<SocketAddr>,
         open_path: Option<PathBuf>,
         expression_fixture: bool,
+        autorun: bool,
     ) -> Result<Self, String> {
         let attributes = WindowAttributes::default()
             .with_title("Field CAD")
@@ -916,6 +935,15 @@ impl WindowState {
             )
         };
 
+        // Submits directly against the freshly built source rather than
+        // going through `Self::submit` (which doesn't exist yet at this
+        // point in construction) — same one `CommandSequencer` every other
+        // transport shares, so this is indistinguishable from a user
+        // pressing Play as the very first thing after the window opens.
+        if autorun {
+            let _ = lock_model(&data_source).submit(CommandPayload::Play);
+        }
+
         Ok(Self {
             egui_state,
             renderer,
@@ -935,7 +963,7 @@ impl WindowState {
             region_geometry_cache: BTreeMap::new(),
             trajectory_geometry_cache: BTreeMap::new(),
             cached_field_layer_geometry: None,
-            overlay_flow_ribbons_capacity_hint: 0,
+            overlay_flow_ribbons: Vec::new(),
             probe_history_cache: (
                 None,
                 ProbeHistory::default(),
@@ -1354,8 +1382,10 @@ impl WindowState {
             &compute.vector_channels,
             scene_scale,
         );
+        let mut reused_flow_ribbons = std::mem::take(&mut self.overlay_flow_ribbons);
+        reused_flow_ribbons.clear();
         let mut overlay = scene::FieldGeometry {
-            flow_ribbons: Vec::with_capacity(self.overlay_flow_ribbons_capacity_hint),
+            flow_ribbons: reused_flow_ribbons,
             ..scene::FieldGeometry::default()
         };
         scene::append_authoring_geometry(
@@ -1490,8 +1520,6 @@ impl WindowState {
                 scene_scale,
             );
         }
-        self.overlay_flow_ribbons_capacity_hint = overlay.flow_ribbons.len();
-
         let status = self.renderer.render(
             SceneFrame {
                 camera: &self.camera,
@@ -1509,6 +1537,10 @@ impl WindowState {
                 pixels_per_point,
             },
         );
+        // Reclaimed after `render` (its last reader) so next frame's
+        // `overlay` starts from this buffer's capacity instead of an empty
+        // `Vec` — see `overlay_flow_ribbons`'s own doc comment.
+        self.overlay_flow_ribbons = overlay.flow_ribbons;
 
         match status {
             RenderStatus::SurfaceLost => {
