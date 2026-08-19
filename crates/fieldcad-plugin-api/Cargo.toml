@@ -8,3 +8,4 @@ fieldcad-core = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

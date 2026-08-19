@@ -21,13 +21,15 @@ use fieldcad_core::{
 };
 use fieldcad_dynamics::{self as dynamics, DynamicsError, IntegrationScheme};
 use fieldcad_expressions::{
-    EvaluationPlan, ExpressionCommand, ExpressionDiagnostic, ExpressionDocument, ExpressionError,
-    ExpressionState, PropertyBindingSchema, PropertyTarget, ValueProvider,
+    ConstantDefinition, ConstantId, ConstantOrigin, ConstantScope, EvaluationPlan,
+    ExpressionCommand, ExpressionDiagnostic, ExpressionDocument, ExpressionError,
+    ExpressionErrorKind, ExpressionState, ExpressionValue, PropertyBindingSchema, PropertyTarget,
+    ValueProvider,
 };
 use fieldcad_plugin_api::{
     ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, FieldBrushStroke,
     PluginConfigurationSchema, PluginError, PluginMetadata, ResolvedFieldBrushStroke,
-    SolverCancellation, SolverContext,
+    SolverCancellation, SolverContext, VariablesSubsystem, build_variables_subsystem,
 };
 use glam::{DVec2, DVec3, UVec2, UVec3};
 use serde::{Deserialize, Serialize};
@@ -760,11 +762,92 @@ fn property_binding_schema(
     })
 }
 
-fn compile_expression_plan(
+/// Global-scope `ConstantDefinition`s for every constant every plugin in
+/// `plugins` has registered — synthesized fresh, never persisted. Spliced
+/// into a document's constants before compiling (see
+/// [`compile_expression_plan`]) so `global.<plugin>.<property>` symbols
+/// resolve to each plugin's CODATA default unless overridden.
+fn global_constant_definitions<'a>(
+    plugins: impl IntoIterator<Item = &'a dyn EquationSystemPlugin>,
+) -> Vec<ConstantDefinition> {
+    let subsystem: VariablesSubsystem = build_variables_subsystem(plugins);
+    subsystem
+        .entries()
+        .map(|(plugin, variable)| ConstantDefinition {
+            id: fieldcad_expressions::global_constant_id(plugin, &variable.property),
+            scope: ConstantScope::Global,
+            name: format!("{plugin}.{}", variable.property),
+            source: fieldcad_expressions::format_quantity_literal(variable.default_value),
+            revision: None,
+            provenance: Some(format!("plugin {plugin}")),
+            origin: None,
+        })
+        .collect()
+}
+
+fn compile_expression_plan<'a>(
     document: &ExpressionDocument,
     world: &WorldSnapshot,
+    plugins: impl IntoIterator<Item = &'a dyn EquationSystemPlugin>,
 ) -> Result<EvaluationPlan, ExpressionError> {
-    EvaluationPlan::compile(document, |target| property_binding_schema(world, target))
+    let spliced =
+        fieldcad_expressions::with_global_constants(document, global_constant_definitions(plugins));
+    EvaluationPlan::compile(&spliced, |target| property_binding_schema(world, target))
+}
+
+/// Scan `document` for `Document`-scope constants imported from a plugin's
+/// global variable ([`ConstantOrigin::GlobalVariable`]) and resolve each
+/// one's currently evaluated value into the `PropertyBag` override that
+/// plugin's configuration must carry — grouped so a document overriding two
+/// properties on the same plugin produces one merged bag, one solver
+/// rebuild, not two.
+///
+/// `plugin_configuration` looks up a plugin's *current* configuration and
+/// schema by id; overrides are merged onto the current configuration (not
+/// the plugin's bare default) so unrelated already-configured properties on
+/// the same plugin survive. Rejects a dimension mismatch between the
+/// resolved override and what the plugin's `configuration_schema` declares
+/// for that property, rather than silently misconfiguring physics.
+fn resolved_plugin_configuration(
+    document: &ExpressionDocument,
+    resolved_constants: &BTreeMap<ConstantId, ExpressionValue>,
+    plugin_configuration: impl Fn(&PluginId) -> Option<(PropertyBag, PluginConfigurationSchema)>,
+) -> Result<BTreeMap<PluginId, PropertyBag>, ExpressionError> {
+    let mut overrides: BTreeMap<PluginId, PropertyBag> = BTreeMap::new();
+    for definition in &document.constants {
+        let Some(ConstantOrigin::GlobalVariable { plugin, property }) = &definition.origin else {
+            continue;
+        };
+        let Some(value) = resolved_constants.get(&definition.id) else {
+            continue;
+        };
+        let Some((configuration, schema)) = plugin_configuration(plugin) else {
+            continue;
+        };
+        let expected_dimension = schema
+            .properties
+            .iter()
+            .find(|candidate| candidate.id == *property)
+            .and_then(|candidate| match candidate.kind {
+                PropertyKind::Scalar(dimension) => Some(dimension),
+                _ => None,
+            });
+        if expected_dimension != Some(value.dimension()) {
+            return Err(ExpressionError {
+                kind: ExpressionErrorKind::DimensionMismatch,
+                message: format!(
+                    "global override for {plugin}.{property} does not match the plugin's expected dimension"
+                ),
+                span: None,
+                dependents: Vec::new(),
+            });
+        }
+        let bag = overrides
+            .entry(plugin.clone())
+            .or_insert_with(|| configuration.clone());
+        bag.insert(property.clone(), PropertyValue::Scalar(value.quantity()));
+    }
+    Ok(overrides)
 }
 
 fn resolved_property_commands(
@@ -823,7 +906,7 @@ impl SimulationRuntime {
             subscription,
             scene_scale,
             sampling_budget,
-            plugins,
+            mut plugins,
             undo_depth,
             integration_scheme,
             initial_sequence,
@@ -898,7 +981,13 @@ impl SimulationRuntime {
 
         // Rebuild transient authored intent and resolve it into the same
         // ordinary SI-valued world every solver will be constructed from.
-        let mut expression_plan = compile_expression_plan(&expressions, &world.snapshot())?;
+        let mut expression_plan = compile_expression_plan(
+            &expressions,
+            &world.snapshot(),
+            plugins
+                .iter()
+                .map(|registration| registration.plugin.as_ref()),
+        )?;
         let expression_values = {
             let snapshot = world.snapshot();
             expression_plan.evaluate(&WorldDistanceProvider(snapshot))?
@@ -912,6 +1001,36 @@ impl SimulationRuntime {
         )?;
         if !expression_commands.is_empty() {
             world.commit(expression_commands)?;
+        }
+
+        // A document constant imported from a plugin's global variable
+        // (`ConstantOrigin::GlobalVariable`) doubles as that plugin's
+        // configuration value — merge its resolved value into the
+        // registration's `PropertyBag` before any solver is constructed, so
+        // a document with an override already authored starts up with the
+        // right physics from the first tick rather than constructing once
+        // and immediately rebuilding.
+        let plugin_configuration_overrides = resolved_plugin_configuration(
+            &expressions,
+            &expression_values.constants,
+            |plugin_id| {
+                plugins
+                    .iter()
+                    .find(|registration| registration.plugin.metadata().id == *plugin_id)
+                    .map(|registration| {
+                        (
+                            registration.configuration.clone(),
+                            registration.plugin.configuration_schema(),
+                        )
+                    })
+            },
+        )?;
+        for registration in &mut plugins {
+            if let Some(bag) =
+                plugin_configuration_overrides.get(&registration.plugin.metadata().id)
+            {
+                registration.configuration = bag.clone();
+            }
         }
 
         let clock = SimulationClock::new(time_step);
@@ -1067,6 +1186,17 @@ impl SimulationRuntime {
         &self,
     ) -> BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue> {
         self.expression_plan.constant_values().collect()
+    }
+
+    /// Every constant currently registered by an active plugin — see
+    /// [`fieldcad_plugin_api::VariablesSubsystem`]. Recomputed on each call,
+    /// like [`Self::resolved_constants`]; the plugin list is small and this
+    /// is a UI-frame accessor, not a hot path.
+    pub fn global_variables(&self) -> Vec<(PluginId, fieldcad_plugin_api::ExportedVariable)> {
+        build_variables_subsystem(self.plugins.iter().map(|slot| slot.plugin.as_ref()))
+            .entries()
+            .map(|(plugin, variable)| (plugin.clone(), variable.clone()))
+            .collect()
     }
 
     /// Accepted graph definitions, direct dependencies, values, and current live fault.
@@ -1259,8 +1389,11 @@ impl SimulationRuntime {
     fn adopt_history_entry(&mut self, entry: &HistoryEntry) -> Result<(), RuntimeError> {
         let mut candidate = self.world.clone();
         candidate.restore(&entry.checkpoint);
-        let mut expression_plan =
-            compile_expression_plan(&entry.expression_document, &candidate.snapshot())?;
+        let mut expression_plan = compile_expression_plan(
+            &entry.expression_document,
+            &candidate.snapshot(),
+            self.plugins.iter().map(|slot| slot.plugin.as_ref()),
+        )?;
         let expression_values = expression_plan
             .evaluate(&WorldDistanceProvider(candidate.snapshot()))?
             .properties;
@@ -2285,7 +2418,11 @@ impl SimulationRuntime {
             }
         }
 
-        let mut plan = compile_expression_plan(&document, &provisional_snapshot)?;
+        let mut plan = compile_expression_plan(
+            &document,
+            &provisional_snapshot,
+            self.plugins.iter().map(|slot| slot.plugin.as_ref()),
+        )?;
         let evaluated = plan.evaluate(&WorldDistanceProvider(provisional_snapshot.clone()))?;
         let resolved = resolved_property_commands(
             &provisional_snapshot,
@@ -2306,12 +2443,75 @@ impl SimulationRuntime {
             slot.solver().validate_world(&candidate_snapshot)?;
         }
 
+        // A document constant imported from a plugin's global variable
+        // doubles as that plugin's configuration value (§ConstantOrigin).
+        // Reconfiguring a plugin is reset-class — see
+        // `set_field_system_configuration` — so build every replacement
+        // solver up front, before any state is mutated, exactly like the
+        // rest of this validate-then-commit transaction.
+        let plugin_configuration_overrides =
+            resolved_plugin_configuration(&document, &evaluated.constants, |plugin_id| {
+                self.plugins
+                    .iter()
+                    .find(|slot| &slot.metadata.id == plugin_id)
+                    .map(|slot| {
+                        (
+                            slot.configuration.clone(),
+                            slot.configuration_schema.clone(),
+                        )
+                    })
+            })?;
+        if !plugin_configuration_overrides.is_empty() && self.is_editing() {
+            return Err(RuntimeError::CannotReconfigurePluginWhileEditing);
+        }
+        let initial_step = SimulationClock::new(self.clock.time_step()).snapshot().step;
+        let mut plugin_solver_replacements: BTreeMap<usize, Box<dyn EquationSystemSolver>> =
+            BTreeMap::new();
+        for (plugin_id, configuration) in &plugin_configuration_overrides {
+            let index = self
+                .plugins
+                .iter()
+                .position(|slot| &slot.metadata.id == plugin_id)
+                .expect("resolved_plugin_configuration only returns registered plugins");
+            if !self.plugins[index].enabled {
+                continue;
+            }
+            let mut solver = self.plugins[index].plugin.create_solver(SolverContext {
+                configuration,
+                domain: &self.domain,
+                world: &candidate_snapshot,
+                initial_step,
+                cancellation: self.cancellation.clone(),
+            })?;
+            solver.validate_world(&candidate_snapshot)?;
+            solver.validate_time_step(self.clock.time_step())?;
+            solver.on_world_changed(&candidate_snapshot)?;
+            plugin_solver_replacements.insert(index, solver);
+        }
+
         self.world = provisional;
         self.expression_document = document;
         self.expression_plan = plan;
         self.expression_values = evaluated.properties;
         self.expression_diagnostics.clear();
         self.expression_resolved_world_revision = candidate_snapshot.revision();
+        for (plugin_id, configuration) in plugin_configuration_overrides {
+            let index = self
+                .plugins
+                .iter()
+                .position(|slot| slot.metadata.id == plugin_id)
+                .expect("resolved above");
+            self.plugins[index].configuration = configuration;
+        }
+        if !plugin_solver_replacements.is_empty() {
+            self.run_generation = self.run_generation.saturating_add(1);
+            self.last_forces.clear();
+            self.body_history.clear();
+            for (index, solver) in plugin_solver_replacements {
+                self.plugins[index].solver = Some(solver);
+                self.plugins[index].sampled_from = None;
+            }
+        }
         let editing = self.is_editing();
         for slot in self
             .plugins
@@ -2602,8 +2802,11 @@ impl SimulationRuntime {
         expression_document.bindings.retain(|binding| {
             property_binding_schema(&candidate_before_expressions, &binding.target).is_some()
         });
-        let mut expression_plan =
-            compile_expression_plan(&expression_document, &candidate_before_expressions)?;
+        let mut expression_plan = compile_expression_plan(
+            &expression_document,
+            &candidate_before_expressions,
+            self.plugins.iter().map(|slot| slot.plugin.as_ref()),
+        )?;
         let evaluated = expression_plan
             .evaluate(&WorldDistanceProvider(candidate_before_expressions.clone()))?;
         let resolved = resolved_property_commands(

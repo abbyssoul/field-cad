@@ -845,6 +845,7 @@ fn authored_expressions_round_trip_and_legacy_documents_default_empty() {
             source: "6400 km".into(),
             revision: None,
             provenance: None,
+            origin: None,
         });
     let document = SceneDocument::capture(capture, "test", None);
     let dir = tempfile::tempdir().unwrap();
@@ -921,6 +922,7 @@ fn embedded_user_constants_bindings_hash_and_refresh_survive_reload() {
         source: "2".into(),
         revision: Some("library-a".to_owned()),
         provenance: Some("user-constants.json".to_owned()),
+        origin: None,
     };
     let expressions = ExpressionDocument {
         constants: vec![
@@ -932,6 +934,7 @@ fn embedded_user_constants_bindings_hash_and_refresh_survive_reload() {
                 source: "user.base * distance.0 / 1 m".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             },
         ],
         bindings: vec![PropertyBinding {

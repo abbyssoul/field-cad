@@ -160,6 +160,7 @@ fn evaluate_expression_text(text: &str, dimension: fieldcad_core::Dimension) -> 
             source: text.into(),
             revision: None,
             provenance: None,
+            origin: None,
         }],
         bindings: Vec::new(),
     };

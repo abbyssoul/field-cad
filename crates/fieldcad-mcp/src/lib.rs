@@ -116,6 +116,19 @@ fn lock(model: &Mutex<HeadlessServer>) -> MutexGuard<'_, HeadlessServer> {
     model.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// One plugin-registered physical constant, as reported by
+/// [`get_global_variables`]. A flat, named-field shape rather than the
+/// underlying `(PluginId, ExportedVariable)` pair, so the JSON an MCP client
+/// receives doesn't require positional-tuple decoding.
+#[derive(Serialize)]
+struct GlobalVariableEntry {
+    plugin: fieldcad_core::PluginId,
+    property: fieldcad_core::PropertyId,
+    display_name: String,
+    description: Option<String>,
+    default_value: fieldcad_core::Quantity,
+}
+
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, ErrorData> {
     let text = serde_json::to_string(value)
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
@@ -1216,6 +1229,24 @@ impl McpServer {
     )]
     async fn get_expression_state(&self) -> Result<CallToolResult, ErrorData> {
         ok_json(&lock(&self.model).expression_state())
+    }
+
+    #[tool(
+        description = "List every physical constant an active equation-system plugin has registered (e.g. the gravitational constant, Coulomb's constant), with its SI default value and dimension. Import one into the document with commit_expressions' ImportGlobalConstants command (scope Document, origin GlobalVariable{plugin, property}), matching the qualified name here — then override it by editing the imported constant's source, same as any other document constant, to run the simulation with a different fundamental constant."
+    )]
+    async fn get_global_variables(&self) -> Result<CallToolResult, ErrorData> {
+        let entries: Vec<GlobalVariableEntry> = lock(&self.model)
+            .global_variables()
+            .into_iter()
+            .map(|(plugin, variable)| GlobalVariableEntry {
+                plugin,
+                property: variable.property,
+                display_name: variable.display_name,
+                description: variable.description,
+                default_value: variable.default_value,
+            })
+            .collect();
+        ok_json(&entries)
     }
 
     #[tool(
@@ -3141,6 +3172,7 @@ mod tests {
                 source: "42".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             },
         );
         let receipt = json_of(

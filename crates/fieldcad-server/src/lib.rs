@@ -1565,6 +1565,10 @@ impl FieldDataSource for HeadlessServer {
         self.source.expression_state()
     }
 
+    fn global_variables(&self) -> Vec<(PluginId, fieldcad_plugin_api::ExportedVariable)> {
+        self.source.global_variables()
+    }
+
     // Not the trait default: a source that actually holds body forces must
     // say so, or an inspector reading this through `&dyn FieldDataSource`
     // (as the desktop UI does) sees an empty map forever.

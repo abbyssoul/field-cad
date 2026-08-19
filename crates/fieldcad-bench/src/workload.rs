@@ -588,6 +588,7 @@ fn expression_plan(nodes: usize) -> EvaluationPlan {
             },
             revision: None,
             provenance: None,
+            origin: None,
         })
         .collect();
     EvaluationPlan::compile(

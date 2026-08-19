@@ -66,6 +66,10 @@ pub struct ComputeView {
         BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
     /// Dependency health and current live-evaluation faults for the accepted graph.
     pub expression_state: fieldcad_expressions::ExpressionState,
+    /// Constants currently registered by an active plugin, for the Variables
+    /// inspector's "Global constants" section — see
+    /// `fieldcad_plugin_api::VariablesSubsystem`.
+    pub global_variables: Vec<(PluginId, fieldcad_plugin_api::ExportedVariable)>,
     /// Channels a generic vector layer can draw, in published order.
     pub vector_channels: Vec<ChannelId>,
     /// Active vector fields that their owning numerical solver permits painting.
@@ -212,6 +216,7 @@ impl ComputeView {
             expressions: source.expressions(),
             resolved_constants: source.resolved_constants(),
             expression_state,
+            global_variables: source.global_variables(),
             vector_channels,
             mutable_vector_channels,
             subscription: source.subscription(),
@@ -652,6 +657,7 @@ mod tests {
                 source: "2 m".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             }],
             bindings: Vec::new(),
         };

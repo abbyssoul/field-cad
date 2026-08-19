@@ -542,6 +542,7 @@ fn object_components(
                             &compute.expressions,
                             &compute.expression_state,
                             user_constants,
+                            &compute.global_variables,
                             output,
                         )
                     } else {
@@ -673,6 +674,10 @@ fn expression_property_editor(
     expressions: &fieldcad_expressions::ExpressionDocument,
     expression_state: &fieldcad_expressions::ExpressionState,
     user_constants: &fieldcad_expressions::UserConstantLibrary,
+    global_variables: &[(
+        fieldcad_core::PluginId,
+        fieldcad_plugin_api::ExportedVariable,
+    )],
     output: &mut UiFrameOutput,
 ) -> bool {
     let PropertyKind::Scalar(dimension) = schema.kind else {
@@ -741,6 +746,7 @@ fn expression_property_editor(
                 source_text,
                 expressions,
                 user_constants,
+                global_variables,
                 world,
                 schema.live_binding,
                 output,

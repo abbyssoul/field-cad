@@ -9,17 +9,19 @@
 use fieldcad_core::quantities::MassKg;
 use fieldcad_core::{
     ChannelId, ChannelSchema, ComponentSchema, CoupledSource, Dimension, FieldValueKind, PluginId,
-    PluginVersion, WorldSnapshot,
+    PluginVersion, PropertyId, Quantity, WorldSnapshot,
 };
-use fieldcad_plugin_api::PluginMetadata;
+use fieldcad_plugin_api::{ExportedVariable, PluginMetadata};
 use fieldcad_sources::{collect_gravity_sources, mass_component_schemas};
 use fieldcad_superposition::InverseSquareSample;
 use fieldcad_superposition_solver::{InverseSquareCoupling, InverseSquarePlugin};
 use glam::DVec3;
 
 pub const PLUGIN_ID: &str = "fieldcad.gravity";
+
 /// Newton's gravitational constant in m³·kg⁻¹·s⁻² (CODATA 2018).
 pub const GRAVITATIONAL_CONSTANT: f64 = 6.674_30e-11;
+
 pub const GRAVITATIONAL_ACCELERATION: &str = "gravitational-acceleration";
 pub const GRAVITATIONAL_POTENTIAL: &str = "gravitational-potential";
 /// The one generic `CoupledSource<T>` → `InverseSquareSource` mapping,
@@ -66,7 +68,7 @@ pub struct GravityCoupling;
 
 impl InverseSquareCoupling for GravityCoupling {
     type Strength = MassKg;
-    const COUPLING_CONSTANT: f64 = -GRAVITATIONAL_CONSTANT;
+    const COUPLING_SIGN: f64 = -1.0;
     const SYSTEM_LABEL: &str = "gravity";
     const NON_FINITE_MESSAGE: &str = "gravitational acceleration overflowed to a non-finite value";
     const DIAGNOSTIC_CODE: &str = "newtonian-gravity-source-count";
@@ -77,9 +79,23 @@ impl InverseSquareCoupling for GravityCoupling {
             id: plugin_id(),
             version: PluginVersion::new(0, 1, 0),
             display_name: "Newtonian gravity".to_owned(),
-            description:
-                "Analytic Newtonian gravitational acceleration and potential with superposition"
-                    .to_owned(),
+            description: "Analytic Newtonian gravitational field and potential with superposition"
+                .to_owned(),
+        }
+    }
+
+    fn coupling_constant() -> ExportedVariable {
+        ExportedVariable {
+            property: PropertyId::new("G").expect("static property id is valid"),
+            display_name: "Gravitational constant".to_owned(),
+            description: Some(
+                "Newton's gravitational constant, CODATA 2018 (m^3 kg^-1 s^-2)".to_owned(),
+            ),
+            default_value: Quantity::new(
+                GRAVITATIONAL_CONSTANT,
+                Dimension::new(-1, 3, -2, 0, 0, 0, 0),
+            )
+            .expect("static dimension is valid"),
         }
     }
 

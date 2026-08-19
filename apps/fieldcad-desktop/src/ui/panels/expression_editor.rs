@@ -8,11 +8,12 @@
 //! the widgets here render UI and hand back a finished draft rather than
 //! deciding how to commit it.
 
-use fieldcad_core::WorldSnapshot;
+use fieldcad_core::{PluginId, WorldSnapshot};
 use fieldcad_expressions::{
-    ConstantDefinition, ConstantId, ConstantScope, EvaluationPlan, ExpressionCommand,
-    ExpressionDocument, ExpressionSubject, UserConstantLibrary,
+    ConstantDefinition, ConstantId, ConstantOrigin, ConstantScope, EvaluationPlan,
+    ExpressionCommand, ExpressionDocument, ExpressionSubject, UserConstantLibrary,
 };
+use fieldcad_plugin_api::ExportedVariable;
 use fieldcad_simulation::CommandPayload;
 
 use super::NoDistanceProvider;
@@ -44,6 +45,7 @@ fn preview_constant(
         source: source.trim().into(),
         revision: None,
         provenance: None,
+        origin: None,
     });
     Some(
         match EvaluationPlan::compile(
@@ -175,11 +177,13 @@ pub(super) fn add_constant_control(
 /// A menu listing every constant already available to the document, plus
 /// every not-yet-embedded user-library constant (embedding it on click),
 /// appending the chosen symbol to `source`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn insert_constant_menu(
     ui: &mut egui::Ui,
     source: &mut String,
     expressions: &ExpressionDocument,
     user_constants: &UserConstantLibrary,
+    global_variables: &[(PluginId, ExportedVariable)],
     world: &WorldSnapshot,
     allow_distances: bool,
     output: &mut UiFrameOutput,
@@ -191,12 +195,23 @@ pub(super) fn insert_constant_menu(
                 match constant.scope {
                     ConstantScope::Document => "doc",
                     ConstantScope::User => "user",
+                    ConstantScope::Global => "global",
                 },
                 constant.name
             );
             if ui.button(&symbol).clicked() {
                 source.push_str(&symbol);
                 ui.close();
+            }
+        }
+        if !global_variables.is_empty() {
+            ui.separator();
+            for (plugin, variable) in global_variables {
+                let symbol = format!("global.{plugin}.{}", variable.property);
+                if ui.button(&symbol).clicked() {
+                    source.push_str(&symbol);
+                    ui.close();
+                }
             }
         }
         if !user_constants.constants.is_empty() {
@@ -271,6 +286,7 @@ pub(super) fn variables_editor(
                 ui.label(match constant.scope {
                     ConstantScope::Document => "doc.",
                     ConstantScope::User => "user.",
+                    ConstantScope::Global => "global.",
                 });
                 let edited = draft.0.edited_mut();
                 let name = ui.add(
@@ -288,6 +304,7 @@ pub(super) fn variables_editor(
                     &mut edited.source,
                     &compute.expressions,
                     user_constants,
+                    &compute.global_variables,
                     world,
                     true,
                     output,
@@ -404,6 +421,7 @@ pub(super) fn variables_editor(
                                         match candidate.scope {
                                             ConstantScope::Document => "doc",
                                             ConstantScope::User => "user",
+                                            ConstantScope::Global => "global",
                                         },
                                         candidate.name
                                     )
@@ -446,6 +464,69 @@ pub(super) fn variables_editor(
         ui.data_mut(|data| data.insert_temp(id, draft));
     }
 
+    if !compute.global_variables.is_empty() {
+        ui.separator();
+        ui.label("Global constants");
+        ui.small("Registered by active plugins. Import to override a value for this document.");
+        for (plugin, variable) in &compute.global_variables {
+            ui.horizontal(|ui| {
+                let label = ui
+                    .label(format!("global.{plugin}.{}", variable.property))
+                    .on_hover_text(
+                        variable
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| "No description".to_owned()),
+                    );
+                let _ = label;
+                ui.small(format!(
+                    "= {} {}",
+                    variable.default_value.si_value(),
+                    variable.default_value.dimension().unit_symbol()
+                ));
+                let already_imported = compute.expressions.constants.iter().any(|constant| {
+                    matches!(
+                        &constant.origin,
+                        Some(ConstantOrigin::GlobalVariable {
+                            plugin: origin_plugin,
+                            property,
+                        }) if origin_plugin == plugin && *property == variable.property
+                    )
+                });
+                if already_imported {
+                    ui.weak("Imported");
+                } else if ui.small_button("Import").clicked() {
+                    let next = compute
+                        .expressions
+                        .constants
+                        .iter()
+                        .filter(|constant| constant.scope == ConstantScope::Document)
+                        .map(|constant| constant.id.get())
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                        .min((1_u64 << 63) - 1);
+                    output.submit(CommandPayload::CommitExpressions(vec![
+                        ExpressionCommand::ImportGlobalConstants(vec![ConstantDefinition {
+                            id: ConstantId::new(next),
+                            scope: ConstantScope::Document,
+                            name: variable.property.as_str().to_owned(),
+                            source: fieldcad_expressions::format_quantity_literal(
+                                variable.default_value,
+                            ),
+                            revision: None,
+                            provenance: Some(format!("plugin {plugin}")),
+                            origin: Some(ConstantOrigin::GlobalVariable {
+                                plugin: plugin.clone(),
+                                property: variable.property.clone(),
+                            }),
+                        }]),
+                    ]));
+                }
+            });
+        }
+    }
+
     ui.separator();
     let control_id = ui.make_persistent_id("add-document-variable");
     let committed = add_constant_control(
@@ -460,6 +541,7 @@ pub(super) fn variables_editor(
                 source,
                 &compute.expressions,
                 user_constants,
+                &compute.global_variables,
                 world,
                 true,
                 output,
@@ -485,6 +567,7 @@ pub(super) fn variables_editor(
                 source: draft.source.trim().into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             }),
         ]));
     }
@@ -563,6 +646,7 @@ pub(super) fn user_constants_editor(ui: &mut egui::Ui, model: &mut UiModel) {
             source: fields.source.trim().into(),
             revision: None,
             provenance: None,
+            origin: None,
         });
         save_library = true;
     }

@@ -8,7 +8,8 @@
 
 use fieldcad_core::quantities::ChargeCoulombs;
 use fieldcad_core::{
-    ChannelSchema, ComponentSchema, CoupledSource, PluginId, PluginVersion, WorldSnapshot,
+    ChannelSchema, ComponentSchema, CoupledSource, Dimension, PluginId, PluginVersion, PropertyId,
+    Quantity, WorldSnapshot,
 };
 pub use fieldcad_electromagnetic_sources::{
     ChargeSource, charge_component_id, charge_properties, charge_property_id,
@@ -17,7 +18,7 @@ pub use fieldcad_electromagnetic_sources::{
 use fieldcad_electromagnetic_sources::{
     charge_component_schema, electric_field_channel_schema, electric_potential_channel_schema,
 };
-use fieldcad_plugin_api::PluginMetadata;
+use fieldcad_plugin_api::{ExportedVariable, PluginMetadata};
 use fieldcad_superposition::InverseSquareSample;
 use fieldcad_superposition_solver::{InverseSquareCoupling, InverseSquarePlugin};
 use glam::DVec3;
@@ -76,7 +77,6 @@ pub struct ElectrostaticsCoupling;
 
 impl InverseSquareCoupling for ElectrostaticsCoupling {
     type Strength = ChargeCoulombs;
-    const COUPLING_CONSTANT: f64 = COULOMB_CONSTANT;
     const SYSTEM_LABEL: &str = "electrostatics";
     const NON_FINITE_MESSAGE: &str = "electrostatic force evaluation produced a non-finite field";
     const DIAGNOSTIC_CODE: &str = "electrostatic-source-count";
@@ -88,6 +88,18 @@ impl InverseSquareCoupling for ElectrostaticsCoupling {
             version: PluginVersion::new(0, 1, 0),
             display_name: "Electrostatics".to_owned(),
             description: "Analytic Coulomb field and potential with superposition".to_owned(),
+        }
+    }
+
+    fn coupling_constant() -> ExportedVariable {
+        ExportedVariable {
+            property: PropertyId::new("K").expect("static property id is valid"),
+            display_name: "Coulomb constant".to_owned(),
+            description: Some(
+                "Coulomb's constant, CODATA conventional value (kg m^3 s^-4 A^-2)".to_owned(),
+            ),
+            default_value: Quantity::new(COULOMB_CONSTANT, Dimension::new(1, 3, -4, -2, 0, 0, 0))
+                .expect("static dimension is valid"),
         }
     }
 

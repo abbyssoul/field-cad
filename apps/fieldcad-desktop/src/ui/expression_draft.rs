@@ -366,6 +366,7 @@ mod tests {
                     source: "1 m".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
                 ConstantDefinition {
                     id: second,
@@ -374,6 +375,7 @@ mod tests {
                     source: "doc.first".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
             ],
             bindings: vec![PropertyBinding {

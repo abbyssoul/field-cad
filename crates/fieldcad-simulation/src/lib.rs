@@ -2265,6 +2265,7 @@ mod tests {
                         source: "2 m".into(),
                         revision: None,
                         provenance: None,
+                        origin: None,
                     },
                 )],
             }))
@@ -2459,6 +2460,140 @@ mod tests {
         // Setting the fixture up is not something a user did.
         runtime.clear_edit_history();
         runtime
+    }
+
+    /// A `Document`-scope constant imported from a plugin's global variable
+    /// (here, electrostatics' Coulomb constant K) and edited to `2 * global.
+    /// ...K` must, once resolved, feed the plugin's own `PropertyBag`
+    /// configuration before its solver is ever constructed — so the field a
+    /// freshly built runtime publishes already reflects the override, not
+    /// just the CODATA default.
+    #[test]
+    fn global_variable_override_present_at_construction_scales_the_electrostatic_field() {
+        use fieldcad_expressions::{
+            ConstantDefinition, ConstantId, ConstantOrigin, ConstantScope, ExpressionDocument,
+        };
+
+        let plugin = fieldcad_electrostatics::plugin_id();
+        let property = fieldcad_core::PropertyId::new("K").unwrap();
+        let expressions = ExpressionDocument {
+            constants: vec![ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::Document,
+                name: "k_scaled".to_owned(),
+                source: format!("2 * global.{plugin}.{property}").into(),
+                revision: None,
+                provenance: None,
+                origin: Some(ConstantOrigin::GlobalVariable {
+                    plugin: plugin.clone(),
+                    property: property.clone(),
+                }),
+            }],
+            bindings: Vec::new(),
+        };
+
+        let mut runtime = SimulationRuntime::new(
+            RuntimeConfig::new(
+                Domain::centred_cube(4.0, 16).unwrap(),
+                time_step(),
+                SessionId::from_u128(22),
+            )
+            .with_expressions(expressions)
+            .with_plugin(Box::new(ElectrostaticsPlugin::new())),
+        )
+        .unwrap();
+        runtime
+            .commit_world_commands(vec![
+                WorldCommand::CreateObject(
+                    ObjectSpec::new("positive point charge")
+                        .with_transform(Transform::default())
+                        .with_shape(ObjectShape::default())
+                        .with_component(
+                            charge_component_id(),
+                            charge_properties(ChargeCoulombs::new::<coulomb>(1.0e-9)).unwrap(),
+                        ),
+                ),
+                WorldCommand::CreateProbe(ProbeSpec::at(
+                    "one metre on x",
+                    DVec3::X,
+                    vec![electric_field_channel_id()],
+                )),
+            ])
+            .unwrap();
+
+        let snapshot = runtime.latest_snapshot();
+        let probe = *runtime.world_snapshot().probes().keys().next().unwrap();
+        let field = snapshot
+            .probe_sample(&electric_field_channel_id(), probe)
+            .unwrap();
+        assert!(
+            (field.value.magnitude() - 2.0 * COULOMB_CONSTANT * 1.0e-9).abs() < 1.0e-12,
+            "expected the overridden (doubled) Coulomb constant to double the field, got {}",
+            field.value.magnitude()
+        );
+    }
+
+    /// The same override, but authored as a live edit through
+    /// `commit_expression_commands` against an already-running runtime —
+    /// the reset-class rebuild path (`run_generation` advances, matching
+    /// `set_field_system_configuration`), not the construction path above.
+    #[test]
+    fn global_variable_override_via_live_edit_rebuilds_the_solver_and_scales_the_field() {
+        use fieldcad_expressions::{
+            ConstantDefinition, ConstantId, ConstantOrigin, ConstantScope, ExpressionCommand,
+        };
+
+        let mut runtime = electrostatic_runtime();
+        let snapshot = runtime.latest_snapshot();
+        let probe = *runtime.world_snapshot().probes().keys().next().unwrap();
+        let before = snapshot
+            .probe_sample(&electric_field_channel_id(), probe)
+            .unwrap()
+            .value
+            .magnitude();
+        let generation_before = runtime.run_generation();
+
+        let plugin = fieldcad_electrostatics::plugin_id();
+        let property = fieldcad_core::PropertyId::new("K").unwrap();
+        runtime
+            .commit_expression_commands(vec![ExpressionCommand::AddConstant(ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::Document,
+                name: "k_scaled".to_owned(),
+                source: format!("3 * global.{plugin}.{property}").into(),
+                revision: None,
+                provenance: None,
+                origin: Some(ConstantOrigin::GlobalVariable { plugin, property }),
+            })])
+            .unwrap();
+
+        assert!(
+            runtime.run_generation() > generation_before,
+            "overriding a plugin's global constant is reset-class and must advance run_generation"
+        );
+        let snapshot = runtime.latest_snapshot();
+        let after = snapshot
+            .probe_sample(&electric_field_channel_id(), probe)
+            .unwrap()
+            .value
+            .magnitude();
+        assert!(
+            (after - 3.0 * before).abs() < 1.0e-9 * before,
+            "expected the field to scale by the overridden coupling constant: before={before}, after={after}"
+        );
+    }
+
+    #[test]
+    fn global_variables_reports_the_electrostatics_plugins_registered_constant() {
+        let runtime = electrostatic_runtime();
+        let entries = runtime.global_variables();
+        let (plugin, variable) = entries
+            .iter()
+            .find(|(plugin, _)| *plugin == fieldcad_electrostatics::plugin_id())
+            .expect("electrostatics registers its Coulomb constant");
+        assert_eq!(plugin, &fieldcad_electrostatics::plugin_id());
+        assert_eq!(variable.property.as_str(), "K");
+        assert!((variable.default_value.si_value() - COULOMB_CONSTANT).abs() < 1.0e-6);
     }
 
     #[test]

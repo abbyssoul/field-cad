@@ -19,12 +19,13 @@ use std::sync::Arc;
 use fieldcad_core::quantities::SiScalar;
 use fieldcad_core::{
     ChannelSchema, ComponentSchema, CoupledSource, DiagnosticSeverity, Domain, FieldColumn,
-    GradientColumn, ObjectIndex, SampleGeometry, SampleValidity, SolverDiagnostic, WorldRevision,
-    WorldSnapshot,
+    GradientColumn, ObjectIndex, PluginId, PropertyBag, PropertyKind, PropertySchema,
+    SampleGeometry, SampleValidity, SolverDiagnostic, WorldRevision, WorldSnapshot,
 };
 use fieldcad_plugin_api::{
-    ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, PluginError,
-    PluginMetadata, SampleCache, SampledColumn, SolverContext, SolverKind,
+    ChannelHandle, DynamicBody, EquationSystemPlugin, EquationSystemSolver, ExportedVariable,
+    PluginConfigurationSchema, PluginError, PluginMetadata, SampleCache, SampledColumn,
+    SolverContext, SolverKind, VariablesSubsystem,
 };
 use fieldcad_superposition::{
     CpuInverseSquareEvaluator, InverseSquareBatchEvaluator, InverseSquareSample,
@@ -233,8 +234,12 @@ pub trait InverseSquareCoupling: Send + Sync + 'static {
     /// methods, instead of as an identical two-line impl per plugin.
     type Strength: SiScalar + Send;
 
-    /// The coupling constant in SI, sign included.
-    const COUPLING_CONSTANT: f64;
+    /// The sign applied to `coupling_constant().default_value` to get the
+    /// force-law coefficient (gravity: `-1.0`, electrostatics: `1.0`). Kept
+    /// separate from the exported value so a user overriding it in the
+    /// Variables panel sees the physically meaningful positive magnitude
+    /// (CODATA G, CODATA k), not the internal force-law sign.
+    const COUPLING_SIGN: f64 = 1.0;
     /// The equation system's own name, for the evaluator/domain precision
     /// mismatch error.
     const SYSTEM_LABEL: &'static str;
@@ -252,6 +257,12 @@ pub trait InverseSquareCoupling: Send + Sync + 'static {
     /// source of the plugin id — diagnostics report `metadata().id`, so
     /// identity cannot drift between the two.
     fn metadata() -> PluginMetadata;
+    /// SI default and export metadata for this coupling's constant (e.g.
+    /// CODATA G or k, as a positive magnitude — see [`Self::COUPLING_SIGN`]).
+    /// The single source for the trait's runtime coupling value
+    /// ([`InverseSquareSolver::new`]), the plugin's configuration schema,
+    /// and its exported Variables-subsystem entry.
+    fn coupling_constant() -> ExportedVariable;
     /// The channels this coupling publishes, in field-then-potential
     /// handle order ([`FIELD_CHANNEL_HANDLE`], then
     /// [`POTENTIAL_CHANNEL_HANDLE`]).
@@ -298,6 +309,12 @@ pub struct InverseSquareSolver<C: InverseSquareCoupling> {
     inverse_square_sources: Vec<InverseSquareSource>,
     world_revision: WorldRevision,
     evaluator: Arc<dyn InverseSquareBatchEvaluator>,
+    /// The resolved coupling constant, sign included — read from
+    /// `SolverContext.configuration` at construction (falling back to the
+    /// CODATA default when the property is absent, e.g. a hand-built
+    /// registration in a test) and never re-read afterward, matching every
+    /// other plugin configuration value.
+    coupling_constant: f64,
     /// Runtime publication asks for the field and the potential separately,
     /// and unchanged-world reads ask again. Each geometry's evaluation and
     /// every column both channels derive from it live in one entry, so a
@@ -325,12 +342,18 @@ impl<C: InverseSquareCoupling> InverseSquareSolver<C> {
             )));
         }
         let (sources, inverse_square_sources) = load_sources::<C>(context.world)?;
+        let exported = C::coupling_constant();
+        let magnitude = context
+            .configuration
+            .scalar(&exported.property)
+            .unwrap_or_else(|| exported.default_value.si_value());
         Ok(Self {
             domain: *context.domain,
             sources,
             inverse_square_sources,
             world_revision: context.world.revision(),
             evaluator,
+            coupling_constant: C::COUPLING_SIGN * magnitude,
             cache: SampleCache::new(SAMPLE_CACHE_CAPACITY),
         })
     }
@@ -427,7 +450,7 @@ impl<C: InverseSquareCoupling> EquationSystemSolver for InverseSquareSolver<C> {
         // by the kernel. One call per tick; the force law itself lives in
         // the kernel, once, with its tests.
         add_forces_excluding_into(
-            C::COUPLING_CONSTANT,
+            self.coupling_constant,
             &self.inverse_square_sources,
             bodies
                 .iter()
@@ -480,7 +503,7 @@ impl<C: InverseSquareCoupling> InverseSquareSolver<C> {
             || {
                 let bundle = GeometrySamples::evaluate(
                     self.evaluator.as_ref(),
-                    C::COUPLING_CONSTANT,
+                    self.coupling_constant,
                     &self.inverse_square_sources,
                     &self.domain,
                     geometry,
@@ -490,7 +513,7 @@ impl<C: InverseSquareCoupling> InverseSquareSolver<C> {
             |slice| {
                 slice[0].refill(
                     self.evaluator.as_ref(),
-                    C::COUPLING_CONSTANT,
+                    self.coupling_constant,
                     &self.inverse_square_sources,
                     &self.domain,
                     geometry,
@@ -548,6 +571,36 @@ impl<C: InverseSquareCoupling> EquationSystemPlugin for InverseSquarePlugin<C> {
         C::component_schemas()
     }
 
+    fn configuration_schema(&self) -> PluginConfigurationSchema {
+        let exported = C::coupling_constant();
+        PluginConfigurationSchema {
+            properties: vec![PropertySchema {
+                id: exported.property,
+                display_name: exported.display_name,
+                description: exported.description,
+                kind: PropertyKind::Scalar(exported.default_value.dimension()),
+                required: false,
+                live_binding: false,
+                default_value: Some(fieldcad_core::PropertyValue::Scalar(exported.default_value)),
+                relevant_when: None,
+            }],
+        }
+    }
+
+    fn default_configuration(&self) -> PropertyBag {
+        let exported = C::coupling_constant();
+        let mut bag = PropertyBag::default();
+        bag.insert(
+            exported.property,
+            fieldcad_core::PropertyValue::Scalar(exported.default_value),
+        );
+        bag
+    }
+
+    fn register_variables(&self, plugin: &PluginId, variables: &mut VariablesSubsystem) {
+        variables.register(plugin.clone(), C::coupling_constant());
+    }
+
     fn create_solver(
         &self,
         context: SolverContext<'_>,
@@ -587,7 +640,6 @@ mod tests {
 
     impl InverseSquareCoupling for ToyCoupling {
         type Strength = f64;
-        const COUPLING_CONSTANT: f64 = 1.0;
         const SYSTEM_LABEL: &str = "toy";
         const NON_FINITE_MESSAGE: &str = "toy coupling overflowed";
         const DIAGNOSTIC_CODE: &str = "toy-source-count";
@@ -599,6 +651,20 @@ mod tests {
                 version: PluginVersion::new(0, 1, 0),
                 display_name: "Toy coupling".to_owned(),
                 description: "Unit-strength sources for skeleton contract tests".to_owned(),
+            }
+        }
+
+        fn coupling_constant() -> ExportedVariable {
+            ExportedVariable {
+                property: fieldcad_core::PropertyId::new("coupling")
+                    .expect("static property id is valid"),
+                display_name: "Toy coupling constant".to_owned(),
+                description: None,
+                default_value: fieldcad_core::Quantity::new(
+                    1.0,
+                    fieldcad_core::Dimension::DIMENSIONLESS,
+                )
+                .expect("dimensionless quantity is always valid"),
             }
         }
 

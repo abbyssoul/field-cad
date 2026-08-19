@@ -52,6 +52,7 @@ fn warmed_candidate_evaluation_allocates_nothing() {
             },
             revision: None,
             provenance: None,
+            origin: None,
         })
         .collect();
     let document = ExpressionDocument {

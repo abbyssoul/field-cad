@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use fieldcad_core::{ComponentTypeId, Dimension, DistanceProbeId, ObjectId, PropertyId, Quantity};
+use fieldcad_core::{
+    ComponentTypeId, Dimension, DistanceProbeId, ObjectId, PluginId, PropertyId, Quantity,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -201,6 +203,31 @@ pub enum ConstantScope {
     Document,
     /// Reproducibly embedded copy of a user-library constant.
     User,
+    /// Registered by a plugin into the shared variables subsystem. Never
+    /// authored or persisted in an [`ExpressionDocument`] — synthesized
+    /// fresh, once per compile, from the currently registered plugins (see
+    /// `fieldcad-simulation`). Read-only: a user who wants to override one
+    /// imports it into `Document` scope (`ImportGlobalConstants`), which
+    /// produces an ordinary, independently editable copy tagged with
+    /// [`ConstantOrigin::GlobalVariable`].
+    Global,
+}
+
+/// Where an embedded/imported constant's value came from, for definitions
+/// whose scope is not authored directly by hand.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConstantOrigin {
+    /// Embedded from a [`UserConstantLibrary`] entry (`ImportUserConstants`).
+    UserLibrary,
+    /// Imported from a plugin-registered [`ConstantScope::Global`] constant
+    /// (`ImportGlobalConstants`). The runtime uses this to recognize that a
+    /// `Document`-scope constant stands in for one plugin's configuration
+    /// property, and feeds its resolved value back into that plugin's
+    /// configuration before constructing/rebuilding its solver.
+    GlobalVariable {
+        plugin: PluginId,
+        property: PropertyId,
+    },
 }
 
 /// One authored document or embedded-library constant.
@@ -220,6 +247,10 @@ pub struct ConstantDefinition {
     /// Human-readable origin for embedded provenance.
     #[serde(default)]
     pub provenance: Option<String>,
+    /// Structured origin, for definitions the runtime needs to recognize
+    /// programmatically rather than just display — see [`ConstantOrigin`].
+    #[serde(default)]
+    pub origin: Option<ConstantOrigin>,
 }
 
 /// Stable address of one scalar component property.
@@ -360,6 +391,13 @@ pub enum ExpressionCommand {
     ClearPropertyExpression(PropertyTarget),
     /// Import or explicitly refresh embedded user definitions supplied as data.
     ImportUserConstants(Vec<ConstantDefinition>),
+    /// Import a `Document`-scoped copy of a plugin-registered
+    /// [`ConstantScope::Global`] constant, tagged with
+    /// [`ConstantOrigin::GlobalVariable`]. This is how a user gains override
+    /// control: the imported copy is edited exactly like any other document
+    /// constant (`SetConstantSource`), and its resolved value is what the
+    /// runtime feeds back into the originating plugin's configuration.
+    ImportGlobalConstants(Vec<ConstantDefinition>),
 }
 
 /// Standalone, desktop-owned reusable constant library file.
@@ -477,6 +515,61 @@ impl UserConstantLibrary {
     }
 }
 
+/// Return `document` with the given plugin-registered constants spliced in
+/// as `ConstantScope::Global` entries, for one [`EvaluationPlan::compile`]
+/// call. Never persisted — the caller (`fieldcad-simulation`) synthesizes
+/// this list fresh from the currently registered plugins on every compile.
+pub fn with_global_constants(
+    document: &ExpressionDocument,
+    global: impl IntoIterator<Item = ConstantDefinition>,
+) -> ExpressionDocument {
+    let mut spliced = document.clone();
+    spliced.constants.extend(global);
+    spliced
+}
+
+/// A stable identity for a plugin-registered global constant, derived from
+/// its qualified name. Only needs to be stable within one compiled
+/// [`EvaluationPlan`] — global constants are never persisted, so this need
+/// not be stable across process runs or plugin versions.
+pub fn global_constant_id(plugin: &PluginId, property: &PropertyId) -> ConstantId {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for byte in format!("global:{plugin}:{property}").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    ConstantId::new(hash)
+}
+
+/// Render `value` as authored [`ExpressionSource`] literal text that
+/// round-trips through this crate's own unit-literal grammar (`m`/`kg`/`s`/
+/// `A`, see [`unit`]) — used to synthesize a `Global`-scope constant's
+/// authored source from a plugin's `Quantity` default.
+///
+/// Only supports the dimensions this grammar has base-unit symbols for.
+/// Panics on temperature/amount/luminous-intensity: no plugin currently
+/// exports a constant carrying one, and there is no base-unit symbol for
+/// them in this grammar to round-trip through.
+pub fn format_quantity_literal(value: Quantity) -> ExpressionSource {
+    let dimension = value.dimension();
+    assert!(
+        dimension.temperature == 0 && dimension.amount == 0 && dimension.luminous_intensity == 0,
+        "no base unit symbol available for temperature/amount/luminous-intensity dimensions"
+    );
+    let mut source = format!("{:e}", value.si_value());
+    for (symbol, exponent) in [
+        ("kg", dimension.mass),
+        ("m", dimension.length),
+        ("s", dimension.time),
+        ("A", dimension.current),
+    ] {
+        if exponent != 0 {
+            source.push_str(&format!(" * {symbol}^{exponent}"));
+        }
+    }
+    ExpressionSource::new(source)
+}
+
 impl ExpressionDocument {
     /// Deterministic SHA-256 of authored graph content, independent of resolved values.
     pub fn content_hash(&self) -> String {
@@ -516,14 +609,7 @@ impl ExpressionDocument {
                 format!("constant {} does not exist", id.get()),
             ));
         };
-        let qualified = format!(
-            "{}.{}",
-            match definition.scope {
-                ConstantScope::Document => "doc",
-                ConstantScope::User => "user",
-            },
-            definition.name
-        );
+        let qualified = format!("{}.{}", scope_name(definition.scope), definition.name);
         let mut dependents = Vec::new();
         for item in &self.constants {
             if item.id != id && source_mentions_symbol(item.source.as_str(), &qualified) {
@@ -576,8 +662,8 @@ impl ExpressionDocument {
                     candidate.constant_mut(constant)?.source = source;
                 }
                 ExpressionCommand::RenameConstant { constant, name } => {
-                    validate_name(&name)?;
                     let definition = candidate.constant_mut(constant)?.clone();
+                    validate_name(&name, definition.scope)?;
                     if candidate.constants.iter().any(|item| {
                         item.id != constant && item.scope == definition.scope && item.name == name
                     }) {
@@ -623,6 +709,30 @@ impl ExpressionDocument {
                         item.scope != ConstantScope::User || !imported.contains(&item.id)
                     });
                     candidate.constants.extend(definitions);
+                }
+                ExpressionCommand::ImportGlobalConstants(definitions) => {
+                    if definitions.iter().any(|item| {
+                        item.scope != ConstantScope::Document
+                            || !matches!(item.origin, Some(ConstantOrigin::GlobalVariable { .. }))
+                    }) {
+                        return Err(ExpressionError::graph(
+                            ExpressionErrorKind::ScopeViolation,
+                            "only document-scoped, global-origin constants may be imported this way",
+                        ));
+                    }
+                    for definition in definitions {
+                        if candidate
+                            .constants
+                            .iter()
+                            .any(|item| item.id == definition.id)
+                        {
+                            return Err(ExpressionError::graph(
+                                ExpressionErrorKind::AmbiguousSymbol,
+                                format!("constant identity {} already exists", definition.id.get()),
+                            ));
+                        }
+                        candidate.constants.push(definition);
+                    }
                 }
             }
         }
@@ -1291,7 +1401,7 @@ fn build_name_index(
                 ),
             ));
         }
-        validate_name(&definition.name)?;
+        validate_name(&definition.name, definition.scope)?;
         let key = (definition.scope, definition.name.clone());
         if names.insert(key, definition.id).is_some() {
             return Err(ExpressionError::graph(
@@ -1307,13 +1417,29 @@ fn build_name_index(
     Ok(names)
 }
 
-fn validate_name(name: &str) -> Result<(), ExpressionError> {
-    if name.is_empty()
-        || !name.chars().enumerate().all(|(index, character)| {
+/// A plain identifier: non-empty, ASCII alphanumeric/underscore, not
+/// digit-leading.
+fn is_valid_name_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.chars().enumerate().all(|(index, character)| {
             character.is_ascii_alphanumeric() || character == '_' && index > 0
         })
-        || name.as_bytes()[0].is_ascii_digit()
-    {
+        && !segment.as_bytes()[0].is_ascii_digit()
+}
+
+fn validate_name(name: &str, scope: ConstantScope) -> Result<(), ExpressionError> {
+    // `Global` names are synthesized as `<plugin-id>.<property>` (see
+    // `format_quantity_literal`'s neighbor `global_constant_id` and the
+    // `"global."`-prefixed symbol grammar in `parse_constant_symbol`) — each
+    // dot-separated segment must still be a plain identifier, but the dots
+    // themselves are allowed only in this scope; `Document`/`User` names stay
+    // single plain identifiers, matching the plain `doc.`/`user.` prefixes.
+    let valid = if scope == ConstantScope::Global {
+        name.split('.').all(is_valid_name_segment)
+    } else {
+        is_valid_name_segment(name)
+    };
+    if !valid {
         return Err(ExpressionError::graph(
             ExpressionErrorKind::Syntax,
             format!("'{name}' is not a valid constant name"),
@@ -1326,6 +1452,7 @@ fn scope_name(scope: ConstantScope) -> &'static str {
     match scope {
         ConstantScope::Document => "doc",
         ConstantScope::User => "user",
+        ConstantScope::Global => "global",
     }
 }
 
@@ -1406,6 +1533,13 @@ fn scan_constant_dependencies(
                     token.span,
                 ));
             }
+            if current_scope == ConstantScope::User && scope == ConstantScope::Global {
+                return Err(ExpressionError::at(
+                    ExpressionErrorKind::ScopeViolation,
+                    "user constants cannot reference global (plugin) constants",
+                    token.span,
+                ));
+            }
             let id = names.get(&(scope, local.to_owned())).ok_or_else(|| {
                 ExpressionError::at(
                     ExpressionErrorKind::UnknownSymbol,
@@ -1464,6 +1598,10 @@ fn parse_constant_symbol(name: &str) -> Option<(ConstantScope, &str)> {
         .or_else(|| {
             name.strip_prefix("user.")
                 .map(|name| (ConstantScope::User, name))
+        })
+        .or_else(|| {
+            name.strip_prefix("global.")
+                .map(|name| (ConstantScope::Global, name))
         })
 }
 
@@ -2115,6 +2253,7 @@ mod tests {
                 source: "doc.a * 2".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             },
             ConstantDefinition {
                 id: ConstantId::new(1),
@@ -2123,6 +2262,7 @@ mod tests {
                 source: "3 m".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             },
         ];
         let plan = EvaluationPlan::compile(
@@ -2146,6 +2286,7 @@ mod tests {
                     source: "doc.b".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
                 ConstantDefinition {
                     id: ConstantId::new(2),
@@ -2154,6 +2295,7 @@ mod tests {
                     source: "doc.a".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
             ],
             bindings: vec![],
@@ -2175,6 +2317,7 @@ mod tests {
                     source: "1 m".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
                 ConstantDefinition {
                     id: ConstantId::new(2),
@@ -2183,6 +2326,7 @@ mod tests {
                     source: "doc.a".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
             ],
             bindings: vec![],
@@ -2274,6 +2418,7 @@ mod tests {
                 source: "2 m".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             }],
             bindings: vec![PropertyBinding {
                 target: target(),
@@ -2307,6 +2452,7 @@ mod tests {
                     source: "2.7 g / cm^3".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
                 ConstantDefinition {
                     id: ConstantId::new(2),
@@ -2315,6 +2461,7 @@ mod tests {
                     source: "user.density * 2".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
                 ConstantDefinition {
                     id: ConstantId::new(3),
@@ -2323,6 +2470,7 @@ mod tests {
                     source: "1 s".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
             ],
             ..UserConstantLibrary::default()
@@ -2366,6 +2514,7 @@ mod tests {
                 source: "distance.7".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             }],
             bindings: vec![PropertyBinding {
                 target: target(),
@@ -2392,6 +2541,7 @@ mod tests {
                 source: "distance.7".into(),
                 revision: None,
                 provenance: None,
+                origin: None,
             }],
             bindings: vec![],
         };
@@ -2401,6 +2551,163 @@ mod tests {
                 .kind,
             ExpressionErrorKind::ScopeViolation
         );
+    }
+
+    #[test]
+    fn global_scope_symbol_parses_and_document_may_reference_it() {
+        let document = ExpressionDocument {
+            constants: vec![
+                ConstantDefinition {
+                    id: ConstantId::new(1),
+                    scope: ConstantScope::Global,
+                    name: "fieldcad.gravity.G".into(),
+                    source: "6.6743e-11 * m^3 * kg^-1 * s^-2".into(),
+                    revision: None,
+                    provenance: Some("plugin fieldcad.gravity".into()),
+                    origin: None,
+                },
+                ConstantDefinition {
+                    id: ConstantId::new(2),
+                    scope: ConstantScope::Document,
+                    name: "scaled_g".into(),
+                    source: "global.fieldcad.gravity.G * 2".into(),
+                    revision: None,
+                    provenance: None,
+                    origin: Some(ConstantOrigin::GlobalVariable {
+                        plugin: PluginId::new("fieldcad.gravity").unwrap(),
+                        property: PropertyId::new("G").unwrap(),
+                    }),
+                },
+            ],
+            bindings: vec![],
+        };
+        EvaluationPlan::compile(&document, |_| None).unwrap();
+    }
+
+    #[test]
+    fn user_constants_cannot_reference_global_constants() {
+        let document = ExpressionDocument {
+            constants: vec![
+                ConstantDefinition {
+                    id: ConstantId::new(1),
+                    scope: ConstantScope::Global,
+                    name: "fieldcad.gravity.G".into(),
+                    source: "6.6743e-11 * m^3 * kg^-1 * s^-2".into(),
+                    revision: None,
+                    provenance: None,
+                    origin: None,
+                },
+                ConstantDefinition {
+                    id: ConstantId::new(2),
+                    scope: ConstantScope::User,
+                    name: "leak".into(),
+                    source: "global.fieldcad.gravity.G".into(),
+                    revision: None,
+                    provenance: None,
+                    origin: None,
+                },
+            ],
+            bindings: vec![],
+        };
+        assert_eq!(
+            EvaluationPlan::compile(&document, |_| None)
+                .unwrap_err()
+                .kind,
+            ExpressionErrorKind::ScopeViolation
+        );
+    }
+
+    #[test]
+    fn import_global_constants_rejects_non_document_scope_or_missing_origin() {
+        let document = ExpressionDocument::default();
+        let wrong_scope = document.apply([ExpressionCommand::ImportGlobalConstants(vec![
+            ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::Global,
+                name: "g".into(),
+                source: "1".into(),
+                revision: None,
+                provenance: None,
+                origin: Some(ConstantOrigin::GlobalVariable {
+                    plugin: PluginId::new("fieldcad.gravity").unwrap(),
+                    property: PropertyId::new("G").unwrap(),
+                }),
+            },
+        ])]);
+        assert_eq!(
+            wrong_scope.unwrap_err().kind,
+            ExpressionErrorKind::ScopeViolation
+        );
+
+        let missing_origin = document.apply([ExpressionCommand::ImportGlobalConstants(vec![
+            ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::Document,
+                name: "g".into(),
+                source: "1".into(),
+                revision: None,
+                provenance: None,
+                origin: None,
+            },
+        ])]);
+        assert_eq!(
+            missing_origin.unwrap_err().kind,
+            ExpressionErrorKind::ScopeViolation
+        );
+    }
+
+    #[test]
+    fn import_global_constants_creates_an_editable_document_copy() {
+        let document = ExpressionDocument::default();
+        let imported = document
+            .apply([ExpressionCommand::ImportGlobalConstants(vec![
+                ConstantDefinition {
+                    id: ConstantId::new(1),
+                    scope: ConstantScope::Document,
+                    name: "g".into(),
+                    source: "6.6743e-11 * m^3 * kg^-1 * s^-2".into(),
+                    revision: None,
+                    provenance: Some("plugin fieldcad.gravity".into()),
+                    origin: Some(ConstantOrigin::GlobalVariable {
+                        plugin: PluginId::new("fieldcad.gravity").unwrap(),
+                        property: PropertyId::new("G").unwrap(),
+                    }),
+                },
+            ])])
+            .unwrap();
+        assert_eq!(imported.constants.len(), 1);
+        // The imported copy is an ordinary document constant afterward —
+        // editable exactly like any other, which is how override happens.
+        let overridden = imported
+            .apply([ExpressionCommand::SetConstantSource {
+                constant: ConstantId::new(1),
+                source: "1.0".into(),
+            }])
+            .unwrap();
+        assert_eq!(overridden.constants[0].source.as_str(), "1.0");
+    }
+
+    #[test]
+    fn quantity_literal_round_trips_through_the_expression_grammar() {
+        let value = Quantity::new(6.674_30e-11, Dimension::new(-1, 3, -2, 0, 0, 0, 0)).unwrap();
+        let source = format_quantity_literal(value);
+        let document = ExpressionDocument {
+            constants: vec![ConstantDefinition {
+                id: ConstantId::new(1),
+                scope: ConstantScope::Document,
+                name: "g".into(),
+                source,
+                revision: None,
+                provenance: None,
+                origin: None,
+            }],
+            bindings: vec![],
+        };
+        let mut plan = EvaluationPlan::compile(&document, |_| None).unwrap();
+        let result = plan.evaluate(&Distances(BTreeMap::new())).unwrap();
+        let resolved = result.constants[&ConstantId::new(1)];
+        assert!((resolved.si_value() - 6.674_30e-11).abs() < 1e-20);
+        assert_eq!(resolved.dimension(), value.dimension());
     }
 
     #[test]
@@ -2414,6 +2721,7 @@ mod tests {
                     source: "distance.7".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
                 ConstantDefinition {
                     id: ConstantId::new(2),
@@ -2422,6 +2730,7 @@ mod tests {
                     source: "doc.gap / 2".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
             ],
             bindings: vec![PropertyBinding {

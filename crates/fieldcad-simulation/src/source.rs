@@ -18,7 +18,7 @@ use fieldcad_core::{
 };
 use fieldcad_dynamics::IntegrationScheme;
 use fieldcad_expressions::{ExpressionCommand, ExpressionDocument, ExpressionState};
-use fieldcad_plugin_api::FieldBrushStroke;
+use fieldcad_plugin_api::{ExportedVariable, FieldBrushStroke};
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
@@ -578,6 +578,15 @@ pub trait FieldDataSource: Send {
     /// Accepted expression graph, dependency health, values, and current live fault.
     fn expression_state(&self) -> ExpressionState {
         ExpressionState::default()
+    }
+    /// Constants currently registered by an active plugin (a
+    /// `VariablesSubsystem`'s entries) — visible independent of any
+    /// document, importable per-document via
+    /// `ExpressionCommand::ImportGlobalConstants`. Empty for a source that
+    /// does not locally hold this, e.g. a remote session that has not chosen
+    /// to transmit it — same convention as [`Self::body_forces`].
+    fn global_variables(&self) -> Vec<(PluginId, ExportedVariable)> {
+        Vec::new()
     }
 
     /// The dynamics system's summed force on every body it advanced, as of the
@@ -1434,6 +1443,10 @@ impl FieldDataSource for LocalDataSource {
         self.core.runtime.expression_state()
     }
 
+    fn global_variables(&self) -> Vec<(PluginId, ExportedVariable)> {
+        self.core.runtime.global_variables()
+    }
+
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         self.core.runtime.body_forces()
     }
@@ -1655,6 +1668,10 @@ impl FieldDataSource for LoopbackDataSource {
 
     fn expression_state(&self) -> ExpressionState {
         self.core.runtime.expression_state()
+    }
+
+    fn global_variables(&self) -> Vec<(PluginId, ExportedVariable)> {
+        self.core.runtime.global_variables()
     }
 
     fn execute(&mut self, command: Command) -> Result<CommandReceipt, SourceError> {

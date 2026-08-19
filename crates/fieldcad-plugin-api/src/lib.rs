@@ -19,9 +19,9 @@ use std::{
 use fieldcad_core::quantities::{LengthMetres, MassKg};
 use fieldcad_core::{
     BoxId, ChannelId, ChannelSchema, ComponentSchema, Domain, FieldColumn, GradientColumn,
-    ObjectId, PlaneId, PluginId, PluginVersion, ProbeId, PropertyBag, PropertySchema, Quantity,
-    SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic, SphereId, StepContext, TimeStep,
-    Transform, Velocity, WorldSnapshot, validate_properties,
+    ObjectId, PlaneId, PluginId, PluginVersion, ProbeId, PropertyBag, PropertyId, PropertySchema,
+    Quantity, SampleGeometry, SampleValidity, SchemaError, SolverDiagnostic, SphereId, StepContext,
+    TimeStep, Transform, Velocity, WorldSnapshot, validate_properties,
 };
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,65 @@ impl PluginConfigurationSchema {
     /// single validation implementation rather than repeating it.
     pub fn validate(&self, values: &PropertyBag) -> Result<(), SchemaError> {
         validate_properties(&self.properties, values)
+    }
+}
+
+/// One physical constant a plugin registers into the shared
+/// [`VariablesSubsystem`] — visible globally (independent of any document or
+/// running simulation) and importable into a document's expression
+/// constants, where the imported copy also doubles as this plugin's
+/// configuration value (`property` is the same key used in
+/// [`EquationSystemPlugin::default_configuration`]/`configuration_schema`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExportedVariable {
+    pub property: PropertyId,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub default_value: Quantity,
+}
+
+/// Registry plugins register their constants into during catalog assembly.
+///
+/// Built once from a plugin catalog (desktop or server), independent of any
+/// running [`fieldcad_simulation`] session or open document — this is what
+/// backs a global, session-independent view of plugin-exported constants
+/// (e.g. a Settings window), and the source [`ConstantScope::Global`]-style
+/// entries in the expression system are synthesized from.
+#[derive(Default)]
+pub struct VariablesSubsystem {
+    entries: std::collections::BTreeMap<(PluginId, PropertyId), ExportedVariable>,
+}
+
+impl VariablesSubsystem {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one constant on behalf of `plugin`. Registering the same
+    /// `(plugin, property)` pair twice is a programming error — plugin
+    /// catalogs are assembled once per session and each plugin registers its
+    /// own constants exactly once — so this overwrites and logs rather than
+    /// panicking, keeping catalog assembly infallible.
+    pub fn register(&mut self, plugin: PluginId, variable: ExportedVariable) {
+        let key = (plugin, variable.property.clone());
+        if self.entries.contains_key(&key) {
+            tracing::warn!(
+                plugin = %key.0,
+                property = %key.1,
+                "duplicate variable registration; keeping the newest value"
+            );
+        }
+        self.entries.insert(key, variable);
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&PluginId, &ExportedVariable)> {
+        self.entries
+            .iter()
+            .map(|((plugin, _), variable)| (plugin, variable))
+    }
+
+    pub fn get(&self, plugin: &PluginId, property: &PropertyId) -> Option<&ExportedVariable> {
+        self.entries.get(&(plugin.clone(), property.clone()))
     }
 }
 
@@ -286,10 +345,34 @@ pub trait EquationSystemPlugin: Send + Sync {
         PropertyBag::default()
     }
 
+    /// Register this plugin's exported physical constants into `variables`.
+    /// Called once, when the plugin catalog is assembled — see
+    /// [`build_variables_subsystem`]. Default no-op: most plugins export
+    /// nothing.
+    fn register_variables(&self, _plugin: &PluginId, _variables: &mut VariablesSubsystem) {}
+
     fn create_solver(
         &self,
         context: SolverContext<'_>,
     ) -> Result<Box<dyn EquationSystemSolver>, PluginError>;
+}
+
+/// Build a [`VariablesSubsystem`] from an assembled plugin catalog, calling
+/// [`EquationSystemPlugin::register_variables`] once per plugin.
+///
+/// Takes trait objects rather than a concrete registration type so it has no
+/// dependency on `fieldcad-simulation`'s `PluginRegistration` — the caller
+/// (desktop/server catalog assembly) maps its own registrations down to
+/// `&dyn EquationSystemPlugin` first.
+pub fn build_variables_subsystem<'a>(
+    plugins: impl IntoIterator<Item = &'a dyn EquationSystemPlugin>,
+) -> VariablesSubsystem {
+    let mut subsystem = VariablesSubsystem::new();
+    for plugin in plugins {
+        let id = plugin.metadata().id;
+        plugin.register_variables(&id, &mut subsystem);
+    }
+    subsystem
 }
 
 /// Mutable state owned by one simulation session for one equation system.

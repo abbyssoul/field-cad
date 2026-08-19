@@ -21,7 +21,7 @@ use fieldcad_core::{
     ObjectId, PluginId, ProbeId, PropertyBag, SceneScale, WorldCommand, WorldSnapshot,
 };
 use fieldcad_dynamics::IntegrationScheme;
-use fieldcad_plugin_api::SolverCancellation;
+use fieldcad_plugin_api::{ExportedVariable, SolverCancellation};
 use glam::DVec3;
 
 use crate::{
@@ -158,6 +158,7 @@ struct SourceState {
     expression_state: fieldcad_expressions::ExpressionState,
     resolved_constants:
         BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
+    global_variables: Vec<(PluginId, ExportedVariable)>,
     snapshot: Option<Arc<FieldSnapshot>>,
     forces: BTreeMap<ObjectId, DVec3>,
     step_compute_ms: f32,
@@ -179,6 +180,7 @@ impl SourceState {
             expressions: source.expressions(),
             expression_state: source.expression_state(),
             resolved_constants: source.resolved_constants(),
+            global_variables: source.global_variables(),
             snapshot: source.latest_snapshot(),
             forces: source.runtime().body_forces(),
             step_compute_ms: source.runtime().last_tick_compute_ms(),
@@ -217,6 +219,7 @@ pub struct AsyncLocalDataSource {
     expression_state: fieldcad_expressions::ExpressionState,
     resolved_constants:
         BTreeMap<fieldcad_expressions::ConstantId, fieldcad_expressions::ExpressionValue>,
+    global_variables: Vec<(PluginId, ExportedVariable)>,
     forces: BTreeMap<ObjectId, DVec3>,
     step_compute_ms: f32,
     mailbox: SnapshotMailbox,
@@ -305,6 +308,7 @@ impl AsyncLocalDataSource {
             expressions: initial.expressions,
             expression_state: initial.expression_state,
             resolved_constants: initial.resolved_constants,
+            global_variables: initial.global_variables,
             forces: initial.forces,
             step_compute_ms: initial.step_compute_ms,
             mailbox,
@@ -335,6 +339,7 @@ impl AsyncLocalDataSource {
         self.expressions = state.expressions;
         self.expression_state = state.expression_state;
         self.resolved_constants = state.resolved_constants;
+        self.global_variables = state.global_variables;
         self.forces = state.forces;
         self.step_compute_ms = state.step_compute_ms;
         match state.snapshot {
@@ -875,6 +880,10 @@ impl FieldDataSource for AsyncLocalDataSource {
         self.expression_state.clone()
     }
 
+    fn global_variables(&self) -> Vec<(PluginId, ExportedVariable)> {
+        self.global_variables.clone()
+    }
+
     fn body_forces(&self) -> BTreeMap<ObjectId, DVec3> {
         self.forces.clone()
     }
@@ -1158,6 +1167,7 @@ mod tests {
                     source: "2 m".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
                 fieldcad_expressions::ConstantDefinition {
                     id: fieldcad_expressions::ConstantId::new(2),
@@ -1166,6 +1176,7 @@ mod tests {
                     source: "doc.length / 1 m".into(),
                     revision: None,
                     provenance: None,
+                    origin: None,
                 },
             ],
             bindings: Vec::new(),
@@ -1197,6 +1208,34 @@ mod tests {
         // Equality covers the document, graph hash, resolved revision,
         // deterministic node order, dependencies, values, statuses, and live diagnostics.
         assert_eq!(async_source.expression_state(), expected);
+    }
+
+    #[test]
+    fn async_source_projects_the_same_global_variables_as_its_wrapped_local_source() {
+        fn electrostatics_runtime() -> SimulationRuntime {
+            let domain = Domain::new(
+                DomainBounds::new(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)).unwrap(),
+                Resolution::new(8, 8, 8).unwrap(),
+                BoundaryConditions::uniform(BoundaryCondition::Periodic),
+                Precision::F64,
+            );
+            let step = TimeStep::from_seconds(courant_limit(&domain) * 0.5).unwrap();
+            SimulationRuntime::new(
+                RuntimeConfig::new(domain, step, SessionId::from_u128(101)).with_plugin(Box::new(
+                    fieldcad_electrostatics::ElectrostaticsPlugin::new(),
+                )),
+            )
+            .unwrap()
+        }
+
+        let expected = LocalDataSource::new(electrostatics_runtime()).global_variables();
+        assert!(
+            !expected.is_empty(),
+            "electrostatics must register at least K"
+        );
+        let async_source =
+            AsyncLocalDataSource::new(LocalDataSource::new(electrostatics_runtime()));
+        assert_eq!(async_source.global_variables(), expected);
     }
 
     #[test]
