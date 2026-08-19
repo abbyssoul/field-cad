@@ -16,9 +16,9 @@ members = [
     "crates/fieldcad-simulation",
     "crates/fieldcad-superposition",
     "crates/fieldcad-superposition-solver",
-    "plugins/electrostatics",
     "plugins/electromagnetism",
-    "plugins/gravity",
+    "plugins/electrostatics",
+    "plugins/gravitostatics",
     "plugins/test-field",
 ]
 default-members = ["apps/fieldcad-desktop"]
@@ -95,5 +95,5 @@ fieldcad-superposition = { path = "crates/fieldcad-superposition" }
 fieldcad-superposition-solver = { path = "crates/fieldcad-superposition-solver" }
 fieldcad-electrostatics = { path = "plugins/electrostatics" }
 fieldcad-electromagnetism = { path = "plugins/electromagnetism" }
-fieldcad-gravity = { path = "plugins/gravity" }
+fieldcad-gravitostatics = { path = "plugins/gravitostatics" }
 fieldcad-test-field = { path = "plugins/test-field" }

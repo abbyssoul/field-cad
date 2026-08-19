@@ -7,7 +7,7 @@
 //! opposite sign. This crate owns that shared numerical core once; a
 //! caller supplies only the constant (magnitude and sign) and its sources.
 //! It has no notion of "charge" or "mass," no plugin, and no runtime
-//! dependency — `plugins/electrostatics` and `plugins/gravity` are both
+//! dependency — `plugins/electrostatics` and `plugins/gravitostatics` are both
 //! thin adapters over it, converting their own source/sample types to and
 //! from the generic shapes here and supplying their own coupling constant.
 //! [`InverseSquareBatchEvaluator`] is the shared evaluator seam both

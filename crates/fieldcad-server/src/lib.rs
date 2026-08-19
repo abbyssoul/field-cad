@@ -26,7 +26,7 @@ use fieldcad_core::{
 };
 use fieldcad_electromagnetism::{ElectromagnetismPlugin, courant_limit};
 use fieldcad_electrostatics::ElectrostaticsPlugin;
-use fieldcad_gravity::NewtonianGravityPlugin;
+use fieldcad_gravitostatics::NewtonianGravityPlugin;
 use fieldcad_scene_document::{FieldSystemComposition, LoadError, ResolveError, RunRecord};
 use fieldcad_simulation::{
     AsyncLocalDataSource, BodySample, Command, CommandDisposition, CommandEvent, CommandId,

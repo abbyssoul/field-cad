@@ -4,7 +4,7 @@
 //! What makes a body dynamic is mass, not membership of any particular
 //! crate's component: [`collect_particles`] iterates authored masses, and
 //! charge is optional (an uncharged body is neutral, not invalid). This
-//! stays a private module of the sole consumer (`plugins/gravity` already
+//! stays a private module of the sole consumer (`plugins/gravitostatics` already
 //! has its own `fieldcad_sources::collect_gravity_sources` and does not
 //! need this) rather than a new shared crate.
 

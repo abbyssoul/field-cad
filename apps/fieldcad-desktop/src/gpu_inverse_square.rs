@@ -5,7 +5,7 @@
 //! form with a different coupling constant and, for gravity, an opposite
 //! sign — see `fieldcad-superposition`'s module doc. [`GpuInverseSquareEvaluator`]
 //! implements that crate's `InverseSquareBatchEvaluator` directly and is
-//! injected into both `plugins/electrostatics` and `plugins/gravity` with
+//! injected into both `plugins/electrostatics` and `plugins/gravitostatics` with
 //! their own coupling constant; there is no per-equation-system wrapper
 //! left to keep in step, since source conversion and the coupling constant
 //! are the plugins' own job now, not this adapter's.
@@ -656,13 +656,13 @@ mod tests {
             ];
             let inverse_square_sources: Vec<_> = sources
                 .iter()
-                .map(fieldcad_gravity::inverse_square_source)
+                .map(fieldcad_gravitostatics::inverse_square_source)
                 .collect();
 
             for geometry in test_geometries() {
                 let gpu = InverseSquareBatchEvaluator::evaluate(
                     &evaluator,
-                    -fieldcad_gravity::GRAVITATIONAL_CONSTANT,
+                    -fieldcad_gravitostatics::GRAVITATIONAL_CONSTANT,
                     &inverse_square_sources,
                     &domain,
                     &geometry,
@@ -670,7 +670,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(gpu.len(), geometry.len());
                 for (index, (gpu, position)) in gpu.iter().zip(geometry.positions()).enumerate() {
-                    let cpu = fieldcad_gravity::evaluate_sources(&sources, position);
+                    let cpu = fieldcad_gravitostatics::evaluate_sources(&sources, position);
                     assert_eq!(gpu.validity, cpu.validity, "validity at sample {index}");
                     if cpu.validity.is_usable() {
                         for (actual, expected) in

@@ -297,7 +297,7 @@ mod tests {
     /// though `evaluate_sources` has always had the correct finite
     /// interior formula right next to it — a body dragged inside a charged
     /// sphere felt exactly zero force from it. Fixed by sharing one
-    /// implementation with `plugins/gravity`, which already got this right
+    /// implementation with `plugins/gravitostatics`, which already got this right
     /// for gravity (PH-2/PH-19).
     #[test]
     fn a_body_inside_a_charged_sphere_feels_its_finite_interior_field() {

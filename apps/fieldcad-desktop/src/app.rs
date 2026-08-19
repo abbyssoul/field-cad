@@ -24,7 +24,7 @@ use fieldcad_electromagnetism::{
 use fieldcad_electrostatics::{
     ElectrostaticsPlugin, electric_field_channel_id, electric_potential_channel_id,
 };
-use fieldcad_gravity::NewtonianGravityPlugin;
+use fieldcad_gravitostatics::NewtonianGravityPlugin;
 use fieldcad_plugin_api::{FieldBrushFalloff, FieldBrushStroke};
 use fieldcad_server::HeadlessServer;
 use fieldcad_simulation::{

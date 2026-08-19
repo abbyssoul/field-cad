@@ -30,7 +30,7 @@ use fieldcad_expressions::{
     ConstantDefinition, ConstantId, ConstantScope, EvaluationPlan, ExpressionDocument,
     PropertyBinding, PropertyBindingSchema, PropertyTarget, ValueProvider,
 };
-use fieldcad_gravity::GRAVITATIONAL_ACCELERATION_HANDLE;
+use fieldcad_gravitostatics::GRAVITATIONAL_ACCELERATION_HANDLE;
 use fieldcad_plugin_api::{
     DynamicBody, EquationSystemPlugin, EquationSystemSolver, SolverCancellation, SolverContext,
 };
@@ -179,7 +179,7 @@ fn gravity_world(scene: &Scene) -> World {
 }
 
 fn gravity_solver(scene: &Scene, world: &World) -> Box<dyn EquationSystemSolver> {
-    use fieldcad_gravity::NewtonianGravityPlugin;
+    use fieldcad_gravitostatics::NewtonianGravityPlugin;
     NewtonianGravityPlugin::new()
         .create_solver(SolverContext {
             configuration: &Default::default(),

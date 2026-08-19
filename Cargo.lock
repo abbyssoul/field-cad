@@ -1182,7 +1182,7 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-expressions",
- "fieldcad-gravity",
+ "fieldcad-gravitostatics",
  "fieldcad-plugin-api",
  "fieldcad-scene-document",
  "fieldcad-simulation",
@@ -1238,7 +1238,7 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-expressions",
- "fieldcad-gravity",
+ "fieldcad-gravitostatics",
  "fieldcad-mcp",
  "fieldcad-plugin-api",
  "fieldcad-scene-document",
@@ -1322,7 +1322,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fieldcad-gravity"
+name = "fieldcad-gravitostatics"
 version = "0.1.0"
 dependencies = [
  "fieldcad-core",
@@ -1407,7 +1407,7 @@ dependencies = [
  "fieldcad-electromagnetism",
  "fieldcad-electrostatics",
  "fieldcad-expressions",
- "fieldcad-gravity",
+ "fieldcad-gravitostatics",
  "fieldcad-scene-document",
  "fieldcad-simulation",
  "fieldcad-sources",

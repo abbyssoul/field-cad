@@ -28,7 +28,7 @@ use fieldcad_bench::{measure::summarize, report::format_ns};
 use fieldcad_core::{SessionId, World};
 use fieldcad_electromagnetism::ElectromagnetismPlugin;
 use fieldcad_electrostatics::ElectrostaticsPlugin;
-use fieldcad_gravity::NewtonianGravityPlugin;
+use fieldcad_gravitostatics::NewtonianGravityPlugin;
 use fieldcad_simulation::{PluginRegistration, RuntimeConfig, SimulationRuntime, Subscription};
 use glam::{UVec2, UVec3};
 
