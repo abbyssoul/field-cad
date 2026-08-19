@@ -1400,6 +1400,12 @@ impl WindowState {
         // tolerance the field snapshot itself already has.
         if show.objects {
             let mut new_trajectory_cache = BTreeMap::new();
+            // Summed across every watched object, then reserved on the GPU
+            // flow-ribbon buffer up front (below) — a bounded, known set (a
+            // user watches a handful of objects at most), unlike field-layer
+            // streamlines, whose count and density come from open-ended
+            // layer settings with no single worthwhile bound to precompute.
+            let mut trajectory_ribbon_capacity = 0usize;
             for (&object_id, &display) in &self.ui_model.object_trajectories {
                 if !display.visible {
                     continue;
@@ -1412,6 +1418,7 @@ impl WindowState {
                 }
                 let history_capacity =
                     display.required_body_history_capacity(compute.time_step_seconds);
+                trajectory_ribbon_capacity += scene::max_ribbon_vertices(history_capacity);
                 let mut model = self.model();
                 model.set_body_history_capacity(object_id, history_capacity);
                 model.request_body_history(object_id);
@@ -1458,6 +1465,8 @@ impl WindowState {
                 new_trajectory_cache.insert(object_id, TrajectoryGeometryCache { inputs, ribbon });
             }
             self.trajectory_geometry_cache = new_trajectory_cache;
+            self.renderer
+                .reserve_flow_line_capacity(trajectory_ribbon_capacity);
         }
         // Kept for next frame's `ComputeView::build` to reuse whatever is
         // still current — every other use of `compute` above is a borrow, so

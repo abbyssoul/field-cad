@@ -35,6 +35,32 @@ the ribbon `Vec` now reaches its lifetime capacity in one reservation
 instead of the usual doubling sequence, so filling from an empty history to
 a full one costs one allocation per object instead of ~`log₂(capacity)`.
 
+**Update (2026-08-19, later still):** the CPU-side fix above didn't stop
+the Diagnostics panel's `Mem` plot from still climbing-then-plateauing —
+because that field reads whole-process RSS from `/proc/self/status`
+(`frame_stats` in `app.rs`), not the Rust heap, and the actual remaining
+growth was on the GPU side, invisible to dhat entirely. Confirmed by
+comparing a dhat pass's `gmax` (peak simultaneous Rust-heap bytes, ~84 MB)
+against the RSS the same run's Diagnostics panel reported (~189 MB): dhat
+only instruments Rust's global allocator, and `renderer.rs`'s
+`DynamicFlowLineBuffer` (backing the flow-ribbon draw call, shared by
+streamlines and trajectories) grows its `wgpu::Buffer` reactively via
+`next_power_of_two` — a real GPU allocation on every regrow, invisible to
+dhat, that ratchets up in step with the same trajectory-history-filling
+timeline and then holds at that high-water mark. Fixed the same way as the
+CPU buffer: `SceneRenderer::reserve_flow_line_capacity`/
+`DynamicFlowLineBuffer::ensure_capacity` let a caller reserve a tight known
+upper bound up front. `WindowState::redraw`'s trajectory loop now sums
+`scene::max_ribbon_vertices` across every currently-watched object (a
+small, bounded set) and reserves that on the GPU buffer before `update`
+would otherwise discover it needs to grow reactively — one GPU allocation
+at (or near) the buffer's lifetime size instead of the usual doubling
+sequence. Deliberately *not* applied to `field_surface`/`field_lines`
+(the other two `Dynamic*Buffer`s, backing streamline/glyph geometry): those
+depend on open-ended per-layer density/streamline settings with no single
+worthwhile bound to precompute, unlike a session's small, explicit set of
+watched trajectory objects.
+
 **What's still open:** `overlay.flow_ribbons.extend(ribbon.iter().copied())`
 still copies the (now-cached) ribbon into `overlay` every single redraw,
 because `overlay` itself is deliberately rebuilt fresh every frame (see the

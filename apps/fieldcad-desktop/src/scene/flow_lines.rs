@@ -428,13 +428,7 @@ pub(super) fn trace_domain_streamlines(
                         field_color(scale.normalized(magnitude)).extend(1.0)
                     })
                     .collect();
-                build_flow_ribbon(
-                    &polyline,
-                    &colors,
-                    display.into(),
-                    scene_scale,
-                    output,
-                );
+                build_flow_ribbon(&polyline, &colors, display.into(), scene_scale, output);
                 if output.len() >= MAX_RIBBON_VERTICES {
                     break 'seeds;
                 }
@@ -507,13 +501,7 @@ pub(super) fn trace_box_streamlines(
                         field_color(scale.normalized(magnitude)).extend(1.0)
                     })
                     .collect();
-                build_flow_ribbon(
-                    &polyline,
-                    &colors,
-                    display.into(),
-                    scene_scale,
-                    output,
-                );
+                build_flow_ribbon(&polyline, &colors, display.into(), scene_scale, output);
                 if output.len() >= MAX_RIBBON_VERTICES {
                     break 'seeds;
                 }
@@ -587,13 +575,7 @@ pub(super) fn trace_sphere_streamlines(
                         field_color(scale.normalized(magnitude)).extend(1.0)
                     })
                     .collect();
-                build_flow_ribbon(
-                    &polyline,
-                    &colors,
-                    display.into(),
-                    scene_scale,
-                    output,
-                );
+                build_flow_ribbon(&polyline, &colors, display.into(), scene_scale, output);
                 if output.len() >= MAX_RIBBON_VERTICES {
                     break 'seeds;
                 }
@@ -664,13 +646,7 @@ pub(super) fn trace_plane_streamlines(
                     field_color(scale.normalized(magnitude)).extend(1.0)
                 })
                 .collect();
-            build_flow_ribbon(
-                &polyline,
-                &colors,
-                display.into(),
-                scene_scale,
-                output,
-            );
+            build_flow_ribbon(&polyline, &colors, display.into(), scene_scale, output);
             if output.len() >= MAX_RIBBON_VERTICES {
                 break 'seeds;
             }

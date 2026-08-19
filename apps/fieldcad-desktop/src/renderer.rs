@@ -245,6 +245,12 @@ impl ViewportRenderer {
         }
     }
 
+    /// See [`SceneRenderer::reserve_flow_line_capacity`].
+    pub(crate) fn reserve_flow_line_capacity(&mut self, elements: usize) {
+        self.scene
+            .reserve_flow_line_capacity(&self.device, elements);
+    }
+
     pub fn render(&mut self, frame: SceneFrame<'_>, gui_paint: GuiPaint<'_>) -> RenderStatus {
         if self.size.width == 0 || self.size.height == 0 {
             return RenderStatus::Skipped;
@@ -831,6 +837,17 @@ impl SceneRenderer {
         }
     }
 
+    /// Grow the flow-ribbon GPU buffer up front to hold at least
+    /// `elements` vertices, if it doesn't already. `WindowState::redraw`
+    /// calls this with the sum of every currently-watched trajectory's
+    /// worst-case ribbon size — a small, known set (a user watches a
+    /// handful of objects at most), unlike field-layer streamlines, whose
+    /// count and density depend on layer settings with no single bound
+    /// worth precomputing here. See [`DynamicFlowLineBuffer::ensure_capacity`].
+    pub(crate) fn reserve_flow_line_capacity(&mut self, device: &wgpu::Device, elements: usize) {
+        self.flow_lines.ensure_capacity(device, elements);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn update(
         &mut self,
@@ -1164,20 +1181,7 @@ impl DynamicFlowLineBuffer {
         if allowed == 0 {
             return;
         }
-        if allowed > self.capacity {
-            // See the equivalent comment in `DynamicVertexBuffer::update`.
-            self.capacity = allowed.next_power_of_two().min(max_buffer_elements(
-                device,
-                std::mem::size_of::<FlowLineVertex>(),
-            ));
-            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: (self.capacity * std::mem::size_of::<FlowLineVertex>())
-                    as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
+        self.ensure_capacity(device, allowed);
         let base_allowed = allowed.min(base.len());
         let overlay_allowed = allowed - base_allowed;
         self.scratch.extend(
@@ -1193,6 +1197,30 @@ impl DynamicFlowLineBuffer {
                 .map(FlowLineVertex::from),
         );
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.scratch));
+    }
+
+    /// Grow the backing buffer to hold at least `elements`, recreating it
+    /// only if `self.capacity` doesn't already cover that. Called both
+    /// reactively from [`Self::update`] (`allowed > self.capacity`) and
+    /// eagerly from `WindowState::redraw`'s trajectory loop, which knows a
+    /// tight upper bound up front (`TrajectoryDisplay::required_body_history_capacity`)
+    /// and would rather pay for one GPU allocation than the handful of
+    /// reactive regrows a history ring buffer filling from empty otherwise
+    /// triggers.
+    fn ensure_capacity(&mut self, device: &wgpu::Device, elements: usize) {
+        if elements <= self.capacity {
+            return;
+        }
+        self.capacity = elements.next_power_of_two().min(max_buffer_elements(
+            device,
+            std::mem::size_of::<FlowLineVertex>(),
+        ));
+        self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(self.label),
+            size: (self.capacity * std::mem::size_of::<FlowLineVertex>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
     }
 }
 
